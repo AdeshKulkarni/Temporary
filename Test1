@@ -10,7 +10,6 @@ import {
   Paper,
   Typography,
   Grid,
-  Container,
   Card,
   CardContent,
   CardHeader,
@@ -23,6 +22,7 @@ import { Box, styled } from "@mui/system";
 import DialogActions from "@mui/material/DialogActions";
 import CloseIcon from "@mui/icons-material/Close";
 import InfoIcon from "@mui/icons-material/Info";
+import AddCircleOutlineIcon from '@mui/icons-material/AddCircleOutline';
 import ReactQuill from "react-quill";
 import Quill from "quill";
 import "react-quill/dist/quill.snow.css";
@@ -72,6 +72,16 @@ Font.whitelist = [
 ];
 Quill.register(Font, true);
 
+// Register custom blot for invalid variables
+const Inline = Quill.import('blots/inline');
+class InvalidBlot extends Inline {
+  static blotName = 'invalid-variable';
+  static tagName = 'span';
+  static className = 'invalid-variable';
+}
+Quill.register(InvalidBlot);
+
+
 const iv = crypto.getRandomValues(new Uint8Array(12));
 const ivBase64 = btoa(String.fromCharCode.apply(null, iv));
 const salt = crypto.getRandomValues(new Uint8Array(16));
@@ -102,6 +112,7 @@ const EmailTemplate = () => {
   const [isEditing, setIsEditing] = useState(false);
   const [isPreviewing, setIsPreviewing] = useState(false);
   const [templateContent, settemplateContent] = useState(null);
+  const [lastState, setLastState] = useState(null); // For undo reset
 
   const draftVar = [
     "{{DATE}}", "{{REF_NO}}", "{{FIRM_NAME}}", "{{FRN_NO}}",
@@ -117,7 +128,6 @@ const EmailTemplate = () => {
   ];
 
   const bodyEditorRef = useRef(null);
-  const headerEditorRef = useRef(null);
 
   const modules = {
     toolbar: [
@@ -139,6 +149,20 @@ const EmailTemplate = () => {
   useEffect(() => {
     fetchData();
   }, []);
+
+  // Autosave functionality
+  useEffect(() => {
+    if (!isEditing) return;
+
+    const handler = setTimeout(() => {
+      handleSave(true); // Pass true for autosave
+    }, 3000); // 3-second delay
+
+    return () => {
+      clearTimeout(handler);
+    };
+  }, [bodyContent, isEditing]);
+
 
   const fetchData = async () => {
     try {
@@ -168,8 +192,24 @@ const EmailTemplate = () => {
   }
 
   const handleBodyChange = (content, delta, source, editor) => {
+    if (source === 'api') return;
+    
     let htmlContent = editor.getHTML();
+    let textContent = editor.getText();
     let length = countWord(htmlContent);
+
+    // --- Inline Variable Validation ---
+    const allVars = textContent.match(/\{{2}[A-Z_]+\}{2}/g) || [];
+    editor.formatText(0, textContent.length, 'invalid-variable', false); // Clear previous formatting
+    allVars.forEach(variable => {
+      if (!draftVar.includes(variable)) {
+        let match;
+        const regex = new RegExp(variable.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'), 'g');
+        while ((match = regex.exec(textContent)) !== null) {
+          editor.formatText(match.index, variable.length, 'invalid-variable', true);
+        }
+      }
+    });
 
     const insertedOp = delta.ops?.find((op) => typeof op.insert === "string");
     if (insertedOp) {
@@ -189,7 +229,7 @@ const EmailTemplate = () => {
       }
     }
 
-    if (length > 2000) { // Updated word limit for consistency with instructions
+    if (length > 2000) {
       const quillEditor = bodyEditorRef.current?.getEditor();
       if (quillEditor) {
         const selection = quillEditor.getSelection();
@@ -219,18 +259,34 @@ const EmailTemplate = () => {
     }
   };
 
-  const handleSave = async () => {
-    setIsEditing(false);
+  const insertVariable = (variable) => {
+    const editor = bodyEditorRef.current?.getEditor();
+    if (editor && isEditing) {
+      const range = editor.getSelection(true) || { index: editor.getLength() };
+      editor.insertText(range.index, variable, 'user');
+      editor.focus();
+    } else if (!isEditing) {
+      setSbar({ isOpen: true, Msg: "Please enable Edit mode to add variables." });
+    }
+  };
+
+  const handleSave = async (isAutosave = false) => {
+    if (!isEditing && !isAutosave) {
+        setIsEditing(false);
+    }
+    
     const fullContent = headerContent + bodyContent;
     let str = fullContent.match(/\{{2}[A-Z_]+\}{2}/g);
     let checked = str?.filter((w) => draftVar.some((s) => s === w));
 
     if (str != null && str.length > checked.length) {
-      setSbar({
-        isOpen: true,
-        Msg: "Invalid Variable Names added! Please use only the allowed variables.",
-      });
-      handleCloseDialog();
+      if (!isAutosave) {
+        setSbar({
+          isOpen: true,
+          Msg: "Invalid Variable Names found! Please fix them before saving.",
+        });
+        handleCloseDialog();
+      }
       return;
     }
 
@@ -246,15 +302,20 @@ const EmailTemplate = () => {
       const response = await axios.post("Server/IAMServices/saveMasterTemplate", payload, {
         headers: { Authorization: `Bearer ${localStorage.getItem("token")}` },
       });
-      if (response.data.statusCode === 200) {
+      if (response.data.statusCode === 200 && !isAutosave) {
         setSbar({ isOpen: true, Msg: "✅ Saved Successfully!" });
+      } else if (isAutosave) {
+        console.log("Draft autosaved.");
       }
     } catch (error) {
       console.error("Error saving template:", error);
-      setSbar({ isOpen: true, Msg: "❌ Error saving template." });
+      if (!isAutosave) setSbar({ isOpen: true, Msg: "❌ Error saving template." });
     }
-    setIsPreviewing(false);
-    handleCloseDialog();
+
+    if (!isAutosave) {
+        setIsPreviewing(false);
+        handleCloseDialog();
+    }
   };
 
   const handlePreview = async () => {
@@ -273,6 +334,7 @@ const EmailTemplate = () => {
   const handleCloseDialog = () => setIsPreviewing(false);
 
   const handleReset = async () => {
+    setLastState({ header: headerContent, body: bodyContent }); // Save current state for undo
     try {
       const response = await axios.post("Server/IAMServices/resetTemplate", {}, {
         headers: { Authorization: `Bearer ${localStorage.getItem("token")}` },
@@ -293,6 +355,15 @@ const EmailTemplate = () => {
       setSbar({ isOpen: true, Msg: "❌ Error resetting template." });
     }
   };
+  
+  const handleUndoReset = () => {
+    if (lastState) {
+      setHeaderContent(lastState.header);
+      setBodyContent(lastState.body);
+      setLastState(null);
+      setSbar({ isOpen: true, Msg: "Undo successful." });
+    }
+  };
 
   const handleHeaderCopy = (e) => {
     e.preventDefault();
@@ -310,17 +381,27 @@ const EmailTemplate = () => {
           <Grid container direction="column" spacing={3}>
             <Grid item>
               <Card elevation={3}>
-                <CardHeader title="Available Variables" subheader="Drag to add them to the email body" />
+                <CardHeader title="Available Variables" subheader="Drag or click the icon to add" />
                 <CardContent>
                   {draftVar.map((label) => (
-                    <DraggableVariable
-                      key={label}
-                      draggable={isEditing}
-                      onDragStart={handleDragStart}
-                      isediting={isEditing ? 1 : 0}
-                    >
-                      {label}
-                    </DraggableVariable>
+                    <Box key={label} sx={{ display: 'inline-flex', alignItems: 'center', mr: 1, mb: 1 }}>
+                        <DraggableVariable
+                          draggable={isEditing}
+                          onDragStart={handleDragStart}
+                          isediting={isEditing ? 1 : 0}
+                        >
+                          {label}
+                        </DraggableVariable>
+                        <IconButton
+                            size="small"
+                            onClick={() => insertVariable(label)}
+                            aria-label={`Insert ${label} variable`}
+                            disabled={!isEditing}
+                            sx={{ ml: 0.5, p: 0.2 }}
+                        >
+                            <AddCircleOutlineIcon fontSize="small" />
+                        </IconButton>
+                    </Box>
                   ))}
                 </CardContent>
               </Card>
@@ -403,9 +484,14 @@ const EmailTemplate = () => {
                   <Button variant="contained" color="secondary" onClick={handlePreview} sx={{ mr: 1 }}>
                     Preview
                   </Button>
-                  <Button variant="outlined" color="secondary" onClick={handleReset}>
+                  <Button variant="outlined" color="secondary" onClick={handleReset} sx={{ mr: lastState ? 1 : 0}}>
                     Reset
                   </Button>
+                  {lastState && (
+                     <Button variant="outlined" color="primary" onClick={handleUndoReset}>
+                        Undo
+                     </Button>
+                  )}
                 </Box>
               </Box>
             </CardContent>
@@ -416,7 +502,7 @@ const EmailTemplate = () => {
       <Dialogue
         open={isPreviewing}
         close={handleCloseDialog}
-        save={handleSave}
+        save={() => handleSave(false)} // Explicitly call save without autosave flag
         content={templateContent}
       />
 
@@ -440,7 +526,6 @@ const BootstrapDialog = styled(Dialog)(({ theme }) => ({
     padding: theme.spacing(1),
   },
 }));
-
 const Dialogue = ({ open, close, save, content }) => {
   return (
     <BootstrapDialog
@@ -485,3 +570,4 @@ const Dialogue = ({ open, close, save, content }) => {
 };
 
 export default EmailTemplate;
+
