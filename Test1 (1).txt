@@ -1,11 +1,12 @@
-import React, { useEffect, useMemo, useState, useCallback } from "react";
-import { EditorContent, useEditor } from "@tiptap/react";
+import React, { useEffect, useState } from "react";
+import { EditorContent, useEditor, ReactNodeViewRenderer, NodeViewWrapper } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
 import { TextStyle } from "@tiptap/extension-text-style";
 import Color from "@tiptap/extension-color";
 import FontSize from "@tiptap/extension-font-size";
 import { Node, mergeAttributes } from "@tiptap/core";
+
 import {
   Button,
   Typography,
@@ -27,6 +28,7 @@ import {
   DialogContent,
   IconButton,
 } from "@mui/material";
+
 import EditIcon from "@mui/icons-material/Edit";
 import PreviewIcon from "@mui/icons-material/Preview";
 import RestartAltIcon from "@mui/icons-material/RestartAlt";
@@ -64,6 +66,105 @@ const MAX_WORDS = 2000;
 const ALLOWED_CHARS_REGEX =
   /^[a-zA-Z0-9_\s.+|\\/*&,;!?'"()\[\]%{}\-\u0900-\u097F]*$/; // Adjust as needed
 
+// --- Custom Variable Chip React component using NodeViewWrapper
+function VariableChipComponent({ node, editor, getPos }) {
+  const removeChip = () => {
+    const pos = getPos();
+    editor
+      .chain()
+      .focus()
+      .deleteRange({ from: pos, to: pos + node.nodeSize })
+      .run();
+  };
+
+  return (
+    <NodeViewWrapper
+      as="span"
+      contentEditable={false}
+      style={{
+        backgroundColor: "#A9A9A9",
+        color: "black",
+        padding: "4px 18px 4px 4px",
+        borderRadius: "3px",
+        display: "inline-block",
+        position: "relative",
+        margin: "0 4px",
+        userSelect: "none",
+      }}
+      data-type="variable-chip"
+    >
+      <span style={{ pointerEvents: "none" }}>{node.attrs.value}</span>
+      <span
+        onClick={removeChip}
+        style={{
+          position: "absolute",
+          right: 4,
+          top: "50%",
+          transform: "translateY(-50%)",
+          fontWeight: "bold",
+          fontFamily: "monospace",
+          fontSize: 14,
+          cursor: "pointer",
+          userSelect: "none",
+          paddingLeft: 6,
+          paddingRight: 6,
+        }}
+        title="Remove variable"
+      >
+        ×
+      </span>
+    </NodeViewWrapper>
+  );
+}
+
+// --- VariableChip extension using the above React component ---
+const VariableChipExtension = Node.create({
+  name: "variableChip",
+  group: "inline",
+  inline: true,
+  atom: true,
+
+  addAttributes() {
+    return {
+      value: {
+        default: "",
+      },
+    };
+  },
+
+  parseHTML() {
+    return [{ tag: "variable-chip" }];
+  },
+
+  renderHTML({ node, HTMLAttributes }) {
+    return [
+      "variable-chip",
+      mergeAttributes(HTMLAttributes, {}),
+      0, // content ignored because atom: true
+    ];
+  },
+
+  addNodeView() {
+    return ReactNodeViewRenderer(VariableChipComponent);
+  },
+
+  addCommands() {
+    return {
+      insertVariable:
+        (value) =>
+        ({ chain }) => {
+          return chain()
+            .insertContent({
+              type: this.name,
+              attrs: { value },
+            })
+            .run();
+        },
+    };
+  },
+});
+
+// --- Main Component ---
 function EmailTemplateTiptap() {
   const [headerContent] = useState(initialHeader);
   const [bodyHtml, setBodyHtml] = useState(initialBody);
@@ -73,12 +174,13 @@ function EmailTemplateTiptap() {
   const [previewHtml, setPreviewHtml] = useState("");
   const [wordCount, setWordCount] = useState(0);
 
-  // ---- Tiptap editor ----
   const editor = useEditor({
     editable: isEditing,
     content: bodyHtml,
     extensions: [
-      StarterKit,
+      StarterKit.configure({
+        horizontalRule: false,
+      }),
       TextStyle,
       Color,
       FontSize,
@@ -86,63 +188,72 @@ function EmailTemplateTiptap() {
         placeholder: "Type the email body here...",
         emptyEditorClass: "is-editor-empty",
       }),
-      // Custom Variable Extension Below
-      VariableChipExtension({
-        onDuplicate: () =>
-          setSnackbar({
-            open: true,
-            msg: "❌ Cannot add the same variable consecutively.",
-          }),
-      }),
+      VariableChipExtension,
     ],
     onUpdate: ({ editor }) => {
-      setBodyHtml(editor.getHTML());
-      // Count words
+      const newHtml = editor.getHTML();
+      setBodyHtml(newHtml);
+
       const text = editor.getText();
       const words = text.trim().split(/\s+/).filter(Boolean);
       setWordCount(words.length);
+
+      if (words.length > MAX_WORDS) {
+        setSnackbar({
+          open: true,
+          msg: "Word limit exceeded. Please reduce content.",
+        });
+      }
     },
   });
 
-  // ---- Drag and drop (sidebar to editor) ----
+  // Drag start for sidebar variables
   const handleDragStart = (e, label) => {
     e.dataTransfer.setData("variable", label);
   };
 
+  // Drag & Drop into editor
   useEffect(() => {
     if (!editor) return;
-    // Handle drop event
+
     const dom = editor.view.dom;
+
     const handleDrop = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+
       const variable = event.dataTransfer.getData("variable");
       if (isEditing && VARIABLE_LIST.includes(variable)) {
-        let { from } = editor.state.selection;
-        // Prevent consecutive duplicates
-        const before = editor.state.doc.textBetween(
-          Math.max(0, from - variable.length),
-          from
-        );
-        if (before === variable) {
+        const { from } = editor.state.selection;
+
+        // check last inserted node for duplicates
+        const beforePos = Math.max(0, from - 1);
+        const beforeNode = editor.state.doc.nodeAt(beforePos);
+        if (
+          beforeNode?.type.name === "variableChip" &&
+          beforeNode.attrs.value === variable
+        ) {
           setSnackbar({
             open: true,
-            msg: `❌ Cannot add the same variable consecutively.`,
+            msg: "❌ Cannot add the same variable consecutively.",
           });
           return;
         }
-        editor.commands.insertContent(
-          `<variable-chip>${variable}</variable-chip>`
-        );
+
+        editor.chain().focus().insertVariable(variable).run();
       }
     };
+
     dom.addEventListener("drop", handleDrop);
     return () => dom.removeEventListener("drop", handleDrop);
   }, [editor, isEditing]);
 
-  // ---- Paste validation & blank line check ----
+  // Paste validation
   useEffect(() => {
     if (!editor) return;
+
     editor.setOptions({
-      handlePaste(view, event, slice) {
+      handlePaste(view, event) {
         const text = event.clipboardData.getData("text/plain");
         if (!ALLOWED_CHARS_REGEX.test(text)) {
           setSnackbar({
@@ -151,8 +262,7 @@ function EmailTemplateTiptap() {
           });
           return true; // block paste
         }
-        // Prevent >3 consecutive blank lines
-        if ((editor.getText().match(/(\n{4,})/) || []).length) {
+        if (text.match(/\n{4,}/)) {
           setSnackbar({
             open: true,
             msg: "❌ You cannot enter more than 3 consecutive blank lines.",
@@ -164,27 +274,23 @@ function EmailTemplateTiptap() {
     });
   }, [editor]);
 
-  // ---- Validation on editor update ----
-  useEffect(() => {
-    if (!editor) return;
-    // Validate word count
-    if (wordCount > MAX_WORDS) {
-      setSnackbar({
-        open: true,
-        msg: "Word limit exceeded. Please reduce content.",
-      });
-    }
-  }, [editor, wordCount]);
+  // Block header copy
+  const handleHeaderCopy = (e) => {
+    e.preventDefault();
+    setSnackbar({
+      open: true,
+      msg: "❌ Copying from the header is not allowed!",
+    });
+  };
 
-  // ---- Preview logic ----
+  // Preview with substitutions
   const handlePreview = () => {
-    // Replace <variable-chip> with PREVIEW_MAP values
     let html = bodyHtml.replace(
-      /<variable-chip>({{[A-Z_]+}})<\/variable-chip>/g,
-      (m, v) => {
-        const key = v.replace(/{{|}}/g, "");
+      /<variable-chip>(\{\{[A-Z_]+\}\})<\/variable-chip>/g,
+      (match, variable) => {
+        const key = variable.replace(/\{\{|\}\}/g, "");
         return `<span style="background:#e3f2fd;padding:2px 4px;border-radius:2px;">${
-          PREVIEW_MAP[key] || v
+          PREVIEW_MAP[key] || variable
         }</span>`;
       }
     );
@@ -192,29 +298,18 @@ function EmailTemplateTiptap() {
     setPreviewOpen(true);
   };
 
-  // ---- Save handler ----
   const handleSave = () => {
     setIsEditing(false);
     setSnackbar({ open: true, msg: "✅ Template saved successfully!" });
     setPreviewOpen(false);
-    // Store or send : { headerContent, bodyHtml }
+    // your save logic here
   };
 
-  // ---- Reset handler ----
   const handleReset = () => {
-    editor.commands.setContent(initialBody);
+    editor.chain().focus().setContent(initialBody).run();
     setSnackbar({ open: true, msg: "✅ Template reset to default." });
     setIsEditing(false);
     setWordCount(0);
-  };
-
-  // ---- Copy protection for header ----
-  const handleHeaderCopy = (e) => {
-    e.preventDefault();
-    setSnackbar({
-      open: true,
-      msg: "❌ Copying from the header is not allowed!",
-    });
   };
 
   return (
@@ -242,6 +337,7 @@ function EmailTemplateTiptap() {
                       borderRadius: "0",
                       cursor: isEditing ? "move" : "not-allowed",
                       fontWeight: "medium",
+                      userSelect: "none",
                     }}
                   />
                 ))}
@@ -272,15 +368,13 @@ function EmailTemplateTiptap() {
               </CardContent>
             </Card>
           </Grid>
+
           {/* Editor */}
           <Grid item xs={12} md={8}>
             <Card>
               <CardHeader title="Empanelment Intimation Letter Draft" />
               <CardContent>
-                <Typography
-                  variant="subtitle1"
-                  sx={{ color: "text.secondary" }}
-                >
+                <Typography variant="subtitle1" sx={{ color: "text.secondary" }}>
                   Non Configurable
                 </Typography>
                 <Paper
@@ -291,6 +385,7 @@ function EmailTemplateTiptap() {
                     mb: 3,
                     border: "1px solid #e0e0e0",
                     borderRadius: 1,
+                    userSelect: "text",
                   }}
                   onCopy={handleHeaderCopy}
                 >
@@ -304,10 +399,8 @@ function EmailTemplateTiptap() {
                     }}
                   />
                 </Paper>
-                <Typography
-                  variant="subtitle1"
-                  sx={{ color: "text.secondary" }}
-                >
+
+                <Typography variant="subtitle1" sx={{ color: "text.secondary" }}>
                   Configurable
                 </Typography>
                 <Paper
@@ -318,38 +411,32 @@ function EmailTemplateTiptap() {
                   <Box sx={{ display: "flex", gap: "4px", mb: 1 }}>
                     <Button
                       size="small"
-                      variant={
-                        editor?.isActive("bold") ? "contained" : "outlined"
-                      }
+                      variant={editor?.isActive("bold") ? "contained" : "outlined"}
                       onClick={() => editor?.chain().focus().toggleBold().run()}
+                      disabled={!isEditing}
                     >
                       B
                     </Button>
                     <Button
                       size="small"
-                      variant={
-                        editor?.isActive("italic") ? "contained" : "outlined"
-                      }
-                      onClick={() =>
-                        editor?.chain().focus().toggleItalic().run()
-                      }
+                      variant={editor?.isActive("italic") ? "contained" : "outlined"}
+                      onClick={() => editor?.chain().focus().toggleItalic().run()}
+                      disabled={!isEditing}
                     >
                       I
                     </Button>
                     <Button
                       size="small"
-                      variant={
-                        editor?.isActive("underline") ? "contained" : "outlined"
-                      }
-                      onClick={() =>
-                        editor?.chain().focus().toggleUnderline().run()
-                      }
+                      variant={editor?.isActive("underline") ? "contained" : "outlined"}
+                      onClick={() => editor?.chain().focus().toggleUnderline().run()}
+                      disabled={!isEditing}
                     >
                       U
                     </Button>
-                    {/* Add more toolbar buttons as needed */}
                   </Box>
+
                   <EditorContent editable={isEditing} editor={editor} />
+
                   <Box
                     sx={{
                       display: "flex",
@@ -381,19 +468,23 @@ function EmailTemplateTiptap() {
                           Cancel
                         </Button>
                       )}
+
                       <Button
                         variant="outlined"
                         color="info"
                         startIcon={<PreviewIcon />}
                         onClick={handlePreview}
+                        disabled={!editor}
                       >
                         Preview
                       </Button>
+
                       <Button
                         variant="outlined"
                         color="secondary"
                         startIcon={<RestartAltIcon />}
                         onClick={handleReset}
+                        disabled={!editor}
                       >
                         Reset
                       </Button>
@@ -405,6 +496,7 @@ function EmailTemplateTiptap() {
           </Grid>
         </Grid>
       </Box>
+
       {/* Preview Dialog */}
       <Dialog
         open={previewOpen}
@@ -444,7 +536,13 @@ function EmailTemplateTiptap() {
           />
         </DialogContent>
         <Box
-          sx={{ p: 2, borderTop: "1px solid #eee", display: "flex", gap: 2 }}
+          sx={{
+            p: 2,
+            borderTop: "1px solid #eee",
+            display: "flex",
+            gap: 2,
+            justifyContent: "flex-end",
+          }}
         >
           <Button onClick={() => setPreviewOpen(false)} color="secondary">
             Cancel
@@ -459,6 +557,7 @@ function EmailTemplateTiptap() {
           </Button>
         </Box>
       </Dialog>
+
       <Snackbar
         open={snackbar.open}
         autoHideDuration={6000}
@@ -471,59 +570,3 @@ function EmailTemplateTiptap() {
 }
 
 export default EmailTemplateTiptap;
-
-// --- Custom Tiptap Extension for Variable Chips ---
-
-function VariableChipExtension({ onDuplicate }) {
-  return Node.create({
-    name: "variableChip",
-    group: "inline",
-    inline: true,
-    selectable: true,
-    atom: true,
-    parseHTML: () => [{ tag: "variable-chip" }],
-    renderHTML: ({ node, HTMLAttributes }) => [
-      "variable-chip",
-      mergeAttributes(HTMLAttributes, {
-        style:
-          "background:#A9A9A9;color:black;padding:4px 18px 4px 4px;border-radius:3px;display:inline-block;position:relative;margin:0 4px;",
-      }),
-      node.attrs.value
-        ? ["span", { style: "pointer-events:none;" }, node.attrs.value]
-        : "",
-      [
-        "span",
-        {
-          style:
-            "position:absolute;right:4px;top:50%;transform:translateY(-50%);font-weight:bold;font-family:monospace;font-size:14px;cursor:pointer;",
-          onclick: "this.parentElement.remove()", // Simple way to add 'X' remove for proof of concept — in real app, use ProseMirror transactions!
-        },
-        "X",
-      ],
-    ],
-    addAttributes() {
-      return { value: { default: "" } };
-    },
-    addKeyboardShortcuts() {
-      return {
-        Backspace: () => {
-          // Custom logic for deleting variable chip if selection is on it (optional)
-          return false;
-        },
-      };
-    },
-    addCommands() {
-      return {
-        insertVariable:
-          (value) =>
-          ({ chain }) => {
-            // Prevent consecutive duplicates
-            // (Handle outside in handleDrop for simplicity)
-            return chain()
-              .insertContent(`<variable-chip>${value}</variable-chip>`)
-              .run();
-          },
-      };
-    },
-  });
-}
