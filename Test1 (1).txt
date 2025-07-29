@@ -69,15 +69,17 @@ class VariableBlot extends Embed {
     return node;
   }
 
+  // IMPORTANT: This method tells Quill how to extract the value from the DOM node
+  // when it's parsing existing HTML (e.g., after a refresh or loading from DB).
   static value(node) {
-    // Return the actual variable name stored in the data attribute
     const textSpan = node.querySelector(".variable-name-display");
+    // Retrieve the stored variable name from the data attribute
     return textSpan ? textSpan.dataset.variableName : null;
   }
 }
 
 VariableBlot.blotName = "variable";
-VariableBlot.tagName = "span";
+VariableBlot.tagName = "span"; // This is the HTML tag Quill looks for
 Quill.register(VariableBlot);
 
 const Size = Quill.import("formats/size");
@@ -133,6 +135,16 @@ function stripStyling(html) {
   container.innerHTML = html;
   container.querySelectorAll("*").forEach((el) => {
     el.removeAttribute("class");
+    // Also remove any style attributes if you want truly stripped HTML for backend
+    el.removeAttribute("style");
+    // And remove data attributes related to Quill's internal workings if not needed on backend
+    if (el.dataset) {
+      for (const key in el.dataset) {
+        if (key.startsWith('ql') || key.startsWith('variable')) { // Adjust prefix as needed
+          delete el.dataset[key];
+        }
+      }
+    }
   });
   return container.innerHTML;
 }
@@ -216,7 +228,7 @@ const EmailTemplate = () => {
     "background",
     "align",
     "script",
-    "variable",
+    "variable", // Ensure your custom blot's name is in formats
   ];
 
   /**
@@ -303,6 +315,8 @@ const EmailTemplate = () => {
       const splitIndex = res.indexOf(deliminator) + deliminator.length;
       if (splitIndex > deliminator.length) {
         setHeaderContent(res.substring(0, splitIndex));
+        // Quill expects valid HTML. Ensure the content is structured
+        // If the backend returns stripped HTML, you might need to re-add minimal structure.
         setBodyContent(res.substring(splitIndex));
       } else {
         setHeaderContent("");
@@ -341,7 +355,7 @@ const EmailTemplate = () => {
    * @param {object} editor - The Quill editor instance.
    */
   const handleBodyChange = (content, delta, source, editor) => {
-    if (source === "api") return;
+    if (source === "api") return; // Ignore changes from API (e.g., initial load)
     const htmlContent = editor.getHTML();
     const fullText = headerContent + htmlContent;
     const length = countWord(fullText);
@@ -354,12 +368,10 @@ const EmailTemplate = () => {
         /[^a-zA-Z0-9_\s.+|\\/*&,;!?'"()\[\]%\{\}\-]/
       ); // Regex for allowed characters
       if (illegalCharMatch) {
-        // Find the index of the first illegal character in the inserted string
-        const illegalCharIndex = inserted.indexOf(illegalCharMatch[0]);
         // Calculate the starting position in the editor's content where the illegal character was inserted
         let position = editor.getSelection()?.index || editor.getLength();
-        // Delete only the illegal character
-        editor.deleteText(position - (inserted.length - illegalCharIndex), 1, "silent");
+        // Delete the illegal character that was just typed
+        editor.deleteText(position - (inserted.length - inserted.indexOf(illegalCharMatch[0])), 1, "silent");
         setSbar({
           isOpen: true,
           Msg: "❌ Special characters are not allowed!",
@@ -368,7 +380,6 @@ const EmailTemplate = () => {
         return;
       }
     }
-
 
     if (length > 2000) {
       const quillEditor = bodyEditorRef.current?.getEditor();
@@ -390,28 +401,34 @@ const EmailTemplate = () => {
    */
   const handleSave = async () => {
     setIsEditing(false);
-    // Adjust bodyContent based on whether it starts with <p><br></p>
-    let fullContent = bodyContent.startsWith("<p><br></p>")
-      ? headerContent + bodyContent
-      : headerContent + "<p><br/></p>" + bodyContent; // Ensure a consistent starting point if needed
+    // Ensure bodyContent has a paragraph break if it's empty or doesn't start with one
+    // This needs to be handled carefully, as `getHTML()` might give `<p><br></p>` for an empty editor.
+    let fullContent = bodyContent;
+    if (!fullContent.startsWith("<p>") && !fullContent.startsWith("<div>")) {
+        fullContent = "<p>" + fullContent + "</p>"; // Wrap in a paragraph if it's just plain text/variables
+    }
+    fullContent = headerContent + fullContent;
 
-    let cleanContent = removeVariableDeleteIcons(fullContent);
 
-    // Before stripping styling, replace variable blots with their original variable names
+    // Step 1: Replace variable blots with their original variable names for storage
+    // This is done before stripping classes/styles so we can identify the blots.
     const tempDivForVariableExtraction = document.createElement("div");
-    tempDivForVariableExtraction.innerHTML = cleanContent;
+    tempDivForVariableExtraction.innerHTML = fullContent;
     tempDivForVariableExtraction.querySelectorAll(".variable-blot").forEach((blot) => {
       const variableTextSpan = blot.querySelector(".variable-name-display");
       if (variableTextSpan && variableTextSpan.dataset.variableName) {
         blot.replaceWith(document.createTextNode(variableTextSpan.dataset.variableName));
       }
     });
-    cleanContent = tempDivForVariableExtraction.innerHTML;
+    let contentToSave = tempDivForVariableExtraction.innerHTML;
 
+    // Step 2: Remove delete icons (though they should already be gone if you replaced blots)
+    contentToSave = removeVariableDeleteIcons(contentToSave);
 
-    let backendContent = stripStyling(cleanContent);
+    // Step 3: Strip all styling and extra classes/data attributes for backend storage
+    let backendContent = stripStyling(contentToSave);
 
-
+    // Validate variables
     let str = backendContent.match(/\{{2}[A-Z_]+\}{2}/g);
     let checked = str?.filter((w) => draftVar.some((s) => s === w));
     if (str != null && str.length > checked.length) {
@@ -423,6 +440,7 @@ const EmailTemplate = () => {
       return;
     }
     let SanStr = backendContent.replace(/[^\x00-\x7F]/g, ""); // Remove non-ASCII characters
+
     let dataToSend = { MASTER_TEMPLATE: `<html>${SanStr}</html>` };
     try {
       let jsonFormData = JSON.stringify(dataToSend);
@@ -439,6 +457,8 @@ const EmailTemplate = () => {
       );
       if (response.data.statusCode === 200 && response.data.result !== "") {
         setSbar({ isOpen: true, Msg: "✅ Template saved successfully!" });
+        // After saving, re-fetch to ensure the editor reflects the saved state accurately
+        fetchData();
       }
     } catch (error) {
       console.error("Error saving template:", error);
@@ -452,11 +472,13 @@ const EmailTemplate = () => {
    * Generates a preview of the template with dummy data and opens the preview dialog.
    */
   const handlePreview = async () => {
-    let i = bodyContent.search(/<p><br><\/p>/g);
-    let fullContent =
-      i === 0
-        ? headerContent + bodyContent
-        : headerContent + "<p><br/></p>" + bodyContent;
+    // Start with the current bodyContent from the editor
+    let currentEditorContent = bodyEditorRef.current?.getEditor().getHTML();
+    
+    // Combine with header
+    let fullContent = headerContent + currentEditorContent;
+
+    // Remove delete icons for preview (though they're usually hidden anyway if not editing)
     const cleanContent = removeVariableDeleteIcons(fullContent);
 
     let data = {
@@ -473,7 +495,7 @@ const EmailTemplate = () => {
     const tempDiv = document.createElement("div");
     tempDiv.innerHTML = cleanContent;
 
-    // Replace variable blots with dummy data
+    // Replace variable blots with dummy data for preview
     tempDiv.querySelectorAll(".variable-blot").forEach((blot) => {
       const variableTextSpan = blot.querySelector(".variable-name-display");
       if (variableTextSpan && variableTextSpan.dataset.variableName) {
@@ -481,13 +503,13 @@ const EmailTemplate = () => {
         if (data[variableName]) {
           blot.replaceWith(document.createTextNode(data[variableName]));
         } else {
-          // If a variable doesn't have dummy data, display its name or an empty string
+          // If a variable doesn't have dummy data, display its name or an empty string for clarity in preview
           blot.replaceWith(document.createTextNode(`[${variableName}]`));
         }
       }
     });
 
-    // Also replace any remaining {{VAR}} strings that might not be blots (e.g., if copied as plain text)
+    // Also replace any remaining {{VAR}} strings that might not have been recognized as blots (e.g., if copied as plain text)
     let htmlString = tempDiv.innerHTML.replace(
       /{{([A-Z_]+)}}/g,
       (match, p1) => {
@@ -530,6 +552,8 @@ const EmailTemplate = () => {
         setBodyContent(res);
       }
       setSbar({ isOpen: true, Msg: "✅ Template has been reset to default." });
+      // After reset, ensure the word count is updated
+      setWordCount(countWord(res));
     } catch (e) {
       console.error("Error resetting template:", e);
       setSbar({ isOpen: true, Msg: "❌ Error resetting template." });
@@ -558,7 +582,7 @@ const EmailTemplate = () => {
                     style={{ height: "50vh" }}
                     modules={modules}
                     formats={formats}
-                    value={bodyContent}
+                    value={bodyContent} // Quill will render this HTML
                     ref={bodyEditorRef}
                     onChange={handleBodyChange}
                     readOnly={!isEditing}
