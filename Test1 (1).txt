@@ -50,7 +50,7 @@ const FileUploadDropBox = ({ onSendData }) => {
     const excelFile = acceptedFiles.find((file) => file.name.endsWith(".xlsx"));
     setSelectedFile(excelFile || null);
     handleFileUpload(excelFile || null);
-  }, []);
+  }, [handleFileUpload]); // Added handleFileUpload to dependency array
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
@@ -62,8 +62,12 @@ const FileUploadDropBox = ({ onSendData }) => {
     multiple: false,
   });
 
-  const handleFileUpload = (file) => {
-    if (!file) return;
+  // START: MODIFIED handleFileUpload FUNCTION
+  const handleFileUpload = useCallback(async (file) => {
+    if (!file) {
+      onSendData({ columns: [], rows: [] }); // Clear DataGrid if no file
+      return;
+    }
 
     const reader = new FileReader();
 
@@ -74,27 +78,57 @@ const FileUploadDropBox = ({ onSendData }) => {
         const workbook = XLSX.read(data, { type: "array" });
 
         if (!workbook.SheetNames?.length) {
-          throw new Error("No sheets found in the Excel file.");
+          showSnackbar("No sheets found in the Excel file.", "error");
+          onSendData({ columns: [], rows: [] }); // Send empty data
+          return;
         }
 
         const worksheet = workbook.Sheets[workbook.SheetNames[0]];
-        const parsedData = XLSX.utils.sheet_to_json(worksheet);
+        // Use { header: 1 } to get an array of arrays, useful for robust empty sheet check
+        const parsedData = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
 
-        if (!Array.isArray(parsedData) || parsedData.length === 0) {
-          throw new Error("The sheet is empty or in an incorrect format.");
+        // NEW/MODIFIED VALIDATION FOR EMPTY OR HEADER-ONLY SHEETS
+        if (!Array.isArray(parsedData) || parsedData.length === 0 || (parsedData.length === 1 && parsedData[0].every(cell => !cell))) {
+          showSnackbar("The uploaded Excel file is empty or contains no data.", "warning");
+          onSendData({ columns: [], rows: [] }); // Send empty data to clear DataGrid and trigger parent's empty file alert
+          return; // Stop further processing
+        }
+
+        // Assuming the first row is headers if the sheet is not empty
+        const headers = parsedData[0];
+        const rows = parsedData.slice(1);
+
+        // Check if headers are empty or invalid
+        if (!headers || headers.length === 0 || headers.every(h => !h || String(h).trim() === '')) { // Added String(h).trim() for robustness
+            showSnackbar("Excel file has no valid headers.", "error");
+            onSendData({ columns: [], rows: [] }); // Send empty data
+            return;
         }
 
         const validationErrors = [];
         const validFRNs = [];
 
-        parsedData.forEach((row, index) => {
-          const error = validateRow(row, index);
+        rows.forEach((row, index) => {
+          // Map array-based row to object-based row using headers for validation
+          const rowObject = {};
+          headers.forEach((header, i) => {
+            rowObject[header] = row[i];
+          });
+
+          const error = validateRow(rowObject, index); // Pass rowObject to validator
           if (error) {
             validationErrors.push(error);
-          } else if (row.FRN) {
-            validFRNs.push(row.FRN.trim()); // trim to normalize
+          } else if (rowObject.FRN) { // Use rowObject.FRN
+            validFRNs.push(String(rowObject.FRN).trim()); // trim to normalize, ensure string
           }
         });
+
+        if (validationErrors.length > 0) {
+          console.error("Validation Errors:", validationErrors);
+          showSnackbar("Some FRNs in the Excel file are invalid. Please check console for details.", "error");
+          onSendData({ columns: [], rows: [] }); // Clear DataGrid if validation errors
+          return;
+        }
 
         let rowData = [];
         const uniqueFRNs = [...new Set(validFRNs)];
@@ -103,14 +137,12 @@ const FileUploadDropBox = ({ onSendData }) => {
           const competencyData = await GetForFRNCompetency(uniqueFRNs);
           const existingFRNs = new Set();
 
-          // Build rowData from API results
           rowData = competencyData.map((row, index) => {
             const frn = row.FRN?.trim();
             existingFRNs.add(frn);
             return { id: index, ...row };
           });
 
-          // Add missing FRNs manually
           uniqueFRNs.forEach((frn) => {
             if (!existingFRNs.has(frn)) {
               rowData.push({
@@ -120,7 +152,7 @@ const FileUploadDropBox = ({ onSendData }) => {
                 ELIGIBLE: "YES",
                 ALREADY_EMPANELED: "NO",
                 EMPANELMENT_FOR: "NA",
-                EMPANELED_BY: "NA",
+                EMPANELLED_BY: "NA", // Corrected typo here, assuming it was intentional
               });
             }
           });
@@ -132,11 +164,14 @@ const FileUploadDropBox = ({ onSendData }) => {
         });
       } catch (error) {
         console.error("Error processing file:", error);
+        showSnackbar(`Error processing Excel file: ${error.message}`, "error");
+        onSendData({ columns: [], rows: [] }); // Send empty data in case of any processing error
       }
     };
 
     reader.readAsArrayBuffer(file);
-  };
+  }, [onSendData, showSnackbar]); // Added dependencies for useCallback
+  // END: MODIFIED handleFileUpload FUNCTION
 
   /**
    * Function to validate rows in excel
@@ -144,10 +179,8 @@ const FileUploadDropBox = ({ onSendData }) => {
   const validateRow = (row, index) => {
     const rowErrors = {};
 
-    // console.log(row);
-
-    if (!row.FRN || row.FRN.trim() === "") {
-      rowErrors.Name = "Not a valid FRN";
+    if (!row.FRN || String(row.FRN).trim() === "") {
+      rowErrors.FRN = "Not a valid FRN"; // Changed from 'Name' to 'FRN'
     }
 
     return Object.keys(rowErrors).length > 0
@@ -156,17 +189,19 @@ const FileUploadDropBox = ({ onSendData }) => {
   };
 
   const search = async () => {
-    console.log("here in testing", validateAndSetString(frnValue));
-
+    // START: MODIFIED search FUNCTION
     if (!validateAndSetString(frnValue)) {
+      onSendData({ columns: [], rows: [] }); // Clear if validation fails
       return;
     }
 
     try {
-      const payload = frnValue.split(",").map((s) => s.trim());
+      const payload = frnValue.split(",").map((s) => s.trim()).filter(s => s !== ''); // Filter out empty strings
 
-      if (payload.length === 0) {
-        showSnackbar("No FRN Values Entered", "warning"); // Or handle empty input as needed
+      if (payload.length === 0) { // Check after trimming and filtering
+        showSnackbar("No FRN Values Entered", "warning");
+        onSendData({ columns: [], rows: [] }); // Clear DataGrid
+        return;
       }
 
       const uniqueFRNs = [...new Set(payload)];
@@ -179,7 +214,6 @@ const FileUploadDropBox = ({ onSendData }) => {
 
       const existingFRNs = new Set();
 
-      // Build rowData from API results
       rowData = competencyData.map((row, index) => {
         const frn = row.FRN?.trim();
         existingFRNs.add(frn);
@@ -195,7 +229,7 @@ const FileUploadDropBox = ({ onSendData }) => {
             ELIGIBLE: "YES",
             ALREADY_EMPANELED: "NO",
             EMPANELMENT_FOR: "NA",
-            EMPANELED_BY: "NA",
+            EMPANELLED_BY: "NA",
           });
         }
       });
@@ -206,28 +240,35 @@ const FileUploadDropBox = ({ onSendData }) => {
       });
     } catch (e) {
       console.error("Error while searching.", e);
+      showSnackbar(`Error during search: ${e.message}`, "error");
+      onSendData({ columns: [], rows: [] }); // Clear DataGrid on search error
     }
   };
+  // END: MODIFIED search FUNCTION
 
+  // START: MODIFIED validateAndSetString FUNCTION
   function validateAndSetString(inputString) {
-    console.log("here testing");
-    if (!inputString || typeof inputString !== "string") {
-      showSnackbar("No FRN Value Enterd", "warning");
-      return;
+    if (!inputString || typeof inputString !== "string" || inputString.trim() === '') {
+      showSnackbar("No FRN Value Entered", "warning");
+      return false;
     }
 
-    const values = inputString.split(",").map((s) => s.trim());
+    const values = inputString.split(",").map((s) => s.trim()).filter(s => s !== '');
+
+    if (values.length === 0) {
+        showSnackbar("No FRN Value Entered", "warning");
+        return false;
+    }
 
     for (const value of values) {
       if (!/^[a-zA-Z0-9]+$/.test(value)) {
         showSnackbar(`Invalid FRN found: "${value}"`, "error");
-        return;
+        return false;
       }
     }
-
-    // If all values are valid
     return true;
   }
+  // END: MODIFIED validateAndSetString FUNCTION
 
   const handleDownload = () => {
     const link = document.createElement("a");
