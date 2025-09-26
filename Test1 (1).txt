@@ -1,255 +1,31 @@
-import React, { useEffect, useState } from "react";
-import {
-  Divider,
-  Grid,
-  Button,
-  Autocomplete,
-  TextField,
-  Paper,
-  Box,
-  Typography,
-  Dialog,
-  DialogContent,
-  CircularProgress,
-  Snackbar,
-  Alert,
-} from "@mui/material";
-import { Download } from "@mui/icons-material";
-import { SnackbarProvider } from "notistack";
-import axios from "axios";
-import { encrypt } from "../../Security/AES-GCM256";
-import downloadFile from "../../DownloadFile/DownloadFile";
+CommonRequestService Backend Architecture Guide : 
+1. Overview
+This document outlines the architecture of the backend system, which is composed of several microservices. The primary focus here is the CommonRequestService and the MasterDataService.
+2. CommonRequestService
+This service's bounded context is the Change Management Workflow. It handles the creation, validation, processing, and auditing of all change requests.
+Key Architectural Concepts
+2.1. Fail-Fast Payload Validation
+When a request is created via POST /create-request, the system uses Jackson's polymorphic deserialization (@JsonTypeInfo) to intelligently validate the payload object.
+●	The CreateRequestDto uses the requestType field to determine which specific DTO (SegmentPayloadDto, CglPayloadDto) to map the payload to.
+●	Spring's validation (@Valid) is triggered automatically, catching any structural or data-related errors before the service layer is invoked. This provides immediate feedback to the Maker(Creator).
+2.2. Pre-emptive Uniqueness Check
+Before creating a new request, the RequestService performs two critical pre-flight checks:
+1.	It extracts the primary key from the payload (e.g., segmentCode or a computed cglNumber) and sets it as the targetId on the CommonReq entity.
+2.	It queries the database to ensure no other PENDING or ACCEPTED request for the same targetId already exists. This prevents duplicate conflicting requests.
+2.3. Strategy Pattern for Approvals
+The logic for approving a request is handled by the Strategy Pattern to keep the core service clean and extensible.
+●	The approve method in the RequestTypeStrategy interface is now smarter. It checks the request's changeType and branches its logic for ADD vs. UPDATE operations, including uniqueness checks and fetching existing records by targetId.
+2.4. API Response Handling
+The system uses a @JsonRawValue annotation on the getPayload() method of the CommonReq entity. This is a targeted fix to ensure that the JSON string stored in the database is correctly rendered as a nested JSON object in the final API response, preventing double-serialization issues.
+3. Security
+3.1 Current Implementation
+●	Authentication: Services expect a JWT Bearer token in the Authorization header.
+●	User ID Extraction: The userId is currently extracted using a local JwtUtil class. This utility performs a basic decode and does not validate the token's signature.
+3.2 TODO: Future Security Enhancements (CRITICAL)
+The current security implementation is for development and testing only. The following enhancements are required before moving to production:
+●	[ ] Create a Shared security-jwt-lib: A common library must be created to handle all JWT validation. This library will contain the production-ready logic to:
+○	Perform full signature validation against the identity provider's issuer-uri.
+○	Securely extract user information from the validated token.
+○	Contain the custom JwtRoleConverter to map numeric roles (51, 52) to Spring Security authorities.
+●	[ ] Implement Method-Level Security: Once the shared library is in place, the service methods in CommonRequestService must be annotated with @PreAuthorize to enforce role-based access control (e.g., @PreAuthorize("hasAuthority('ROLE_MAKER')")). This will replace the temporary, insecure JwtUtil.
 
-function FrtUserEvidenceDownload() {
-  const [quarter, setQuarter] = useState(null);
-  const [quarterList, setQuarterList] = useState([]);
-  const [loadOpen, setLoadOpen] = useState(false);
-  const [snackbar, setSnackbar] = useState(null);
-  const [circleCode, setCircleCode] = useState(null);
-  const [circleOptions, setCircleOptions] = useState([]);
-
-  // This section for encryption and utility functions remains the same
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ivBase64 = btoa(String.fromCharCode.apply(null, iv));
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const saltBase64 = btoa(String.fromCharCode.apply(null, salt));
-
-  const handleCloseSnackbar = () => setSnackbar(null);
-
-  const generateQuarterEndDates = (previousYearDate) => {
-    if (!previousYearDate) {
-      return [];
-    }
-    const parts = previousYearDate.split("/");
-    const month = parseInt(parts[1], 10);
-    const year = parseInt(parts[2], 10);
-    let targetYear;
-
-    if ([6, 9, 12].includes(month)) {
-      targetYear = year + 1;
-    } else {
-      targetYear = year;
-    }
-    const newDate = `31-03-${targetYear}`;
-    return [{ DATE: newDate }];
-  };
-
-  useEffect(() => {
-    // Using a sample date based on today's date for demonstration
-    const previousDateFromToken = "30/09/2025";
-    const generatedQuarters = generateQuarterEndDates(previousDateFromToken);
-    setQuarterList(generatedQuarters);
-    if (generatedQuarters.length > 0) {
-      setQuarter(generatedQuarters[0]);
-    }
-  }, []);
-
-  const loadingScreenOpen = () => setLoadOpen(true);
-  const loadingScreenClose = () => setLoadOpen(false);
-
-  const getCicleList = async () => {
-    if (!quarter) return;
-    try {
-      loadingScreenOpen();
-      const response = await axios.post(
-        "Server/frtUserService/getDashCircleList",
-        {},
-        {
-          headers: { Authorization: `Bearer ${localStorage.getItem("token")}` },
-        }
-      );
-      if (response.data.result && response.data.result.length > 0) {
-        setCircleOptions(response.data.result);
-      } else {
-        setSnackbar({
-          children: "Failed to fetch list of circles.",
-          severity: "error",
-        });
-      }
-    } catch (e) {
-      console.error(e);
-      setSnackbar({
-        children: "An error occurred while fetching circles.",
-        severity: "error",
-      });
-    } finally {
-      loadingScreenClose();
-    }
-  };
-
-  useEffect(() => {
-    setCircleCode(null);
-    setCircleOptions([]);
-    getCicleList();
-  }, [quarter]);
-
-  // --- MODIFIED DOWNLOAD HANDLER ---
-  const handleDownload = async (e) => {
-    e.preventDefault();
-    if (!quarter || !circleCode) {
-      setSnackbar({
-        children: "Please select a Quarter and a Circle.",
-        severity: "error",
-      });
-      return;
-    }
-
-    try {
-      loadingScreenOpen();
-      const dataToSend = {
-        quarterDate: quarter.DATE,
-        circleCode: [circleCode.CRS_SYS_PARAM_ID],
-      };
-      let jsonFormData = JSON.stringify(dataToSend);
-      const encryptedData = await encrypt(iv, salt, jsonFormData);
-      const payload = {
-        iv: ivBase64,
-        salt: saltBase64,
-        data: encryptedData,
-      };
-
-      // --- KEY CHANGE: Updated the API endpoint URL ---
-      const response = await axios.post(
-        "/FRTService/TARFRT/downloadEvidence", // <-- THIS URL IS UPDATED
-        payload,
-        {
-          headers: { Authorization: `Bearer ${localStorage.getItem("token")}` },
-        }
-      );
-
-      // This logic correctly handles the Base64 zip content
-      if (response.data.result) {
-        downloadFile(
-          response.data.result.zipContent, // The Base64 string
-          "zip",                            // The file type
-          response.data.result.zipName      // The desired filename
-        );
-        setSnackbar({
-          children: "Download successful!",
-          severity: "success",
-        });
-      } else {
-        setSnackbar({
-          children: "Failed to prepare download.",
-          severity: "warning",
-        });
-      }
-    } catch (e) {
-      console.error(e);
-      setSnackbar({
-        children: "An error occurred during download.",
-        severity: "error",
-      });
-    } finally {
-      loadingScreenClose();
-    }
-  };
-
-  return (
-    // The JSX part of your component remains unchanged
-    <>
-      <Box sx={{ p: 2 }}>
-        <Typography variant={"h5"} gutterBottom>
-          Evidence Download
-        </Typography>
-        <Divider />
-
-        <Paper sx={{ mt: 3, p: 4 }}>
-          <Grid container spacing={4} justifyContent="center">
-            <Grid item xs={12} md={5}>
-              <Autocomplete
-                options={quarterList}
-                getOptionLabel={(option) => option.DATE || ""}
-                value={quarter}
-                onChange={(event, newValue) => {
-                  setQuarter(newValue);
-                }}
-                renderInput={(params) => (
-                  <TextField {...params} label="Select Quarter" />
-                )}
-                readOnly
-              />
-            </Grid>
-            <Grid item xs={12} md={5}>
-              <Autocomplete
-                options={circleOptions}
-                getOptionLabel={(option) => option.CRS_SYS_PARAM_NAME || ""}
-                value={circleCode}
-                onChange={(event, newValue) => {
-                  setCircleCode(newValue);
-                }}
-                disabled={!quarter}
-                renderInput={(params) => (
-                  <TextField {...params} label="Select Circle" />
-                )}
-              />
-            </Grid>
-          </Grid>
-
-          <Box sx={{ display: "flex", justifyContent: "center", mt: 5 }}>
-            <Button
-              variant="contained"
-              color="warning"
-              startIcon={<Download />}
-              onClick={handleDownload}
-              size="large"
-              sx={{ px: 4, py: 1.5 }}
-            >
-              Download Evidence
-            </Button>
-          </Box>
-        </Paper>
-      </Box>
-
-      {!!snackbar && (
-        <SnackbarProvider maxSnack={3}>
-          <Snackbar
-            open
-            anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
-            onClose={handleCloseSnackbar}
-            autoHideDuration={5000}
-          >
-            <Alert
-              {...snackbar}
-              onClose={handleCloseSnackbar}
-              variant="filled"
-            />
-          </Snackbar>
-        </SnackbarProvider>
-      )}
-
-      <Dialog
-        open={loadOpen}
-        PaperProps={{
-          style: { backgroundColor: "transparent", boxShadow: "none" },
-        }}
-      >
-        <DialogContent>
-          <CircularProgress />
-        </DialogContent>
-      </Dialog>
-    </>
-  );
-}
-
-export default FrtUserEvidenceDownload;
