@@ -1,710 +1,149 @@
-import React from 'react'
+package com.tcs.fincore.CommonRequestService.service;
 
-export default function Calendar() {
-  return (
-    <div>Calendar</div>
-  )
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.dto.CreateRequestDto;
+import com.tcs.fincore.CommonRequestService.dto.ProcessRequestDto;
+import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
+import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import com.tcs.fincore.CommonRequestService.repository.CommonRequestRepository;
+import com.tcs.fincore.CommonRequestService.service.strategy.RequestStrategyFactory;
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Optional;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class RequestServiceImpl implements RequestService {
+
+    private final CommonRequestRepository commonRequestRepository;
+    private final RequestStrategyFactory strategyFactory;
+    private final ObjectMapper objectMapper;
+
+    @Override
+    @Transactional
+    public CommonReq createRequest(CreateRequestDto dto, String creatorId) throws JsonProcessingException {
+        // The payload DTO is already validated by the controller
+        KeyablePayload payload = (KeyablePayload) dto.getPayload();
+
+        // --- PRE-FLIGHT CHECKS ---
+        // 1. Extract the targetId from the payload.
+        String targetId = payload.getKey();
+        if (targetId == null || targetId.isBlank()) {
+            throw new IllegalArgumentException("Could not determine targetId from payload.");
+        }
+        log.info("Determined targetId for new request as: {}", targetId);
+
+        // 2. Check for duplicate PENDING or ACCEPTED requests for this targetId.
+        List<CommonReq> existingRequests = commonRequestRepository.findByTargetIdAndReqStatusNot(targetId,
+                RequestStatus.REJECTED);
+        if (!existingRequests.isEmpty()) {
+            log.warn(
+                    "Attempted to create a duplicate request for targetId {} which already has a {} request.",
+                    targetId, existingRequests.get(0).getReqStatus());
+            throw new DataIntegrityViolationException(
+                    "An active or pending request for '" + targetId + "' already exists.");
+        }
+        log.info("Uniqueness check passed for targetId: {}", targetId);
+
+        // --- ALL CHECKS PASSED, PROCEED TO CREATE ---
+        CommonReq request = new CommonReq();
+        request.setCreatorId(creatorId);
+        request.setReqType(dto.getRequestType());
+        request.setChangeType(dto.getChangeType());
+        request.setPayload(objectMapper.writeValueAsString(payload));
+        request.setTargetId(targetId); // Setting the targetId at creation time.
+        request.setReqStatus(RequestStatus.PENDING);
+
+        log.info("Saving new, validated request for targetId {}", targetId);
+        return commonRequestRepository.save(request);
+    }
+
+    @Override
+    @Transactional
+    public Optional<CommonReq> updateRequestStatus(ProcessRequestDto dto, String executorId)
+            throws JsonProcessingException {
+        Long requestId = dto.getRequestId();
+        log.info("Attempting to update status for request ID: {} by executor: {}", requestId, executorId);
+
+        CommonReq request = commonRequestRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("Request with ID " + requestId + " not found."));
+
+        // SELF-APPROVAL CHECK
+        if (executorId.equals(request.getCreatorId())) {
+            log.warn("SECURITY VIOLATION: User {} attempted to approve their own request (ID: {}).", executorId,
+                    requestId);
+            throw new IllegalStateException("User cannot approve or reject their own request.");
+        }
+
+        // Only pending requests can be processed.
+        if (request.getReqStatus() != RequestStatus.PENDING) {
+            log.warn("Attempted to modify an already processed request. ID: {}, Current Status: {}", dto.getRequestId(),
+                    request.getReqStatus());
+            throw new IllegalStateException("Request has already been processed and cannot be modified.");
+        }
+
+        request.setExecutorId(executorId);
+        request.setExecutorRemarks(dto.getRemarks());
+        request.setExecutionDate(LocalDateTime.now());
+        request.setReqStatus(dto.getStatus());
+
+        // IF the request status type is accepted executing the specific approval logic
+        // using the strategy pattern.
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            log.info("Request {} ACCEPTED. Applying strategy for type {}", dto.getRequestId(), request.getReqType());
+            strategyFactory.getStrategy(request.getReqType()).processApproval(request);
+        } else {
+            log.info("Request {} REJECTED.", dto.getRequestId());
+        }
+        // now return saving the commonRequestRepository with updated request. P.N: If
+        // any of the request failed in between @transactional will rollback all the
+        // changes
+        // save other fields after succesfull execution : accept/reject only, for
+        // failure changes will be rolled back.
+        request.setExecutionDate(LocalDateTime.now());
+        request.setExecutionRemarks(objectMapper.writeValueAsString("success")); // as the field data type is clob,
+                                                                                 // which expects a json object
+        return Optional.of(commonRequestRepository.save(request));
+    }
+
+    @Override
+    public List<CommonReq> getMyRequests(String userId, RequestType requestType) {
+        if (requestType == null) {
+            log.info("Request type is missing, Please provide correct request type to fetch requests for user :{}",
+                    userId);
+            throw new IllegalArgumentException(
+                    "Request type is missing, Please provide correct request type to fetch requests.");
+        }
+        log.info("Fetching requests for user {} with type {}", userId, requestType);
+        return commonRequestRepository.findByCreatorIdAndReqType(userId, requestType);
+    }
+
+    @Override
+    public List<CommonReq> getPendingRequests(RequestType requestType) {
+        if (requestType == null) {
+            log.info("Request type is missing, Please provide correct request type to fetch pending requests.");
+            throw new IllegalArgumentException(
+                    "Request type is missing, Please provide correct request type to fetch pending requests.");
+        }
+        log.info("Fetching requests for user {} with type {}", requestType);
+        return commonRequestRepository.findByReqStatusAndReqType(RequestStatus.PENDING, requestType);
+    }
+
+    @Override
+    public List<CommonReq> getAllRequests() {
+        return commonRequestRepository.findAll();
+    }
 }
 
-
-import { createTheme } from "@mui/material/styles";
-import { getPalette } from "./Palette";
-import { typography } from "./Typography";
-
-const glassmorphismBaseStyles = (theme) => ({
-  background: "rgba(255, 255, 255, 0.1)", // Semi-transparent white
-  backdropFilter: "blur(20px) saturate(180%)", // Frosted glass effect
-  WebkitBackdropFilter: "blur(10px) saturate(180%)", // For Safari support
-  border: "1px solid rgba(255, 255, 255, 0.125)", // Subtle white border
-  boxShadow: theme.shadows[10], // Stronger shadow for depth
-  borderRadius: "12px",
-});
-
-const paletteConfig = getPalette("dark");
-
-const liquidGlassTheme = createTheme({
-  ...paletteConfig,
-  typography,
-  components: {
-    // Apply styles to surfaces and containers
-    MuiPaper: {
-      styleOverrides: {
-        root: ({ theme }) => ({
-          ...glassmorphismBaseStyles(theme),
-        }),
-      },
-    },
-    // Apply styles to card and alert surfaces
-    MuiCard: {
-      styleOverrides: {
-        root: ({ theme }) => ({
-          ...glassmorphismBaseStyles(theme),
-        }),
-      },
-    },
-    MuiAlert: {
-      styleOverrides: {
-        root: ({ theme }) => ({
-          ...glassmorphismBaseStyles(theme),
-          color: "inherit",
-          backgroundColor: "rgba(255, 255, 255, 0.1)",
-        }),
-      },
-    },
-    MuiAppBar: {
-      styleOverrides: {
-        root: ({ theme }) => ({
-          // ...glassmorphismBaseStyles(theme),
-          backgroundColor: "rgba(255, 255, 255, 0.05)",
-          //   borderRadius: 0,
-        }),
-      },
-    },
-    // Apply styles to input fields
-    MuiOutlinedInput: {
-      styleOverrides: {
-        root: ({ theme }) => ({
-          // ...glassmorphismBaseStyles(theme),
-          backgroundColor: "rgba(255, 255, 255, 0.05)",
-        }),
-        notchedOutline: {
-          // borderColor: "rgba(255, 255, 255, 0.2)",
-        },
-      },
-    },
-    MuiFilledInput: {
-      styleOverrides: {
-        root: ({ theme }) => ({
-          // ...glassmorphismBaseStyles(theme),
-          backgroundColor: "rgba(255, 255, 255, 0.05)",
-          "&:hover": {
-            backgroundColor: "rgba(255, 255, 255, 0.1)",
-          },
-        }),
-      },
-    },
-    MuiInput: {
-      styleOverrides: {
-        root: ({ theme }) => ({
-          // borderBottom: "1px solid rgba(255, 255, 255, 0.125)",
-        }),
-      },
-    },
-    // Apply styles to buttons
-    MuiButton: {
-      styleOverrides: {
-        root: ({ theme }) => ({
-          // ...glassmorphismBaseStyles(theme),
-          // backgroundColor: "rgba(255, 255, 255, 0.1)",
-          // color: "white",
-          borderRadius: 12,
-          "&:hover": {
-            backgroundColor: "rgba(255, 255, 255, 0.2)",
-            boxShadow: theme.shadows[15],
-          },
-          // Add subtle shine with a pseudo-element
-          "&::before": {
-            content: '""',
-            position: "absolute",
-            top: "0",
-            left: "0",
-            width: "100%",
-            height: "100%",
-            background:
-              "radial-gradient(ellipse at center, rgba(255,255,255,0.2) 0%, rgba(255,255,255,0) 70%)",
-            transition: "all 0.3s ease-in-out",
-            opacity: 0,
-          },
-          "&:hover::before": {
-            opacity: 1,
-          },
-        }),
-      },
-    },
-    // Apply styles to dialogs and modals
-    MuiDialog: {
-      styleOverrides: {
-        paper: ({ theme }) => ({
-          ...glassmorphismBaseStyles(theme),
-          // Override border-radius for dialogs
-          borderRadius: "16px",
-        }),
-      },
-    },
-    MuiSnackbarContent: {
-      styleOverrides: {
-        root: ({ theme }) => ({
-          ...glassmorphismBaseStyles(theme),
-          backgroundColor: "rgba(255, 255, 255, 0.1)",
-        }),
-      },
-    },
-    // Apply styles to tooltips
-    MuiTooltip: {
-      styleOverrides: {
-        tooltip: ({ theme }) => ({
-          ...glassmorphismBaseStyles(theme),
-          padding: "8px 12px",
-          fontSize: "0.8rem",
-        }),
-      },
-    },
-
-    MuiDataGrid: {
-      styleOverrides: {
-        root: ({ theme }) => ({
-          ...glassmorphismBaseStyles(theme),
-          "& .MuiDataGrid-columnHeaders": {
-            backgroundColor: "rgba(255, 255, 255, 0.1)",
-            borderBottom: "1px solid rgba(255, 255, 255, 0.125)",
-          },
-          "& .MuiDataGrid-row": {
-            "&:hover": {
-              backgroundColor: "rgba(255, 255, 255, 0.08)",
-            },
-          },
-          "& .MuiDataGrid-cell": {
-            borderBottom: "1px solid rgba(255, 255, 255, 0.08)",
-          },
-        }),
-      },
-    },
-
-    // Table (Material UI)
-    MuiTableContainer: {
-      styleOverrides: {
-        root: ({ theme }) => ({
-          ...glassmorphismBaseStyles(theme),
-        }),
-      },
-    },
-    MuiTableHead: {
-      styleOverrides: {
-        root: {
-          backgroundColor: "rgba(255, 255, 255, 0.1)",
-          borderBottom: "1px solid rgba(255, 255, 255, 0.125)",
-        },
-      },
-    },
-    MuiTableRow: {
-      styleOverrides: {
-        root: {
-          "&:hover": {
-            backgroundColor: "rgba(255, 255, 255, 0.08)",
-          },
-        },
-      },
-    },
-    MuiTableCell: {
-      styleOverrides: {
-        root: {
-          borderBottom: "1px solid rgba(255, 255, 255, 0.08)",
-        },
-      },
-    },
-
-    // Autocomplete
-    /*  MuiAutocomplete: {
-      styleOverrides: {
-        paper: ({ theme }) => ({
-          ...glassmorphismBaseStyles(theme),
-          backgroundColor: "rgba(255, 255, 255, 0.1)",
-        }),
-        option: {
-          "&:hover": {
-            backgroundColor: "rgba(255, 255, 255, 0.2)",
-          },
-        },
-      },
-    }, */
-
-    // Chip
-    MuiChip: {
-      styleOverrides: {
-        root: ({ theme }) => ({
-          ...glassmorphismBaseStyles(theme),
-          backgroundColor: "rgba(255, 255, 255, 0.1)",
-          borderColor: "rgba(255, 255, 255, 0.2)",
-        }),
-      },
-    },
-
-    // Menu and MenuItem
-    MuiMenu: {
-      styleOverrides: {
-        paper: ({ theme }) => ({
-          ...glassmorphismBaseStyles(theme),
-          backgroundColor: "rgba(255, 255, 255, 0.1)",
-        }),
-      },
-    },
-    MuiMenuItem: {
-      styleOverrides: {
-        root: {
-          "&:hover": {
-            backgroundColor: "rgba(255, 255, 255, 0.2)",
-          },
-        },
-      },
-    },
-
-    // Dialog Title, Content, Actions
-    MuiDialogTitle: {
-      styleOverrides: {
-        root: {
-          borderBottom: "1px solid rgba(255, 255, 255, 0.125)",
-        },
-      },
-    },
-    MuiDialogContent: {
-      styleOverrides: {
-        root: {
-          borderTop: "1px solid rgba(255, 255, 255, 0.125)",
-        },
-      },
-    },
-
-    // Tabs
-    MuiTabs: {
-      styleOverrides: {
-        root: ({ theme }) => ({
-          ...glassmorphismBaseStyles(theme),
-          backgroundColor: "rgba(255, 255, 255, 0.05)",
-          border: "none",
-        }),
-      },
-    },
-
-    // Accordion
-    MuiAccordion: {
-      styleOverrides: {
-        root: ({ theme }) => ({
-          ...glassmorphismBaseStyles(theme),
-          backgroundColor: "rgba(255, 255, 255, 0.05)",
-          "&::before": {
-            display: "none", // Removes default line
-          },
-          "&:not(:last-of-type)": {
-            marginBottom: theme.spacing(1),
-          },
-        }),
-      },
-    },
-
-    // Drawer
-    MuiDrawer: {
-      styleOverrides: {
-        paper: ({ theme }) => ({
-          ...glassmorphismBaseStyles(theme),
-          backgroundColor: "rgba(255, 255, 255, 0.1)",
-        }),
-      },
-    },
-  },
-});
-
-export default liquidGlassTheme;
-
-import { createTheme } from "@mui/material/styles";
-import typography from "./Typography";
-import { shadows } from "./Shadows";
-
-const baselightTheme = createTheme({
-  direction: 'ltr',
-  palette: {
-    primary: {
-      main: '#5D87FF',
-      light: '#ECF2FF',
-      dark: '#4570EA',
-      contrastText: '#ffffff',
-      transparent: "#ffffff00"
-    },
-    secondary: {
-      main: '#49BEFF',
-      light: '#E8F7FF',
-      dark: '#23afdb',
-      contrastText: '#ffffff',
-    },
-    success: {
-      main: '#13DEB9',
-      light: '#E6FFFA',
-      dark: '#02b3a9',
-      contrastText: '#ffffff',
-    },
-    info: {
-      main: '#539BFF',
-      light: '#EBF3FE',
-      dark: '#1682d4',
-      contrastText: '#ffffff',
-    },
-    error: {
-      main: '#FA896B',
-      light: '#FDEDE8',
-      dark: '#f3704d',
-      contrastText: '#ffffff',
-    },
-    warning: {
-      main: '#FFAE1F',
-      light: '#FEF5E5',
-      dark: '#ae8e59',
-      contrastText: '#ffffff',
-    },
-    purple: {
-      A50: '#EBF3FE',
-      A100: '#6610f2',
-      A200: '#557fb9',
-    },
-    grey: {
-      100: '#F2F6FA',
-      200: '#EAEFF4',
-      300: '#DFE5EF',
-      400: '#7C8FAC',
-      500: '#5A6A85',
-      600: '#2A3547',
-      700: '#dfe5ef'
-
-    },
-    text: {
-      primary: '#2A3547',
-      secondary: '#5A6A85',
-    },
-    action: {
-      disabledBackground: 'rgba(73,82,88,0.12)',
-      hoverOpacity: 0.02,
-      hover: '#f6f9fc',
-    },
-    divider: '#e5eaef',
-  },
-  typography,
-  shadows,
-  components: {
-    MuiCssBaseline: {
-      styleOverrides: {
-        a: {
-          textDecoration: "none",
-        },
-        '.simplebar-scrollbar:before': {
-          background: " #DFE5EF!important"
-        },
-      }
-    },
-    MuiButton: {
-      styleOverrides: {
-        root: {
-          borderRadius: "7px",
-          boxShadow: 'none',
-          '&:hover': {
-            boxShadow: 'none'
-          }
-        },
-      },
-    },
-    MuiCard: {
-      styleOverrides: {
-        root: {
-          boxShadow: '0 9px 17.5px rgb(0,0,0,0.05)'
-        },
-      },
-    },
-    MuiFab: {
-      styleOverrides: {
-        root: {
-          boxShadow: 'none',
-          '&:hover': {
-            boxShadow: 'none'
-          }
-        },
-      },
-    },
-    MuiOutlinedInput: {
-      styleOverrides: {
-        root: {
-          '& .MuiOutlinedInput-notchedOutline': {
-            borderColor: '#e5eaef !important',
-          },
-          borderRadius: "7px",
-          '&.Mui-focused .MuiOutlinedInput-notchedOutline, &:hover .MuiOutlinedInput-notchedOutline': {
-            borderColor: '#5D87FF !important'
-          }
-        },
-      },
-    },
-  }
-},
-
-);
-
-export { baselightTheme };
-// A helper function to create a semi-transparent color for glass effects
-const getGlassBackgroundColor = (color, opacity) => {
-  const alpha = Math.round(opacity * 255).toString(16);
-  return `${color}${alpha}`;
-};
-
-// M3-inspired color tokens
-const lightPalette = {
-  primary: {
-    main: "#6750A4", // Primary
-    contrastText: "#FFFFFF",
-  },
-  secondary: {
-    main: "#625B71", // Secondary
-    contrastText: "#FFFFFF",
-  },
-  tertiary: {
-    main: "#7D5260",
-    contrastText: "#FFFFFF",
-  },
-  error: {
-    main: "#B3261E",
-    contrastText: "#FFFFFF",
-  },
-  background: {
-    default: "#FFFBFE", // Surface
-    paper: "#FFFBFE", // Surface
-  },
-  text: {
-    primary: "#1C1B1F", // On Surface
-    secondary: "#49454F", // On Surface Variant
-  },
-  // Custom glass color token
-  glass: {
-    primary: getGlassBackgroundColor("#EADDFF", 0.8), // A light primary-based color for glass
-  },
-};
-
-// This palette complements the subtle gray gradient for a classic dark mode.
-// Gradient: linear-gradient(135deg, #000 0%, #252525ff 100%)
-const darkPalette1 = {
-  primary: {
-    main: "#FFFFFF",
-    contrastText: "#000000",
-  },
-  secondary: {
-    main: "#B0B0B0", // Light gray for secondary elements
-    contrastText: "#1A1A1A",
-  },
-  tertiary: {
-    main: "#7A7A7A", // Medium gray for tertiary elements
-    contrastText: "#F0F0F0",
-  },
-  error: {
-    main: "#FF6B6B", // A soft red for errors
-    contrastText: "#331616",
-  },
-  background: {
-    default: "#1c1b1f",
-    paper: "#1c1b1f",
-  },
-  text: {
-    primary: "#E6E1E5", // Light text for readability
-    secondary: "#CAC4D0", // Slightly darker text for secondary content
-  },
-  glass: {
-    primary: getGlassBackgroundColor("#424242", 0.6), // Dark gray glass
-  },
-};
-
-/*This theme works with the dark blue-to-light blue gradient, evoking an aquatic feel.
-Gradient: linear-gradient(135deg, #0d253f 0%, #0170a8 100%)*/
-const deepOceanPalette = {
-  primary: {
-    main: "#80D0C7", // Bright aqua from the gradient's end point
-    contrastText: "#0D253F",
-  },
-  secondary: {
-    main: "#B2DFDB", // Lighter aqua for accents
-    contrastText: "#053E5C",
-  },
-  tertiary: {
-    main: "#0170A8", // Mid-tone blue from the gradient
-    contrastText: "#E0F5FF",
-  },
-  error: {
-    main: "#F56262", // A contrasting error red
-    contrastText: "#3D0F0F",
-  },
-  background: {
-    default: "#0D253F", // Deep blue for background
-    paper: "#0D253F",
-  },
-  text: {
-    primary: "#E0F5FF", // Off-white for text
-    secondary: "#B2DFDB", // Lighter text for secondary content
-  },
-  glass: {
-    primary: getGlassBackgroundColor("#0d253f", 0.6), // Dark blue glass
-  },
-};
-
-//linear-gradient(135deg, #2c3e50 0%, #4ca1af 100%)
-const mutedTealPalette = {
-  primary: {
-    main: "#FFFFFF",
-    contrastText: "#2c3e50",
-  },
-  secondary: {
-    main: "#4CA1AF", // Vibrant teal for highlights
-    contrastText: "#1F2E3A",
-  },
-  tertiary: {
-    main: "#7B9AB0", // Softer blue-gray
-    contrastText: "#2c3e50",
-  },
-  error: {
-    main: "#F08080", // A soft coral for errors
-    contrastText: "#3C1D1D",
-  },
-  background: {
-    default: "#2c3e50", // Slate gray for background
-    paper: "#2c3e50",
-  },
-  text: {
-    primary: "#EAEAEA",
-    secondary: "#B0BEC5",
-  },
-  glass: {
-    primary: getGlassBackgroundColor("#2c3e50", 0.6), // Muted dark blue glass
-  },
-};
-
-// Forest floor - linear-gradient(135deg, #16222a 0%, #3a6073 100%)
-const forestFloorPalette = {
-  primary: {
-    main: "#FFFFFF",
-    contrastText: "#16222a",
-  },
-  secondary: {
-    main: "#4A6C7B", // Blue-green for secondary elements
-    contrastText: "#16222a",
-  },
-  tertiary: {
-    main: "#3A6073", // Mid-tone blue-green from the gradient
-    contrastText: "#F0F5F8",
-  },
-  error: {
-    main: "#E57373", // A dark coral
-    contrastText: "#381818",
-  },
-  background: {
-    default: "#16222a", // Very dark green-blue
-    paper: "#16222a",
-  },
-  text: {
-    primary: "#E0E7E9",
-    secondary: "#BACED6",
-  },
-  glass: {
-    primary: getGlassBackgroundColor("#16222a", 0.6), // Deep forest glass
-  },
-};
-
-//Deep blue - linear-gradient(to left, #44048aff 0%, #001f55ff 100%)
-const deepBluePalette = {
-  primary: {
-    main: "#E6E1E5", // Light, neutral primary
-    contrastText: "#001F55",
-  },
-  secondary: {
-    main: "#A573D5", // Muted purple for accents
-    contrastText: "#1D0332",
-  },
-  tertiary: {
-    main: "#6B58A6", // Rich lavender for tertiary elements
-    contrastText: "#001F55",
-  },
-  error: {
-    main: "#F2B8B5",
-    contrastText: "#601410",
-  },
-  background: {
-    default: "#001f55", // Deep blue
-    paper: "#001f55",
-  },
-  text: {
-    primary: "#FFFFFF",
-    secondary: "#D1C4E9",
-  },
-  glass: {
-    primary: getGlassBackgroundColor("#220245", 0.6), // Deep purple glass
-  },
-};
-
-// Aqua splash -linnear-gradient(150deg, #13547a 0%, #80d0c7 100%)
-const aquaSplashPalette = {
-  primary: {
-    main: "#13547A", // The deep blue start of the gradient
-    contrastText: "#FFFFFF",
-  },
-  secondary: {
-    main: "#80D0C7", // The bright aqua end of the gradient
-    contrastText: "#13547A",
-  },
-  tertiary: {
-    main: "#C7F1ED", // Very light aqua for softer elements
-    contrastText: "#13547A",
-  },
-  error: {
-    main: "#FF6666", // A bright red for visibility
-    contrastText: "#331313",
-  },
-  background: {
-    default: "#13547A", // Deep blue
-    paper: "#13547A",
-  },
-  text: {
-    primary: "#E0F5FF",
-    secondary: "#A9E8E1",
-  },
-  glass: {
-    primary: getGlassBackgroundColor("#13547A", 0.6), // Dark aqua glass
-  },
-};
-
-export const getPalette = (mode) => ({
-  palette: {
-    mode,
-    ...(mode === "light" ? lightPalette : deepOceanPalette),
-  },
-});
-const shadows = [
-  'none',
-  '0px 2px 3px rgba(0,0,0,0.10)',
-  '0 0 1px 0 rgba(0,0,0,0.31), 0 2px 2px -2px rgba(0,0,0,0.25)',
-  '0 0 1px 0 rgba(0,0,0,0.31), 0 3px 4px -2px rgba(0,0,0,0.25)',
-  '0 0 1px 0 rgba(0,0,0,0.31), 0 3px 4px -2px rgba(0,0,0,0.25)',
-  '0 0 1px 0 rgba(0,0,0,0.31), 0 4px 6px -2px rgba(0,0,0,0.25)',
-  '0 0 1px 0 rgba(0,0,0,0.31), 0 4px 6px -2px rgba(0,0,0,0.25)',
-  '0 0 1px 0 rgba(0,0,0,0.31), 0 4px 8px -2px rgba(0,0,0,0.25)',
-  '0 9px 17.5px rgb(0,0,0,0.05)',
-  'rgb(145 158 171 / 30%) 0px 0px 2px 0px, rgb(145 158 171 / 12%) 0px 12px 24px -4px',
-  '0 0 1px 0 rgba(0,0,0,0.31), 0 7px 12px -4px rgba(0,0,0,0.25)',
-  '0 0 1px 0 rgba(0,0,0,0.31), 0 6px 16px -4px rgba(0,0,0,0.25)',
-  '0 0 1px 0 rgba(0,0,0,0.31), 0 7px 16px -4px rgba(0,0,0,0.25)',
-  '0 0 1px 0 rgba(0,0,0,0.31), 0 8px 18px -8px rgba(0,0,0,0.25)',
-  '0 0 1px 0 rgba(0,0,0,0.31), 0 9px 18px -8px rgba(0,0,0,0.25)',
-  '0 0 1px 0 rgba(0,0,0,0.31), 0 10px 20px -8px rgba(0,0,0,0.25)',
-  '0 0 1px 0 rgba(0,0,0,0.31), 0 11px 20px -8px rgba(0,0,0,0.25)',
-  '0 0 1px 0 rgba(0,0,0,0.31), 0 12px 22px -8px rgba(0,0,0,0.25)',
-  '0 0 1px 0 rgba(0,0,0,0.31), 0 13px 22px -8px rgba(0,0,0,0.25)',
-  '0 0 1px 0 rgba(0,0,0,0.31), 0 14px 24px -8px rgba(0,0,0,0.25)',
-  '0 0 1px 0 rgba(0,0,0,0.31), 0 16px 28px -8px rgba(0,0,0,0.25)',
-  '0 0 1px 0 rgba(0,0,0,0.31), 0 18px 30px -8px rgba(0,0,0,0.25)',
-  '0 0 1px 0 rgba(0,0,0,0.31), 0 20px 32px -8px rgba(0,0,0,0.25)',
-  '0 0 1px 0 rgba(0,0,0,0.31), 0 22px 34px -8px rgba(0,0,0,0.25)',
-  '0 0 1px 0 rgba(0,0,0,0.31), 0 24px 36px -8px rgba(0,0,0,0.25)',
-];
-
-export { shadows };
-
-above i gave u all themes colurs and all i need page which i geving u in the pictures when i click on the edit it should show the second image 
-theme should be same which i gave u create and give mi 
-
-import React from 'react'
-
-export default function Calendar() {
-  return (
-    <div>Calendar</div>
-  )
-}
-
+explain me in technical why what this code doing
