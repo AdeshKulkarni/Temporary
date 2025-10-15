@@ -1,373 +1,152 @@
-import React, { useState, useMemo, useEffect } from "react";
-import {
-  Box,
-  Typography,
-  Fab,
-  Dialog,
-  DialogActions,
-  DialogContent,
-  DialogTitle,
-  TextField,
-  Button,
-} from "@mui/material";
-import { DataGrid, GridActionsCellItem } from "@mui/x-data-grid";
-import AddIcon from "@mui/icons-material/Add";
-import EditIcon from "@mui/icons-material/Edit";
-import useApi from "../../../hooks/useApi";
-import useCustomSnackbar from "../../../utils/useCustomSnackbar";
 
-const initialFormState = {
-  currencyCode: "",
-  currencyName: "",
-  currencyRate: "",
-};
+	@PostMapping("/create-request")
+	@ResponseStatus(HttpStatus.CREATED)
+	public CommonReq createRequest(
+			@Valid @RequestBody CreateRequestDto createRequestDto,
+			@RequestHeader("Authorization") String token
+	) throws JsonProcessingException {
+		String userId = JwtUtil.getUserIdFromToken(token);    
+		log.info("Received request creation call from user: {}", userId);
+		return requestService.createRequest(createRequestDto, userId);
+	}
 
-export default function CurrencyMaster() {
-  const { callApi } = useApi();
-  const showSnackBar = useCustomSnackbar();
-  const [rows, setRows] = useState([]);
-  const [isLoading, setIsLoading] = useState(true);
+public CommonReq createRequest(
+			CreateRequestDto dto,
+			String creatorId
+	) throws JsonProcessingException {
+		// The payload DTO is already validated by the controller
+		KeyablePayload payload = (KeyablePayload) dto.getPayload();
 
-  const [isDialogOpen, setIsDialogOpen] = useState(false);
-  const [formData, setFormData] = useState(initialFormState);
-  const [editingRow, setEditingRow] = useState(null);
-  const [errors, setErrors] = useState({});
+		// --- PRE-FLIGHT CHECKS ---
+		// 1. Extract the targetId from the payload.
+		String targetId = payload.getKey();
+		if (targetId == null || targetId.isBlank()) {
+			throw new IllegalArgumentException("Could not determine targetId from payload.");
+		}
+		log.info("Determined targetId for new request as: {}", targetId);
 
-  const fetchData = async () => {
-    setIsLoading(true);
-    try {
-      const response = await callApi("CM/currency-master", null, "GET");
+		// 2. Check for duplicate PENDING or ACCEPTED requests for this targetId.
+		List<CommonReq> existingRequests = commonRequestRepository.findByTargetIdAndReqStatus(targetId,
+				RequestStatus.PENDING);
+		
+		if (!existingRequests.isEmpty()) {
+			log.warn("Attempted to create a duplicate request for targetId {} which already has a {} request.",
+					targetId, existingRequests.get(0).getReqStatus());
+			throw new DataIntegrityViolationException(
+					"An active or pending request for '" + targetId + "' already exists.");
+		}
+		log.info("Uniqueness check passed for targetId: {}", targetId);
 
-      if (response && response.data && Array.isArray(response.data)) {
-        const formattedData = response.data.map((row) => {
-          let formattedDate = "N/A";
-          if (row.updatedAt) {
-            const date = new Date(row.updatedAt);
-            if (!isNaN(date.getTime())) {
-              const day = String(date.getDate()).padStart(2, "0");
-              const month = String(date.getMonth() + 1).padStart(2, "0");
-              const year = date.getFullYear();
-              formattedDate = `${day}-${month}-${year}`;
-            }
-          }
-          return {
-            ...row,
-            id: row.currencyCode,
-            updatedAt: formattedDate,
-          };
-        });
+		// --- ALL CHECKS PASSED, PROCEED TO CREATE ---
+		CommonReq request = new CommonReq();
+		request.setCreatorId(creatorId);
+		request.setReqType(dto.getRequestType());
+		request.setChangeType(dto.getChangeType());
+		request.setPayload(objectMapper.writeValueAsString(payload));
+		request.setTargetId(targetId); // Setting the targetId at creation time.
+		request.setReqStatus(RequestStatus.PENDING);
 
-        setRows(formattedData);
-        if (formattedData.length === 0) {
-          showSnackBar("No currency data found.", "info");
-        }
-      } else {
-        showSnackBar("Received invalid data format.", "error");
-        setRows([]);
-      }
-    } catch (error) {
-      console.error("Error fetching currency data:", error);
-      showSnackBar(
-        "Something went wrong while fetching data. Please try again later.",
-        "error"
-      );
-      setRows([]);
-    } finally {
-      setIsLoading(false);
+		log.info("Saving new, validated request for targetId {}", targetId);
+		return commonRequestRepository.save(request);
+	}
+
+	@Override
+	@Transactional(rollbackOn = RuntimeException.class)
+	public Optional<CommonReq> updateRequestStatus(
+			ProcessRequestDto dto,
+			String executorId
+	) throws JsonProcessingException {
+		Long requestId = dto.getRequestId();
+		log.info("Attempting to update status for request ID: {} by executor: {}", requestId, executorId);
+
+		CommonReq request = commonRequestRepository.findById(requestId)
+				.orElseThrow(() -> new ResourceNotFoundException("Request with ID " + requestId + " not found."));
+
+		// SELF-APPROVAL CHECK
+		if (executorId.equals(request.getCreatorId())) {
+			log.warn("SECURITY VIOLATION: User {} attempted to approve their own request (ID: {}).", executorId,
+					requestId);
+			throw new IllegalStateException("User cannot approve or reject their own request.");
+		}
+
+		// Only pending requests can be processed.
+		if (request.getReqStatus() != RequestStatus.PENDING) {
+			log.warn("Attempted to modify an already processed request. ID: {}, Current Status: {}", dto.getRequestId(),
+					request.getReqStatus());
+			throw new IllegalStateException("Request has already been processed and cannot be modified.");
+		}
+
+		request.setExecutorId(executorId);
+		request.setExecutorRemarks(dto.getRemarks());
+		request.setExecutionDate(LocalDateTime.now());
+		request.setReqStatus(dto.getStatus());
+
+		// IF the request status type is accepted executing the specific approval logic
+		// using the strategy pattern.
+		if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+			log.info("Request {} ACCEPTED. Applying strategy for type {}", dto.getRequestId(), request.getReqType());
+			strategyFactory.getStrategy(request.getReqType()).processApproval(request);
+		} else {
+			log.info("Request {} REJECTED.", dto.getRequestId());
+		}
+		
+		log.info("updation done>>>>>>>>>>>>>>>>>>>>>");
+		// now return saving the commonRequestRepository with updated request. P.N: If
+		// any of the request failed in between @transactional will rollback all the
+		// changes
+		// save other fields after succesfull execution : accept/reject only, for
+		// failure changes will be rolled back.
+		request.setExecutionDate(LocalDateTime.now());
+		request.setExecutionRemarks("success"); // as the field data type is clob,
+												// which expects a json object
+		return Optional.of(commonRequestRepository.save(request));
+	}
+
+package com.tcs.fincore.CommonRequestService.model.enums;
+
+/**
+ * Represents the status of a request in the system.
+ */
+import lombok.Getter;
+
+@Getter
+public enum RequestStatus {
+    PENDING("P"),
+    ACCEPTED("A"),
+    REJECTED("R");
+
+    private final String code;
+
+    RequestStatus(String code) {
+        this.code = code;
     }
-  };
-
-  useEffect(() => {
-    fetchData();
-  }, []);
-
-  const handleOpenDialog = () => {
-    setEditingRow(null);
-    setFormData(initialFormState);
-    setErrors({});
-    setIsDialogOpen(true);
-  };
-
-  const handleCloseDialog = () => {
-    setIsDialogOpen(false);
-    setEditingRow(null);
-    setFormData(initialFormState);
-    setErrors({});
-  };
-
-  const handleEditClick = (id) => () => {
-    const rowToEdit = rows.find((row) => row.id === id);
-    if (rowToEdit) {
-      setEditingRow(rowToEdit);
-      setFormData({
-        currencyCode: rowToEdit.currencyCode,
-        currencyName: rowToEdit.currencyName,
-        currencyRate: rowToEdit.currencyRate,
-      });
-      setErrors({});
-      setIsDialogOpen(true);
-    }
-  };
-
-  const validate = () => {
-    let tempErrors = {};
-
-    if (!formData.currencyName?.trim()) {
-      tempErrors.currencyName = "Currency Name is required.";
-    } else if (/\d/.test(formData.currencyName)) {
-      tempErrors.currencyName = "Numbers are not allowed in Currency Name.";
-    }
-
-    if (!editingRow) {
-      if (!formData.currencyCode?.trim()) {
-        tempErrors.currencyCode = "Currency Code is required.";
-      } else if (formData.currencyCode.length !== 3) {
-        tempErrors.currencyCode = "Currency Code must be exactly 3 characters.";
-      }
-
-      if (!String(formData.currencyRate).trim()) {
-        tempErrors.currencyRate = "Currency Rate is required.";
-      }
-    }
-
-    setErrors(tempErrors);
-    return Object.keys(tempErrors).length === 0;
-  };
-
-  const handleInputChange = (e) => {
-    const { name, value } = e.target;
-    let processedValue = value;
-
-    if (name === "currencyCode") {
-      processedValue = value
-        .toUpperCase()
-        .slice(0, 3)
-        .replace(/[^A-Z]/g, "");
-    }
-    if (name === "currencyName") {
-      processedValue = value.slice(0, 30).replace(/[^a-zA-Z\s]/g, "");
-    }
-    if (name === "currencyRate") {
-      if (value !== "" && !/^\d{0,6}(\.\d{0,6})?$/.test(value)) {
-        return;
-      }
-      processedValue = value;
-    }
-
-    setFormData({ ...formData, [name]: processedValue });
-    if (errors[name]) {
-      setErrors({ ...errors, [name]: "" });
-    }
-  };
-
-  const handleSubmit = async () => {
-    if (!validate()) {
-      return;
-    }
-
-    const isEditing = !!editingRow;
-    let apiPayload;
-
-    if (isEditing) {
-      apiPayload = {
-        requestType: "CURRENCY",
-        changeType: "UPDATE",
-        payload: {
-          currencyCode: editingRow.currencyCode,
-          currencyName: formData.currencyName,
-          currencyRate: editingRow.currencyRate,
-          flag: 1,
-        },
-      };
-    } else {
-      apiPayload = {
-        requestType: "CURRENCY",
-        changeType: "ADD",
-        payload: {
-          currencyCode: formData.currencyCode,
-          currencyName: formData.currencyName,
-          currencyRate: parseFloat(formData.currencyRate) || 0,
-          flag: 0,
-        },
-      };
-    }
-
-    try {
-      await callApi("CR/create-request", apiPayload, "POST");
-
-      showSnackBar(
-        `Request to ${
-          isEditing ? "update" : "add"
-        } currency submitted successfully!`,
-        "success"
-      );
-      handleCloseDialog();
-      fetchData();
-    } catch (error) {
-      console.error("Error submitting request:", error);
-      showSnackBar(
-        error.response?.data?.message ||
-          `Failed to submit ${isEditing ? "update" : "add"} request.`,
-        "error"
-      );
-    }
-  };
-
-  const columns = useMemo(
-    () => [
-      {
-        field: "currencyCode",
-        headerName: "Currency Code",
-        flex: 1,
-        sortable: true,
-        align: "center",
-        headerAlign: "center",
-      },
-      {
-        field: "currencyName",
-        headerName: "Currency Name",
-        flex: 2,
-        sortable: true,
-        align: "center",
-        headerAlign: "center",
-      },
-      {
-        field: "currencyRate",
-        headerName: "Currency Rate",
-        type: "number",
-        flex: 1,
-        sortable: true,
-        align: "center",
-        headerAlign: "center",
-      },
-      {
-        field: "updatedAt",
-        headerName: "Last Updated",
-        flex: 1,
-        sortable: true,
-        align: "center",
-        headerAlign: "center",
-      },
-      {
-        field: "actions",
-        type: "actions",
-        headerName: "Actions",
-        width: 80,
-        headerAlign: "center",
-        align: "center",
-        cellClassName: "actions",
-        getActions: ({ id }) => [
-          <GridActionsCellItem
-            icon={<EditIcon />}
-            label="Edit"
-            onClick={handleEditClick(id)}
-            color="primary"
-          />,
-        ],
-      },
-    ],
-    [rows]
-  );
-
-  return (
-    <Box sx={{ p: 3 }}>
-      <DataGrid
-        rows={rows}
-        columns={columns}
-        disableRowSelectionOnClick
-        pageSizeOptions={[5, 10, 25, 50]}
-        initialState={{
-          pagination: { paginationModel: { pageSize: 10, page: 0 } },
-          sorting: { sortModel: [{ field: "updatedAt", sort: "desc" }] },
-        }}
-        loading={isLoading}
-        autoHeight
-        sx={{
-          width: "100%",
-          "& .MuiDataGrid-cell:focus, & .MuiDataGrid-cell:focus-within": {
-            outline: "none",
-          },
-          "& .MuiDataGrid-row:nth-of-type(odd)": {
-            backgroundColor: (theme) => theme.palette.action.hover,
-          },
-        }}
-      />
-
-      <Fab
-        color="primary"
-        aria-label="add"
-        onClick={handleOpenDialog}
-        sx={{ position: "fixed", bottom: 30, right: 30 }}
-      >
-        <AddIcon />
-      </Fab>
-
-      <Dialog
-        open={isDialogOpen}
-        onClose={handleCloseDialog}
-        fullWidth
-        maxWidth="sm"
-      >
-        <DialogTitle sx={{ fontWeight: "bold" }}>
-          {editingRow ? "Edit Currency" : "Add New Currency"}
-        </DialogTitle>
-        <DialogContent>
-          <TextField
-            autoFocus
-            margin="dense"
-            name="currencyCode"
-            label="Currency Code"
-            type="text"
-            fullWidth
-            variant="outlined"
-            value={formData.currencyCode}
-            onChange={handleInputChange}
-            error={!!errors.currencyCode}
-            helperText={
-              errors.currencyCode || "Must be 3 uppercase letters (e.g., USD)."
-            }
-            disabled={!!editingRow}
-            inputProps={{ maxLength: 3 }}
-          />
-          <TextField
-            margin="dense"
-            name="currencyName"
-            label="Currency Name"
-            type="text"
-            fullWidth
-            variant="outlined"
-            value={formData.currencyName}
-            onChange={handleInputChange}
-            error={!!errors.currencyName}
-            helperText={
-              errors.currencyName || "Letters and spaces only, max 30 characters."
-            }
-            inputProps={{ maxLength: 30 }}
-          />
-          <TextField
-            margin="dense"
-            name="currencyRate"
-            label="Currency Rate"
-            type="text"
-            fullWidth
-            variant="outlined"
-            value={formData.currencyRate}
-            onChange={handleInputChange}
-            error={!!errors.currencyRate}
-            helperText={
-              errors.currencyRate ||
-              "Numeric value. Max 6 digits before and 6 after the decimal."
-            }
-            disabled={!!editingRow}
-          />
-        </DialogContent>
-        <DialogActions sx={{ p: "16px 24px" }}>
-          <Button onClick={handleCloseDialog}>Cancel</Button>
-          <Button onClick={handleSubmit} variant="contained">
-            Submit
-          </Button>
-        </DialogActions>
-      </Dialog>
-    </Box>
-  );
 }
+
+package com.tcs.fincore.CommonRequestService.model.enums;
+
+/**
+ * Defines the type of entity a request is for (e.g., Segment Code, CGL).
+ */
+
+import lombok.Getter;
+
+@Getter
+public enum RequestType {
+	// The dbValue (e.g., "SegmentCode") is used for the database.
+    SEGMENT_CODE("SEGMENT"),
+    CGL_CODE("CGL"),
+    STATE("STATE"),
+    BRANCH("BRANCH"),
+    CIRCLE("CIRCLE"),
+    CURRENCY("CURRENCY"),
+    CALENDER("CALENDER"),
+	CURRENCY_RATE_CHANGE("CURRENCY_RATE");
+
+	private final String dbValue;
+
+	RequestType(String dbValue) {
+		this.dbValue = dbValue;
+	}
+}
+
+i am giving the create request explain me what is this doing and i think this is for common but i need to create for one not for common there is a specific request type called as Moc for that i need to send the data or that request in a diff table called as tempMoc so i dont want to duplicate code and make saparate request for that can u add any kind of condtion so that i dont need to create saprate give mi step wise
