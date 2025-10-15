@@ -1,152 +1,136 @@
+@Component("defaultRequestCreation") // Give it a name
+@RequiredArgsConstructor // Lombok for constructor injection
+@Slf4j
+public class DefaultRequestCreationStrategy implements RequestCreationStrategy {
 
-	@PostMapping("/create-request")
-	@ResponseStatus(HttpStatus.CREATED)
-	public CommonReq createRequest(
-			@Valid @RequestBody CreateRequestDto createRequestDto,
-			@RequestHeader("Authorization") String token
-	) throws JsonProcessingException {
-		String userId = JwtUtil.getUserIdFromToken(token);    
-		log.info("Received request creation call from user: {}", userId);
-		return requestService.createRequest(createRequestDto, userId);
-	}
+    private final CommonRequestRepository commonRequestRepository;
+    private final ObjectMapper objectMapper;
 
-public CommonReq createRequest(
-			CreateRequestDto dto,
-			String creatorId
-	) throws JsonProcessingException {
-		// The payload DTO is already validated by the controller
-		KeyablePayload payload = (KeyablePayload) dto.getPayload();
+    @Override
+    public Object create(CreateRequestDto dto, String creatorId) throws JsonProcessingException {
+        KeyablePayload payload = (KeyablePayload) dto.getPayload();
+        String targetId = payload.getKey();
 
-		// --- PRE-FLIGHT CHECKS ---
-		// 1. Extract the targetId from the payload.
-		String targetId = payload.getKey();
-		if (targetId == null || targetId.isBlank()) {
-			throw new IllegalArgumentException("Could not determine targetId from payload.");
-		}
-		log.info("Determined targetId for new request as: {}", targetId);
+        if (targetId == null || targetId.isBlank()) {
+            throw new IllegalArgumentException("Could not determine targetId from payload.");
+        }
 
-		// 2. Check for duplicate PENDING or ACCEPTED requests for this targetId.
-		List<CommonReq> existingRequests = commonRequestRepository.findByTargetIdAndReqStatus(targetId,
-				RequestStatus.PENDING);
-		
-		if (!existingRequests.isEmpty()) {
-			log.warn("Attempted to create a duplicate request for targetId {} which already has a {} request.",
-					targetId, existingRequests.get(0).getReqStatus());
-			throw new DataIntegrityViolationException(
-					"An active or pending request for '" + targetId + "' already exists.");
-		}
-		log.info("Uniqueness check passed for targetId: {}", targetId);
+        // The duplicate check, specific to this repository
+        List<CommonReq> existingRequests = commonRequestRepository.findByTargetIdAndReqStatus(targetId, RequestStatus.PENDING);
+        if (!existingRequests.isEmpty()) {
+            log.warn("Attempted to create a duplicate request for targetId {}", targetId);
+            throw new DataIntegrityViolationException("An active or pending request for '" + targetId + "' already exists.");
+        }
 
-		// --- ALL CHECKS PASSED, PROCEED TO CREATE ---
-		CommonReq request = new CommonReq();
-		request.setCreatorId(creatorId);
-		request.setReqType(dto.getRequestType());
-		request.setChangeType(dto.getChangeType());
-		request.setPayload(objectMapper.writeValueAsString(payload));
-		request.setTargetId(targetId); // Setting the targetId at creation time.
-		request.setReqStatus(RequestStatus.PENDING);
+        CommonReq request = new CommonReq();
+        request.setCreatorId(creatorId);
+        request.setReqType(dto.getRequestType());
+        request.setChangeType(dto.getChangeType());
+        request.setPayload(objectMapper.writeValueAsString(payload));
+        request.setTargetId(targetId);
+        request.setReqStatus(RequestStatus.PENDING);
 
-		log.info("Saving new, validated request for targetId {}", targetId);
-		return commonRequestRepository.save(request);
-	}
-
-	@Override
-	@Transactional(rollbackOn = RuntimeException.class)
-	public Optional<CommonReq> updateRequestStatus(
-			ProcessRequestDto dto,
-			String executorId
-	) throws JsonProcessingException {
-		Long requestId = dto.getRequestId();
-		log.info("Attempting to update status for request ID: {} by executor: {}", requestId, executorId);
-
-		CommonReq request = commonRequestRepository.findById(requestId)
-				.orElseThrow(() -> new ResourceNotFoundException("Request with ID " + requestId + " not found."));
-
-		// SELF-APPROVAL CHECK
-		if (executorId.equals(request.getCreatorId())) {
-			log.warn("SECURITY VIOLATION: User {} attempted to approve their own request (ID: {}).", executorId,
-					requestId);
-			throw new IllegalStateException("User cannot approve or reject their own request.");
-		}
-
-		// Only pending requests can be processed.
-		if (request.getReqStatus() != RequestStatus.PENDING) {
-			log.warn("Attempted to modify an already processed request. ID: {}, Current Status: {}", dto.getRequestId(),
-					request.getReqStatus());
-			throw new IllegalStateException("Request has already been processed and cannot be modified.");
-		}
-
-		request.setExecutorId(executorId);
-		request.setExecutorRemarks(dto.getRemarks());
-		request.setExecutionDate(LocalDateTime.now());
-		request.setReqStatus(dto.getStatus());
-
-		// IF the request status type is accepted executing the specific approval logic
-		// using the strategy pattern.
-		if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
-			log.info("Request {} ACCEPTED. Applying strategy for type {}", dto.getRequestId(), request.getReqType());
-			strategyFactory.getStrategy(request.getReqType()).processApproval(request);
-		} else {
-			log.info("Request {} REJECTED.", dto.getRequestId());
-		}
-		
-		log.info("updation done>>>>>>>>>>>>>>>>>>>>>");
-		// now return saving the commonRequestRepository with updated request. P.N: If
-		// any of the request failed in between @transactional will rollback all the
-		// changes
-		// save other fields after succesfull execution : accept/reject only, for
-		// failure changes will be rolled back.
-		request.setExecutionDate(LocalDateTime.now());
-		request.setExecutionRemarks("success"); // as the field data type is clob,
-												// which expects a json object
-		return Optional.of(commonRequestRepository.save(request));
-	}
-
-package com.tcs.fincore.CommonRequestService.model.enums;
-
-/**
- * Represents the status of a request in the system.
- */
-import lombok.Getter;
-
-@Getter
-public enum RequestStatus {
-    PENDING("P"),
-    ACCEPTED("A"),
-    REJECTED("R");
-
-    private final String code;
-
-    RequestStatus(String code) {
-        this.code = code;
+        log.info("Saving new, validated DEFAULT request for targetId {}", targetId);
+        return commonRequestRepository.save(request);
     }
 }
 
-package com.tcs.fincore.CommonRequestService.model.enums;
 
-/**
- * Defines the type of entity a request is for (e.g., Segment Code, CGL).
- */
 
-import lombok.Getter;
 
-@Getter
-public enum RequestType {
-	// The dbValue (e.g., "SegmentCode") is used for the database.
-    SEGMENT_CODE("SEGMENT"),
-    CGL_CODE("CGL"),
-    STATE("STATE"),
-    BRANCH("BRANCH"),
-    CIRCLE("CIRCLE"),
-    CURRENCY("CURRENCY"),
-    CALENDER("CALENDER"),
-	CURRENCY_RATE_CHANGE("CURRENCY_RATE");
 
-	private final String dbValue;
+@Component("mocRequestCreation") // Give it a different name
+@RequiredArgsConstructor
+@Slf4j
+public class MocRequestCreationStrategy implements RequestCreationStrategy {
 
-	RequestType(String dbValue) {
-		this.dbValue = dbValue;
-	}
+    private final TempMocRepository tempMocRepository;
+    private final ObjectMapper objectMapper;
+
+    @Override
+    public Object create(CreateRequestDto dto, String creatorId) throws JsonProcessingException {
+        KeyablePayload payload = (KeyablePayload) dto.getPayload();
+        String targetId = payload.getKey();
+
+        if (targetId == null || targetId.isBlank()) {
+            throw new IllegalArgumentException("Could not determine targetId from payload.");
+        }
+
+        // The duplicate check, specific to the MOC repository
+        List<TempMoc> existingRequests = tempMocRepository.findByTargetIdAndReqStatus(targetId, RequestStatus.PENDING);
+        if (!existingRequests.isEmpty()) {
+            log.warn("Attempted to create a duplicate MOC request for targetId {}", targetId);
+            throw new DataIntegrityViolationException("An active or pending MOC request for '" + targetId + "' already exists.");
+        }
+
+        TempMoc request = new TempMoc();
+        request.setCreatorId(creatorId);
+        request.setReqType(dto.getRequestType());
+        request.setChangeType(dto.getChangeType());
+        request.setPayload(objectMapper.writeValueAsString(payload));
+        request.setTargetId(targetId);
+        request.setReqStatus(RequestStatus.PENDING);
+
+        log.info("Saving new, validated MOC request for targetId {} to temp_moc table", targetId);
+        return tempMocRepository.save(request);
+    }
 }
 
-i am giving the create request explain me what is this doing and i think this is for common but i need to create for one not for common there is a specific request type called as Moc for that i need to send the data or that request in a diff table called as tempMoc so i dont want to duplicate code and make saparate request for that can u add any kind of condtion so that i dont need to create saprate give mi step wise
+
+
+@Component
+public class RequestCreationStrategyFactory {
+
+    private final Map<RequestType, RequestCreationStrategy> strategyMap = new EnumMap<>(RequestType.class);
+    
+    // Spring will inject the two named beans we created
+    public RequestCreationStrategyFactory(
+        @Qualifier("defaultRequestCreation") RequestCreationStrategy defaultStrategy,
+        @Qualifier("mocRequestCreation") RequestCreationStrategy mocStrategy
+    ) {
+        // Initialize the map for all default types
+        for (RequestType type : RequestType.values()) {
+            strategyMap.put(type, defaultStrategy);
+        }
+        
+        // Override the MOC type to use its specific strategy
+        strategyMap.put(RequestType.MOC, mocStrategy);
+    }
+
+    public RequestCreationStrategy getStrategy(RequestType requestType) {
+        RequestCreationStrategy strategy = strategyMap.get(requestType);
+        if (strategy == null) {
+            // Fallback to default just in case
+            return strategyMap.get(RequestType.STATE); // Or any default key
+        }
+        return strategy;
+    }
+}
+
+
+
+
+
+// In your RequestServiceImpl class...
+
+// Inject the factory
+@Autowired
+private RequestCreationStrategyFactory creationStrategyFactory;
+
+// Keep the existing repository for your other methods
+@Autowired
+private CommonRequestRepository commonRequestRepository;
+
+// REMOVE the ObjectMapper from here if it's only used for creation
+
+// Your REFACTORED createRequest method
+public Object createRequest(CreateRequestDto dto, String creatorId) throws JsonProcessingException {
+    // 1. Get the correct strategy from the factory based on the request type
+    RequestCreationStrategy strategy = creationStrategyFactory.getStrategy(dto.getRequestType());
+
+    // 2. Execute the strategy
+    log.info("Delegating creation for request type {} to its specific strategy.", dto.getRequestType());
+    return strategy.create(dto, creatorId);
+}
+
+// ... your updateRequestStatus and other methods remain unchanged ...
