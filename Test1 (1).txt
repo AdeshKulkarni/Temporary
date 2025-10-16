@@ -1,44 +1,72 @@
-package com.tcs.fincore.CommonRequestService.service.strategy;
+package com.tcs.fincore.CommonRequestService.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.tcs.fincore.CommonRequestService.dto.payload.MocPayloadDto;
+import com.tcs.fincore.CommonRequestService.dto.CreateRequestDto;
+import com.tcs.fincore.CommonRequestService.dto.ProcessRequestDto;
+import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
 import com.tcs.fincore.CommonRequestService.model.CommonReq;
-import com.tcs.fincore.CommonRequestService.model.master.FnMoc;
-import com.tcs.fincore.CommonRequestService.repository.FnMocRepository;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import com.tcs.fincore.CommonRequestService.repository.CommonRequestRepository;
+import com.tcs.fincore.CommonRequestService.service.strategy.RequestCreationStrategyFactory;
+import com.tcs.fincore.CommonRequestService.service.strategy.RequestStrategyFactory;
+import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Component;
+import org.springframework.stereotype.Service;
+import java.time.LocalDateTime;
+import java.util.Optional;
 
-@Component("MOC") // Name MUST match the RequestType enum value
-@Slf4j
+@Service
 @RequiredArgsConstructor
-public class MocApprovalStrategy implements RequestApprovalStrategy { // Assuming your approval interface is named this
+@Slf4j
+public class RequestServiceImpl implements RequestService {
 
-    private final FnMocRepository fnMocRepository;
-    private final ObjectMapper objectMapper;
+    private final CommonRequestRepository commonRequestRepository;
+    private final RequestStrategyFactory approvalStrategyFactory;
+    private final RequestCreationStrategyFactory creationStrategyFactory;
 
     @Override
-    public void processApproval(CommonReq request) throws JsonProcessingException {
-        log.info("Executing MOC approval strategy for request ID: {}", request.getId());
-
-        // 1. Deserialize the payload from the request into our MOC DTO
-        MocPayloadDto payload = objectMapper.readValue(request.getPayload(), MocPayloadDto.class);
-
-        // 2. Create the master entity from the payload
-        FnMoc masterRecord = new FnMoc();
-        masterRecord.setTmmocPdate(payload.getTmmocPdate());
-        masterRecord.setTmmocBranch(payload.getTmmocBranch());
-        masterRecord.setCurrency(payload.getCurrency());
-        masterRecord.setTmmocCgl(payload.getTmmocCgl());
-        masterRecord.setTmmocAmt(payload.getTmmocAmt());
-        masterRecord.setTxnType(payload.getTxnType());
-        masterRecord.setProductType(payload.getProductType());
-        masterRecord.setRemarks(payload.getRemarks());
-        masterRecord.setArFlag("A"); // 'A' for Accepted
-
-        // 3. Save to the final FN_MOC master table
-        fnMocRepository.save(masterRecord);
-        log.info("Successfully saved MOC data to FN_MOC master table for targetId: {}", request.getTargetId());
+    @Transactional
+    public Object createRequest(CreateRequestDto dto, String creatorId) throws JsonProcessingException {
+        log.info("Delegating creation for request type {} to its specific strategy.", dto.getRequestType());
+        var strategy = creationStrategyFactory.getStrategy(dto.getRequestType());
+        return strategy.create(dto, creatorId);
     }
+
+    @Override
+    @Transactional(rollbackOn = RuntimeException.class)
+    public Optional<CommonReq> updateRequestStatus(ProcessRequestDto dto, String executorId) throws JsonProcessingException {
+        Long requestId = dto.getRequestId();
+        log.info("Attempting to update status for request ID: {} by executor: {}", requestId, executorId);
+
+        // TODO: This part needs to be made generic. For now, it only works for CommonReq.
+        // You will need to pass the RequestType in the ProcessRequestDto to know which table to query.
+        CommonReq request = commonRequestRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("Request with ID " + requestId + " not found."));
+
+        if (executorId.equals(request.getCreatorId())) {
+            throw new IllegalStateException("User cannot approve or reject their own request.");
+        }
+
+        if (request.getReqStatus() != RequestStatus.PENDING) {
+            throw new IllegalStateException("Request has already been processed and cannot be modified.");
+        }
+
+        request.setExecutorId(executorId);
+        request.setExecutorRemarks(dto.getRemarks());
+        request.setExecutionDate(LocalDateTime.now());
+        request.setReqStatus(dto.getStatus());
+
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            log.info("Request {} ACCEPTED. Applying approval strategy for type {}", dto.getRequestId(), request.getReqType());
+            approvalStrategyFactory.getStrategy(request.getReqType()).processApproval(request);
+        } else {
+            log.info("Request {} REJECTED.", dto.getRequestId());
+        }
+
+        request.setExecutionRemarks("success");
+        return Optional.of(commonRequestRepository.save(request));
+    }
+    
+    // ... other get methods remain here
 }
