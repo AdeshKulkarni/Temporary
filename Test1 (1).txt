@@ -1,49 +1,131 @@
-package com.tcs.fincore.MocRequestService.model;
+package com.tcs.fincore.MocRequestService.service;
 
-import com.tcs.fincore.CommonRequestService.model.enums.ChangeType;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
 import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
-import jakarta.persistence.*;
-import lombok.Data;
+import com.tcs.fincore.MocRequestService.dto.CreateMocRequestDto;
+import com.tcs.fincore.MocRequestService.dto.ProcessMocRequestDto;
+import com.tcs.fincore.MocRequestService.model.MasterMoc;
+import com.tcs.fincore.MocRequestService.model.MocRequest;
+import com.tcs.fincore.MocRequestService.repository.MasterMocRepository;
+import com.tcs.fincore.MocRequestService.repository.MocRequestRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Service;
+import jakarta.transaction.Transactional;
 import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Optional;
 
-@Entity
-@Table(name = "MOC_REQUEST")
-@Data
-public class MocRequest {
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class MocRequestServiceImpl implements MocRequestService {
 
-    @Id
-    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "MOC_REQUEST_SEQ")
-    @SequenceGenerator(name = "MOC_REQUEST_SEQ", sequenceName = "MOC_REQUEST_SEQ", allocationSize = 1)
-    @Column(name = "REQ_ID")
-    private Long id;
+    private final MocRequestRepository mocRequestRepository;
+    private final MasterMocRepository masterMocRepository;
+    private final ObjectMapper objectMapper;
 
-    @Enumerated(EnumType.STRING)
-    @Column(name = "REQ_STATUS", length = 2)
-    private RequestStatus requestStatus;
+    @Override
+    @Transactional
+    public MocRequest createRequest(CreateMocRequestDto dto, String creatorId) throws JsonProcessingException {
+        // For MOC, we can define a unique targetId, e.g., by combining key fields.
+        String targetId = dto.getBranch() + "-" + dto.getCgl() + "-" + dto.getPDate();
+        
+        // Check for duplicate PENDING requests for this targetId.
+        List<MocRequest> existing = mocRequestRepository.findByTargetIdAndRequestStatus(targetId, RequestStatus.PENDING);
+        if (!existing.isEmpty()) {
+            throw new DataIntegrityViolationException("A pending request for this MOC record already exists.");
+        }
 
-    @Enumerated(EnumType.STRING)
-    @Column(name = "CHANGE_TYPE", length = 2)
-    private ChangeType changeType;
+        MocRequest request = new MocRequest();
+        request.setCreatorId(creatorId);
+        request.setChangeType(dto.getChangeType());
+        request.setRequestStatus(RequestStatus.PENDING);
+        request.setTargetId(targetId);
+        request.setPayload(objectMapper.writeValueAsString(dto));
 
-    @Column(name = "REQ_DATE", updatable = false)
-    private LocalDateTime requestDate = LocalDateTime.now();
+        log.info("Saving new MOC request for targetId {}", targetId);
+        return mocRequestRepository.save(request);
+    }
 
-    @Column(name = "CREATOR_ID", length = 12, updatable = false)
-    private String creatorId;
+    @Override
+    @Transactional
+    public Optional<MocRequest> updateRequestStatus(ProcessMocRequestDto dto, String executorId) throws JsonProcessingException {
+        MocRequest request = mocRequestRepository.findById(dto.getRequestId())
+                .orElseThrow(() -> new ResourceNotFoundException("MOC Request with ID " + dto.getRequestId() + " not found."));
 
-    @Column(name = "EXECUTOR_ID", length = 12)
-    private String executorId;
+        if (executorId.equals(request.getCreatorId())) {
+            throw new IllegalStateException("User cannot approve or reject their own MOC request.");
+        }
 
-    @Column(name = "EXECUTION_DATE")
-    private LocalDateTime executionDate;
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            throw new IllegalStateException("MOC Request has already been processed.");
+        }
 
-    @Column(name = "EXECUTOR_REMARKS", length = 500)
-    private String executorRemarks;
+        request.setExecutorId(executorId);
+        request.setExecutorRemarks(dto.getRemarks());
+        request.setExecutionDate(LocalDateTime.now());
+        request.setRequestStatus(dto.getStatus());
 
-    @Lob
-    @Column(name = "PAYLOAD")
-    private String payload;
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            log.info("MOC Request {} ACCEPTED. Processing...", dto.getRequestId());
+            processApproval(request);
+        } else {
+            log.info("MOC Request {} REJECTED.", dto.getRequestId());
+        }
 
-    @Column(name = "TARGET_ID", length = 50, nullable = false)
-    private String targetId;
+        return Optional.of(mocRequestRepository.save(request));
+    }
+    
+    private void processApproval(MocRequest request) throws JsonProcessingException {
+        CreateMocRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateMocRequestDto.class);
+
+        switch (request.getChangeType()) {
+            case ADD:
+                MasterMoc newMoc = new MasterMoc();
+                // Map fields from DTO to new MasterMoc entity
+                mapDtoToEntity(payloadDto, newMoc);
+                masterMocRepository.save(newMoc);
+                log.info("Successfully ADDED new MOC record to master table.");
+                break;
+
+            case UPDATE:
+                MasterMoc existingMoc = masterMocRepository.findById(payloadDto.getMasterMocId())
+                        .orElseThrow(() -> new ResourceNotFoundException("MasterMOC with ID " + payloadDto.getMasterMocId() + " not found for update."));
+                mapDtoToEntity(payloadDto, existingMoc);
+                masterMocRepository.save(existingMoc);
+                log.info("Successfully UPDATED MOC record in master table.");
+                break;
+
+            case DELETE:
+                masterMocRepository.deleteById(payloadDto.getMasterMocId());
+                log.info("Successfully DELETED MOC record from master table.");
+                break;
+        }
+    }
+
+    private void mapDtoToEntity(CreateMocRequestDto dto, MasterMoc entity) {
+        entity.setPDate(dto.getPDate());
+        entity.setBranch(dto.getBranch());
+        entity.setCurrency(dto.getCurrency());
+        entity.setCgl(dto.getCgl());
+        entity.setAmount(dto.getAmount());
+        entity.setTransactionType(dto.getTransactionType());
+        entity.setProductType(dto.getProductType());
+        entity.setRemarks(dto.getRemarks());
+        entity.setArFlag(dto.getArFlag());
+    }
+
+    @Override
+    public List<MocRequest> getMyRequests(String userId) {
+        return mocRequestRepository.findByCreatorId(userId);
+    }
+
+    @Override
+    public List<MocRequest> getPendingRequests() {
+        return mocRequestRepository.findByRequestStatus(RequestStatus.PENDING);
+    }
 }
