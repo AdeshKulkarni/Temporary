@@ -1,131 +1,52 @@
-package com.tcs.fincore.MocRequestService.service;
+package com.tcs.fincore.MocRequestService.controller;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
-import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import com.fincore.commonutilities.jwt.JwtUtil;
 import com.tcs.fincore.MocRequestService.dto.CreateMocRequestDto;
 import com.tcs.fincore.MocRequestService.dto.ProcessMocRequestDto;
-import com.tcs.fincore.MocRequestService.model.MasterMoc;
 import com.tcs.fincore.MocRequestService.model.MocRequest;
-import com.tcs.fincore.MocRequestService.repository.MasterMocRepository;
-import com.tcs.fincore.MocRequestService.repository.MocRequestRepository;
+import com.tcs.fincore.MocRequestService.service.MocRequestService;
+import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.stereotype.Service;
-import jakarta.transaction.Transactional;
-import java.time.LocalDateTime;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.*;
 import java.util.List;
-import java.util.Optional;
 
-@Service
+@RestController
+@RequestMapping("/api/moc") // Good practice to group related endpoints
 @RequiredArgsConstructor
 @Slf4j
-public class MocRequestServiceImpl implements MocRequestService {
+public class MocRequestController {
 
-    private final MocRequestRepository mocRequestRepository;
-    private final MasterMocRepository masterMocRepository;
-    private final ObjectMapper objectMapper;
+    private final MocRequestService mocRequestService;
 
-    @Override
-    @Transactional
-    public MocRequest createRequest(CreateMocRequestDto dto, String creatorId) throws JsonProcessingException {
-        // For MOC, we can define a unique targetId, e.g., by combining key fields.
-        String targetId = dto.getBranch() + "-" + dto.getCgl() + "-" + dto.getPDate();
-        
-        // Check for duplicate PENDING requests for this targetId.
-        List<MocRequest> existing = mocRequestRepository.findByTargetIdAndRequestStatus(targetId, RequestStatus.PENDING);
-        if (!existing.isEmpty()) {
-            throw new DataIntegrityViolationException("A pending request for this MOC record already exists.");
-        }
-
-        MocRequest request = new MocRequest();
-        request.setCreatorId(creatorId);
-        request.setChangeType(dto.getChangeType());
-        request.setRequestStatus(RequestStatus.PENDING);
-        request.setTargetId(targetId);
-        request.setPayload(objectMapper.writeValueAsString(dto));
-
-        log.info("Saving new MOC request for targetId {}", targetId);
-        return mocRequestRepository.save(request);
+    @PostMapping("/create-request")
+    @ResponseStatus(HttpStatus.CREATED)
+    public MocRequest createRequest(
+            @Valid @RequestBody CreateMocRequestDto createRequestDto,
+            @RequestHeader("Authorization") String token) throws JsonProcessingException {
+        String userId = JwtUtil.getUserIdFromToken(token);
+        log.info("Received MOC request creation call from user: {}", userId);
+        return mocRequestService.createRequest(createRequestDto, userId);
     }
 
-    @Override
-    @Transactional
-    public Optional<MocRequest> updateRequestStatus(ProcessMocRequestDto dto, String executorId) throws JsonProcessingException {
-        MocRequest request = mocRequestRepository.findById(dto.getRequestId())
-                .orElseThrow(() -> new ResourceNotFoundException("MOC Request with ID " + dto.getRequestId() + " not found."));
-
-        if (executorId.equals(request.getCreatorId())) {
-            throw new IllegalStateException("User cannot approve or reject their own MOC request.");
-        }
-
-        if (request.getRequestStatus() != RequestStatus.PENDING) {
-            throw new IllegalStateException("MOC Request has already been processed.");
-        }
-
-        request.setExecutorId(executorId);
-        request.setExecutorRemarks(dto.getRemarks());
-        request.setExecutionDate(LocalDateTime.now());
-        request.setRequestStatus(dto.getStatus());
-
-        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
-            log.info("MOC Request {} ACCEPTED. Processing...", dto.getRequestId());
-            processApproval(request);
-        } else {
-            log.info("MOC Request {} REJECTED.", dto.getRequestId());
-        }
-
-        return Optional.of(mocRequestRepository.save(request));
-    }
-    
-    private void processApproval(MocRequest request) throws JsonProcessingException {
-        CreateMocRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateMocRequestDto.class);
-
-        switch (request.getChangeType()) {
-            case ADD:
-                MasterMoc newMoc = new MasterMoc();
-                // Map fields from DTO to new MasterMoc entity
-                mapDtoToEntity(payloadDto, newMoc);
-                masterMocRepository.save(newMoc);
-                log.info("Successfully ADDED new MOC record to master table.");
-                break;
-
-            case UPDATE:
-                MasterMoc existingMoc = masterMocRepository.findById(payloadDto.getMasterMocId())
-                        .orElseThrow(() -> new ResourceNotFoundException("MasterMOC with ID " + payloadDto.getMasterMocId() + " not found for update."));
-                mapDtoToEntity(payloadDto, existingMoc);
-                masterMocRepository.save(existingMoc);
-                log.info("Successfully UPDATED MOC record in master table.");
-                break;
-
-            case DELETE:
-                masterMocRepository.deleteById(payloadDto.getMasterMocId());
-                log.info("Successfully DELETED MOC record from master table.");
-                break;
-        }
+    @PatchMapping("/update-request")
+    public MocRequest updateRequestStatus(
+            @RequestHeader("Authorization") String token,
+            @Valid @RequestBody ProcessMocRequestDto processRequestDto) throws JsonProcessingException {
+        String executorId = JwtUtil.getUserIdFromToken(token);
+        return mocRequestService.updateRequestStatus(processRequestDto, executorId).get();
     }
 
-    private void mapDtoToEntity(CreateMocRequestDto dto, MasterMoc entity) {
-        entity.setPDate(dto.getPDate());
-        entity.setBranch(dto.getBranch());
-        entity.setCurrency(dto.getCurrency());
-        entity.setCgl(dto.getCgl());
-        entity.setAmount(dto.getAmount());
-        entity.setTransactionType(dto.getTransactionType());
-        entity.setProductType(dto.getProductType());
-        entity.setRemarks(dto.getRemarks());
-        entity.setArFlag(dto.getArFlag());
+    @GetMapping("/my-requests")
+    public List<MocRequest> getMyRequests(@RequestHeader("Authorization") String token) {
+        String userId = JwtUtil.getUserIdFromToken(token);
+        return mocRequestService.getMyRequests(userId);
     }
 
-    @Override
-    public List<MocRequest> getMyRequests(String userId) {
-        return mocRequestRepository.findByCreatorId(userId);
-    }
-
-    @Override
-    public List<MocRequest> getPendingRequests() {
-        return mocRequestRepository.findByRequestStatus(RequestStatus.PENDING);
+    @GetMapping("/pending-requests")
+    public List<MocRequest> getPendingRequests(@RequestHeader("Authorization") String token) {
+        return mocRequestService.getPendingRequests();
     }
 }
