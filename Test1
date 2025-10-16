@@ -1,45 +1,182 @@
-package com.tcs.fincore.CommonRequestService.service.strategy;
+package com.tcs.fincore.CommonRequestService.service;
 
-import org.springframework.stereotype.Component;
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Optional;
 
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.dto.CreateRequestDto;
+import com.tcs.fincore.CommonRequestService.dto.ProcessRequestDto;
+import com.tcs.fincore.CommonRequestService.dto.TMMocDto; // Import MOC DTO
+import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
+import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.TMMoc; // Import MOC Model
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
 import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import com.tcs.fincore.CommonRequestService.repository.CommonRequestRepository;
+import com.tcs.fincore.CommonRequestService.repository.TMMocRepository; // Import MOC Repo
+import com.tcs.fincore.CommonRequestService.service.strategy.RequestStrategyFactory;
 
+import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 
-@Component
+@Service
 @RequiredArgsConstructor
-public class RequestStrategyFactory {
+@Slf4j
+public class RequestServiceImpl implements RequestService {
 
-	private final SegmentCodeStrategy segmentCodeStrategy;
-	private final CglCodeStrategy cglCodeStrategy;
-	private final BranchMasterStrategy branchCodeStrategy;
-	private final StateReqStrategy stateReqStrategy;
-	private final CurrencyMasterStrategy currencyMasterStrategy;
-    private final CalenderConfigStrategy calenderConfigStrategy;
-    private final CircleMasterStrategy circleMasterStrategy;
-    private final CurrencyRateChangeStrategy CURRENCY_RATE_CHANGE;
+	private final CommonRequestRepository commonRequestRepository;
+	private final TMMocRepository tmMocRepository; // <-- INJECT THE NEW REPOSITORY
+	private final RequestStrategyFactory strategyFactory;
+	private final ObjectMapper objectMapper;
 
-	public RequestTypeStrategy getStrategy(RequestType requestType) {
-		switch (requestType) {
-        case CALENDER:
-            return calenderConfigStrategy;
-		case SEGMENT_CODE:
-			return segmentCodeStrategy;
-		case CGL_CODE:
-			return cglCodeStrategy;
-		case BRANCH:
-			return branchCodeStrategy;
-		case STATE:
-			return stateReqStrategy;
-		case CURRENCY:
-			return currencyMasterStrategy;
-		case CIRCLE:
-			return circleMasterStrategy;
-	    case CURRENCY_RATE_CHANGE:
-				return CURRENCY_RATE_CHANGE;
-
-		default:
-			throw new IllegalArgumentException("Unsupported request type: " + requestType);
+	@Override
+	@Transactional
+	public CommonReq createRequest(CreateRequestDto dto, String creatorId) throws JsonProcessingException {
+		
+		// ================== START OF MODIFICATION ==================
+		// Check if the request type is MOC and delegate if it is.
+		if (RequestType.MOC.equals(dto.getRequestType())) {
+			log.info("MOC request type detected. Delegating to MOC creation logic.");
+			return createMocRequest(dto, creatorId);
 		}
+		// =================== END OF MODIFICATION ===================
+
+
+		// --- Existing logic for all other common requests ---
+		KeyablePayload payload = (KeyablePayload) dto.getPayload();
+		String targetId = payload.getKey();
+		if (targetId == null || targetId.isBlank()) {
+			throw new IllegalArgumentException("Could not determine targetId from payload.");
+		}
+		log.info("Determined targetId for new common request as: {}", targetId);
+
+		List<CommonReq> existingRequests = commonRequestRepository.findByTargetIdAndReqStatus(targetId, RequestStatus.PENDING);
+		if (!existingRequests.isEmpty()) {
+			log.warn("Attempted to create a duplicate common request for targetId {}", targetId);
+			throw new DataIntegrityViolationException("An active or pending request for '" + targetId + "' already exists.");
+		}
+		log.info("Uniqueness check passed for common request targetId: {}", targetId);
+
+		CommonReq request = new CommonReq();
+		request.setCreatorId(creatorId);
+		request.setReqType(dto.getRequestType());
+		request.setChangeType(dto.getChangeType());
+		request.setPayload(objectMapper.writeValueAsString(payload));
+		request.setTargetId(targetId);
+		request.setReqStatus(RequestStatus.PENDING);
+
+		log.info("Saving new, validated common request for targetId {}", targetId);
+		return commonRequestRepository.save(request);
 	}
+
+	/**
+	 * Private helper method to handle the special creation logic for MOC requests.
+	 * It saves the full request to FIN_TMMOC and a simplified placeholder to CommonReq.
+	 */
+	private CommonReq createMocRequest(CreateRequestDto dto, String creatorId) throws JsonProcessingException {
+		TMMocDto payload = (TMMocDto) dto.getPayload();
+		String targetId = payload.getKey();
+
+		if (targetId == null || targetId.isBlank()) {
+			throw new IllegalArgumentException("Could not determine targetId from MOC payload.");
+		}
+		log.info("Determined targetId for new MOC request as: {}", targetId);
+		
+		// Check for duplicates in the temporary MOC table
+		List<TMMoc> existingMocRequests = tmMocRepository.findByTargetIdAndReqStatus(targetId, RequestStatus.PENDING);
+		if (!existingMocRequests.isEmpty()) {
+			log.warn("Attempted to create a duplicate MOC request for targetId {}", targetId);
+			throw new DataIntegrityViolationException("An active or pending MOC request for '" + targetId + "' already exists.");
+		}
+
+		// 1. Create and save the full request to the TMMoc table
+		TMMoc mocRequest = new TMMoc();
+		mocRequest.setCreatorId(creatorId);
+		mocRequest.setReqType(dto.getRequestType());
+		mocRequest.setChangeType(dto.getChangeType());
+		mocRequest.setPayload(objectMapper.writeValueAsString(payload));
+		mocRequest.setTargetId(targetId);
+		mocRequest.setReqStatus(RequestStatus.PENDING);
+		// Map other TMMoc specific fields from payload if necessary
+		mocRequest.setTmmocPdate(new java.sql.Date(payload.getTmmocPdate().getTime()));
+		mocRequest.setTmmocBranch(payload.getTmmocBranch());
+		mocRequest.setCurrency(payload.getCurrency());
+		mocRequest.setTmmocCgl(payload.getTmmocCgl());
+		mocRequest.setTmmocAmt(payload.getTmmocAmt());
+		mocRequest.setTxnType(payload.getTxnType());
+		mocRequest.setProductType(payload.getProductType());
+		mocRequest.setRemarks(payload.getRemarks());
+
+		TMMoc savedMocRequest = tmMocRepository.save(mocRequest);
+		log.info("Saved new MOC request to FIN_TMMOC with ID: {}", savedMocRequest.getId());
+
+		// 2. Create and save a corresponding placeholder in the CommonReq table
+		//    This makes it visible to your existing approval endpoints.
+		CommonReq placeholder = new CommonReq();
+		placeholder.setId(savedMocRequest.getId()); // CRITICAL: Use the same ID
+		placeholder.setCreatorId(creatorId);
+		placeholder.setReqType(dto.getRequestType());
+		placeholder.setChangeType(dto.getChangeType());
+		placeholder.setTargetId(targetId);
+		placeholder.setReqStatus(RequestStatus.PENDING);
+		placeholder.setPayload("{\"message\":\"Placeholder for MOC request ID " + savedMocRequest.getId() + "\"}"); // Minimal payload
+
+		return commonRequestRepository.save(placeholder);
+	}
+
+
+	@Override
+	@Transactional(rollbackOn = RuntimeException.class)
+	public Optional<CommonReq> updateRequestStatus(ProcessRequestDto dto, String executorId) throws JsonProcessingException {
+		Long requestId = dto.getRequestId();
+		log.info("Attempting to update status for request ID: {} by executor: {}", requestId, executorId);
+
+		// NO CHANGE NEEDED HERE. It correctly finds the placeholder CommonReq.
+		CommonReq request = commonRequestRepository.findById(requestId)
+				.orElseThrow(() -> new ResourceNotFoundException("Request with ID " + requestId + " not found."));
+
+		if (executorId.equals(request.getCreatorId())) {
+			log.warn("SECURITY VIOLATION: User {} attempted to approve their own request (ID: {}).", executorId, requestId);
+			throw new IllegalStateException("User cannot approve or reject their own request.");
+		}
+
+		if (request.getReqStatus() != RequestStatus.PENDING) {
+			log.warn("Attempted to modify an already processed request. ID: {}, Current Status: {}", dto.getRequestId(), request.getReqStatus());
+			throw new IllegalStateException("Request has already been processed and cannot be modified.");
+		}
+
+		request.setExecutorId(executorId);
+		request.setExecutorRemarks(dto.getRemarks());
+		request.setExecutionDate(LocalDateTime.now());
+		request.setReqStatus(dto.getStatus());
+
+		if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+			log.info("Request {} ACCEPTED. Applying strategy for type {}", dto.getRequestId(), request.getReqType());
+			// The factory will correctly return MocStrategy, which knows how to handle it from here.
+			strategyFactory.getStrategy(request.getReqType()).processApproval(request);
+		} else {
+			log.info("Request {} REJECTED.", dto.getRequestId());
+            // If rejected, you might also want to update the status in the TMMoc table.
+            if(RequestType.MOC.equals(request.getReqType())) {
+                TMMoc mocRequest = tmMocRepository.findById(requestId).orElseThrow();
+                mocRequest.setReqStatus(RequestStatus.REJECTED);
+                mocRequest.setExecutorId(executorId);
+                mocRequest.setExecutorRemarks(dto.getRemarks());
+                tmMocRepository.save(mocRequest);
+            }
+		}
+
+		return Optional.of(commonRequestRepository.save(request));
+	}
+    
+    // ... other methods (getMyRequests, getPendingRequests) remain unchanged ...
+    // You may want to create equivalent methods for MOC and a new endpoint if you need to see only MOC requests.
+    // But for a unified view, the current methods will work as they query the CommonReq table.
 }
