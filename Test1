@@ -1,142 +1,567 @@
-package com.tcs.fincore.MOCService.Service;
+import React, { useState, useEffect, useCallback } from "react";
+import {
+  Box,
+  Typography,
+  Grid,
+  TextField,
+  Button,
+  Paper,
+  IconButton,
+  MenuItem,
+  CircularProgress,
+  Autocomplete,
+} from "@mui/material";
+import AddIcon from "@mui/icons-material/Add";
+import DeleteIcon from "@mui/icons-material/Delete";
+import { debounce } from "lodash";
+// --- Need a way to generate unique IDs ---
+// Using UUID is a robust way to get unique Batch IDs
+import { v4 as uuidv4 } from 'uuid'; 
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.tcs.fincore.MOCService.Dto.CreateMocRequestDto;
-import com.tcs.fincore.MOCService.Dto.ProcessMocRequestDto;
-import com.tcs.fincore.MOCService.Exception.ResourceNotFoundException;
-import com.tcs.fincore.MOCService.Models.MasterMoc;
-import com.tcs.fincore.MOCService.Models.MocRequest;
-import com.tcs.fincore.MOCService.Models.enums.RequestStatus;
-import com.tcs.fincore.MOCService.Repository.MasterMocRepository;
-import com.tcs.fincore.MOCService.Repository.MocRequestRepository;
+import useApi from "../../../hooks/useApi";
+import useCustomSnackbar from "../../../utils/useCustomSnackbar";
 
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.stereotype.Service;
-import jakarta.transaction.Transactional;
-import java.time.LocalDateTime;
-import java.util.List;
-import java.util.Optional;
+const initialRowState = {
+  id: Date.now(), // This is just for React key, not submitted
+  branch: null,
+  postDate: new Date().toISOString().split("T")[0],
+  currency: "",
+  head: "",
+  cgl: null,
+  amount: "",
+  txnType: "Debit",
+  remarks: "",
+  productCode: "",
+};
 
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class MocRequestServiceImpl implements MocRequestService {
+export default function MOCPosting() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
 
-    private final MocRequestRepository mocRequestRepository;
-    private final MasterMocRepository masterMocRepository;
-    private final ObjectMapper objectMapper;
+  const [rows, setRows] = useState([initialRowState]);
+  const [currencyOptions, setCurrencyOptions] = useState([]);
+  const [headOptions, setHeadOptions] = useState([]);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
-    @Override
-    @Transactional
-    public MocRequest createRequest(CreateMocRequestDto dto, String creatorId) throws JsonProcessingException {
-        
-        String targetId = dto.getBranch() + "-" + dto.getCgl() + "-" + dto.getPDate();
-        
-        List<MocRequest> existing = mocRequestRepository.findByTargetIdAndRequestStatus(targetId, RequestStatus.PENDING);
-        if (!existing.isEmpty()) {
-            throw new DataIntegrityViolationException("A pending request for this specific MOC record (Branch-CGL-Date) already exists.");
-        }
+  const [branchSearch, setBranchSearch] = useState({
+    loading: false,
+    options: [],
+  });
+  const [cglSearch, setCglSearch] = useState({ loading: false, options: [] });
 
-        MocRequest request = new MocRequest();
-        request.setCreatorId(creatorId);
-        request.setChangeType(dto.getChangeType());
-        request.setRequestStatus(RequestStatus.PENDING);
-        request.setTargetId(targetId);
-        request.setBatchId(dto.getBatchId());
-   
-        // --- SAVE JOURNAL ID ---
-        request.setJournalId(dto.getJournalId()); // Save journal ID with the request
-        // --- END CHANGE ---
-   
-        request.setPayload(objectMapper.writeValueAsString(dto)); 
-
-        log.info("Saving new MOC request (Batch ID: {}, Journal ID: {}) for targetId {}", dto.getBatchId(), dto.getJournalId(), targetId);
-        return mocRequestRepository.save(request);
-    }
-
-    // No changes needed in updateRequestStatus, processApproval, or mapDtoToEntity
-    // because the journalId is already correctly handled via the payload.
-
-    @Override
-    @Transactional
-    public Optional<MocRequest> updateRequestStatus(ProcessMocRequestDto dto, String executorId) throws JsonProcessingException {
-        MocRequest request = mocRequestRepository.findById(dto.getRequestId())
-                .orElseThrow(() -> new ResourceNotFoundException("MOC Request with ID " + dto.getRequestId() + " not found."));
-
-        if (executorId.equals(request.getCreatorId())) {
-            throw new IllegalStateException("User cannot approve or reject their own MOC request.");
-        }
-
-        if (request.getRequestStatus() != RequestStatus.PENDING) {
-            throw new IllegalStateException("MOC Request has already been processed.");
-        }
-
-        request.setExecutorId(executorId);
-        request.setExecutorRemarks(dto.getRemarks());
-        request.setExecutionDate(LocalDateTime.now());
-        request.setRequestStatus(dto.getStatus());
-
-        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
-            log.info("MOC Request {} ACCEPTED. Processing for Batch ID: {}", dto.getRequestId(), request.getBatchId());
-            processApproval(request); 
+  // Fetch initial data (remains the same)
+  useEffect(() => {
+    const fetchInitialData = async () => {
+      try {
+        const currencyResponse = await callApi("CM/currency", null, "GET");
+        if (currencyResponse?.success && Array.isArray(currencyResponse.data)) {
+          const uniqueCurrencies = [...new Set(currencyResponse.data)];
+          setCurrencyOptions(uniqueCurrencies);
         } else {
-            log.info("MOC Request {} REJECTED.", dto.getRequestId());
+          showSnackBar("Failed to load currencies.", "error");
         }
 
-        return Optional.of(mocRequestRepository.save(request));
+        const headResponse = await callApi(
+          "MS/api/cgls/classifications",
+          null,
+          "GET"
+        );
+
+        if (headResponse) {
+          const formattedHeads = Object.entries(headResponse).map(
+            ([key, value]) => ({ key, value })
+          );
+          setHeadOptions(formattedHeads);
+        } else {
+          showSnackBar("Failed to load head classifications.", "error");
+        }
+      } catch (error) {
+        console.error("Error fetching initial data:", error);
+        showSnackBar("An error occurred while loading page data.", "error");
+      }
+    };
+
+    fetchInitialData();
+  }, [callApi, showSnackBar]);
+
+  // Row handling functions remain the same
+  const handleAddRow = () => {
+    setRows([...rows, { ...initialRowState, id: Date.now() }]);
+  };
+
+  const handleDeleteRow = (id) => {
+    if (rows.length > 1) {
+      setRows(rows.filter((row) => row.id !== id));
+    } else {
+      showSnackBar("Cannot delete the last row.", "warning");
     }
+  };
+
+  const handleRowChange = (id, field, value) => {
+    const newRows = rows.map((row) => {
+      if (row.id === id) {
+        if (field === "head" && row.head !== value) {
+          setCglSearch({ loading: false, options: [] });
+          searchCgls("", value);
+          return { ...row, [field]: value, cgl: null };
+        }
+        return { ...row, [field]: value };
+      }
+      return row;
+    });
+    setRows(newRows);
+  };
+
+  // Search functions remain the same
+  const searchBranches = useCallback(
+    debounce(async (query) => {
+      if (!query) {
+        setBranchSearch({ loading: false, options: [] });
+        return;
+      }
+      setBranchSearch((prev) => ({ ...prev, loading: true }));
+      try {
+        const response = await callApi(
+          `MS/branches/search?query=${encodeURIComponent(query)}`,
+          null,
+          "GET"
+        );
+        setBranchSearch({ loading: false, options: response || [] });
+      } catch (error) {
+        console.error("Branch search failed:", error);
+        showSnackBar("Branch search failed. See console.", "error");
+        setBranchSearch({ loading: false, options: [] });
+      }
+    }, 300),
+    [callApi, showSnackBar]
+  );
+
+  const searchCgls = useCallback(
+    debounce(async (query, headKey) => {
+      if (!headKey) {
+        setCglSearch({ loading: false, options: [] });
+        return;
+      }
+      setCglSearch((prev) => ({ ...prev, loading: true }));
+      try {
+        const response = await callApi(
+          `MS/api/cgls/search?query=${encodeURIComponent(
+            query
+          )}&classification=${encodeURIComponent(headKey)}`,
+          null,
+          "GET"
+        );
+        setCglSearch({ loading: false, options: response || [] });
+      } catch (error) {
+        console.error("CGL search failed:", error);
+        showSnackBar("CGL search failed. See console.", "error");
+        setCglSearch({ loading: false, options: [] });
+      }
+    }, 300),
+    [callApi, showSnackBar]
+  );
+
+  // --- UPDATED handleSubmit ---
+  const handleSubmit = async () => {
+    setIsSubmitting(true);
     
-    private void processApproval(MocRequest request) throws JsonProcessingException {
-        CreateMocRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateMocRequestDto.class);
+    // --- 1. GENERATE BATCH ID (once per submission) ---
+    const batchId = uuidv4(); // Generate a unique ID for this batch
+    console.log("Generated Batch ID:", batchId);
+    // ---
 
-        switch (request.getChangeType()) {
-            case ADD:
-                MasterMoc newMoc = new MasterMoc();
-                mapDtoToEntity(payloadDto, newMoc);
-                masterMocRepository.save(newMoc);
-                log.info("Successfully ADDED new MOC record to master table (Batch ID: {}, Journal ID: {}).", payloadDto.getBatchId(), payloadDto.getJournalId());
-                break;
+    const branchTotals = new Map();
+    // --- 2. PREPARE JOURNAL ID COUNTERS ---
+    const journalCounters = new Map(); // Map<branchCode, counter>
+    // ---
 
-            case UPDATE:
-                MasterMoc existingMoc = masterMocRepository.findById(payloadDto.getMasterMocId())
-                        .orElseThrow(() -> new ResourceNotFoundException("MasterMOC with ID " + payloadDto.getMasterMocId() + " not found for update."));
-                mapDtoToEntity(payloadDto, existingMoc); 
-                masterMocRepository.save(existingMoc);
-                log.info("Successfully UPDATED MOC record in master table (Batch ID: {}, Journal ID: {}).", payloadDto.getBatchId(), payloadDto.getJournalId());
-                break;
+    // First loop: Validate completeness & calculate totals
+    for (const [index, row] of rows.entries()) {
+      if (
+        !row.branch || !row.currency || !row.head || !row.cgl ||
+        !row.amount || !row.txnType || !row.productCode
+      ) {
+        showSnackBar(`Row ${index + 1} is incomplete. Please fill all fields.`, "error");
+        setIsSubmitting(false);
+        return;
+      }
 
-            case DELETE:
-                masterMocRepository.deleteById(payloadDto.getMasterMocId());
-                log.info("Successfully DELETED MOC record from master table (Was Batch ID: {}, Journal ID: {}).", payloadDto.getBatchId(), payloadDto.getJournalId());
-                break;
-        }
+      const branchCode = row.branch.code;
+      const branchName = row.branch.name;
+
+      if (!branchTotals.has(branchCode)) {
+        branchTotals.set(branchCode, {
+          totalDebit: 0, totalCredit: 0, hasDebit: false, hasCredit: false, branchName: branchName,
+        });
+        // --- Initialize journal counter for new branch ---
+        journalCounters.set(branchCode, 0); 
+        // ---
+      }
+
+      const totals = branchTotals.get(branchCode);
+      const amount = parseFloat(row.amount) || 0;
+
+      if (row.txnType === "Debit") {
+        totals.totalDebit += amount;
+        totals.hasDebit = true;
+      } else if (row.txnType === "Credit") {
+        totals.totalCredit += amount;
+        totals.hasCredit = true;
+      }
     }
 
-    private void mapDtoToEntity(CreateMocRequestDto dto, MasterMoc entity) {
-        entity.setPDate(dto.getPDate());
-        entity.setBranch(dto.getBranch());
-        entity.setCurrency(dto.getCurrency());
-        entity.setCgl(dto.getCgl());
-        entity.setAmount(dto.getAmount());
-        entity.setTransactionType(dto.getTransactionType());
-        entity.setProductType(dto.getProductType());
-        entity.setRemarks(dto.getRemarks());
-        entity.setArFlag(dto.getArFlag());
-        entity.setAcClassification(dto.getAcClassification());
-        entity.setBatchId(dto.getBatchId());
-        entity.setJournalId(dto.getJournalId());
+    // Second loop: Validate balancing per branch
+    for (const [branchCode, totals] of branchTotals.entries()) {
+      const { totalDebit, totalCredit, hasDebit, hasCredit, branchName } = totals;
+      if (!hasDebit || !hasCredit) {
+        showSnackBar(`Submission failed. Branch "${branchName}" (${branchCode}) must have at least one Debit and one Credit entry.`, "error");
+        setIsSubmitting(false);
+        return;
+      }
+      const EPSILON = 0.000001;
+      if (Math.abs(totalDebit - totalCredit) > EPSILON) {
+        showSnackBar(`Submission failed. Totals for branch "${branchName}" (${branchCode}) do not match. Debit: ${totalDebit.toFixed(2)}, Credit: ${totalCredit.toFixed(2)}`, "error");
+        setIsSubmitting(false);
+        return;
+      }
     }
 
-    @Override
-    public List<MocRequest> getMyRequests(String userId) {
-        return mocRequestRepository.findByCreatorId(userId);
+    // Third loop: Submit each row with generated IDs
+    let successfulSubmissions = 0;
+    let failedSubmissions = 0;
+
+    for (const [index, row] of rows.entries()) {
+      const branchCode = row.branch.code;
+
+      // --- 3. GENERATE JOURNAL ID ---
+      let currentCounter = journalCounters.get(branchCode);
+      currentCounter++; // Increment counter for this branch
+      journalCounters.set(branchCode, currentCounter); // Save updated counter
+      // Format sequence number (e.g., 1 -> "001", 10 -> "010")
+      const sequenceNumber = String(currentCounter).padStart(3, '0');
+      const journalId = `${branchCode}-${sequenceNumber}`;
+      console.log(`Row ${index + 1} (Branch ${branchCode}): Generated Journal ID: ${journalId}`);
+      // ---
+
+      const payload = {
+        changeType: "ADD",
+        pDate: row.postDate,
+        branch: branchCode,       // Send branch code
+        currency: row.currency,
+        cgl: row.cgl.cglNumber, // Send CGL number
+        amount: parseFloat(row.amount),
+        transactionType: row.txnType, // "Debit" or "Credit"
+        productType: row.productCode,
+        remarks: row.remarks,
+        arFlag: "A",
+        acClassification: row.head, // Send 'A', 'E' etc.
+
+        // --- 4. INCLUDE GENERATED IDs IN PAYLOAD ---
+        batchId: batchId,
+        journalId: journalId,
+        // ---
+      };
+
+      try {
+        await callApi("MS/moc/create-request", payload, "POST");
+        successfulSubmissions++;
+      } catch (error) {
+        console.error(`Failed to submit row ${index + 1} (Journal ID: ${journalId}):`, error);
+        const errorMsg = error.response?.data?.message || error.message || "Unknown error";
+        showSnackBar(`Failed to submit row ${index + 1} (Journal ID: ${journalId}): ${errorMsg}`, "error");
+        failedSubmissions++;
+        // Optional: Decide if you want to stop on the first error
+        // break; 
+      }
     }
 
-    @Override
-    public List<MocRequest> getPendingRequests() {
-        return mocRequestRepository.findByRequestStatus(RequestStatus.PENDING);
+    // Final result reporting
+    if (successfulSubmissions > 0 && failedSubmissions === 0) {
+      showSnackBar(`All ${successfulSubmissions} MOC entries submitted successfully! Batch ID: ${batchId}`, "success");
+      setRows([{ ...initialRowState, id: Date.now() }]);
+    } else if (successfulSubmissions > 0 && failedSubmissions > 0) {
+      showSnackBar(`Partially successful for Batch ID ${batchId}: ${successfulSubmissions} submitted, ${failedSubmissions} failed.`, "warning");
+    } else if (successfulSubmissions === 0 && failedSubmissions > 0) {
+      showSnackBar(`Submission failed for Batch ID ${batchId}. Please check errors and try again.`, "error");
     }
+
+    setIsSubmitting(false);
+  };
+  // --- END UPDATED handleSubmit ---
+
+
+  // The rest of the component (JSX) remains unchanged from your last version
+  return (
+    <Box sx={{ p: 3, maxWidth: "98%", margin: "auto" }}>
+      <Paper elevation={3} sx={{ p: 3 }}>
+        <Typography
+          variant="h4"
+          gutterBottom
+          sx={{ fontWeight: "bold", color: "primary.main", mb: 3 }}
+        >
+          MOC Posting
+        </Typography>
+
+        {rows.map((row, index) => (
+          <React.Fragment key={row.id}>
+            <Grid container spacing={2} alignItems="center">
+              {/* Branch */}
+              <Grid item xs={12} md={3}>
+                <Autocomplete
+                  options={branchSearch.options}
+                  getOptionLabel={(option) => `${option.code} - ${option.name}`}
+                  value={row.branch}
+                  onChange={(event, newValue) =>
+                    handleRowChange(row.id, "branch", newValue)
+                  }
+                  onInputChange={(event, newInputValue) =>
+                    searchBranches(newInputValue)
+                  }
+                  loading={branchSearch.loading}
+                  filterOptions={(x) => x}
+                  isOptionEqualToValue={(option, value) =>
+                    option.code === value.code
+                  }
+                  renderInput={(params) => (
+                    <TextField
+                      {...params}
+                      label="Branch"
+                      placeholder="Search by name or code"
+                      InputProps={{
+                        ...params.InputProps,
+                        endAdornment: (
+                          <Box sx={{ minWidth: 24, minHeight: 24, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                            {branchSearch.loading ? (
+                              <CircularProgress color="inherit" size={20} />
+                            ) : null}
+                            {params.InputProps.endAdornment}
+                          </Box>
+                        ),
+                      }}
+                    />
+                  )}
+                />
+              </Grid>
+
+              {/* Post Date */}
+              <Grid item xs={12} md={1.5}>
+                <TextField
+                  label="Post Date"
+                  value={row.postDate}
+                  fullWidth
+                  InputProps={{
+                    readOnly: true,
+                  }}
+                 
+                />
+              </Grid>
+
+              {/* Currency */}
+              <Grid item xs={12} md={1.5}>
+                <TextField
+                  select
+                  label="Currency"
+                  value={row.currency}
+                  onChange={(e) =>
+                    handleRowChange(row.id, "currency", e.target.value)
+                  }
+                  fullWidth
+                  sx={{ minWidth: 140 }}
+                >
+                  {currencyOptions.map((c) => (
+                    <MenuItem key={c} value={c}>
+                      {c}
+                    </MenuItem>
+                  ))}
+                </TextField>
+              </Grid>
+
+              {/* Head */}
+              <Grid item xs={12} md={2}>
+                <TextField
+                  select
+                  label="Head"
+                  value={row.head}
+                  onChange={(e) =>
+                    handleRowChange(row.id, "head", e.target.value)
+                  }
+                  fullWidth
+                  sx={{ minWidth: 160 }}
+                >
+                  {headOptions.map((h) => (
+                    <MenuItem key={h.key} value={h.key}>
+                      {h.value}
+                    </MenuItem>
+                  ))}
+                </TextField>
+              </Grid>
+
+              {/* CGL */}
+              <Grid item xs={12} md={3}>
+                <Autocomplete
+                  options={cglSearch.options}
+                  getOptionLabel={(option) =>
+                    `${option.cglNumber} - ${option.description}`
+                  }
+                  value={row.cgl}
+                  onChange={(event, newValue) =>
+                    handleRowChange(row.id, "cgl", newValue)
+                  }
+                  onInputChange={(event, newInputValue) =>
+                    searchCgls(newInputValue, row.head)
+                  }
+                  loading={cglSearch.loading}
+                  disabled={!row.head}
+                  filterOptions={(x) => x}
+                  isOptionEqualToValue={(option, value) =>
+                    option.cglNumber === value.cglNumber
+                  }
+                  renderInput={(params) => (
+                    <TextField
+                      {...params}
+                      label="CGL"
+                      placeholder={
+                        row.head ? "Search CGL" : "Select Head first"
+                      }
+                      InputProps={{
+                        ...params.InputProps,
+                        endAdornment: (
+                          <Box sx={{ minWidth: 24, minHeight: 24, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                            {cglSearch.loading ? (
+                              <CircularProgress color="inherit" size={20} />
+                            ) : null}
+                            {params.InputProps.endAdornment}
+                          </Box>
+                        ),
+                      }}
+                    />
+                  )}
+                />
+              </Grid>
+
+              {/* Amount */}
+              <Grid item xs={12} md={1.5}>
+                <TextField
+                  label="Amount"
+                  type="text"
+                  value={row.amount}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    if (/^\d{0,16}(\.\d{0,6})?$/.test(val)) {
+                      handleRowChange(row.id, "amount", val);
+                    }
+                  }}
+                  fullWidth
+                  placeholder="0.00"
+                />
+              </Grid>
+
+              {/* Txn Type */}
+              <Grid item xs={12} md={1}>
+                <TextField
+                  select
+                  label="Txn Type"
+                  value={row.txnType}
+                  onChange={(e) =>
+                    handleRowChange(row.id, "txnType", e.target.value)
+                  }
+                  fullWidth
+                  sx={{ minWidth: 90 }} // Fixed width
+                >
+                  <MenuItem value="Debit">Debit</MenuItem>
+                  <MenuItem value="Credit">Credit</MenuItem>
+                </TextField>
+              </Grid>
+
+              {/* Product Code */}
+              <Grid item xs={12} md={1.5}>
+                <TextField
+                  label="Product Code"
+                  value={row.productCode}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    if (/^\d{0,8}$/.test(val)) {
+                      handleRowChange(row.id, "productCode", val);
+                    }
+                  }}
+                  fullWidth
+                  InputProps={{
+                    inputProps: {
+                      maxLength: 8,
+                    },
+                  }}
+                />
+              </Grid>
+
+              {/* Remarks */}
+              <Grid item xs={12} md={1.5}>
+                <TextField
+                  label="Remarks"
+                  value={row.remarks}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    if (val.length <= 40) {
+                      handleRowChange(row.id, "remarks", val);
+                    }
+                  }}
+                  fullWidth
+                  InputProps={{
+                    inputProps: {
+                      maxLength: 40,
+                    },
+                  }}
+                />
+              </Grid>
+
+              {/* Actions */}
+              <Grid
+                item
+                xs={12}
+                md={0.5}
+                sx={{ textAlign: "center", minWidth: 50 }}
+              >
+                <IconButton
+                  onClick={() => handleDeleteRow(row.id)}
+                  color="error"
+                  aria-label="delete row"
+                >
+                  <DeleteIcon />
+                </IconButton>
+              </Grid>
+            </Grid>
+
+            {index < rows.length - 1 && (
+              <Box
+                sx={{
+                  borderBottom: 1,
+                  borderColor: "divider",
+                  my: 2,
+                }}
+              />
+            )}
+          </React.Fragment>
+        ))}
+
+        <Box sx={{ mt: 3, display: "flex", gap: 2 }}>
+          <Button
+            variant="contained"
+            startIcon={<AddIcon />}
+            onClick={handleAddRow}
+          >
+            Add Row
+          </Button>
+          <Button
+            variant="contained"
+            color="success"
+            onClick={handleSubmit}
+            disabled={isSubmitting}
+          >
+            {isSubmitting ? <CircularProgress size={24} /> : "Submit"}
+          </Button>
+        </Box>
+      </Paper>
+    </Box>
+  );
 }
+
+
