@@ -1,62 +1,142 @@
-package com.tcs.fincore.MOCService.Dto;
+package com.tcs.fincore.MOCService.Service;
 
-import com.tcs.fincore.MOCService.Models.enums.ChangeType;
-// Removed unused import: jakarta.persistence.Column;
-import lombok.Data;
-import lombok.Getter;
-import lombok.Setter;
-// Added NotNull for validation
-import jakarta.validation.constraints.NotNull;
-import jakarta.validation.constraints.Size;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.MOCService.Dto.CreateMocRequestDto;
+import com.tcs.fincore.MOCService.Dto.ProcessMocRequestDto;
+import com.tcs.fincore.MOCService.Exception.ResourceNotFoundException;
+import com.tcs.fincore.MOCService.Models.MasterMoc;
+import com.tcs.fincore.MOCService.Models.MocRequest;
+import com.tcs.fincore.MOCService.Models.enums.RequestStatus;
+import com.tcs.fincore.MOCService.Repository.MasterMocRepository;
+import com.tcs.fincore.MOCService.Repository.MocRequestRepository;
 
-import java.math.BigDecimal;
-import java.time.LocalDate;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Service;
+import jakarta.transaction.Transactional;
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Optional;
 
-@Data
-@Getter
-@Setter
-public class CreateMocRequestDto {
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class MocRequestServiceImpl implements MocRequestService {
 
-    @NotNull // Added validation
-    private ChangeType changeType;
-  
-    private Long masterMocId; // Only used for UPDATE/DELETE
+    private final MocRequestRepository mocRequestRepository;
+    private final MasterMocRepository masterMocRepository;
+    private final ObjectMapper objectMapper;
 
-    @NotNull // Added validation
-    private LocalDate pDate;
+    @Override
+    @Transactional
+    public MocRequest createRequest(CreateMocRequestDto dto, String creatorId) throws JsonProcessingException {
+        
+        String targetId = dto.getBranch() + "-" + dto.getCgl() + "-" + dto.getPDate();
+        
+        List<MocRequest> existing = mocRequestRepository.findByTargetIdAndRequestStatus(targetId, RequestStatus.PENDING);
+        if (!existing.isEmpty()) {
+            throw new DataIntegrityViolationException("A pending request for this specific MOC record (Branch-CGL-Date) already exists.");
+        }
+
+        MocRequest request = new MocRequest();
+        request.setCreatorId(creatorId);
+        request.setChangeType(dto.getChangeType());
+        request.setRequestStatus(RequestStatus.PENDING);
+        request.setTargetId(targetId);
+        request.setBatchId(dto.getBatchId());
+   
+        // --- SAVE JOURNAL ID ---
+        request.setJournalId(dto.getJournalId()); // Save journal ID with the request
+        // --- END CHANGE ---
+   
+        request.setPayload(objectMapper.writeValueAsString(dto)); 
+
+        log.info("Saving new MOC request (Batch ID: {}, Journal ID: {}) for targetId {}", dto.getBatchId(), dto.getJournalId(), targetId);
+        return mocRequestRepository.save(request);
+    }
+
+    // No changes needed in updateRequestStatus, processApproval, or mapDtoToEntity
+    // because the journalId is already correctly handled via the payload.
+
+    @Override
+    @Transactional
+    public Optional<MocRequest> updateRequestStatus(ProcessMocRequestDto dto, String executorId) throws JsonProcessingException {
+        MocRequest request = mocRequestRepository.findById(dto.getRequestId())
+                .orElseThrow(() -> new ResourceNotFoundException("MOC Request with ID " + dto.getRequestId() + " not found."));
+
+        if (executorId.equals(request.getCreatorId())) {
+            throw new IllegalStateException("User cannot approve or reject their own MOC request.");
+        }
+
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            throw new IllegalStateException("MOC Request has already been processed.");
+        }
+
+        request.setExecutorId(executorId);
+        request.setExecutorRemarks(dto.getRemarks());
+        request.setExecutionDate(LocalDateTime.now());
+        request.setRequestStatus(dto.getStatus());
+
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            log.info("MOC Request {} ACCEPTED. Processing for Batch ID: {}", dto.getRequestId(), request.getBatchId());
+            processApproval(request); 
+        } else {
+            log.info("MOC Request {} REJECTED.", dto.getRequestId());
+        }
+
+        return Optional.of(mocRequestRepository.save(request));
+    }
     
-    @NotNull @Size(min = 1, max = 50) // Added validation
-    private String branch; // This will be the branch CODE from frontend
+    private void processApproval(MocRequest request) throws JsonProcessingException {
+        CreateMocRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateMocRequestDto.class);
 
-    @NotNull @Size(min = 3, max = 3) // Added validation
-    private String currency;
+        switch (request.getChangeType()) {
+            case ADD:
+                MasterMoc newMoc = new MasterMoc();
+                mapDtoToEntity(payloadDto, newMoc);
+                masterMocRepository.save(newMoc);
+                log.info("Successfully ADDED new MOC record to master table (Batch ID: {}, Journal ID: {}).", payloadDto.getBatchId(), payloadDto.getJournalId());
+                break;
 
-    @NotNull @Size(min = 1, max = 50) // Added validation
-    private String cgl; // This will be the CGL NUMBER from frontend
+            case UPDATE:
+                MasterMoc existingMoc = masterMocRepository.findById(payloadDto.getMasterMocId())
+                        .orElseThrow(() -> new ResourceNotFoundException("MasterMOC with ID " + payloadDto.getMasterMocId() + " not found for update."));
+                mapDtoToEntity(payloadDto, existingMoc); 
+                masterMocRepository.save(existingMoc);
+                log.info("Successfully UPDATED MOC record in master table (Batch ID: {}, Journal ID: {}).", payloadDto.getBatchId(), payloadDto.getJournalId());
+                break;
 
-    @NotNull // Added validation
-    private BigDecimal amount;
+            case DELETE:
+                masterMocRepository.deleteById(payloadDto.getMasterMocId());
+                log.info("Successfully DELETED MOC record from master table (Was Batch ID: {}, Journal ID: {}).", payloadDto.getBatchId(), payloadDto.getJournalId());
+                break;
+        }
+    }
 
-    @Size(max = 20) // Added validation
-    private String transactionType; // Frontend will send "Debit" or "Credit"
-    
-    @Size(max = 20) // Added validation
-    private String productType;
-    
-    @Size(max = 40) // Added validation
-    private String remarks;
-    
-    @Size(min = 1, max = 1) // Added validation
-    private String arFlag;
-    
-    @Size(min = 1, max = 1) // Added validation
-    private String acClassification; // Frontend sends 'A', 'E', etc.
+    private void mapDtoToEntity(CreateMocRequestDto dto, MasterMoc entity) {
+        entity.setPDate(dto.getPDate());
+        entity.setBranch(dto.getBranch());
+        entity.setCurrency(dto.getCurrency());
+        entity.setCgl(dto.getCgl());
+        entity.setAmount(dto.getAmount());
+        entity.setTransactionType(dto.getTransactionType());
+        entity.setProductType(dto.getProductType());
+        entity.setRemarks(dto.getRemarks());
+        entity.setArFlag(dto.getArFlag());
+        entity.setAcClassification(dto.getAcClassification());
+        entity.setBatchId(dto.getBatchId());
+        entity.setJournalId(dto.getJournalId());
+    }
 
-    // --- ADD THESE FIELDS ---
-    @NotNull @Size(min = 1, max = 50) // Added validation
-    private String batchId;
+    @Override
+    public List<MocRequest> getMyRequests(String userId) {
+        return mocRequestRepository.findByCreatorId(userId);
+    }
 
-    @NotNull @Size(min = 1, max = 50) // Added validation
-    private String journalId;
-    // --- END ADD ---
+    @Override
+    public List<MocRequest> getPendingRequests() {
+        return mocRequestRepository.findByRequestStatus(RequestStatus.PENDING);
+    }
 }
