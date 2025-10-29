@@ -1,151 +1,198 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import {
   Box,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogActions,
-  TextField,
   Typography,
+  Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  TextField,
   Button,
-  Stack,
+  CircularProgress,
   Tooltip,
   IconButton,
-  Chip,
+  Stack,
 } from "@mui/material";
 import { DataGrid } from "@mui/x-data-grid";
 import { Check as CheckIcon, Clear as ClearIcon } from "@mui/icons-material";
-import AddBoxIcon from "@mui/icons-material/AddBox";
-import AutoDeleteIcon from "@mui/icons-material/AutoDelete";
-import EditDocumentIcon from "@mui/icons-material/EditDocument";
 import AccountCircleIcon from "@mui/icons-material/AccountCircle";
-import { useNavigate } from "react-router-dom";
-import useApi from "../../hooks/useApi";
-import useCustomSnackbar from "../../utils/useCustomSnackbar";
-import { COMMON_REQ_SCREEN_CONFIGS } from "../common/CommonConstants";
-import { useSelector } from "react-redux";
+import InfoIcon from "@mui/icons-material/Info";
 
-export default function CommonRequestScreen() {
-  const selectedMenuItem = useSelector((state) => state.menus.selectedMenuItem);
-  const navigate = useNavigate();
+// Import your custom hooks
+import useApi from "../../../hooks/useApi"; // Adjust path as needed
+import useCustomSnackbar from "../../../utils/useCustomSnackbar"; // Adjust path as needed
+
+// Helper function to format currency
+const formatCurrency = (num) => {
+  return new Intl.NumberFormat("en-IN", {
+    style: "decimal",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(num);
+};
+
+// Custom No Rows Overlay
+function CustomNoRowsOverlay() {
+  return (
+    <Stack height="100%" alignItems="center" justifyContent="center">
+      <InfoIcon sx={{ fontSize: 48, color: "text.secondary", mb: 2 }} />
+      <Typography variant="h6">No Pending Requests Found</Typography>
+      <Typography>All MOC requests have been processed.</Typography>
+    </Stack>
+  );
+}
+
+export default function MocRequestApproval() {
   const { callApi } = useApi();
   const showSnackBar = useCustomSnackbar();
-  const screenConfig = COMMON_REQ_SCREEN_CONFIGS[selectedMenuItem?.id];
-  const { requestType, columns, transformData } = screenConfig;
-  const [rows, setRows] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [remarks, setRemarks] = useState("");
-  const [confirmDialog, setConfirmDialog] = useState({
-    open: false,
-    type: null,
-    rowId: null,
-  });
 
-  const fetchData = async () => {
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([]); // This will hold the grouped batches
+
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [selectedBatch, setSelectedBatch] = useState(null);
+  const [modalMode, setModalMode] = useState("ACCEPTED"); // 'ACCEPTED' or 'REJECT'
+  const [executorRemarks, setExecutorRemarks] = useState("");
+
+  // Function to fetch and process data
+  const fetchPendingBatches = useCallback(async () => {
     setLoading(true);
     try {
-      const response = await callApi(
-        "/CR/pending-requests",
-        { requestType },
-        "POST"
+      const pendingRequests = await callApi(
+        "MS/moc/pending-requests",
+        null,
+        "GET"
       );
-      const result = response?.data || [];
 
-      const data = result.map((row) => ({
-        ...row,
-        ...(typeof row.payload === "object" ? row.payload : {}),
-      }));
+      if (!Array.isArray(pendingRequests) || pendingRequests.length === 0) {
+        setRows([]);
+        setLoading(false);
+        showSnackBar("No pending requests found.", "info");
+        return;
+      }
 
-      setRows(transformData ? transformData(data) : data);
+      // Group requests by batchId
+      const groupedBatches = new Map();
+      for (const request of pendingRequests) {
+        const batchId = request.batchId;
 
-      if (!data.length) showSnackBar("No pending requests found", "warning");
+        if (!groupedBatches.has(batchId)) {
+          groupedBatches.set(batchId, {
+            // Use batchId as the unique ID for the row
+            id: batchId, // DataGrid needs 'id'
+            batchId: batchId,
+            creatorId: request.creatorId,
+            requestStatus: request.requestStatus,
+            requestDate: request.requestDate,
+            commonBatchRemarks: request.commonBatchRemarks,
+            totalDebit: 0,
+            totalCredit: 0,
+            requestCount: 0,
+          });
+        }
+
+        const batchDetails = groupedBatches.get(batchId);
+        batchDetails.requestCount++;
+
+        // Parse payload to calculate totals
+        try {
+          const payload = JSON.parse(request.payload);
+          const amount = parseFloat(payload.amount) || 0;
+          if (payload.transactionType === "Debit") {
+            batchDetails.totalDebit += amount;
+          } else if (payload.transactionType === "Credit") {
+            batchDetails.totalCredit += amount;
+          }
+        } catch (e) {
+          console.error(`Failed to parse payload for request ${request.id}`, e);
+        }
+      }
+      setRows(Array.from(groupedBatches.values()));
     } catch (err) {
-      console.error(err);
-      showSnackBar("Error fetching data", "error");
+      console.error("Failed to fetch pending requests:", err);
+      showSnackBar("Failed to load pending requests.", "error");
     } finally {
       setLoading(false);
     }
+  }, [callApi, showSnackBar]);
+
+  // Fetch data on component mount
+  useEffect(() => {
+    fetchPendingBatches();
+  }, [fetchPendingBatches]);
+
+  // --- Modal Handlers ---
+  const handleOpenModal = (batch, mode) => {
+    setSelectedBatch(batch);
+    setModalMode(mode);
+    setExecutorRemarks("");
+    setIsModalOpen(true);
   };
 
-  useEffect(() => {
-    if (!screenConfig || !requestType) {
-      navigate("/404");
+  const handleCloseModal = () => {
+    if (isSubmitting) return; // Prevent closing while submitting
+    setIsModalOpen(false);
+    setSelectedBatch(null);
+  };
+
+  const handleSubmitAction = async () => {
+    if (modalMode === "REJECTED" && !executorRemarks.trim()) {
+      showSnackBar("Approver remarks are required for rejection.", "warning");
       return;
     }
-    setRows([]);
-    setRemarks("");
-    setConfirmDialog({ open: false, type: null, rowId: null });
 
-    fetchData();
-  }, [selectedMenuItem?.id]);
-
-  const handleConfirm = async () => {
-    if (confirmDialog.type === "reject" && !remarks.trim()) {
-      showSnackBar("Please provide remarks before rejecting", "warning");
-      return;
-    }
+    setIsSubmitting(true);
+    const payload = {
+      batchId: selectedBatch.batchId,
+      status: modalMode,
+      remarks:
+        executorRemarks.trim() ||
+        (modalMode === "ACCEPTED" ? "Accepted" : "Rejected"),
+    };
 
     try {
-      const payload = {
-        requestId: confirmDialog.rowId,
-        status: confirmDialog.type === "reject" ? "REJECTED" : "ACCEPTED",
-        remarks:
-          confirmDialog.type === "reject" ? remarks.trim() : "No Remarks",
-      };
-
-      const res = await callApi("/CR/update-request", payload, "PATCH");
-
-      if (res?.success || res) {
-        showSnackBar(
-          confirmDialog.type === "accept"
-            ? "Request Approved"
-            : "Request Rejected",
-          "success"
-        );
-        fetchData();
-      } else {
-        showSnackBar("Failed to process request", "error");
-      }
-    } catch (err) {
-      console.error(err);
-      showSnackBar("Error while processing request", "error");
+      await callApi("MS/moc/process-bulk", payload, "POST");
+      showSnackBar(
+        `Batch ${selectedBatch.batchId} successfully ${modalMode.toLowerCase()}ed.`,
+        "success"
+      );
+      handleCloseModal();
+      fetchPendingBatches(); // Refresh the list
+    } catch (error) {
+      console.error("Failed to process batch:", error);
+      const errorMsg =
+        error.response?.data?.message || `Failed to ${modalMode.toLowerCase()} batch.`;
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setIsSubmitting(false);
     }
-    closeConfirmDialog();
   };
 
-  const openConfirmDialog = (type, rowId) =>
-    setConfirmDialog({ open: true, type, rowId });
-
-  const closeConfirmDialog = () =>
-    setConfirmDialog({ open: false, type: null, rowId: null });
-
-  const allColumns = [
-    ...columns,
+  // --- DataGrid Columns Definition ---
+  const columns = [
     {
-      field: "changeType",
-      headerName: "Request Type",
+      field: "batchId",
+      headerName: "Batch ID",
+      flex: 1.2,
+      minWidth: 150,
+    },
+    {
+      field: "requestStatus",
+      headerName: "Status",
       flex: 0.5,
       align: "center",
       headerAlign: "center",
-      renderCell: (params) => {
-        const val = params.value;
-        return (
-          <Box>
-            {val === "ADD" ? (
-              <Chip icon={<AddBoxIcon />} label="Added" size="small" />
-            ) : val === "DELETE" ? (
-              <Chip icon={<AutoDeleteIcon />} label="Deleted" size="small" />
-            ) : (
-              <Chip icon={<EditDocumentIcon />} label="Modified" size="small" />
-            )}
-          </Box>
-        );
-      },
+      renderCell: (params) => (
+        <Chip label={params.value} color="warning" size="small" />
+      ),
     },
     {
       field: "creatorId",
-      headerName: "Creator ID",
-      flex: 0.8,
+      headerName: "Creator",
+      flex: 0.6,
       align: "center",
       headerAlign: "center",
       renderCell: (params) => (
@@ -153,54 +200,80 @@ export default function CommonRequestScreen() {
       ),
     },
     {
-      field: "reqDate",
-      headerName: "Requested Date",
+      field: "requestDate",
+      headerName: "Submitted On",
       flex: 1,
+      minWidth: 180,
+      renderCell: (params) => (
+        <Box>
+          {new Date(params.value).toLocaleString("en-IN", {
+            dateStyle: "medium",
+            timeStyle: "short",
+          })}
+        </Box>
+      ),
+    },
+    {
+      field: "commonBatchRemarks",
+      headerName: "Creator Remarks",
+      flex: 1.5,
+      minWidth: 200,
+    },
+    {
+      field: "requestCount",
+      headerName: "Entries",
+      flex: 0.4,
+      minWidth: 50,
       align: "center",
       headerAlign: "center",
-      renderCell: (params) => {
-        const isoString = params.value;
-        if (!isoString) return null;
-        try {
-          const date = new Date(isoString);
-          return (
-            <Box>
-              {date.toLocaleString("en-US", {
-                year: "numeric",
-                month: "long",
-                day: "numeric",
-                hour: "2-digit",
-                minute: "2-digit",
-                second: "2-digit",
-                hour12: true,
-                timeZone: "Asia/Calcutta",
-              })}
-            </Box>
-          );
-        } catch {
-          return <Box>{isoString}</Box>;
-        }
-      },
+    },
+    {
+      field: "totalCredit",
+      headerName: "Total Credit",
+      flex: 0.7,
+      minWidth: 120,
+      align: "right",
+      headerAlign: "right",
+      renderCell: (params) => (
+        <Typography sx={{ color: "success.dark", fontWeight: "bold" }}>
+          {formatCurrency(params.value)}
+        </Typography>
+      ),
+    },
+    {
+      field: "totalDebit",
+      headerName: "Total Debit",
+      flex: 0.7,
+      minWidth: 120,
+      align: "right",
+      headerAlign: "right",
+      renderCell: (params) => (
+        <Typography sx={{ color: "error.dark", fontWeight: "bold" }}>
+          {formatCurrency(params.value)}
+        </Typography>
+      ),
     },
     {
       field: "actions",
       headerName: "Actions",
       flex: 0.6,
+      minWidth: 100,
       align: "center",
       headerAlign: "center",
+      sortable: false,
       renderCell: (params) => (
-        <Stack direction="row" spacing={1} justifyContent="center">
-          <Tooltip title="Approve">
+        <Stack direction="row" spacing={1}>
+          <Tooltip title="Accept Batch">
             <IconButton
-              onClick={() => openConfirmDialog("accept", params.row.id)}
+              onClick={() => handleOpenModal(params.row, "ACCEPTED")}
               color="success"
             >
               <CheckIcon />
             </IconButton>
           </Tooltip>
-          <Tooltip title="Reject">
+          <Tooltip title="Reject Batch">
             <IconButton
-              onClick={() => openConfirmDialog("reject", params.row.id)}
+              onClick={() => handleOpenModal(params.row, "REJECTED")}
               color="error"
             >
               <ClearIcon />
@@ -212,18 +285,29 @@ export default function CommonRequestScreen() {
   ];
 
   return (
-    <Box>
+    <Box sx={{ p: 3, width: "100%" }}>
+      <Typography
+        variant="h4"
+        gutterBottom
+        sx={{ fontWeight: "bold", color: "primary.main", mb: 3 }}
+      >
+        MOC Request Approval
+      </Typography>
+
       <DataGrid
         rows={rows}
-        columns={allColumns}
+        columns={columns}
+        loading={loading}
+        getRowId={(row) => row.batchId} // Use batchId as the unique row ID
         disableRowSelectionOnClick
-        pageSizeOptions={[5, 10, 25, 50]}
+        pageSizeOptions={[5, 10, 25]}
         initialState={{
           pagination: { paginationModel: { pageSize: 10, page: 0 } },
-          sorting: { sortModel: [{ field: "reqDate", sort: "desc" }] },
+          sorting: { sortModel: [{ field: "requestDate", sort: "desc" }] },
         }}
-        getRowId={(row) => row.id}
-        loading={loading}
+        slots={{
+          noRowsOverlay: CustomNoRowsOverlay,
+        }}
         sx={{
           height: 600,
           width: "100%",
@@ -231,50 +315,69 @@ export default function CommonRequestScreen() {
         }}
       />
 
-      <Dialog
-        open={confirmDialog.open}
-        onClose={closeConfirmDialog}
-        maxWidth="sm"
-        fullWidth
-      >
-        <DialogTitle>
-          {confirmDialog.type === "accept"
-            ? "Confirm Approval"
-            : "Confirm Rejection"}
+      {/* --- Action Confirmation Modal --- */}
+      <Dialog open={isModalOpen} onClose={handleCloseModal} fullWidth maxWidth="sm">
+        <DialogTitle
+          sx={{
+            backgroundColor:
+              modalMode === "ACCEPTED" ? "success.main" : "error.main",
+            color: "white",
+            fontWeight: "bold",
+          }}
+        >
+          {modalMode === "ACCEPTED" ? "Approve" : "Reject"} Batch
         </DialogTitle>
-        <DialogContent>
-          <Typography sx={{ p: 2 }}>
-            {confirmDialog.type === "accept"
-              ? "Are you sure you want to approve this request?"
-              : "Are you sure you want to reject this request? Please enter remarks."}
-          </Typography>
-          {confirmDialog.type === "reject" && (
-            <TextField
-              fullWidth
-              label="Rejection Remarks"
-              value={remarks}
-              onChange={(e) => setRemarks(e.target.value.slice(0, 100))}
-              multiline
-              rows={2}
-              margin="dense"
-              inputProps={{ maxLength: 100 }}
-            />
-          )}
+        <DialogContent sx={{ pt: 3, mt: 2 }}>
+          <DialogContentText sx={{ mb: 2 }}>
+            You are about to{" "}
+            <strong
+              style={{
+                color: modalMode === "ACCEPTED" ? "green" : "red",
+                textTransform: "uppercase",
+              }}
+            >
+              {modalMode}
+            </strong>{" "}
+            the entire batch{" "}
+            <strong>{selectedBatch?.batchId}</strong>.
+            {modalMode === "REJECTED" &&
+              " Please provide mandatory remarks below."}
+          </DialogContentText>
+          <TextField
+            autoFocus={modalMode === "REJECTED"}
+            required={modalMode === "REJECTED"}
+            margin="dense"
+            id="executorRemarks"
+            label="Approver Remarks"
+            type="text"
+            fullWidth
+            multiline
+            rows={3}
+            value={executorRemarks}
+            onChange={(e) => setExecutorRemarks(e.target.value)}
+            disabled={isSubmitting}
+            InputProps={{
+              inputProps: {
+                maxLength: 200,
+              },
+            }}
+          />
         </DialogContent>
-        <DialogActions>
-          <Button
-            onClick={closeConfirmDialog}
-            color="inherit"
-            variant="contained"
-          >
+        <DialogActions sx={{ p: 2 }}>
+          <Button onClick={handleCloseModal} disabled={isSubmitting}>
             Cancel
           </Button>
           <Button
-            onClick={handleConfirm}
-            color={confirmDialog.type === "accept" ? "success" : "error"}
+            onClick={handleSubmitAction}
             variant="contained"
+            color={modalMode === "ACCEPTED" ? "success" : "error"}
+            disabled={isSubmitting}
           >
-            {confirmDialog.type === "accept" ? "Approve" : "Reject"}
+            {isSubmitting ? (
+              <CircularProgress size={24} color="inherit" />
+            ) : (
+              `Confirm ${modalMode === "ACCEPTED" ? "Approval" : "Rejection"}`
+            )}
           </Button>
         </DialogActions>
       </Dialog>
