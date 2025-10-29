@@ -1,69 +1,89 @@
 package com.tcs.fincore.MOCService.Service;
 
-import java.util.List;
-import java.util.Optional;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.tcs.fincore.MOCService.Dto.BulkProcessMocRequestDto; // Import new DTO
-import com.tcs.fincore.MOCService.Dto.CreateMocRequestDto;
-import com.tcs.fincore.MOCService.Dto.ProcessMocRequestDto;
-import com.tcs.fincore.MOCService.Models.MocRequest;
-
-public interface MocRequestService {
-	
-	 MocRequest createRequest(CreateMocRequestDto dto, String creatorId) throws JsonProcessingException;
-	 Optional<MocRequest> updateRequestStatus(ProcessMocRequestDto dto, String executorId) throws JsonProcessingException;
-	 List<MocRequest> getMyRequests(String userId);
-	 List<MocRequest> getPendingRequests();
-
-     // --- ADD THIS NEW METHOD ---
-     List<MocRequest> processBulkRequests(BulkProcessMocRequestDto dto, String executorId) throws JsonProcessingException;
-}
-
-
-
-package com.tcs.fincore.MOCService.Controllers;
-
 // ... other imports
 import com.tcs.fincore.MOCService.Dto.BulkProcessMocRequestDto; // Import new DTO
-import jakarta.validation.Valid;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.HttpStatus;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.util.StringUtils; // Import StringUtils
+import java.util.ArrayList; // Import ArrayList
+import java.util.Collections; // Import Collections
 import java.util.List;
+// ...
 
-@RestController
-@RequestMapping("moc") 
+@Service
 @RequiredArgsConstructor
 @Slf4j
-public class MocRequestController {
+public class MocRequestServiceImpl implements MocRequestService {
 
-    private final MocRequestService mocRequestService;
+    // ... (existing fields and methods: createRequest, updateRequestStatus, etc.) ...
+    
+    // --- ADD THE FULL METHOD BELOW ---
 
-    // ... (Your existing createRequest, updateRequestStatus, etc. methods) ...
+    @Override
+    @Transactional
+    public List<MocRequest> processBulkRequests(BulkProcessMocRequestDto dto, String executorId) throws JsonProcessingException {
 
-    @PostMapping("/create-request")
-    @ResponseStatus(HttpStatus.CREATED)
-    public MocRequest createRequest( /* ... */ ) { /* ... */ }
+        boolean hasBatchId = StringUtils.hasText(dto.getBatchId());
+        boolean hasJournalIds = dto.getJournalIds() != null && !dto.getJournalIds().isEmpty();
 
-    @PatchMapping("/update-request")
-    public MocRequest updateRequestStatus( /* ... */ ) { /* ... */ }
+        // 1. Validation: Ensure one and only one identifier is provided
+        if (!hasBatchId && !hasJournalIds) {
+            throw new IllegalArgumentException("Either batchId or a list of journalIds must be provided.");
+        }
+        if (hasBatchId && hasJournalIds) {
+            throw new IllegalArgumentException("Provide either batchId or journalIds, not both.");
+        }
 
-    @GetMapping("/my-requests")
-    public List<MocRequest> getMyRequests( /* ... */ ) { /* ... */ }
+        // 2. Find all PENDING requests based on the criteria
+        List<MocRequest> requestsToProcess;
+        if (hasBatchId) {
+            log.info("Processing bulk request by Batch ID: {} for user: {}", dto.getBatchId(), executorId);
+            requestsToProcess = mocRequestRepository.findByBatchIdAndRequestStatus(dto.getBatchId(), RequestStatus.PENDING);
+        } else { // We know hasJournalIds is true
+            log.info("Processing bulk request by Journal IDs: {} for user: {}", dto.getJournalIds().size(), executorId);
+            requestsToProcess = mocRequestRepository.findByJournalIdInAndRequestStatus(dto.getJournalIds(), RequestStatus.PENDING);
+        }
 
-    @GetMapping("/pending-requests")
-    public List<MocRequest> getPendingRequests( /* ... */ ) { /* ... */ }
+        if (requestsToProcess.isEmpty()) {
+            log.warn("No pending requests found for the given criteria.");
+            return Collections.emptyList();
+        }
 
+        List<MocRequest> processedRequests = new ArrayList<>();
 
-    // --- ADD THIS NEW ENDPOINT ---
-    @PostMapping("/process-bulk")
-    public List<MocRequest> processBulkRequests(
-            @RequestHeader("Authorization") String token,
-            @Valid @RequestBody BulkProcessMocRequestDto processRequestDto) throws JsonProcessingException {
-        
-        String executorId = JwtUtil.getUserIdFromToken(token);
-        log.info("Received bulk MOC process call from user: {}", executorId);
-        return mocRequestService.processBulkRequests(processRequestDto, executorId);
+        // 3. Loop through each request and apply the logic
+        for (MocRequest request : requestsToProcess) {
+            
+            // Self-approval check
+            if (executorId.equals(request.getCreatorId())) {
+                log.warn("Skipping request {}: User {} cannot approve/reject their own request.", request.getId(), executorId);
+                continue; // Skip this one and continue with the next
+            }
+
+            // This check is redundant due to the query, but good for safety
+            if (request.getRequestStatus() != RequestStatus.PENDING) {
+                log.warn("Skipping request {}: It is not in PENDING status.", request.getId());
+                continue;
+            }
+
+            // 4. Update the request entity
+            request.setExecutorId(executorId);
+            request.setExecutorRemarks(dto.getRemarks());
+            request.setExecutionDate(LocalDateTime.now());
+            request.setRequestStatus(dto.getStatus());
+
+            // 5. Process approval if ACCEPTED (this will throw if it fails)
+            if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+                log.info("MOC Request {} ACCEPTED. Processing...", request.getId());
+                processApproval(request); // Re-use your existing logic
+            } else {
+                log.info("MOC Request {} REJECTED.", request.getId());
+            }
+
+            processedRequests.add(request);
+        }
+
+        // 6. Save all updated requests in one transaction
+        // If any processApproval() failed, the @Transactional annotation
+        // will roll back everything, and nothing will be saved.
+        return mocRequestRepository.saveAll(processedRequests);
     }
 }
