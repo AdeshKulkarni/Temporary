@@ -1,26 +1,271 @@
 package com.tcs.fincore.MOCService.Service;
 
-import java.util.List;
-import java.util.Optional;
-
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.util.StringUtils;
+import java.util.ArrayList;
+import java.util.stream.Collectors; // --- IMPORT ADDED ---
 import com.tcs.fincore.MOCService.Dto.BulkProcessMocRequestDto;
 import com.tcs.fincore.MOCService.Dto.CreateMocRequestDto;
 import com.tcs.fincore.MOCService.Dto.MocRequestStatusDto; // --- IMPORT ADDED ---
 import com.tcs.fincore.MOCService.Dto.ProcessMocRequestDto;
+import com.tcs.fincore.MOCService.Exception.ResourceNotFoundException;
+import com.tcs.fincore.MOCService.Models.MasterMoc;
 import com.tcs.fincore.MOCService.Models.MocRequest;
+import com.tcs.fincore.MOCService.Models.enums.RequestStatus;
+import com.tcs.fincore.MOCService.Repository.MasterMocRepository;
+import com.tcs.fincore.MOCService.Repository.MocRequestRepository;
 
-public interface MocRequestService {
-	
-	 MocRequest createRequest(CreateMocRequestDto dto, String creatorId) throws JsonProcessingException;
-	    Optional<MocRequest> updateRequestStatus(ProcessMocRequestDto dto, String executorId) throws JsonProcessingException;
-	    List<MocRequest> getMyRequests(String userId);
-	    List<MocRequest> getPendingRequests();
-	    List<MocRequest> processBulkRequests(BulkProcessMocRequestDto dto, String executorId) throws JsonProcessingException;
-	    List<MocRequest> getRequestsByBatchId(String batchId);
-	    void cancelMyRequest(Long requestId, String userId);
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Service;
+import jakarta.transaction.Transactional;
+import java.time.LocalDateTime;
+import java.util.Collections;
+import java.util.List;
+import java.util.Optional;
 
-    // --- NEW METHOD ADDED HERE ---
-    List<MocRequestStatusDto> getMocRequestStatusList();
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class MocRequestServiceImpl implements MocRequestService {
 
+    private final MocRequestRepository mocRequestRepository;
+    private final MasterMocRepository masterMocRepository;
+    private final ObjectMapper objectMapper;
+
+    @Override
+    @Transactional
+    public MocRequest createRequest(CreateMocRequestDto dto, String creatorId) throws JsonProcessingException {
+        
+        // --- THIS IS THE FIX ---
+        // The check is now correctly against the unique Journal ID, not Target ID
+        List<MocRequest> existing = mocRequestRepository.findByJournalIdAndRequestStatus(dto.getJournalId(), RequestStatus.PENDING);
+        if (!existing.isEmpty()) {
+            throw new DataIntegrityViolationException("A pending request for this specific MOC record (Journal ID: "+ dto.getJournalId() +") already exists.");
+        }
+
+        MocRequest request = new MocRequest();
+        request.setCreatorId(creatorId);
+        request.setChangeType(dto.getChangeType());
+        request.setRequestStatus(RequestStatus.PENDING);
+        // targetId is removed, as it's commented out in your MocRequest model
+        request.setBatchId(dto.getBatchId());
+   
+       
+        request.setJournalId(dto.getJournalId()); 
+        request.setCommonBatchRemarks(dto.getCommonBatchRemarks());
+      
+   
+        request.setPayload(objectMapper.writeValueAsString(dto)); 
+
+        log.info("Saving new MOC request (Batch ID: {}, Journal ID: {})", dto.getBatchId(), dto.getJournalId());
+        return mocRequestRepository.save(request);
+    }
+
+  
+
+    @Override
+    @Transactional
+    public Optional<MocRequest> updateRequestStatus(ProcessMocRequestDto dto, String executorId) throws JsonProcessingException {
+        MocRequest request = mocRequestRepository.findById(dto.getRequestId())
+                .orElseThrow(() -> new ResourceNotFoundException("MOC Request with ID " + dto.getRequestId() + " not found."));
+
+        if (executorId.equals(request.getCreatorId())) {
+            throw new IllegalStateException("User cannot approve or reject their own MOC request.");
+        }
+
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            throw new IllegalStateException("MOC Request has already been processed.");
+        }
+
+        request.setExecutorId(executorId);
+        request.setExecutorRemarks(dto.getRemarks());
+        request.setExecutionDate(LocalDateTime.now());
+        request.setRequestStatus(dto.getStatus());
+
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            log.info("MOC Request {} ACCEPTED. Processing for Batch ID: {}", dto.getRequestId(), request.getBatchId());
+            processApproval(request); 
+        } else {
+            log.info("MOC Request {} REJECTED.", dto.getRequestId());
+        }
+
+        return Optional.of(mocRequestRepository.save(request));
+    }
+    
+    private void processApproval(MocRequest request) throws JsonProcessingException {
+        CreateMocRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateMocRequestDto.class);
+
+        switch (request.getChangeType()) {
+            case ADD:
+                MasterMoc newMoc = new MasterMoc();
+                mapDtoToEntity(payloadDto, newMoc);
+                masterMocRepository.save(newMoc);
+                log.info("Successfully ADDED new MOC record to master table (Batch ID: {}, Journal ID: {}).", payloadDto.getBatchId(), payloadDto.getJournalId());
+                break;
+
+            case UPDATE:
+                MasterMoc existingMoc = masterMocRepository.findById(payloadDto.getMasterMocId())
+                        .orElseThrow(() -> new ResourceNotFoundException("MasterMOC with ID " + payloadDto.getMasterMocId() + " not found for update."));
+                mapDtoToEntity(payloadDto, existingMoc); 
+                masterMocRepository.save(existingMoc);
+                log.info("Successfully UPDATED MOC record in master table (Batch ID: {}, Journal ID: {}).", payloadDto.getBatchId(), payloadDto.getJournalId());
+                break;
+
+            case DELETE:
+                masterMocRepository.deleteById(payloadDto.getMasterMocId());
+                log.info("Successfully DELETED MOC record from master table (Was Batch ID: {}, Journal ID: {}).", payloadDto.getBatchId(), payloadDto.getJournalId());
+                break;
+        }
+    }
+
+    private void mapDtoToEntity(CreateMocRequestDto dto, MasterMoc entity) {
+        entity.setPDate(dto.getPDate());
+        entity.setBranch(dto.getBranch());
+        entity.setCurrency(dto.getCurrency());
+        entity.setCgl(dto.getCgl());
+        entity.setAmount(dto.getAmount());
+        entity.setTransactionType(dto.getTransactionType());
+        entity.setProductType(dto.getProductType());
+        entity.setRemarks(dto.getRemarks());
+        entity.setArFlag(dto.getArFlag());
+        entity.setAcClassification(dto.getAcClassification());
+        entity.setBatchId(dto.getBatchId());
+        entity.setJournalId(dto.getJournalId());
+        entity.setCommonBatchRemarks(dto.getCommonBatchRemarks());
+    }
+
+    @Override
+    public List<MocRequest> getMyRequests(String userId) {
+        return mocRequestRepository.findByCreatorId(userId);
+    }
+
+    @Override
+    public List<MocRequest> getPendingRequests() {
+        return mocRequestRepository.findByRequestStatus(RequestStatus.PENDING);
+    }
+    
+    @Override
+    @Transactional
+    public List<MocRequest> processBulkRequests(BulkProcessMocRequestDto dto, String executorId) throws JsonProcessingException {
+
+        boolean hasBatchId = StringUtils.hasText(dto.getBatchId());
+        boolean hasJournalIds = dto.getJournalIds() != null && !dto.getJournalIds().isEmpty();
+
+        
+        if (!hasBatchId && !hasJournalIds) {
+            throw new IllegalArgumentException("Either batchId or a list of journalIds must be provided.");
+        }
+        if (hasBatchId && hasJournalIds) {
+            throw new IllegalArgumentException("Provide either batchId or journalIds, not both.");
+        }
+
+        // 2. Find all PENDING requests based on the criteria
+        List<MocRequest> requestsToProcess;
+        if (hasBatchId) {
+            log.info("Processing bulk request by Batch ID: {} for user: {}", dto.getBatchId(), executorId);
+            requestsToProcess = mocRequestRepository.findByBatchIdAndRequestStatus(dto.getBatchId(), RequestStatus.PENDING);
+        } else {
+            log.info("Processing bulk request by Journal IDs: {} for user: {}", dto.getJournalIds().size(), executorId);
+            requestsToProcess = mocRequestRepository.findByJournalIdInAndRequestStatus(dto.getJournalIds(), RequestStatus.PENDING);
+        }
+
+        if (requestsToProcess.isEmpty()) {
+            log.warn("No pending requests found for the given criteria.");
+            return Collections.emptyList();
+        }
+
+        List<MocRequest> processedRequests = new ArrayList<>();
+
+        
+        for (MocRequest request : requestsToProcess) {
+            
+            // Self-approval check
+            if (executorId.equals(request.getCreatorId())) {
+                log.warn("Skipping request {}: User {} cannot approve/reject their own request.", request.getId(), executorId);
+                continue; 
+            }
+
+          
+            if (request.getRequestStatus() != RequestStatus.PENDING) {
+                log.warn("Skipping request {}: It is not in PENDING status.", request.getId());
+                continue;
+            }
+
+            // 4. Update the request entity
+            request.setExecutorId(executorId);
+            request.setExecutorRemarks(dto.getRemarks());
+            request.setExecutionDate(LocalDateTime.now());
+            request.setRequestStatus(dto.getStatus());
+
+        
+            if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+                log.info("MOC Request {} ACCEPTED. Processing...", request.getId());
+                processApproval(request); 
+            } else {
+                log.info("MOC Request {} REJECTED.", request.getId());
+            }
+
+            processedRequests.add(request);
+        }
+
+     
+        return mocRequestRepository.saveAll(processedRequests);
+    }
+    
+    @Override
+    public List<MocRequest> getRequestsByBatchId(String batchId) {
+        log.info("Fetching all MOC requests for Batch ID: {}", batchId);
+        List<MocRequest> requests = mocRequestRepository.findByBatchId(batchId);
+        
+        if (requests.isEmpty()) {
+            log.warn("No requests found for Batch ID: {}", batchId);
+          
+            throw new ResourceNotFoundException("No MOC requests found for Batch ID: " + batchId);
+        }
+        
+      
+        return requests;
+    }
+
+   
+    @Override
+    @Transactional
+    public void cancelMyRequest(Long requestId, String userId) {
+        // 1. Find the request
+        MocRequest request = mocRequestRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("MOC Request with ID " + requestId + " not found."));
+
+        // 2. Check if the user is the creator
+        if (!userId.equals(request.getCreatorId())) {
+            log.warn("User {} attempted to cancel request {} owned by {}", userId, requestId, request.getCreatorId());
+            throw new IllegalStateException("You are not authorized to cancel this request.");
+        }
+
+        // 3. Check if the request is still PENDING
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            log.warn("User {} attempted to cancel request {} which is already in status {}", userId, requestId, request.getRequestStatus());
+            throw new IllegalStateException("Cannot cancel a request that has already been processed.");
+        }
+
+        // 4. Delete the request
+        mocRequestRepository.delete(request);
+        log.info("User {} successfully canceled MOC request {}", userId, requestId);
+    }
+
+    // --- NEW METHOD IMPLEMENTATION ADDED HERE ---
+    @Override
+    public List<MocRequestStatusDto> getMocRequestStatusList() {
+        log.info("Fetching all MOC requests for status list");
+        
+        // Fetch all requests
+        List<MocRequest> allRequests = mocRequestRepository.findAll();
+        
+        // Map them to the DTO using the constructor we created
+        return allRequests.stream()
+                .map(MocRequestStatusDto::new) // Same as .map(request -> new MocRequestStatusDto(request))
+                .collect(Collectors.toList());
+    }
 }
