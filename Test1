@@ -1,27 +1,131 @@
 package com.tcs.fincore.MOCService.Service;
 
-import java.util.List;
-import java.util.Optional;
-
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.util.StringUtils;
+import java.util.ArrayList;
+import java.util.stream.Collectors;
 import com.tcs.fincore.MOCService.Dto.BatchRequestDto; // --- NEW ---
 import com.tcs.fincore.MOCService.Dto.BulkProcessMocRequestDto;
-// import com.tcs.fincore.MOCService.Dto.CreateMocRequestDto; // --- REMOVED ---
-import com.tcs.fincore.MOCService.Dto.MocRequestStatusDto;
+import com.tcs.fincore.MOCService.Dto.CreateMocRequestDto; // This is still needed for the payload
+import com.tcs.fincore.MOCService.Dto.MocRequestStatusDto; 
 import com.tcs.fincore.MOCService.Dto.ProcessMocRequestDto;
+import com.tcs.fincore.MOCService.Exception.ResourceNotFoundException;
+import com.tcs.fincore.MOCService.Models.MasterMoc;
 import com.tcs.fincore.MOCService.Models.MocRequest;
+import com.tcs.fincore.MOCService.Models.enums.RequestStatus;
+import com.tcs.fincore.MOCService.Repository.MasterMocRepository;
+import com.tcs.fincore.MOCService.Repository.MocRequestRepository;
 
-public interface MocRequestService {
-	
-    // --- REPLACED ---
-	// MocRequest createRequest(CreateMocRequestDto dto, String creatorId) throws JsonProcessingException;
-    List<MocRequest> createBatchRequest(BatchRequestDto dto, String creatorId) throws JsonProcessingException;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Service;
+import jakarta.transaction.Transactional;
+import java.time.LocalDateTime;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map; // --- NEW ---
+import java.util.Optional;
 
-	Optional<MocRequest> updateRequestStatus(ProcessMocRequestDto dto, String executorId) throws JsonProcessingException;
-	List<MocRequest> getMyRequests(String userId);
-	List<MocRequest> getPendingRequests();
-	List<MocRequest> processBulkRequests(BulkProcessMocRequestDto dto, String executorId) throws JsonProcessingException;
-	List<MocRequest> getRequestsByBatchId(String batchId);
-	void cancelMyRequest(Long requestId, String userId);
-    List<MocRequestStatusDto> getMocRequestStatusList();
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class MocRequestServiceImpl implements MocRequestService {
+
+    private final MocRequestRepository mocRequestRepository;
+    private final MasterMocRepository masterMocRepository;
+    private final ObjectMapper objectMapper;
+    private final SequenceService sequenceService; // --- NEW ---
+
+    @Override
+    @Transactional
+    public List<MocRequest> createBatchRequest(BatchRequestDto batchDto, String creatorId) throws JsonProcessingException {
+        
+        // 1. Get a single Batch ID for the entire submission
+        String batchId = sequenceService.getNextBatchId();
+        log.info("Creating new MOC batch with Batch ID: {}", batchId);
+
+        List<MocRequest> requestsToSave = new ArrayList<>();
+        String commonRemarks = batchDto.getCommonBatchRemarks();
+
+        // 2. Group all incoming rows by Branch + Currency
+        Map<String, List<BatchRequestDto.MocRequestRow>> groupedRows = batchDto.getRows().stream()
+                .collect(Collectors.groupingBy(row -> row.getBranch() + ":" + row.getCurrency()));
+        
+        log.info("Batch {} contains {} distinct Branch-Currency groups.", batchId, groupedRows.size());
+
+        // 3. Process each group
+        for (Map.Entry<String, List<BatchRequestDto.MocRequestRow>> entry : groupedRows.entrySet()) {
+            
+            // 4. Get ONE Journal ID prefix for this entire group
+            String journalIdPrefix = sequenceService.getNextJournalIdPrefix();
+            int journalSequence = 1;
+
+            List<BatchRequestDto.MocRequestRow> rowsInGroup = entry.getValue();
+            
+            for (BatchRequestDto.MocRequestRow rowDto : rowsInGroup) {
+                
+                // 5. Create the full Journal ID with suffix
+                String journalId = String.format("%s-%03d", journalIdPrefix, journalSequence++);
+
+                // 6. Create the DTO that will be saved in the payload
+                // This payload must contain the new IDs
+                CreateMocRequestDto payloadDto = new CreateMocRequestDto();
+                payloadDto.setChangeType(rowDto.getChangeType());
+                payloadDto.setMasterMocId(rowDto.getMasterMocId());
+                payloadDto.setPDate(rowDto.getPDate());
+                payloadDto.setBranch(rowDto.getBranch());
+                payloadDto.setCurrency(rowDto.getCurrency());
+                payloadDto.setCgl(rowDto.getCgl());
+                payloadDto.setAmount(rowDto.getAmount());
+                payloadDto.setTransactionType(rowDto.getTransactionType());
+                payloadDto.setProductType(rowDto.getProductType());
+                payloadDto.setRemarks(rowDto.getRemarks());
+                payloadDto.setArFlag(rowDto.getArFlag());
+                payloadDto.setAcClassification(rowDto.getAcClassification());
+                payloadDto.setBatchId(batchId); // Add generated Batch ID
+                payloadDto.setJournalId(journalId); // Add generated Journal ID
+                payloadDto.setCommonBatchRemarks(commonRemarks);
+                
+
+                // 7. Create the MocRequest Entity to be saved
+                MocRequest request = new MocRequest();
+                request.setCreatorId(creatorId);
+                request.setChangeType(rowDto.getChangeType());
+                request.setRequestStatus(RequestStatus.PENDING);
+                request.setBatchId(batchId);
+                request.setJournalId(journalId);
+                request.setCommonBatchRemarks(commonRemarks);
+                request.setPayload(objectMapper.writeValueAsString(payloadDto));
+
+                requestsToSave.add(request);
+            }
+        }
+
+        // 8. Save all requests in one transaction
+        return mocRequestRepository.saveAll(requestsToSave);
+    }
+  
+    // --- OLD createRequest method is REMOVED ---
+
+    @Override
+    @Transactional
+    public Optional<MocRequest> updateRequestStatus(ProcessMocRequestDto dto, String executorId) throws JsonProcessingException {
+        MocRequest request = mocRequestRepository.findById(dto.getRequestId())
+                .orElseThrow(() -> new ResourceNotFoundException("MOC Request with ID " + dto.getRequestId() + " not found."));
+        // ... (rest of method is unchanged)
+// ... (rest of file is unchanged)
+// ... (mapDtoToEntity, getMyRequests, getPendingRequests, processBulkRequests, getRequestsByBatchId, cancelMyRequest)
+// ...
+    @Override
+    public List<MocRequestStatusDto> getMocRequestStatusList() {
+        log.info("Fetching all MOC requests for status list");
+        
+        List<MocRequest> allRequests = mocRequestRepository.findAll();
+        
+        return allRequests.stream()
+                .map(MocRequestStatusDto::new)
+                .collect(Collectors.toList());
+    }
 }
