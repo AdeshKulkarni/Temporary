@@ -1,38 +1,666 @@
-package com.tcs.fincore.MOCService.Controllers;
+import React, { useState, useEffect, useCallback } from "react";
+import {
+  Box,
+  Typography,
+  Grid,
+  TextField,
+  Button,
+  Paper,
+  IconButton,
+  MenuItem,
+  CircularProgress,
+  Autocomplete,
+} from "@mui/material";
+import AddIcon from "@mui/icons-material/Add";
+import DeleteIcon from "@mui/icons-material/Delete";
+import { debounce } from "lodash";
 
-import lombok.RequiredArgsConstructor;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
+import useApi from "../../../hooks/useApi";
+import useCustomSnackbar from "../../../utils/useCustomSnackbar";
 
-import com.tcs.fincore.MOCService.Dto.BranchDto;
-import com.tcs.fincore.MOCService.Service.BranchService;
+// --- `postDate` REMOVED FROM INITIAL STATE ---
+const initialRowState = {
+  id: Date.now(),
+  branch: null,
+  // postDate: new Date().toISOString().split("T")[0], // <-- REMOVED
+  currency: "",
+  head: "",
+  cgl: null,
+  amount: "",
+  txnType: "Debit",
+  remarks: "",
+  productCode: "",
+};
 
-import java.util.Collections; // --- MODIFIED --- (Add this import)
-import java.util.List;
-import java.util.Map;
+// --- Helper function (unchanged) ---
+const generateRandomPrefix = (length = 10) => {
+  let result = "";
+  while (result.length < length) {
+    result += Math.random()
+      .toString(36)
+      .substring(2, 12);
+  }
+  return result.substring(0, length);
+};
+// ---------------------------------
 
-@RestController
-@RequestMapping("branches")
-@RequiredArgsConstructor
-public class BranchController {
+export default function MOCPosting() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
 
-	private final BranchService branchService;
+  const [rows, setRows] = useState([initialRowState]);
+  const [currencyOptions, setCurrencyOptions] = useState([]);
+  const [headOptions, setHeadOptions] = useState([]);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
-	@GetMapping("/map")
-	public Map<String, String> getBranchMap() {
-		return branchService.getBranchCodeAndNameMap();
-	}
+  const [commonBatchRemarks, setCommonBatchRemarks] = useState("");
+  
+  // --- NEW STATE FOR THE DATE ---
+  const [postingDate, setPostingDate] = useState("");
+  // --- END NEW STATE ---
 
-	@GetMapping("/search")
-	public List<BranchDto> searchBranches(@RequestParam String query) {
-        // --- MODIFIED ---
-        // Add a safety check. If the query is empty, return an empty list.
-        if (query == null || query.trim().isEmpty()) {
-            return Collections.emptyList();
+  const [branchSearch, setBranchSearch] = useState({
+    loading: false,
+    options: [],
+  });
+  const [cglSearch, setCglSearch] = useState({ loading: false, options: [] });
+
+  useEffect(() => {
+    const fetchInitialData = async () => {
+      try {
+        // --- NEW CALL TO GET THE DATE ---
+        const dateResponse = await callApi(
+          "MS/moc/current-posting-date",
+          null,
+          "GET"
+        );
+        if (dateResponse) {
+          setPostingDate(dateResponse); // API returns a plain string "YYYY-MM-DD"
+        } else {
+          showSnackBar("Failed to load official posting date.", "error");
+          setPostingDate("Error");
         }
-        // --- END OF MODIFICATION ---
-		return branchService.searchBranches(query);
-	}
+        // --- END NEW CALL ---
+
+        const currencyResponse = await callApi("CM/currency", null, "GET");
+        if (currencyResponse?.success && Array.isArray(currencyResponse.data)) {
+          const uniqueCurrencies = [...new Set(currencyResponse.data)];
+          setCurrencyOptions(uniqueCurrencies);
+        } else {
+          showSnackBar("Failed to load currencies.", "error");
+        }
+
+        const headResponse = await callApi(
+          "MS/api/cgls/classifications",
+          null,
+          "GET"
+        );
+
+        if (headResponse) {
+          const formattedHeads = Object.entries(headResponse).map(
+            ([key, value]) => ({ key, value })
+          );
+          setHeadOptions(formattedHeads);
+        } else {
+          showSnackBar("Failed to load head classifications.", "error");
+        }
+      } catch (error) {
+        console.error("Error fetching initial data:", error);
+        showSnackBar("An error occurred while loading page data.", "error");
+      }
+    };
+
+    fetchInitialData();
+  }, [callApi, showSnackBar]);
+
+  const handleAddRow = () => {
+    setRows([...rows, { ...initialRowState, id: Date.now() }]);
+  };
+
+  const handleDeleteRow = (id) => {
+    if (rows.length > 1) {
+      setRows(rows.filter((row) => row.id !== id));
+    } else {
+      showSnackBar("Cannot delete the last row.", "warning");
+    }
+  };
+
+  const handleRowChange = (id, field, value) => {
+    const newRows = rows.map((row) => {
+      if (row.id === id) {
+        if (field === "head" && row.head !== value) {
+          setCglSearch({ loading: false, options: [] });
+          searchCgls("", value);
+          return { ...row, [field]: value, cgl: null };
+        }
+        return { ...row, [field]: value };
+      }
+      return row;
+    });
+    setRows(newRows);
+  };
+
+  const searchBranches = useCallback(
+    debounce(async (query) => {
+      if (!query) {
+        setBranchSearch({ loading: false, options: [] });
+        return;
+      }
+      setBranchSearch((prev) => ({ ...prev, loading: true }));
+      try {
+        const response = await callApi(
+          `MS/branches/search?query=${encodeURIComponent(query)}`,
+          null,
+          "GET"
+        );
+        setBranchSearch({ loading: false, options: response || [] });
+      } catch (error) {
+        console.error("Branch search failed:", error);
+        showSnackBar("Branch search failed. See console.", "error");
+        setBranchSearch({ loading: false, options: [] });
+      }
+    }, 300),
+    [callApi, showSnackBar]
+  );
+
+  const searchCgls = useCallback(
+    debounce(async (query, headKey) => {
+      if (!headKey) {
+        setCglSearch({ loading: false, options: [] });
+        return;
+      }
+      setCglSearch((prev) => ({ ...prev, loading: true }));
+      try {
+        const response = await callApi(
+          `MS/api/cgls/search?query=${encodeURIComponent(
+            query
+          )}&classification=${encodeURIComponent(headKey)}`,
+          null,
+          "GET"
+        );
+        setCglSearch({ loading: false, options: response || [] });
+      } catch (error) {
+        console.error("CGL search failed:", error);
+        showSnackBar("CGL search failed. See console.", "error");
+        setCglSearch({ loading: false, options: [] });
+      }
+    }, 300),
+    [callApi, showSnackBar]
+  );
+
+  const handleSubmit = async () => {
+    setIsSubmitting(true);
+
+    if (!commonBatchRemarks.trim()) {
+      showSnackBar(
+        "Please enter Common Batch Remarks before submitting.",
+        "error"
+      );
+      setIsSubmitting(false);
+      return;
+    }
+
+    const branchCurrencyTotals = new Map();
+    const branchEntryCheck = new Map();
+    const rowPayloads = [];
+
+    for (const [index, row] of rows.entries()) {
+      if (
+        !row.branch ||
+        !row.currency ||
+        !row.head ||
+        !row.cgl ||
+        !row.amount ||
+        !row.txnType ||
+        !row.productCode
+      ) {
+        showSnackBar(
+          `Row ${index + 1} is incomplete. Please fill all fields.`,
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
+      }
+
+      const branchCode = row.branch.code;
+      const branchName = row.branch.name;
+      const currency = row.currency;
+      const amount = parseFloat(row.amount) || 0;
+      const compositeKey = `${branchCode}-${currency}`;
+
+      if (!branchCurrencyTotals.has(compositeKey)) {
+        branchCurrencyTotals.set(compositeKey, {
+          totalDebit: 0,
+          totalCredit: 0,
+          branchName: branchName,
+          branchCode: branchCode,
+          currency: currency,
+        });
+      }
+      const currencyTotals = branchCurrencyTotals.get(compositeKey);
+      if (row.txnType === "Debit") {
+        currencyTotals.totalDebit += amount;
+      } else if (row.txnType === "Credit") {
+        currencyTotals.totalCredit += amount;
+      }
+
+      if (!branchEntryCheck.has(branchCode)) {
+        branchEntryCheck.set(branchCode, {
+          hasDebit: false,
+          hasCredit: false,
+          branchName: branchName,
+        });
+      }
+      const branchCheck = branchEntryCheck.get(branchCode);
+      if (row.txnType === "Debit" && amount > 0) {
+        branchCheck.hasDebit = true;
+      } else if (row.txnType === "Credit" && amount > 0) {
+        branchCheck.hasCredit = true;
+      }
+
+      // --- `pdate` IS REMOVED FROM THIS PAYLOAD ---
+      rowPayloads.push({
+        changeType: "ADD",
+        // pdate: row.postDate, // <-- REMOVED
+        branch: row.branch.code,
+        currency: row.currency,
+        cgl: row.cgl.cglNumber,
+        amount: parseFloat(row.amount),
+        transactionType: row.txnType,
+        productType: row.productCode,
+        remarks: row.remarks,
+        arFlag: "A",
+        acClassification: row.head,
+      });
+    }
+
+    for (const [branchCode, totals] of branchEntryCheck.entries()) {
+      const { hasDebit, hasCredit, branchName } = totals;
+      if (!hasDebit || !hasCredit) {
+        showSnackBar(
+          `Submission failed. Branch "${branchName}" (${branchCode}) must have at least one Debit and one Credit entry.`,
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
+      }
+    }
+
+    const EPSILON = 0.000001;
+    for (const [compositeKey, totals] of branchCurrencyTotals.entries()) {
+      const { totalDebit, totalCredit, branchName, branchCode, currency } =
+        totals;
+
+      if (Math.abs(totalDebit - totalCredit) > EPSILON) {
+        showSnackBar(
+          `Submission failed. Totals for branch "${branchName}" (${branchCode}) and currency "${currency}" do not match. Debit: ${totalDebit.toFixed(
+            2
+          )}, Credit: ${totalCredit.toFixed(2)}`,
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
+      }
+    }
+
+    const finalPayload = {
+      commonBatchRemarks: commonBatchRemarks.trim(),
+      rows: rowPayloads,
+    };
+
+    try {
+      const response = await callApi("MS/moc/create-batch", finalPayload, "POST");
+
+      const newBatchId = response?.[0]?.batchId || "N/A";
+
+      showSnackBar(
+        `All ${response.length} MOC entries submitted successfully! Batch ID: ${newBatchId}`,
+        "success"
+      );
+      setRows([{ ...initialRowState, id: Date.now() }]);
+      setCommonBatchRemarks("");
+    } catch (error) {
+      console.error("Failed to submit batch:", error);
+      const errorMsg =
+        error.response?.data?.message || error.message || "Batch submission failed.";
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <Box sx={{ p: 3, maxWidth: "98%", margin: "auto" }}>
+      <Paper elevation={3} sx={{ p: 3 }}>
+        <Typography
+          variant="h4"
+          gutterBottom
+          sx={{ fontWeight: "bold", color: "primary.main", mb: 3 }}
+        >
+          MOC Posting
+        </Typography>
+
+        {/* --- MODIFIED SECTION TO SHOW THE DATE --- */}
+        <Grid container spacing={2} sx={{ mb: 3 }}>
+          <Grid item xs={12} md={3}>
+            <TextField
+              label="Posting Date "
+              value={postingDate || "Loading..."}
+              fullWidth
+              InputProps={{
+                readOnly: true,
+                style: {
+                  // fontWeight: "bold",
+                  color: postingDate === "Error" ? "red" : "default",
+                },
+              }}
+              variant="filled"
+            />
+          </Grid>
+          <Grid item xs={12} md={9}>
+            <TextField
+              label="Common Batch Remarks"
+              value={commonBatchRemarks}
+              onChange={(e) => {
+                if (e.target.value.length <= 200) {
+                  setCommonBatchRemarks(e.target.value);
+                }
+              }}
+              fullWidth
+              required
+              multiline
+              rows={2}
+              placeholder="Enter remarks for the entire batch (max 200 chars)..."
+              InputProps={{
+                inputProps: {
+                  maxLength: 200,
+                },
+              }}
+            />
+          </Grid>
+        </Grid>
+        {/* --- END OF MODIFIED SECTION --- */}
+
+
+        {rows.map((row, index) => (
+          <React.Fragment key={row.id}>
+            <Grid container spacing={2} alignItems="center">
+              {/* Branch */}
+              <Grid item xs={12} md={3}>
+                <Autocomplete
+                  options={branchSearch.options}
+                  getOptionLabel={(option) => `${option.code} - ${option.name}`}
+                  value={row.branch}
+                  onChange={(event, newValue) =>
+                    handleRowChange(row.id, "branch", newValue)
+                  }
+                  onInputChange={(event, newInputValue) =>
+                    searchBranches(newInputValue)
+                  }
+                  loading={branchSearch.loading}
+                  filterOptions={(x) => x}
+                  isOptionEqualToValue={(option, value) =>
+                    option.code === value.code
+                  }
+                  renderInput={(params) => (
+                    <TextField
+                      {...params}
+                      label="Branch"
+                      placeholder="Search by name or code"
+                      InputProps={{
+                        ...params.InputProps,
+                        endAdornment: (
+                          <Box
+                            sx={{
+                              minWidth: 24,
+                              minHeight: 24,
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                            }}
+                          >
+                            {branchSearch.loading ? (
+                              <CircularProgress color="inherit" size={20} />
+                            ) : null}
+                            {params.InputProps.endAdornment}
+                          </Box>
+                        ),
+                      }}
+                    />
+                  )}
+                />
+              </Grid>
+
+              {/* --- `Post Date` FIELD REMOVED FROM HERE --- */}
+              {/*
+              <Grid item xs={12} md={1.5}>
+                <TextField
+                  label="Post Date"
+                  value={row.postDate} // This variable no longer exists
+                  fullWidth
+                  InputProps={{
+                    readOnly: true,
+                  }}
+                />
+              </Grid>
+              */}
+
+              {/* Currency */}
+              {/* The Grid sizing is adjusted to account for the removed field */}
+              <Grid item xs={12} md={1.5}>
+                <TextField
+                  select
+                  label="Currency"
+                  value={row.currency}
+                  onChange={(e) =>
+                    handleRowChange(row.id, "currency", e.target.value)
+                  }
+                  fullWidth
+                  sx={{ minWidth: 140 }}
+                >
+                  {currencyOptions.map((c) => (
+                    <MenuItem key={c} value={c}>
+                      {c}
+                    </MenuItem>
+                  ))}
+                </TextField>
+              </Grid>
+
+              {/* Head */}
+              <Grid item xs={12} md={2}>
+                <TextField
+                  select
+                  label="Head"
+                  value={row.head}
+                  onChange={(e) =>
+                    handleRowChange(row.id, "head", e.target.value)
+                  }
+                  fullWidth
+                  sx={{ minWidth: 160 }}
+                >
+                  {headOptions.map((h) => (
+                    <MenuItem key={h.key} value={h.key}>
+                      {h.value}
+                    </MenuItem>
+                  ))}
+                </TextField>
+              </Grid>
+
+              {/* CGL */}
+              <Grid item xs={12} md={3}>
+                <Autocomplete
+                  options={cglSearch.options}
+                  getOptionLabel={(option) =>
+                    `${option.cglNumber} - ${option.description}`
+                  }
+                  value={row.cgl}
+                  onChange={(event, newValue) =>
+                    handleRowChange(row.id, "cgl", newValue)
+                  }
+                  onInputChange={(event, newInputValue) =>
+                    searchCgls(newInputValue, row.head)
+                  }
+                  loading={cglSearch.loading}
+                  disabled={!row.head}
+                  filterOptions={(x) => x}
+                  isOptionEqualToValue={(option, value) =>
+                    option.cglNumber === value.cglNumber
+                  }
+                  renderInput={(params) => (
+                    <TextField
+                      {...params}
+                      label="CGL"
+                      placeholder={
+                        row.head ? "Search CGL" : "Select Head first"
+                      }
+                      InputProps={{
+                        ...params.InputProps,
+                        endAdornment: (
+                          <Box
+                            sx={{
+                              minWidth: 24,
+                              minHeight: 24,
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                            }}
+                          >
+                            {cglSearch.loading ? (
+                              <CircularProgress color="inherit" size={20} />
+                            ) : null}
+                            {params.InputProps.endAdornment}
+                          </Box>
+                        ),
+                      }}
+                    />
+                  )}
+                />
+              </Grid>
+
+              {/* Amount */}
+              <Grid item xs={12} md={1.5}>
+                <TextField
+                  label="Amount"
+                  type="text"
+                  value={row.amount}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    if (/^\d{0,16}(\.\d{0,6})?$/.test(val)) {
+                      handleRowChange(row.id, "amount", val);
+                    }
+                  }}
+                  fullWidth
+                  placeholder="0.00"
+                />
+              </Grid>
+
+              {/* Txn Type */}
+              <Grid item xs={12} md={1}>
+                <TextField
+                  select
+                  label="Txn Type"
+                  value={row.txnType}
+                  onChange={(e) =>
+                    handleRowChange(row.id, "txnType", e.target.value)
+                  }
+                  fullWidth
+                  sx={{ minWidth: 90 }}
+                >
+                  <MenuItem value="Debit">Debit</MenuItem>
+                  <MenuItem value="Credit">Credit</MenuItem>
+                </TextField>
+              </Grid>
+
+              {/* Product Code */}
+              <Grid item xs={12} md={1.5}>
+                <TextField
+                  label="Product Code"
+                  value={row.productCode}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    if (/^\d{0,8}$/.test(val)) {
+                      handleRowChange(row.id, "productCode", val);
+                    }
+                  }}
+                  fullWidth
+                  InputProps={{
+                    inputProps: {
+                      maxLength: 8,
+                    },
+                  }}
+                />
+              </Grid>
+
+              {/* Remarks (Individual) */}
+              <Grid item xs={12} md={1.5}>
+                <TextField
+                  label="Remarks"
+                  value={row.remarks}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    if (val.length <= 40) {
+                      handleRowChange(row.id, "remarks", val);
+                    }
+                  }}
+                  fullWidth
+                  InputProps={{
+                    inputProps: {
+                      maxLength: 40,
+                    },
+                  }}
+                />
+              </Grid>
+
+              {/* Actions */}
+              <Grid
+                item
+                xs={12}
+                md={0.5}
+                sx={{ textAlign: "center", minWidth: 50 }}
+              >
+                <IconButton
+                  onClick={() => handleDeleteRow(row.id)}
+                  color="error"
+                  aria-label="delete row"
+                >
+                  <DeleteIcon />
+                </IconButton>
+              </Grid>
+            </Grid>
+
+            {index < rows.length - 1 && (
+              <Box
+                sx={{
+                  borderBottom: 1,
+                  borderColor: "divider",
+                  my: 2,
+                }}
+              />
+            )}
+          </React.Fragment>
+        ))}
+
+        <Box sx={{ mt: 3, display: "flex", gap: 2 }}>
+          <Button
+            variant="contained"
+            startIcon={<AddIcon />}
+            onClick={handleAddRow}
+          >
+            Add Row
+          </Button>
+          <Button
+            variant="contained"
+            color="success"
+            onClick={handleSubmit}
+            disabled={isSubmitting}
+          >
+            {isSubmitting ? <CircularProgress size={24} /> : "Submit"}
+          </Button>
+        </Box>
+      </Paper>
+    </Box>
+  );
 }
+
+THERE is one more change which should be there like common batch should be little long it should looks profetional -> frontend
+in the backend there is most imp change is like remove head cgl should depends on the head and in cgl search it should be like searching the branch code and barach name make the changes and remove the head compltly make changes in frontend and backend as well
