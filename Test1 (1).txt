@@ -1,11 +1,392 @@
-TypeError: Cannot read properties of undefined (reading 'size')
-    at https://localhost:1000/node_modules/.vite/deps/@mui_x-data-grid.js?v=f104ed8b:4989:43
-    at selector (https://localhost:1000/node_modules/.vite/deps/@mui_x-data-grid.js?v=f104ed8b:1441:14)
-    at selector (https://localhost:1000/node_modules/.vite/deps/@mui_x-data-grid.js?v=f104ed8b:1630:44)
-    at useGridSelector (https://localhost:1000/node_modules/.vite/deps/@mui_x-data-grid.js?v=f104ed8b:2730:22)
-    at GridFooter2 (https://localhost:1000/node_modules/.vite/deps/@mui_x-data-grid.js?v=f104ed8b:16490:28)
-    at Component (https://localhost:1000/node_modules/.vite/deps/@mui_x-data-grid.js?v=f104ed8b:168:34)
-    at Object.react_stack_bottom_frame (https://localhost:1000/node_modules/.vite/deps/react-dom_client.js?v=f104ed8b:18509:20)
-    at renderWithHooks (https://localhost:1000/node_modules/.vite/deps/react-dom_client.js?v=f104ed8b:5654:24)
-    at updateFunctionComponent (https://localhost:1000/node_modules/.vite/deps/react-dom_client.js?v=f104ed8b:7475:21)
-    at beginWork (https://localhost:1000/node_modules/.vite/deps/react-dom_client.js?v=f104ed8b:8525:20)
+import React, { useState, useEffect, useCallback } from "react";
+import {
+  Box,
+  Typography,
+  Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  Button,
+  CircularProgress,
+  Tooltip,
+  IconButton,
+  Stack,
+} from "@mui/material";
+import { DataGrid } from "@mui/x-data-grid";
+import {
+  Ballot,
+  Cancel as CancelIcon,
+  HelpOutline as HelpIcon,
+} from "@mui/icons-material";
+import AccountCircleIcon from "@mui/icons-material/AccountCircle";
+import InfoIcon from "@mui/icons-material/Info";
+
+import useApi from "../../../hooks/useApi";
+import useCustomSnackbar from "../../../utils/useCustomSnackbar";
+
+// Helper to get chip color based on status
+const getStatusChipColor = (status) => {
+  switch (status) {
+    case "PENDING":
+      return "warning";
+    case "ACCEPTED":
+      return "success";
+    case "REJECTED":
+      return "error";
+    default:
+      return "default";
+  }
+};
+
+// Helper "N/A" chip component
+const NaChip = () => <Chip label="N/A" size="small" variant="outlined" />;
+
+// Helper function to get the journal prefix (e.g., "0000092")
+const getJournalPrefix = (journalId) => {
+  if (!journalId) {
+    return null;
+  }
+  const parts = journalId.split("-");
+  return parts[0];
+};
+
+function CustomNoRowsOverlay() {
+  return (
+    <Stack height="100%" alignItems="center" justifyContent="center">
+      <InfoIcon sx={{ fontSize: 48, color: "text.secondary", mb: 2 }} />
+      <Typography variant="h6">No Requests Found</Typography>
+      <Typography>No MOC requests found.</Typography>
+    </Stack>
+  );
+}
+
+export default function JournalPostingStatus() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([]);
+
+  // This will hold the IDs (REQ_ID) of the selected rows
+  const [selectionModel, setSelectionModel] = useState([]);
+  const [isBulkModalOpen, setIsBulkModalOpen] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const fetchMyRequests = useCallback(async () => {
+    setLoading(true);
+    try {
+      const myRequests = await callApi("MS/moc/my-requests", null, "GET");
+      if (Array.isArray(myRequests)) {
+        setRows(myRequests);
+      } else {
+        setRows([]);
+      }
+    } catch (err) {
+      console.error("Failed to fetch user's requests:", err);
+      const errorMsg =
+        err.response?.data?.message || "Failed to load your requests.";
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setLoading(false);
+    }
+  }, [callApi, showSnackBar]);
+
+  useEffect(() => {
+    fetchMyRequests();
+  }, [fetchMyRequests]);
+
+  // --- NEW HANDLER FOR BULK MODAL ---
+  const handleOpenBulkModal = () => setIsBulkModalOpen(true);
+  const handleCloseBulkModal = () => {
+    if (isSubmitting) return;
+    setIsBulkModalOpen(false);
+  };
+
+  // --- NEW HANDLER FOR GROUP SELECTION ---
+  const handleSelectionChange = (newSelectionModel) => {
+    if (newSelectionModel.length === 0) {
+      setSelectionModel([]);
+      return;
+    }
+
+    // Find the ID that was just added or removed
+    const lastChangedId =
+      newSelectionModel.find((id) => !selectionModel.includes(id)) ||
+      selectionModel.find((id) => !newSelectionModel.includes(id));
+
+    if (!lastChangedId) {
+      setSelectionModel(newSelectionModel);
+      return;
+    }
+
+    const changedRow = rows.find((r) => r.id === lastChangedId);
+    if (!changedRow) return;
+
+    const prefix = getJournalPrefix(changedRow.journalId);
+    const siblingIds = rows
+      .filter((r) => getJournalPrefix(r.journalId) === prefix)
+      .map((r) => r.id);
+
+    const wasSelected = selectionModel.includes(lastChangedId);
+
+    if (wasSelected) {
+      // It was a deselection, so remove the whole group
+      const newSelection = selectionModel.filter(
+        (id) => !siblingIds.includes(id)
+      );
+      setSelectionModel(newSelection);
+    } else {
+      // It was an addition, so add the whole group
+      const newSelection = [...new Set([...selectionModel, ...siblingIds])];
+      setSelectionModel(newSelection);
+    }
+  };
+
+  // --- NEW HANDLER FOR BULK CANCELLATION ---
+  const handleConfirmBulkCancel = async () => {
+    setIsSubmitting(true);
+    try {
+      // 1. Get all selected rows
+      const selectedRows = rows.filter((r) => selectionModel.includes(r.id));
+
+      // 2. Check if all are PENDING
+      const allPending = selectedRows.every(
+        (r) => r.requestStatus === "PENDING"
+      );
+      if (!allPending) {
+        throw new Error("You can only cancel requests that are PENDING.");
+      }
+
+      // 3. Get unique journal prefixes
+      const journalPrefixesToCancel = [
+        ...new Set(
+          selectedRows.map((r) => getJournalPrefix(r.journalId)).filter(Boolean)
+        ),
+      ];
+
+      if (journalPrefixesToCancel.length === 0) {
+        throw new Error("No valid journal IDs selected.");
+      }
+
+      // 4. Call the API for each unique prefix
+      await Promise.all(
+        journalPrefixesToCancel.map((prefix) =>
+          callApi(`MS/moc/my-requests/by-journal/${prefix}`, null, "DELETE")
+        )
+      );
+
+      showSnackBar(
+        `Successfully canceled all requests for ${journalPrefixesToCancel.length} journal group(s).`,
+        "success"
+      );
+      
+      handleCloseBulkModal();
+      setSelectionModel([]); // Clear selection
+      fetchMyRequests(); // Refresh data
+    } catch (error) {
+      console.error("Failed to bulk-cancel requests:", error);
+      const errorMsg =
+        error.response?.data?.message || "Failed to cancel the requests.";
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const columns = [
+    {
+      field: "batchId",
+      headerName: "Batch ID",
+      flex: 1.5,
+      minWidth: 150,
+      renderCell: (params) => params.value || "N/A",
+    },
+    {
+      field: "journalId",
+      headerName: "Journal ID",
+      flex: 1.5,
+      minWidth: 150,
+      renderCell: (params) => params.value || "N/A",
+    },
+    {
+      field: "requestStatus",
+      headerName: "Req Status",
+      flex: 1,
+      minWidth: 100,
+      renderCell: (params) =>
+        params.value ? (
+          <Chip
+            label={params.value}
+            color={getStatusChipColor(params.value)}
+            size="small"
+          />
+        ) : (
+          <NaChip />
+        ),
+    },
+    {
+      field: "requestDate",
+      headerName: "Req Date",
+      flex: 1.5,
+      minWidth: 180,
+      renderCell: (params) =>
+        params.value ? (
+          <Box>
+            {new Date(params.value).toLocaleString("en-IN", {
+              dateStyle: "medium",
+              timeStyle: "short",
+            })}
+          </Box>
+        ) : (
+          "N/A"
+        ),
+    },
+    {
+      field: "creatorId",
+      headerName: "Creator ID",
+      flex: 1,
+      minWidth: 120,
+      renderCell: (params) =>
+        params.value ? (
+          <Chip
+            icon={<AccountCircleIcon />}
+            label={params.value}
+            size="small"
+            variant="outlined"
+          />
+        ) : (
+          <NaChip />
+        ),
+    },
+    {
+      field: "executorId",
+      headerName: "Executor ID",
+      flex: 1,
+      minWidth: 120,
+      renderCell: (params) =>
+        params.value ? (
+          <Chip
+            icon={<AccountCircleIcon />}
+            label={params.value}
+            size="small"
+          />
+        ) : (
+          <NaChip />
+        ),
+    },
+    {
+      field: "executorRemarks",
+      headerName: "Executor Remarks",
+      flex: 2,
+      minWidth: 200,
+      renderCell: (params) => params.value || "N/A",
+    },
+  ];
+
+  return (
+    <Box sx={{ p: 3, width: "100%" }}>
+      <Box
+        sx={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          mb: 3,
+        }}
+      >
+        <Typography
+          variant="h4"
+          gutterBottom
+          sx={{ fontWeight: "bold", color: "primary.main", m: 0 }}
+        >
+          All MOC Requests
+        </Typography>
+        <Button
+          variant="contained"
+          color="error"
+          startIcon={<CancelIcon />}
+          disabled={selectionModel.length === 0 || loading}
+          onClick={handleOpenBulkModal}
+        >
+          Cancel Selected ({selectionModel.length})
+        </Button>
+      </Box>
+
+      <DataGrid
+        rows={rows}
+        columns={columns}
+        loading={loading}
+        getRowId={(row) => row.id}
+        checkboxSelection
+        onRowSelectionModelChange={handleSelectionChange}
+        rowSelectionModel={selectionModel}
+        disableRowSelectionOnClick
+        pageSizeOptions={[10, 25, 50]}
+        
+        // --- THIS IS THE FIX ---
+        // Replaced the 'paginationModel' object with a direct 'pageSize'
+        initialState={{
+          pagination: {
+            pageSize: 10, 
+          },
+          sorting: { sortModel: [{ field: "requestDate", sort: "desc" }] },
+        }}
+        // --- END OF FIX ---
+
+        slots={{
+          noRowsOverlay: CustomNoRowsOverlay,
+        }}
+        sx={{
+          height: 600,
+          width: "100%",
+          "& .MuiDataGrid-cell:focus": { outline: "none" },
+        }}
+      />
+
+      {/* --- NEW BULK CANCEL MODAL --- */}
+      <Dialog
+        open={isBulkModalOpen}
+        onClose={handleCloseBulkModal}
+        fullWidth
+        maxWidth="sm"
+      >
+        <DialogTitle sx={{ display: "flex", alignItems: "center" }}>
+          <Ballot sx={{ mr: 1, color: "warning.main" }} />
+          Confirm Bulk Cancellation
+        </DialogTitle>
+        <DialogContent sx={{ pt: 3 }}>
+          <DialogContentText>
+            Are you sure you want to cancel the selected{" "}
+            <strong>{selectionModel.length} request(s)</strong>?
+            <br />
+            <br />
+            This will cancel all associated journal entries (e.g., -001, -002)
+            for the selected groups.
+            <br />
+            <br />
+            Only <strong>PENDING</strong> requests will be canceled. This action
+            cannot be undone.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions sx={{ p: 2 }}>
+          <Button onClick={handleCloseBulkModal} disabled={isSubmitting}>
+            Back
+          </Button>
+          <Button
+            onClick={handleConfirmBulkCancel}
+            variant="contained"
+            color="error"
+            disabled={isSubmitting}
+          >
+            {isSubmitting ? (
+              <CircularProgress size={24} color="inherit" />
+            ) : (
+              "Yes, Cancel Selected"
+            )}
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
+}
