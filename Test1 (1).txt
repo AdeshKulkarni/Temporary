@@ -1,71 +1,347 @@
-// ... other imports
-import jakarta.transaction.Transactional;
+import React, { useState, useEffect, useCallback } from "react";
+import {
+  Box,
+  Typography,
+  Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  Button,
+  CircularProgress,
+  Tooltip,
+  IconButton,
+  Stack,
+} from "@mui/material";
+import { DataGrid } from "@mui/x-data-grid";
+import {
+  Ballot,
+  Cancel as CancelIcon,
+  HelpOutline as HelpIcon,
+} from "@mui/icons-material";
+import AccountCircleIcon from "@mui/icons-material/AccountCircle";
+import InfoIcon from "@mui/icons-material/Info";
 
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class MocRequestServiceImpl implements MocRequestService {
+import useApi from "../../../hooks/useApi";
+import useCustomSnackbar from "../../../utils/useCustomSnackbar";
 
-    // ... other fields ...
+// Helper to get chip color based on status
+const getStatusChipColor = (status) => {
+  switch (status) {
+    case "PENDING":
+      return "warning";
+    case "ACCEPTED":
+      return "success";
+    case "REJECTED":
+      return "error";
+    default:
+      return "default";
+  }
+};
 
-    // ... other methods like createBatchRequest, updateRequestStatus, etc. ...
-   
-    @Override
-    @Transactional
-    public void cancelMyRequest(Long requestId, String userId) {
-        // This is the original method for single-cancellation
-        MocRequest request = mocRequestRepository.findById(requestId)
-                .orElseThrow(() -> new ResourceNotFoundException("MOC Request with ID " + requestId + " not found."));
+// Helper "N/A" chip component
+const NaChip = () => <Chip label="N/A" size="small" variant="outlined" />;
 
-        if (!userId.equals(request.getCreatorId())) {
-            log.warn("User {} attempted to cancel request {} owned by {}", userId, requestId, request.getCreatorId());
-            throw new IllegalStateException("You are not authorized to cancel this request.");
-        }
+// --- NEW HELPER FUNCTION ---
+/**
+ * Extracts the journal prefix (e.g., "0000092")
+ * from a full journal ID (e.g., "0000092-001").
+ */
+const getJournalPrefix = (journalId) => {
+  if (!journalId) {
+    return null;
+  }
+  const parts = journalId.split("-");
+  return parts[0];
+};
+// --- END OF NEW HELPER ---
 
-        if (request.getRequestStatus() != RequestStatus.PENDING) {
-            log.warn("User {} attempted to cancel request {} which is already in status {}", userId, requestId, request.getRequestStatus());
-            throw new IllegalStateException("Cannot cancel a request that has already been processed.");
-        }
+function CustomNoRowsOverlay() {
+  return (
+    <Stack height="100%" alignItems="center" justifyContent="center">
+      <InfoIcon sx={{ fontSize: 48, color: "text.secondary", mb: 2 }} />
+      <Typography variant="h6">No Requests Found</Typography>
+      <Typography>No MOC requests found.</Typography>
+    </Stack>
+  );
+}
 
-        mocRequestRepository.delete(request);
-        log.info("User {} successfully canceled MOC request {}", userId, requestId);
+export default function JournalPostingStatus() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([]);
+
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [selectedRequest, setSelectedRequest] = useState(null);
+
+  const fetchMyRequests = useCallback(async () => {
+    setLoading(true);
+    try {
+      const myRequests = await callApi("MS/moc/my-requests", null, "GET");
+      if (Array.isArray(myRequests)) {
+        setRows(myRequests);
+      } else {
+        setRows([]);
+      }
+    } catch (err) {
+      console.error("Failed to fetch user's requests:", err);
+      const errorMsg =
+        err.response?.data?.message || "Failed to load your requests.";
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setLoading(false);
+    }
+  }, [callApi, showSnackBar]);
+
+  useEffect(() => {
+    fetchMyRequests();
+  }, [fetchMyRequests]);
+
+  const handleOpenModal = (request) => {
+    setSelectedRequest(request);
+    setIsModalOpen(true);
+  };
+
+  const handleCloseModal = () => {
+    if (isSubmitting) return;
+    setIsModalOpen(false);
+    setSelectedRequest(null);
+  };
+
+  // --- MODIFIED CANCELLATION LOGIC ---
+  const handleConfirmCancel = async () => {
+    if (!selectedRequest) return;
+
+    // 1. Get the journal prefix from the selected row
+    const journalIdPrefix = getJournalPrefix(selectedRequest.journalId);
+
+    if (!journalIdPrefix) {
+      showSnackBar("Cannot cancel: Invalid Journal ID format.", "error");
+      return;
     }
 
-    // --- NEW METHOD ---
-    @Override
-    @Transactional
-    public void cancelMyRequestsByJournalPrefix(String journalIdPrefix, String userId) {
-        log.info("User {} attempting to cancel all requests with journal prefix: {}", userId, journalIdPrefix);
+    setIsSubmitting(true);
+    try {
+      // 2. Call the new bulk-cancel endpoint
+      await callApi(
+        `MS/moc/my-requests/by-journal/${journalIdPrefix}`, // <-- NEW API ENDPOINT
+        null,
+        "DELETE"
+      );
 
-        // Find ALL requests with this prefix
-        List<MocRequest> requestsToCancel = mocRequestRepository.findByJournalIdStartingWith(journalIdPrefix);
-
-        if (requestsToCancel.isEmpty()) {
-            throw new ResourceNotFoundException("No requests found with journal prefix: " + journalIdPrefix);
-        }
-
-        // Check permissions and status for ALL of them before deleting
-        for (MocRequest request : requestsToCancel) {
-            // Check 1: User must be the creator
-            if (!userId.equals(request.getCreatorId())) {
-                log.warn("User {} attempted to bulk-cancel requests owned by {}", userId, request.getCreatorId());
-                throw new IllegalStateException("You are not authorized to cancel requests in this journal batch.");
-            }
-            // Check 2: All requests must be PENDING
-            if (request.getRequestStatus() != RequestStatus.PENDING) {
-                log.warn("User {} attempted to bulk-cancel request {} which is already in status {}", userId, request.getId(), request.getRequestStatus());
-                throw new IllegalStateException("Cannot cancel requests that are not in PENDING status. Batch is already processed.");
-            }
-        }
-
-        // All checks passed, delete them all
-        mocRequestRepository.deleteAll(requestsToCancel);
-        log.info("User {} successfully bulk-canceled {} requests for journal prefix {}", userId, requestsToCancel.size(), journalIdPrefix);
+      // 3. Update success message
+      showSnackBar(
+        `All requests for journal ${journalIdPrefix} were successfully canceled.`,
+        "success"
+      );
+      handleCloseModal();
+      fetchMyRequests(); // Refresh the data
+    } catch (error) {
+      console.error("Failed to cancel request:", error);
+      const errorMsg =
+        error.response?.data?.message || "Failed to cancel the request(s).";
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setIsSubmitting(false);
     }
-    // --- END OF NEW METHOD ---
+  };
+  // --- END OF MODIFICATION ---
 
-    @Override
-    public List<MocRequestStatusDto> getMocRequestStatusList() {
-       // ...
-    }
+  const columns = [
+    {
+      field: "batchId",
+      headerName: "Batch ID",
+      flex: 1.5,
+      minWidth: 150,
+      renderCell: (params) => params.value || "N/A",
+    },
+    {
+      field: "journalId",
+      headerName: "Journal ID",
+      flex: 1.5,
+      minWidth: 150,
+      renderCell: (params) => params.value || "N/A",
+    },
+    {
+      field: "requestStatus",
+      headerName: "Req Status",
+      flex: 1,
+      minWidth: 100,
+      renderCell: (params) =>
+        params.value ? (
+          <Chip
+            label={params.value}
+            color={getStatusChipColor(params.value)}
+            size="small"
+          />
+        ) : (
+          <NaChip />
+        ),
+    },
+    {
+      field: "requestDate",
+      headerName: "Req Date",
+      flex: 1.5,
+      minWidth: 180,
+      renderCell: (params) =>
+        params.value ? (
+          <Box>
+            {new Date(params.value).toLocaleString("en-IN", {
+              dateStyle: "medium",
+              timeStyle: "short",
+            })}
+          </Box>
+        ) : (
+          "N/A"
+        ),
+    },
+    {
+      field: "creatorId",
+      headerName: "Creator ID",
+      flex: 1,
+      minWidth: 120,
+      renderCell: (params) =>
+        params.value ? (
+          <Chip
+            icon={<AccountCircleIcon />}
+            label={params.value}
+            size="small"
+            variant="outlined"
+          />
+        ) : (
+          <NaChip />
+        ),
+    },
+    {
+      field: "executorId",
+      headerName: "Executor ID",
+      flex: 1,
+      minWidth: 120,
+      renderCell: (params) =>
+        params.value ? (
+          <Chip
+            icon={<AccountCircleIcon />}
+            label={params.value}
+            size="small"
+          />
+        ) : (
+          <NaChip />
+        ),
+    },
+    {
+      field: "executorRemarks",
+      headerName: "Executor Remarks",
+      flex: 2,
+      minWidth: 200,
+      renderCell: (params) => params.value || "N/A",
+    },
+    {
+      field: "actions",
+      headerName: "Actions",
+      flex: 0.8,
+      minWidth: 100,
+      align: "center",
+      headerAlign: "center",
+      sortable: false,
+      renderCell: (params) => (
+        <Tooltip title="Cancel Journal Batch"> {/* Tooltip updated */}
+          <Box>
+            <IconButton
+              onClick={() => handleOpenModal(params.row)}
+              color="error"
+              disabled={params.row.requestStatus !== "PENDING"}
+            >
+              <CancelIcon />
+            </IconButton>
+          </Box>
+        </Tooltip>
+      ),
+    },
+  ];
+
+  return (
+    <Box sx={{ p: 3, width: "100%" }}>
+      <Typography
+        variant="h4"
+        gutterBottom
+        sx={{ fontWeight: "bold", color: "primary.main", mb: 3 }}
+      >
+        All MOC Requests
+      </Typography>
+
+      <DataGrid
+        rows={rows}
+        columns={columns}
+        loading={loading}
+        getRowId={(row) => row.id}
+        disableRowSelectionOnClick
+        pageSizeOptions={[10, 25, 50]}
+        initialState={{
+          pagination: {
+            paginationModel: { page: 0, pageSize: 10 },
+          },
+          sorting: { sortModel: [{ field: "requestDate", sort: "desc" }] },
+        }}
+        slots={{
+          noRowsOverlay: CustomNoRowsOverlay,
+        }}
+        sx={{
+          height: 600,
+          width: "100%",
+          "& .MuiDataGrid-cell:focus": { outline: "none" },
+        }}
+      />
+
+      {/* --- MODIFIED MODAL TEXT --- */}
+      <Dialog
+        open={isModalOpen}
+        onClose={handleCloseModal}
+        fullWidth
+        maxWidth="sm"
+      >
+        <DialogTitle sx={{ display: "flex", alignItems: "center" }}>
+          <Ballot sx={{ mr: 1, color: "warning.main" }} />
+          Confirm Journal Cancellation
+        </DialogTitle>
+        <DialogContent sx={{ pt: 3 }}>
+          <DialogContentText>
+            Are you sure you want to cancel and delete{" "}
+            <strong>all requests</strong> in this journal batch?
+            <br />
+            <br />
+            <strong>Batch ID:</strong> {selectedRequest?.batchId || "N/A"}
+            <br />
+            <strong>Journal Prefix:</strong>{" "}
+            {getJournalPrefix(selectedRequest?.journalId) || "N/A"}
+            <br />
+            <br />
+            This will cancel all associated entries (e.g., -001, -002, etc.) and
+            cannot be undone.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions sx={{ p: 2 }}>
+          <Button onClick={handleCloseModal} disabled={isSubmitting}>
+            Back
+          </Button>
+          <Button
+            onClick={handleConfirmCancel}
+            variant="contained"
+            color="error"
+            disabled={isSubmitting}
+          >
+            {isSubmitting ? (
+              <CircularProgress size={24} color="inherit" />
+            ) : (
+              "Yes, Cancel All" // Button text updated
+            )}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      {/* --- END OF MODIFICATION --- */}
+    </Box>
+  );
 }
