@@ -1,96 +1,635 @@
-package com.tcs.fincore.MOCService.Service;
+import React, { useState, useEffect, useCallback } from "react";
+import {
+  Box,
+  Typography,
+  Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  Button,
+  CircularProgress,
+  Tooltip,
+  IconButton,
+  Stack,
+  Grid,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Paper,
+  Checkbox,
+  Divider,
+} from "@mui/material";
+import { DataGrid } from "@mui/x-data-grid";
+import {
+  Cancel as CancelIcon,
+  DeleteSweep as DeleteSweepIcon,
+  Visibility as VisibilityIcon,
+} from "@mui/icons-material";
+import AccountCircleIcon from "@mui/icons-material/AccountCircle";
+import InfoIcon from "@mui/icons-material/Info";
 
-// ... (all imports) ...
-import org.springframework.data.domain.Sort;
-import org.springframework.stereotype.Service;
-import jakarta.transaction.Transactional;
+import useApi from "../../../hooks/useApi";
+import useCustomSnackbar from "../../../utils/useCustomSnackbar";
 
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class MocRequestServiceImpl implements MocRequestService {
 
-    private final MocRequestRepository mocRequestRepository;
-    private final MasterMocRepository masterMocRepository;
-    private final ObjectMapper objectMapper;
-    private final SequenceService sequenceService; 
+const formatCurrency = (num) => {
+  return new Intl.NumberFormat("en-IN", {
+    style: "decimal",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(num);
+};
 
-    // ... (createBatchRequest, updateRequestStatus, processApproval, mapDtoToEntity, getMyRequests, getPendingRequests, processBulkRequests, getRequestsByBatchId) ...
 
-   
-    @Override
-    @Transactional
-    public void cancelMyRequest(Long requestId, String userId) {
-        // ... (your existing code for this)
-    }
+const getTxnTypeColor = (txnType) => {
+  return txnType === "Debit" ? "error" : "success";
+};
 
-    // --- THIS METHOD IS UPDATED FOR BETTER LOGIC ---
-    @Override
-    @Transactional
-    public void cancelMyRequestsByJournalPrefix(String journalIdPrefix, String userId) {
-        log.info("User {} attempting to cancel all requests with journal prefix: {}", userId, journalIdPrefix);
+function CustomNoRowsOverlay() {
+  return (
+    <Stack height="100%" alignItems="center" justifyContent="center">
+      <InfoIcon sx={{ fontSize: 48, color: "text.secondary", mb: 2 }} />
+      <Typography variant="h6">No Pending Requests Found</Typography>
+      <Typography>You do not have any MOC requests awaiting processing.</Typography>
+    </Stack>
+  );
+}
 
-        // UPDATED: Use the new, more specific repo method
-        List<MocRequest> requestsToCancel = mocRequestRepository.findByJournalIdStartingWithAndCreatorIdAndRequestStatus(
-                journalIdPrefix, userId, RequestStatus.PENDING);
+export default function JournalPostingStatus() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
 
-        if (requestsToCancel.isEmpty()) {
-            throw new ResourceNotFoundException("No pending requests found for you with journal prefix: " + journalIdPrefix);
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([]);
+
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [selectedBatch, setSelectedBatch] = useState(null);
+
+  const [isViewModalOpen, setIsViewModalOpen] = useState(false);
+  const [isViewLoading, setIsViewLoading] = useState(false);
+  
+  const [batchDetails, setBatchDetails] = useState([]);
+  const [viewingBatchId, setViewingBatchId] = useState(null);
+
+  const [selectedJournalPrefixes, setSelectedJournalPrefixes] = useState([]);
+  const [isPartialSubmitting, setIsPartialSubmitting] = useState(false);
+
+  const fetchMyPendingBatches = useCallback(async () => {
+    setLoading(true);
+    try {
+      // 1. Fetch ALL requests created by the user
+      const myRequests = await callApi(
+        "MS/moc/my-requests",
+        null,
+        "GET"
+      );
+
+      // 2. Filter for ONLY pending requests
+      const pendingRequests = Array.isArray(myRequests)
+        ? myRequests.filter((req) => req.requestStatus === "PENDING")
+        : [];
+
+      if (pendingRequests.length === 0) {
+        setRows([]);
+        setLoading(false);
+        return;
+      }
+
+      // 3. Group them by Batch ID (same logic as approval screen)
+      const groupedBatches = new Map();
+      for (const request of pendingRequests) {
+        const batchId = request.batchId;
+
+        if (!groupedBatches.has(batchId)) {
+          groupedBatches.set(batchId, {
+            id: batchId,
+            batchId: batchId,
+            creatorId: request.creatorId,
+            requestStatus: request.requestStatus,
+            requestDate: request.requestDate,
+            commonBatchRemarks: request.commonBatchRemarks,
+            totalDebit: 0,
+            totalCredit: 0,
+            requestCount: 0,
+          });
         }
-        
-        // The old logic was flawed. This is safer.
-        mocRequestRepository.deleteAll(requestsToCancel);
-        log.info("User {} successfully bulk-canceled {} requests for journal prefix {}", userId, requestsToCancel.size(), journalIdPrefix);
-    }
-    // --- END OF UPDATE ---
 
-    @Override
-    public List<MocRequestStatusDto> getMocRequestStatusList() {
-       // ... (your existing code for this)
-    }
+        const batchDetails = groupedBatches.get(batchId);
+        batchDetails.requestCount++;
 
-    // --- ADD THESE TWO NEW IMPLEMENTATIONS ---
-
-    @Override
-    @Transactional
-    public void cancelMyRequestsByBatchId(String batchId, String userId) {
-        log.info("User {} attempting to cancel PENDING requests created by them in batch ID: {}", userId, batchId);
-
-        List<MocRequest> requestsToCancel = mocRequestRepository.findByBatchIdAndCreatorIdAndRequestStatus(
-                batchId, userId, RequestStatus.PENDING);
-
-        if (requestsToCancel.isEmpty()) {
-            log.warn("No pending requests found for user {} in batch ID {}", userId, batchId);
-            throw new ResourceNotFoundException("No pending requests found for you in this batch.");
+        try {
+          const payload = JSON.parse(request.payload);
+          const amount = parseFloat(payload.amount) || 0;
+          if (payload.transactionType === "Debit") {
+            batchDetails.totalDebit += amount;
+          } else if (payload.transactionType === "Credit") {
+            batchDetails.totalCredit += amount;
+          }
+        } catch (e) {
+          console.error(`Failed to parse payload for request ${request.id}`, e);
         }
-
-        mocRequestRepository.deleteAll(requestsToCancel);
-        log.info("User {} successfully bulk-canceled {} requests for batch ID {}", userId, requestsToCancel.size(), batchId);
+      }
+      setRows(Array.from(groupedBatches.values()));
+    } catch (err) {
+      console.error("Failed to fetch user's pending requests:", err);
+      const errorMsg =
+        err.response?.data?.message || "Failed to load your pending requests.";
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setLoading(false);
     }
+  }, [callApi, showSnackBar]);
 
-    @Override
-    @Transactional
-    public void cancelMyRequestsByJournalPrefixes(List<String> journalIdPrefixes, String userId) {
-        log.info("User {} attempting to bulk-cancel PENDING requests for journal prefixes: {}", userId, journalIdPrefixes.size());
-        
-        List<MocRequest> requestsToCancel = new ArrayList<>();
-        for (String prefix : journalIdPrefixes) {
-            List<MocRequest> requestsForPrefix = mocRequestRepository.findByJournalIdStartingWithAndCreatorIdAndRequestStatus(
-                    prefix, userId, RequestStatus.PENDING);
-            
-            if (!requestsForPrefix.isEmpty()) {
-                 requestsToCancel.addAll(requestsForPrefix);
-            } else {
-                 log.warn("No pending requests found for user {} with journal prefix {}", userId, prefix);
+  useEffect(() => {
+    fetchMyPendingBatches();
+  }, [fetchMyPendingBatches]);
+
+  const handleOpenModal = (batch) => {
+    setSelectedBatch(batch);
+    setIsModalOpen(true);
+  };
+
+  const handleCloseModal = () => {
+    if (isSubmitting) return;
+    setIsModalOpen(false);
+    setSelectedBatch(null);
+  };
+
+  const handleOpenViewModal = async (batchId) => {
+    setIsViewModalOpen(true);
+    setIsViewLoading(true);
+    setViewingBatchId(batchId);
+    try {
+      const data = await callApi(`MS/moc/by-batch/${batchId}`, null, "GET");
+
+      if (Array.isArray(data)) {
+        const journalGroups = new Map();
+
+        const processedData = data
+          .map((req) => {
+            if (req.requestStatus !== "PENDING") {
+              return null; 
             }
+            try {
+              const payload = JSON.parse(req.payload);
+              const prefix = req.journalId.split('-')[0]; 
+              return {
+                ...req, 
+                payload, 
+                journalPrefix: prefix,
+                amount: parseFloat(payload.amount) || 0,
+                transactionType: payload.transactionType
+              };
+            } catch (e) {
+              console.error("Failed to parse payload for req:", req.id, e);
+              return null;
+            }
+          })
+          .filter(Boolean); 
+          
+        processedData.sort((a, b) => a.journalId.localeCompare(b.journalId));
+
+        for (const row of processedData) {
+          const prefix = row.journalPrefix;
+          if (!journalGroups.has(prefix)) {
+            journalGroups.set(prefix, []);
+          }
+          journalGroups.get(prefix).push(row);
         }
 
-        if (requestsToCancel.isEmpty()) {
-            throw new ResourceNotFoundException("No pending requests found for you with the specified journal prefixes.");
-        }
-
-        mocRequestRepository.deleteAll(requestsToCancel);
-        log.info("User {} successfully bulk-canceled {} requests for {} journal prefixes.", userId, requestsToCancel.size(), journalIdPrefixes.size());
+        setBatchDetails(Array.from(journalGroups.values()));
+      } else {
+        setBatchDetails([]);
+        showSnackBar("No pending details found for this batch.", "info");
+      }
+    } catch (error) {
+      console.error("Failed to fetch batch details:", error);
+      const errorMsg =
+        error.response?.data?.message || "Failed to load batch details.";
+      showSnackBar(errorMsg, "error");
+      setBatchDetails([]);
+    } finally {
+      setIsViewLoading(false);
     }
-    // --- END OF NEW IMPLEMENTATIONS ---
+  };
+
+  const handleCloseViewModal = () => {
+    setIsViewModalOpen(false);
+    setBatchDetails([]);
+    setViewingBatchId(null);
+    setSelectedJournalPrefixes([]);
+    setIsPartialSubmitting(false);
+  };
+
+  const handleSubmitBatchCancel = async () => {
+    setIsSubmitting(true);
+    try {
+      // Calls the new backend endpoint for batch cancellation
+      await callApi(`MS/moc/my-requests/by-batch/${selectedBatch.batchId}`, null, "DELETE");
+      showSnackBar(`Batch ${selectedBatch.batchId} successfully canceled.`, "success");
+      handleCloseModal();
+      fetchMyPendingBatches();
+    } catch (error) {
+      console.error("Failed to cancel batch:", error);
+      const errorMsg =
+        error.response?.data?.message || "Failed to cancel batch.";
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleCancelSelectedJournals = async () => {
+    if (selectedJournalPrefixes.length === 0) {
+      showSnackBar("Please select at least one journal group to cancel.", "warning");
+      return;
+    }
+
+    setIsPartialSubmitting(true);
+
+    try {
+      // Calls the new bulk journal cancellation endpoint
+      await callApi("MS/moc/my-requests/by-journal", selectedJournalPrefixes, "DELETE");
+      showSnackBar("Selected journal entries successfully canceled.", "success");
+      handleCloseViewModal();
+      fetchMyPendingBatches();
+    } catch (error) {
+      console.error("Failed to process partial batch:", error);
+      const errorMsg =
+        error.response?.data?.message || "Failed to cancel selected entries.";
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setIsPartialSubmitting(false);
+    }
+  };
+
+  const handleSelectAllClick = (event) => {
+    if (event.target.checked) {
+      const newSelecteds = batchDetails.map((group) => group[0].journalPrefix);
+      setSelectedJournalPrefixes(newSelecteds);
+      return;
+    }
+    setSelectedJournalPrefixes([]);
+  };
+
+  const handleRowCheckboxClick = (event, prefix) => {
+    if (event) {
+      event.stopPropagation();
+    }
+
+    const selectedIndex = selectedJournalPrefixes.indexOf(prefix);
+    let newSelected = [];
+
+    if (selectedIndex === -1) {
+      newSelected = newSelected.concat(selectedJournalPrefixes, prefix);
+    } else if (selectedIndex === 0) {
+      newSelected = newSelected.concat(selectedJournalPrefixes.slice(1));
+    } else if (selectedIndex === selectedJournalPrefixes.length - 1) {
+      newSelected = newSelected.concat(selectedJournalPrefixes.slice(0, -1));
+    } else if (selectedIndex > 0) {
+      newSelected = newSelected.concat(
+        selectedJournalPrefixes.slice(0, selectedIndex),
+        selectedJournalPrefixes.slice(selectedIndex + 1)
+      );
+    }
+    setSelectedJournalPrefixes(newSelected);
+  };
+
+  const columns = [
+    {
+      field: "batchId",
+      headerName: "Batch ID",
+      flex: 1.2,
+      minWidth: 150,
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "requestStatus",
+      headerName: "Status",
+      flex: 0.5,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Chip label={params.value} color="warning" size="small" />
+      ),
+    },
+    {
+      field: "creatorId",
+      headerName: "Creator",
+      flex: 0.6,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Chip icon={<AccountCircleIcon />} label={params.value} size="small" />
+      ),
+    },
+    {
+      field: "requestDate",
+      headerName: "Submitted On",
+      flex: 1,
+      minWidth: 180,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Box>
+          {new Date(params.value).toLocaleString("en-IN", {
+            dateStyle: "medium",
+            timeStyle: "short",
+          })}
+        </Box>
+      ),
+    },
+    {
+      field: "commonBatchRemarks",
+      headerName: "Creator Remarks",
+      flex: 1.5,
+      minWidth: 200,
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "requestCount",
+      headerName: "Entries",
+      flex: 0.4,
+      minWidth: 50,
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "totalCredit",
+      headerName: "Total Credit",
+      flex: 0.7,
+      minWidth: 120,
+      align: "center",
+      headerAlign: "center",
+   
+      renderCell: (params) => (
+        <Typography >
+          {formatCurrency(params.value)}
+        </Typography>
+      ),
+    },
+    {
+      field: "totalDebit",
+      headerName: "Total Debit",
+      flex: 0.7,
+      minWidth: 120,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Typography >
+          {formatCurrency(params.value)}
+        </Typography>
+      ),
+    },
+    {
+      field: "actions",
+      headerName: "Actions",
+      flex: 0.8,
+      minWidth: 130,
+      align: "center",
+      headerAlign: "center",
+      sortable: false,
+      renderCell: (params) => (
+        <Stack direction="row" spacing={0.5}>
+          <Tooltip title="View Details">
+            <IconButton
+              onClick={() => handleOpenViewModal(params.row.batchId)}
+              color="primary"
+            >
+              <VisibilityIcon />
+            </IconButton>
+          </Tooltip>
+          <Tooltip title="Cancel Entire Batch">
+            <IconButton
+              onClick={() => handleOpenModal(params.row)}
+              color="error"
+            >
+              <DeleteSweepIcon />
+            </IconButton>
+          </Tooltip>
+        </Stack>
+      ),
+    },
+  ];
+
+  return (
+    <Box sx={{ p: 3, width: "100%" }}>
+    
+      <DataGrid
+        rows={rows}
+        columns={columns}
+        loading={loading}
+        getRowId={(row) => row.batchId}
+        disableRowSelectionOnClick
+        pageSizeOptions={[5, 10, 25]}
+        initialState={{
+          pagination: {
+            paginationModel: { page: 0, pageSize: 10 },
+          },
+          sorting: { sortModel: [{ field: "requestDate", sort: "desc" }] },
+        }}
+        slots={{
+          noRowsOverlay: CustomNoRowsOverlay,
+        }}
+        sx={{
+          height: 600,
+          width: "100%",
+          "& .MuiDataGrid-cell:focus": { outline: "none" },
+        }}
+      />
+
+      
+      <Dialog
+        open={isModalOpen}
+        onClose={handleCloseModal}
+        fullWidth
+        maxWidth="sm"
+      >
+        <DialogTitle sx={{ display: "flex", alignItems: "center" }}>
+          <DeleteSweepIcon sx={{ mr: 1, color: "error.main" }} />
+          Confirm Batch Cancellation
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            Are you sure you want to cancel all your pending requests 
+            in batch <strong>{selectedBatch?.batchId}</strong>?
+            <br/><br/>
+            This will permanently delete {selectedBatch?.requestCount} entry/entries
+            created by you and cannot be undone.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions sx={{ p: 2 }}>
+          <Button onClick={handleCloseModal} disabled={isSubmitting}>
+            Back
+          </Button>
+          <Button
+            onClick={handleSubmitBatchCancel}
+            variant="contained"
+            color="error"
+            disabled={isSubmitting}
+          >
+            {isSubmitting ? (
+              <CircularProgress size={24} color="inherit" />
+            ) : (
+              "Confirm Cancel"
+            )}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      
+      <Dialog
+        open={isViewModalOpen}
+        onClose={handleCloseViewModal}
+        fullWidth
+        maxWidth="xl"
+      >
+        <DialogTitle
+          sx={{
+            fontWeight: "bold",
+            display: "flex",
+            alignItems: "center",
+            pb: 2,
+          }}
+        >
+          <VisibilityIcon sx={{ mr: 1 }} />
+          Batch Details: {viewingBatchId}
+        </DialogTitle>
+
+        <DialogContent sx={{ p: 2, pt: 0 }}>
+          {isViewLoading ? (
+            <Box
+              sx={{
+                display: "flex",
+                justifyContent: "center",
+                alignItems: "center",
+                minHeight: 300,
+              }}
+            >
+              <CircularProgress />
+            </Box>
+          ) : (
+            <>
+              {batchDetails.length > 0 ? (
+                <TableContainer
+                  component={Paper}
+                  sx={{ maxHeight: 400, mt: 1 }}
+                >
+                  <Table sx={{ minWidth: 650 }} size="small" stickyHeader>
+                    <TableHead>
+                      <TableRow>
+                        <TableCell padding="checkbox">
+                          <Checkbox
+                            color="primary"
+                            indeterminate={
+                              selectedJournalPrefixes.length > 0 &&
+                              selectedJournalPrefixes.length < batchDetails.length
+                            }
+                            checked={
+                              batchDetails.length > 0 &&
+                              selectedJournalPrefixes.length === batchDetails.length
+                            }
+                            onChange={handleSelectAllClick}
+                          />
+                        </TableCell>
+                        <TableCell align="left">Journal ID</TableCell>
+                        <TableCell align="left">Branch</TableCell>
+                        <TableCell align="left">Currency</TableCell>
+                        <TableCell align="left">CGL</TableCell>
+                        <TableCell align="right">Amount</TableCell>
+                        <TableCell align="left">Txn Type</TableCell>
+                      </TableRow>
+                    </TableHead>
+                  
+                    
+                    <TableBody>
+                      {batchDetails.map((group, groupIndex) => (
+                        <React.Fragment key={group[0].journalPrefix}>
+                          {group.map((row, rowIndex) => {
+                            const isSelected = selectedJournalPrefixes.includes(row.journalPrefix);
+                            return (
+                              <TableRow
+                                key={row.id}
+                                hover
+                                onClick={() => handleRowCheckboxClick(null, row.journalPrefix)}
+                                role="checkbox"
+                                aria-checked={isSelected}
+                                selected={isSelected}
+                              >
+                                <TableCell padding="checkbox">
+                                  {rowIndex === 0 && (
+                                    <Checkbox
+                                      color="primary"
+                                      checked={isSelected}
+                                      onClick={(e) => handleRowCheckboxClick(e, row.journalPrefix)}
+                                    />
+                                  )}
+                                </TableCell>
+                                <TableCell align="left">
+                                  {rowIndex === 0 ? <>{row.journalPrefix}</> : ""}
+                                </TableCell>
+                                <TableCell align="left">{row.payload.branch}</TableCell>
+                                <TableCell align="left">{row.payload.currency}</TableCell>
+                                <TableCell align="left">{row.payload.cgl}</TableCell>
+                                <TableCell align="right">{formatCurrency(row.amount)}</TableCell>
+                                <TableCell align="left">
+                                  <Chip
+                                    label={row.transactionType}
+                                    color={getTxnTypeColor(row.transactionType)}
+                                    size="small"
+                                  />
+                                </TableCell>
+                              </TableRow>
+                            );
+                          })}
+                        </React.Fragment>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              ) : (
+                <Typography>No pending details found for this batch.</Typography>
+              )}
+              
+           
+              <Divider sx={{ my: 2 }} />
+              <Grid container spacing={2} alignItems="center">
+                <Grid item xs={12} md={6}>
+                  <Typography variant="body2" color="text.secondary">
+                    Select one or more journal groups from the table to cancel.
+                  </Typography>
+                </Grid>
+                <Grid item xs={12} md={6}>
+                  <Stack direction="row" spacing={1} justifyContent="flex-end">
+                    <Button
+                      variant="contained"
+                      color="error"
+                      startIcon={<CancelIcon />}
+                      onClick={handleCancelSelectedJournals}
+                      disabled={isPartialSubmitting || selectedJournalPrefixes.length === 0}
+                    >
+                      {isPartialSubmitting ? (
+                        <CircularProgress size={24} color="inherit" />
+                      ) : "Cancel Selected Journals"}
+                    </Button>
+                  </Stack>
+                </Grid>
+              </Grid>
+            </>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ p: 2 }}>
+          <Button onClick={handleCloseViewModal}>Close</Button>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
 }
