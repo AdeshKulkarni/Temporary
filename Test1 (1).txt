@@ -1,23 +1,740 @@
-{
-  "commonBatchRemarks": "Valid balanced batch test (BR001, INR)",
-  "rows": [
+import React, { useState, useEffect, useCallback } from "react";
+import {
+  Box,
+  Typography,
+  Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  TextField,
+  Button,
+  CircularProgress,
+  Tooltip,
+  IconButton,
+  Stack,
+  Grid,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Paper,
+  Checkbox,
+  Divider,
+} from "@mui/material";
+import { DataGrid } from "@mui/x-data-grid";
+import {
+  Check as CheckIcon,
+  Clear as ClearIcon,
+  Visibility as VisibilityIcon,
+} from "@mui/icons-material";
+import AccountCircleIcon from "@mui/icons-material/AccountCircle";
+import InfoIcon from "@mui/icons-material/Info";
+
+import useApi from "../../../hooks/useApi";
+import useCustomSnackbar from "../../../utils/useCustomSnackbar";
+
+
+const formatCurrency = (num) => {
+
+  return Number(num).toFixed(4);
+};
+
+const getTxnTypeColor = (txnType) => {
+  return txnType === "Debit" ? "error" : "success";
+};
+
+function CustomNoRowsOverlay() {
+  return (
+    <Stack height="100%" alignItems="center" justifyContent="center">
+      <InfoIcon sx={{ fontSize: 48, color: "text.secondary", mb: 2 }} />
+      <Typography variant="h6">No Pending Requests Found</Typography>
+      <Typography>All MOC requests have been processed.</Typography>
+    </Stack>
+  );
+}
+
+export default function MocRequestApproval() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([]);
+
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [selectedBatch, setSelectedBatch] = useState(null);
+  const [modalMode, setModalMode] = useState("ACCEPTED");
+  const [executorRemarks, setExecutorRemarks] = useState("");
+
+  const [isViewModalOpen, setIsViewModalOpen] = useState(false);
+  const [isViewLoading, setIsViewLoading] = useState(false);
+
+  const [batchDetails, setBatchDetails] = useState([]);
+  const [viewingBatchId, setViewingBatchId] = useState(null);
+
+  const [selectedJournalPrefixes, setSelectedJournalPrefixes] = useState([]);
+  const [partialExecutorRemarks, setPartialExecutorRemarks] = useState("");
+  const [isPartialSubmitting, setIsPartialSubmitting] = useState(false);
+
+  const fetchPendingBatches = useCallback(async () => {
+    setLoading(true);
+    try {
+      const pendingRequests = await callApi(
+        "MS/moc/pending-requests",
+        null,
+        "GET"
+      );
+
+      if (!Array.isArray(pendingRequests) || pendingRequests.length === 0) {
+        setRows([]);
+        setLoading(false);
+        return;
+      }
+
+      const groupedBatches = new Map();
+      for (const request of pendingRequests) {
+        const batchId = request.batchId;
+
+        if (!groupedBatches.has(batchId)) {
+          groupedBatches.set(batchId, {
+            id: batchId,
+            batchId: batchId,
+            creatorId: request.creatorId,
+            requestStatus: request.requestStatus,
+            requestDate: request.requestDate,
+            commonBatchRemarks: request.commonBatchRemarks,
+            totalDebit: 0,
+            totalCredit: 0,
+            requestCount: 0,
+          });
+        }
+
+        const batchDetails = groupedBatches.get(batchId);
+        batchDetails.requestCount++;
+
+        try {
+          const payload = JSON.parse(request.payload);
+          const amount = parseFloat(payload.amount) || 0;
+          if (payload.transactionType === "Debit") {
+            batchDetails.totalDebit += amount;
+          } else if (payload.transactionType === "Credit") {
+            batchDetails.totalCredit += amount;
+          }
+        } catch (e) {
+          console.error(`Failed to parse payload for request ${request.id}`, e);
+        }
+      }
+      setRows(Array.from(groupedBatches.values()));
+    } catch (err) {
+      console.error("Failed to fetch pending requests:", err);
+      const errorMsg =
+        err.response?.data?.message || "Failed to load pending requests.";
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setLoading(false);
+    }
+  }, [callApi, showSnackBar]);
+
+  useEffect(() => {
+    fetchPendingBatches();
+  }, [fetchPendingBatches]);
+
+  const handleOpenModal = (batch, mode) => {
+    setSelectedBatch(batch);
+    setModalMode(mode);
+    setExecutorRemarks("");
+    setIsModalOpen(true);
+  };
+
+  const handleCloseModal = () => {
+    if (isSubmitting) return;
+    setIsModalOpen(false);
+    setSelectedBatch(null);
+  };
+
+  const handleOpenViewModal = async (batchId) => {
+    setIsViewModalOpen(true);
+    setIsViewLoading(true);
+    setViewingBatchId(batchId);
+    try {
+      const data = await callApi(`MS/moc/by-batch/${batchId}`, null, "GET");
+
+      if (Array.isArray(data)) {
+        const journalGroups = new Map();
+
+        const processedData = data
+          .map((req) => {
+            if (req.requestStatus !== "PENDING") {
+              return null;
+            }
+            try {
+              const payload = JSON.parse(req.payload);
+              const prefix = req.journalId.split("-")[0];
+              return {
+                ...req,
+                payload,
+                journalPrefix: prefix,
+                amount: parseFloat(payload.amount) || 0,
+                transactionType: payload.transactionType,
+              };
+            } catch (e) {
+              console.error("Failed to parse payload for req:", req.id, e);
+              return null;
+            }
+          })
+          .filter(Boolean);
+
+        processedData.sort((a, b) => a.journalId.localeCompare(b.journalId));
+
+        for (const row of processedData) {
+          const prefix = row.journalPrefix;
+          if (!journalGroups.has(prefix)) {
+            journalGroups.set(prefix, []);
+          }
+          journalGroups.get(prefix).push(row);
+        }
+
+        setBatchDetails(Array.from(journalGroups.values()));
+      } else {
+        setBatchDetails([]);
+        showSnackBar("No details found for this batch.", "info");
+      }
+    } catch (error) {
+      console.error("Failed to fetch batch details:", error);
+      const errorMsg =
+        error.response?.data?.message || "Failed to load batch details.";
+      showSnackBar(errorMsg, "error");
+      setBatchDetails([]);
+    } finally {
+      setIsViewLoading(false);
+    }
+  };
+
+  const handleCloseViewModal = () => {
+    setIsViewModalOpen(false);
+    setBatchDetails([]);
+    setViewingBatchId(null);
+    setSelectedJournalPrefixes([]);
+    setPartialExecutorRemarks("");
+    setIsPartialSubmitting(false);
+  };
+
+  const handleSubmitAction = async () => {
+    if (modalMode === "REJECTED" && !executorRemarks.trim()) {
+      showSnackBar("Approver remarks are required for rejection.", "warning");
+      return;
+    }
+
+    setIsSubmitting(true);
+    const payload = {
+      batchId: selectedBatch.batchId,
+      status: modalMode,
+      remarks:
+        executorRemarks.trim() ||
+        (modalMode === "ACCEPTED" ? "Accepted" : "Rejected"),
+    };
+
+    try {
+      await callApi("MS/moc/process-bulk", payload, "POST");
+      handleCloseModal();
+      fetchPendingBatches();
+    } catch (error) {
+      console.error("Failed to process batch:", error);
+      const errorMsg =
+        error.response?.data?.message ||
+        `Failed to ${modalMode.toLowerCase()} batch.`;
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleSubmitPartialAction = async (mode) => {
+    if (mode === "REJECTED" && !partialExecutorRemarks.trim()) {
+      showSnackBar("Approver remarks are required for rejection.", "warning");
+      return;
+    }
+
+    if (selectedJournalPrefixes.length === 0) {
+      showSnackBar("Please select at least one entry to process.", "warning");
+      return;
+    }
+
+    setIsPartialSubmitting(true);
+
+    const payload = {
+      journalIdPrefixes: selectedJournalPrefixes,
+      status: mode,
+      remarks:
+        partialExecutorRemarks.trim() ||
+        (mode === "ACCEPTED" ? "Accepted" : "Rejected"),
+    };
+
+    try {
+      await callApi("MS/moc/process-bulk", payload, "POST");
+      handleCloseViewModal();
+      fetchPendingBatches();
+    } catch (error) {
+      console.error("Failed to process partial batch:", error);
+      const errorMsg =
+        error.response?.data?.message ||
+        `Failed to ${mode.toLowerCase()} selected entries.`;
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setIsPartialSubmitting(false);
+    }
+  };
+
+  const handleSelectAllClick = (event) => {
+    if (event.target.checked) {
+      const newSelecteds = batchDetails.map((group) => group[0].journalPrefix);
+      setSelectedJournalPrefixes(newSelecteds);
+      return;
+    }
+    setSelectedJournalPrefixes([]);
+  };
+
+  const handleRowCheckboxClick = (event, prefix) => {
+    if (event) {
+      event.stopPropagation();
+    }
+
+    const selectedIndex = selectedJournalPrefixes.indexOf(prefix);
+    let newSelected = [];
+
+    if (selectedIndex === -1) {
+      newSelected = newSelected.concat(selectedJournalPrefixes, prefix);
+    } else if (selectedIndex === 0) {
+      newSelected = newSelected.concat(selectedJournalPrefixes.slice(1));
+    } else if (selectedIndex === selectedJournalPrefixes.length - 1) {
+      newSelected = newSelected.concat(selectedJournalPrefixes.slice(0, -1));
+    } else if (selectedIndex > 0) {
+      newSelected = newSelected.concat(
+        selectedJournalPrefixes.slice(0, selectedIndex),
+        selectedJournalPrefixes.slice(selectedIndex + 1)
+      );
+    }
+    setSelectedJournalPrefixes(newSelected);
+  };
+
+  const columns = [
     {
-      "changeType": "ADD",
-      "branch": "BR001",
-      "currency": "INR",
-      "cgl": "1111111111",
-      "amount": 1000.00,
-      "productType": "SAVE",
-      "remarks": "Credit entry"
+      field: "batchId",
+      headerName: "Batch ID",
+      width: "125",
+      align: "center",
+      headerAlign: "center",
     },
     {
-      "changeType": "ADD",
-      "branch": "BR001",
-      "currency": "INR",
-      "cgl": "2222222222",
-      "amount": -1000.00,
-      "productType": "LOAN",
-      "remarks": "Debit entry"
-    }
-  ]
+      field: "requestStatus",
+      headerName: "Status",
+      width: "125",
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Chip label={params.value} color="warning" size="small" />
+      ),
+    },
+    {
+      field: "creatorId",
+      headerName: "Creator",
+      width: "150",
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Chip icon={<AccountCircleIcon />} label={params.value} size="small" />
+      ),
+    },
+    {
+      field: "requestDate",
+      headerName: "Submitted On",
+      width: "200",
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Box>
+          {new Date(params.value).toLocaleString("en-IN", {
+            dateStyle: "medium",
+            timeStyle: "short",
+          })}
+        </Box>
+      ),
+    },
+    {
+      field: "commonBatchRemarks",
+      headerName: "Creator Remarks",
+      width: "200",
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "requestCount",
+      headerName: "Entries",
+      width: "100",
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "totalCredit",
+      headerName: "Total Credit",
+      width: "250",
+      
+      align: "right",
+      headerAlign: "right",
+      renderCell: (params) => (
+       
+        <Typography marginTop={"5%"} >{formatCurrency(params.value)}</Typography>
+      ),
+    },
+    {
+      field: "totalDebit",
+      headerName: "Total Debit",
+      width: "250",
+     
+      align: "right",
+      headerAlign: "right",
+      
+      renderCell: (params) => (
+     
+        <Typography  marginTop={"5%"} >{formatCurrency(params.value)}</Typography>
+      ),
+    },
+    {
+      field: "actions",
+      headerName: "Actions",
+      flex: 0.8,
+      minWidth: 130,
+      align: "center",
+      headerAlign: "center",
+      sortable: false,
+      renderCell: (params) => (
+       
+        <Stack direction="row" spacing={0.5}>
+          <Tooltip title="View Details">
+            <IconButton
+              onClick={() => handleOpenViewModal(params.row.batchId)}
+              color="primary"
+            >
+              <VisibilityIcon />
+            </IconButton>
+          </Tooltip>
+          <Tooltip title="Accept Batch">
+            <IconButton
+              onClick={() => handleOpenModal(params.row, "ACCEPTED")}
+              color="success"
+            >
+              <CheckIcon />
+            </IconButton>
+          </Tooltip>
+          <Tooltip title="Reject Batch">
+            <IconButton
+              onClick={() => handleOpenModal(params.row, "REJECTED")}
+              color="error"
+            >
+              <ClearIcon />
+            </IconButton>
+          </Tooltip>
+        </Stack>
+      ),
+    },
+  ];
+
+  return (
+    <Box sx={{ p: 3, width: "100%" }}>
+      <DataGrid
+        rows={rows}
+        columns={columns}
+        loading={loading}
+        getRowId={(row) => row.batchId}
+        disableRowSelectionOnClick
+        pageSizeOptions={[5, 10, 25]}
+        disableColumnResize={true}
+        rowHeight={52}
+        initialState={{
+          pagination: {
+            paginationModel: { page: 0, pageSize: 10 },
+          },
+          sorting: { sortModel: [{ field: "requestDate", sort: "desc" }] },
+        }}
+        slots={{
+          noRowsOverlay: CustomNoRowsOverlay,
+        }}
+        sx={{
+          height: 600,
+          width: "100%",
+          "& .MuiDataGrid-cell:focus": { outline: "none" },
+        }}
+      />
+
+      <Dialog
+        open={isModalOpen}
+        onClose={handleCloseModal}
+        fullWidth
+        maxWidth="sm"
+      >
+        <DialogTitle>
+          {modalMode === "ACCEPTED" ? "Approve" : "Reject"} Batch
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            Are you sure you want to {modalMode.toLowerCase()} the entire batch{" "}
+            <strong>{selectedBatch?.batchId}</strong>?
+            {modalMode === "REJECTED" && " Remarks are required for rejection."}
+          </DialogContentText>
+
+          <TextField
+            autoFocus={modalMode === "REJECTED"}
+            required={modalMode === "REJECTED"}
+            margin="dense"
+            id="executorRemarks"
+            label="Approver Remarks"
+            type="text"
+            fullWidth
+            variant="standard"
+            value={executorRemarks}
+            onChange={(e) => setExecutorRemarks(e.target.value)}
+            disabled={isSubmitting}
+            InputProps={{
+              inputProps: {
+                maxLength: 200,
+              },
+            }}
+          />
+        </DialogContent>
+        <DialogActions sx={{ p: 2 }}>
+          <Button onClick={handleCloseModal} disabled={isSubmitting}>
+            Cancel
+          </Button>
+          <Button
+            onClick={handleSubmitAction}
+            variant="contained"
+            color={modalMode === "ACCEPTED" ? "success" : "error"}
+            disabled={isSubmitting}
+          >
+            {isSubmitting ? (
+              <CircularProgress size={24} color="inherit" />
+            ) : (
+              `Confirm ${modalMode === "ACCEPTED" ? "Approval" : "Rejection"}`
+            )}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog
+        open={isViewModalOpen}
+        onClose={handleCloseViewModal}
+        fullWidth
+        maxWidth="xl"
+        sx={{ maxHeight: "70%" }}
+      >
+        <DialogTitle
+          sx={{
+            fontWeight: "bold",
+            display: "flex",
+            alignItems: "center",
+            pb: 2,
+          }}
+        >
+          Batch Details: {viewingBatchId}
+        </DialogTitle>
+        <Divider />
+        <DialogContent sx={{ p: 2 }}>
+          {isViewLoading ? (
+            <Box
+              sx={{
+                display: "flex",
+                justifyContent: "center",
+                alignItems: "center",
+                minHeight: 300,
+              }}
+            >
+              <CircularProgress />
+            </Box>
+          ) : (
+            <>
+              {batchDetails.length > 0 ? (
+                <TableContainer
+                  component={Paper}
+                  sx={{ maxHeight: 400, mt: 1 }}
+                >
+                  <Table
+                    sx={{ minWidth: 650, overflow: "auto" }}
+                    size="small"
+                    stickyHeader
+                  >
+                    <TableHead sx={{ background: "#ffffff66" }}>
+                      <TableRow>
+                        <TableCell padding="checkbox">
+                          <Checkbox
+                            color="primary"
+                            indeterminate={
+                              selectedJournalPrefixes.length > 0 &&
+                              selectedJournalPrefixes.length <
+                                batchDetails.length
+                            }
+                            checked={
+                              batchDetails.length > 0 &&
+                              selectedJournalPrefixes.length ===
+                                batchDetails.length
+                            }
+                            onChange={handleSelectAllClick}
+                          />
+                        </TableCell>
+                        <TableCell align="center">Journal ID</TableCell>
+                        <TableCell align="center">Branch</TableCell>
+                        <TableCell align="center">Currency</TableCell>
+                        <TableCell align="center">CGL</TableCell>
+                        <TableCell align="center">Amount</TableCell>
+                        <TableCell align="center">Txn Type</TableCell>
+                      </TableRow>
+                    </TableHead>
+
+                    <TableBody>
+                      {batchDetails.map((group, groupIndex) => (
+                        <React.Fragment key={group[0].journalPrefix}>
+                          {group.map((row, rowIndex) => {
+                            const isSelected = selectedJournalPrefixes.includes(
+                              row.journalPrefix
+                            );
+                            return (
+                              <TableRow
+                                key={row.id}
+                                hover
+                                onClick={() =>
+                                  handleRowCheckboxClick(
+                                    null,
+                                    row.journalPrefix
+                                  )
+                                }
+                                role="checkbox"
+                                aria-checked={isSelected}
+                                selected={isSelected}
+                              >
+                                <TableCell padding="checkbox">
+                                  {rowIndex === 0 && (
+                                    <Checkbox
+                                      color="primary"
+                                      checked={isSelected}
+                                      onClick={(e) =>
+                                        handleRowCheckboxClick(
+                                          e,
+                                          row.journalPrefix
+                                        )
+                                      }
+                                    />
+                                  )}
+                                </TableCell>
+
+                                <TableCell align="center">
+                                  {rowIndex === 0 ? (
+                                    <>{row.journalPrefix}</>
+                                  ) : (
+                                    ""
+                                  )}
+                                </TableCell>
+
+                                <TableCell align="center">
+                                  {row.payload.branch}
+                                </TableCell>
+                                <TableCell align="center">
+                                  {row.payload.currency}
+                                </TableCell>
+                                <TableCell align="center">
+                                  {row.payload.cgl}
+                                </TableCell>
+                                <TableCell align="center">
+                                  {formatCurrency(row.amount)}
+                                </TableCell>
+                                <TableCell align="center">
+                                  <Chip
+                                    label={row.transactionType}
+                                    color={getTxnTypeColor(
+                                      row.transactionType
+                                    )}
+                                    size="small"
+                                  />
+                                </TableCell>
+                              </TableRow>
+                            );
+                          })}
+                        </React.Fragment>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              ) : (
+                <Typography>No pending details found for this batch.</Typography>
+              )}
+
+              <Grid container spacing={2} alignItems="center">
+                <Grid item xs={12} md={12}> 
+                  <TextField
+                    margin="dense"
+                    id="partialExecutorRemarks"
+                    label="Approver Remarks (for selected)"
+                    type="text"
+                    fullWidth
+                    multiline
+                    rows={2}
+                    value={partialExecutorRemarks}
+                    onChange={(e) => setPartialExecutorRemarks(e.target.value)}
+                    disabled={
+                      isPartialSubmitting ||
+                      selectedJournalPrefixes.length === 0
+                    }
+                    InputProps={{
+                      inputProps: {
+                        maxLength: 200,
+                      },
+                    }}
+                  />
+                </Grid>
+                <Grid item xs={12} md={12}> 
+                  <Stack direction="row" spacing={1} justifyContent="flex-end">
+                    <Button
+                      variant="contained"
+                      color="success"
+                      onClick={() => handleSubmitPartialAction("ACCEPTED")}
+                      disabled={
+                        isPartialSubmitting ||
+                        selectedJournalPrefixes.length === 0
+                      }
+                    >
+                      {isPartialSubmitting ? (
+                        <CircularProgress size={24} color="inherit" />
+                      ) : (
+                        "Accept Selected"
+                      )}
+                    </Button>
+                    <Button
+                      variant="contained"
+                      color="error"
+                      onClick={() => handleSubmitPartialAction("REJECTED")}
+                      disabled={
+                        isPartialSubmitting ||
+                        selectedJournalPrefixes.length === 0
+                      }
+                    >
+                      {isPartialSubmitting ? (
+                        <CircularProgress size={24} color="inherit" />
+                      ) : (
+                        "Reject Selected"
+                      )}
+                    </Button>
+                  </Stack>
+                </Grid>
+              </Grid>
+            </>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ p: 2 }}>
+          <Button onClick={handleCloseViewModal}>Close</Button>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
 }
