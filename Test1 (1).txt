@@ -10,6 +10,7 @@ import {
   MenuItem,
   CircularProgress,
   Autocomplete,
+  Tooltip, // <-- IMPORTED
 } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
 import DeleteIcon from "@mui/icons-material/Delete";
@@ -30,6 +31,17 @@ const initialRowState = {
   txnType: "",
   remarks: "",
   productCode: "",
+};
+
+// Helper function for BigInt precision math
+const formatBigIntForDisplay = (val) => {
+  if (typeof val !== 'bigint') {
+    val = BigInt(val || 0);
+  }
+  const str = val.toString().padStart(5, '0'); // Pad for at least 0.0001
+  const integer = str.slice(0, -4);
+  const fractional = str.slice(-4);
+  return `${integer || '0'}.${fractional}`;
 };
 
 export default function MOCPosting() {
@@ -211,6 +223,32 @@ export default function MOCPosting() {
       return;
     }
 
+    // --- 4. CGL CHECK ---
+    const cglCheck = new Map();
+    for (const row of rows) {
+      if (!row.branch || !row.currency || !row.cgl) {
+        continue; // This will be caught by the main validation loop
+      }
+      const key = `${row.branch.code}-${row.currency}`;
+      const cgl = row.cgl.cglNumber;
+
+      if (!cglCheck.has(key)) {
+        cglCheck.set(key, new Set());
+      }
+
+      const cglSet = cglCheck.get(key);
+      if (cglSet.has(cgl)) {
+        showSnackBar(
+          `Duplicate CGL entry: "${cgl}" is used more than once for branch "${row.branch.name}" and currency "${row.currency}".`,
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
+      }
+      cglSet.add(cgl);
+    }
+    // --- END CGL CHECK ---
+
     const branchCurrencyTotals = new Map();
     const branchEntryCheck = new Map();
     const rowPayloads = [];
@@ -235,13 +273,20 @@ export default function MOCPosting() {
       const branchName = row.branch.name;
       const currency = row.currency;
 
-      const amount = parseFloat(row.amount) || 0;
+      // --- 3. PRECISION FIX ---
+      // Use BigInt for precise calculations, assuming 4 decimal places
+      const [integerPart = "0", fractionalPart = "0"] = (row.amount || "0").split('.');
+      // Ensure fractional part is 4 digits
+      const fractionalPadded = fractionalPart.substring(0, 4).padEnd(4, '0');
+      const amountAsBigInt = BigInt(integerPart + fractionalPadded);
+      // --- END PRECISION FIX ---
+      
       const compositeKey = `${branchCode}-${currency}`;
 
       if (!branchCurrencyTotals.has(compositeKey)) {
         branchCurrencyTotals.set(compositeKey, {
-          totalDebit: 0,
-          totalCredit: 0,
+          totalDebit: 0n, // Use BigInt
+          totalCredit: 0n, // Use BigInt
           branchName: branchName,
           branchCode: branchCode,
           currency: currency,
@@ -250,9 +295,9 @@ export default function MOCPosting() {
       const currencyTotals = branchCurrencyTotals.get(compositeKey);
 
       if (row.txnType === "Debit") {
-        currencyTotals.totalDebit += amount;
+        currencyTotals.totalDebit += amountAsBigInt;
       } else if (row.txnType === "Credit") {
-        currencyTotals.totalCredit += amount;
+        currencyTotals.totalCredit += amountAsBigInt;
       }
 
       if (!branchEntryCheck.has(branchCode)) {
@@ -263,9 +308,11 @@ export default function MOCPosting() {
         });
       }
       const branchCheck = branchEntryCheck.get(branchCode);
-      if (row.txnType === "Debit" && amount > 0) {
+
+      // Check amountAsBigInt > 0n
+      if (row.txnType === "Debit" && amountAsBigInt > 0n) {
         branchCheck.hasDebit = true;
-      } else if (row.txnType === "Credit" && amount > 0) {
+      } else if (row.txnType === "Credit" && amountAsBigInt > 0n) {
         branchCheck.hasCredit = true;
       }
 
@@ -281,7 +328,9 @@ export default function MOCPosting() {
         amount: finalAmount,
         productType: row.productCode,
         remarks: row.remarks,
-        arFlag: "A",
+        arFlag: "A", 
+        // Note: acClassification is in your DTO but not here. 
+        // Assuming it's optional or handled by backend.
       });
     }
 
@@ -297,22 +346,24 @@ export default function MOCPosting() {
       }
     }
 
-    const EPSILON = 0.000001;
+    // --- 3. PRECISION FIX (Check) ---
     for (const [compositeKey, totals] of branchCurrencyTotals.entries()) {
       const { totalDebit, totalCredit, branchName, branchCode, currency } =
         totals;
 
-      if (Math.abs(totalDebit - totalCredit) > EPSILON) {
+      // Direct BigInt comparison
+      if (totalDebit !== totalCredit) {
         showSnackBar(
-          `Submission failed. Totals for branch "${branchName}" (${branchCode}) and currency "${currency}" do not match. Debit: ${totalDebit.toFixed(
-            2
-          )}, Credit: ${totalCredit.toFixed(2)}`,
+          `Submission failed. Totals for branch "${branchName}" (${branchCode}) and currency "${currency}" do not match. Debit: ${formatBigIntForDisplay(
+            totalDebit
+          )}, Credit: ${formatBigIntForDisplay(totalCredit)}`,
           "error"
         );
         setIsSubmitting(false);
         return;
       }
     }
+    // --- END PRECISION FIX (Check) ---
 
     const finalPayload = {
       commonBatchRemarks: commonBatchRemarks.trim(),
@@ -376,7 +427,8 @@ export default function MOCPosting() {
             value={commonBatchRemarks}
             onChange={(e) => {
               const newValue = e.target.value;
-              if (newValue.length <= 200) {
+              // --- 1. REMARK LIMIT ---
+              if (newValue.length <= 50) {
                 setCommonBatchRemarks(newValue);
 
                 if (checked && newValue.trim()) {
@@ -402,10 +454,10 @@ export default function MOCPosting() {
             fullWidth
             required
             multiline
-            rows={2}
+            rows={1} // <-- CHANGED
             InputProps={{
               inputProps: {
-                maxLength: 200,
+                maxLength: 50, // <-- CHANGED
               },
             }}
           />
@@ -450,22 +502,26 @@ export default function MOCPosting() {
                       option.code === value.code
                     }
                     renderInput={(params) => (
-                      <TextField
-                        {...params}
-                        label="Branch *"
-                        placeholder="Search by name or code"
-                        InputProps={{
-                          ...params.InputProps,
-                          endAdornment: (
-                            <Box>
-                              {branchSearch.loading ? (
-                                <CircularProgress color="inherit" size={20} />
-                              ) : null}
-                              {params.InputProps.endAdornment}
-                            </Box>
-                          ),
-                        }}
-                      />
+                      // --- 2. TOOLTIP ---
+                      <Tooltip title="Search by name or code" placement="top-start"> 
+                        <TextField
+                          {...params}
+                          label="Branch *"
+                          placeholder="Search by name or code"
+                          InputProps={{
+                            ...params.InputProps,
+                            endAdornment: (
+                              <Box>
+                                {branchSearch.loading ? (
+                                  <CircularProgress color="inherit" size={20} />
+                                ) : null}
+                                {params.InputProps.endAdornment}
+                              </Box>
+                            ),
+                          }}
+                        />
+                      </Tooltip>
+                      // --- END TOOLTIP ---
                     )}
                   />
                 </Grid>
@@ -554,7 +610,7 @@ export default function MOCPosting() {
                     value={row.amount}
                     onChange={(e) => {
                       const val = e.target.value;
-                      if (/^\d{0,21}(\.\d{0,4})?$/.test(val)) { // Adjusted for 21.4
+                      if (/^\d{0,21}(\.\d{0,4})?$/.test(val)) { 
                         handleRowChange(row.id, "amount", val);
                       }
                     }}
@@ -610,14 +666,15 @@ export default function MOCPosting() {
                     value={row.remarks}
                     onChange={(e) => {
                       const val = e.target.value; 
-                      if (val.length <= 40) {
+                      // --- 1. REMARK LIMIT ---
+                      if (val.length <= 50) { // <-- CHANGED
                         handleRowChange(row.id, "remarks", val);
                       }
                     }}
                     fullWidth
                     InputProps={{
                       inputProps: {
-                        maxLength: 40,
+                        maxLength: 50, // <-- CHANGED
                       },
                       readOnly: checked,
                     }}
@@ -671,762 +728,3 @@ export default function MOCPosting() {
     </Box>
   );
 }
-
-
-import React, { useState, useEffect, useCallback } from "react";
-import {
-  Box,
-  Typography,
-  Chip,
-  Dialog,
-  DialogActions,
-  DialogContent,
-  DialogContentText,
-  DialogTitle,
-  TextField,
-  Button,
-  CircularProgress,
-  Tooltip,
-  IconButton,
-  Stack,
-  Grid,
-  Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableHead,
-  TableRow,
-  Paper,
-  Checkbox,
-  Divider,
-} from "@mui/material";
-import { DataGrid } from "@mui/x-data-grid";
-import {
-  Check as CheckIcon,
-  Clear as ClearIcon,
-  Visibility as VisibilityIcon,
-} from "@mui/icons-material";
-import AccountCircleIcon from "@mui/icons-material/AccountCircle";
-import InfoIcon from "@mui/icons-material/Info";
-
-import useApi from "../../../hooks/useApi";
-import useCustomSnackbar from "../../../utils/useCustomSnackbar";
-
-
-const formatCurrency = (num) => {
-
-  return Number(num).toFixed(4);
-};
-
-const getTxnTypeColor = (txnType) => {
-  return txnType === "Debit" ? "error" : "success";
-};
-
-function CustomNoRowsOverlay() {
-  return (
-    <Stack height="100%" alignItems="center" justifyContent="center">
-      <InfoIcon sx={{ fontSize: 48, color: "text.secondary", mb: 2 }} />
-      <Typography variant="h6">No Pending Requests Found</Typography>
-      <Typography>All MOC requests have been processed.</Typography>
-    </Stack>
-  );
-}
-
-export default function MocRequestApproval() {
-  const { callApi } = useApi();
-  const showSnackBar = useCustomSnackbar();
-
-  const [loading, setLoading] = useState(true);
-  const [rows, setRows] = useState([]);
-
-  const [isModalOpen, setIsModalOpen] = useState(false);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [selectedBatch, setSelectedBatch] = useState(null);
-  const [modalMode, setModalMode] = useState("ACCEPTED");
-  const [executorRemarks, setExecutorRemarks] = useState("");
-
-  const [isViewModalOpen, setIsViewModalOpen] = useState(false);
-  const [isViewLoading, setIsViewLoading] = useState(false);
-
-  const [batchDetails, setBatchDetails] = useState([]);
-  const [viewingBatchId, setViewingBatchId] = useState(null);
-
-  const [selectedJournalPrefixes, setSelectedJournalPrefixes] = useState([]);
-  const [partialExecutorRemarks, setPartialExecutorRemarks] = useState("");
-  const [isPartialSubmitting, setIsPartialSubmitting] = useState(false);
-
-  const fetchPendingBatches = useCallback(async () => {
-    setLoading(true);
-    try {
-      const pendingRequests = await callApi(
-        "MS/moc/pending-requests",
-        null,
-        "GET"
-      );
-
-      if (!Array.isArray(pendingRequests) || pendingRequests.length === 0) {
-        setRows([]);
-        setLoading(false);
-        return;
-      }
-
-      const groupedBatches = new Map();
-      for (const request of pendingRequests) {
-        const batchId = request.batchId;
-
-        if (!groupedBatches.has(batchId)) {
-          groupedBatches.set(batchId, {
-            id: batchId,
-            batchId: batchId,
-            creatorId: request.creatorId,
-            requestStatus: request.requestStatus,
-            requestDate: request.requestDate,
-            commonBatchRemarks: request.commonBatchRemarks,
-            totalDebit: 0,
-            totalCredit: 0,
-            requestCount: 0,
-          });
-        }
-
-        const batchDetails = groupedBatches.get(batchId);
-        batchDetails.requestCount++;
-
-        try {
-          
-          const payload = JSON.parse(request.payload);
-          const amount = parseFloat(payload.amount) || 0;
-          
-          if (amount < 0) { 
-            batchDetails.totalDebit += Math.abs(amount);
-          } else { 
-            batchDetails.totalCredit += amount;
-          }
-         
-        } catch (e) {
-          console.error(`Failed to parse payload for request ${request.id}`, e);
-        }
-      }
-      setRows(Array.from(groupedBatches.values()));
-    } catch (err) {
-      console.error("Failed to fetch pending requests:", err);
-      const errorMsg =
-        err.response?.data?.message || "Failed to load pending requests.";
-      showSnackBar(errorMsg, "error");
-    } finally {
-      setLoading(false);
-    }
-  }, [callApi, showSnackBar]);
-
-  useEffect(() => {
-    fetchPendingBatches();
-  }, [fetchPendingBatches]);
-
-  const handleOpenModal = (batch, mode) => {
-    setSelectedBatch(batch);
-    setModalMode(mode);
-    setExecutorRemarks("");
-    setIsModalOpen(true);
-  };
-
-  const handleCloseModal = () => {
-    if (isSubmitting) return;
-    setIsModalOpen(false);
-    setSelectedBatch(null);
-  };
-
-  const handleOpenViewModal = async (batchId) => {
-    setIsViewModalOpen(true);
-    setIsViewLoading(true);
-    setViewingBatchId(batchId);
-    try {
-      const data = await callApi(`MS/moc/by-batch/${batchId}`, null, "GET");
-
-      if (Array.isArray(data)) {
-        const journalGroups = new Map();
-
-        const processedData = data
-          .map((req) => {
-            if (req.requestStatus !== "PENDING") {
-              return null;
-            }
-            try {
-             
-              const payload = JSON.parse(req.payload);
-              const prefix = req.journalId.split("-")[0];
-              const amount = parseFloat(payload.amount) || 0;
-              
-              return {
-                ...req,
-                payload,
-                journalPrefix: prefix,
-                amount: Math.abs(amount),
-                transactionType: amount < 0 ? "Debit" : "Credit", 
-              };
-              
-            } catch (e) {
-              console.error("Failed to parse payload for req:", req.id, e);
-              return null;
-            }
-          })
-          .filter(Boolean);
-
-        processedData.sort((a, b) => a.journalId.localeCompare(b.journalId));
-
-        for (const row of processedData) {
-          const prefix = row.journalPrefix;
-          if (!journalGroups.has(prefix)) {
-            journalGroups.set(prefix, []);
-          }
-          journalGroups.get(prefix).push(row);
-        }
-
-        setBatchDetails(Array.from(journalGroups.values()));
-      } else {
-        setBatchDetails([]);
-        showSnackBar("No details found for this batch.", "info");
-      }
-    } catch (error) {
-      console.error("Failed to fetch batch details:", error);
-      const errorMsg =
-        error.response?.data?.message || "Failed to load batch details.";
-      showSnackBar(errorMsg, "error");
-      setBatchDetails([]);
-    } finally {
-      setIsViewLoading(false);
-    }
-  };
-
-  const handleCloseViewModal = () => {
-    setIsViewModalOpen(false);
-    setBatchDetails([]);
-    setViewingBatchId(null);
-    setSelectedJournalPrefixes([]);
-    setPartialExecutorRemarks("");
-    setIsPartialSubmitting(false);
-  };
-
-  const handleSubmitAction = async () => {
-    if (modalMode === "REJECTED" && !executorRemarks.trim()) {
-      showSnackBar("Approver remarks are required for rejection.", "warning");
-      return;
-    }
-
-    setIsSubmitting(true);
-    const payload = {
-      batchId: selectedBatch.batchId,
-      status: modalMode,
-      remarks:
-        executorRemarks.trim() ||
-        (modalMode === "ACCEPTED" ? "Accepted" : "Rejected"),
-    };
-
-    try {
-      await callApi("MS/moc/process-bulk", payload, "POST");
-      handleCloseModal();
-      fetchPendingBatches();
-    } catch (error) {
-      console.error("Failed to process batch:", error);
-      const errorMsg =
-        error.response?.data?.message ||
-        `Failed to ${modalMode.toLowerCase()} batch.`;
-      showSnackBar(errorMsg, "error");
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  const handleSubmitPartialAction = async (mode) => {
-    if (mode === "REJECTED" && !partialExecutorRemarks.trim()) {
-      showSnackBar("Approver remarks are required for rejection.", "warning");
-      return;
-    }
-
-    if (selectedJournalPrefixes.length === 0) {
-      showSnackBar("Please select at least one entry to process.", "warning");
-      return;
-    }
-
-    setIsPartialSubmitting(true);
-
-    const payload = {
-      journalIdPrefixes: selectedJournalPrefixes,
-      status: mode,
-      remarks:
-        partialExecutorRemarks.trim() ||
-        (mode === "ACCEPTED" ? "Accepted" : "Rejected"),
-    };
-
-    try {
-      await callApi("MS/moc/process-bulk", payload, "POST");
-      handleCloseViewModal();
-      fetchPendingBatches();
-    } catch (error) {
-      console.error("Failed to process partial batch:", error);
-      const errorMsg =
-        error.response?.data?.message ||
-        `Failed to ${mode.toLowerCase()} selected entries.`;
-      showSnackBar(errorMsg, "error");
-    } finally {
-      setIsPartialSubmitting(false);
-    }
-  };
-
-  const handleSelectAllClick = (event) => {
-    if (event.target.checked) {
-      const newSelecteds = batchDetails.map((group) => group[0].journalPrefix);
-      setSelectedJournalPrefixes(newSelecteds);
-      return;
-    }
-    setSelectedJournalPrefixes([]);
-  };
-
-  const handleRowCheckboxClick = (event, prefix) => {
-    if (event) {
-      event.stopPropagation();
-    }
-
-    const selectedIndex = selectedJournalPrefixes.indexOf(prefix);
-    let newSelected = [];
-
-    if (selectedIndex === -1) {
-      newSelected = newSelected.concat(selectedJournalPrefixes, prefix);
-    } else if (selectedIndex === 0) {
-      newSelected = newSelected.concat(selectedJournalPrefixes.slice(1));
-    } else if (selectedIndex === selectedJournalPrefixes.length - 1) {
-      newSelected = newSelected.concat(selectedJournalPrefixes.slice(0, -1));
-    } else if (selectedIndex > 0) {
-      newSelected = newSelected.concat(
-        selectedJournalPrefixes.slice(0, selectedIndex),
-        selectedJournalPrefixes.slice(selectedIndex + 1)
-      );
-    }
-    setSelectedJournalPrefixes(newSelected);
-  };
-
-  const columns = [
-    {
-      field: "batchId",
-      headerName: "Batch ID",
-      width: "125",
-      align: "center",
-      headerAlign: "center",
-    },
-    {
-      field: "requestStatus",
-      headerName: "Status",
-      width: "125",
-      align: "center",
-      headerAlign: "center",
-      renderCell: (params) => (
-        <Chip label={params.value} color="warning" size="small" />
-      ),
-    },
-    {
-      field: "creatorId",
-      headerName: "Creator",
-      width: "150",
-      align: "center",
-      headerAlign: "center",
-      renderCell: (params) => (
-        <Chip icon={<AccountCircleIcon />} label={params.value} size="small" />
-      ),
-    },
-    {
-      field: "requestDate",
-      headerName: "Submitted On",
-      width: "200",
-      align: "center",
-      headerAlign: "center",
-      renderCell: (params) => (
-        <Box>
-          {new Date(params.value).toLocaleString("en-IN", {
-            dateStyle: "medium",
-            timeStyle: "short",
-          })}
-        </Box>
-      ),
-    },
-    {
-      field: "commonBatchRemarks",
-      headerName: "Creator Remarks",
-      width: "200",
-      align: "center",
-      headerAlign: "center",
-    },
-    {
-      field: "requestCount",
-      headerName: "Entries",
-      width: "100",
-      align: "center",
-      headerAlign: "center",
-    },
-    {
-      field: "totalCredit",
-      headerName: "Total Credit",
-      width: "250",
-      
-      align: "right",
-      headerAlign: "right",
-      renderCell: (params) => (
-       
-        <Typography marginTop={"5%"} >{formatCurrency(params.value)}</Typography>
-      ),
-    },
-    {
-      field: "totalDebit",
-      headerName: "Total Debit",
-      width: "250",
-     
-      align: "right",
-      headerAlign: "right",
-      
-      renderCell: (params) => (
-     
-        <Typography  marginTop={"5%"} >{formatCurrency(params.value)}</Typography>
-      ),
-    },
-    {
-      field: "actions",
-      headerName: "Actions",
-      flex: 0.8,
-      minWidth: 130,
-      align: "center",
-      headerAlign: "center",
-      sortable: false,
-      renderCell: (params) => (
-       
-        <Stack direction="row" spacing={0.5}>
-          <Tooltip title="View Details">
-            <IconButton
-              onClick={() => handleOpenViewModal(params.row.batchId)}
-              color="primary"
-            >
-              <VisibilityIcon />
-            </IconButton>
-          </Tooltip>
-          <Tooltip title="Accept Batch">
-            <IconButton
-              onClick={() => handleOpenModal(params.row, "ACCEPTED")}
-              color="success"
-            >
-              <CheckIcon />
-            </IconButton>
-          </Tooltip>
-          <Tooltip title="Reject Batch">
-            <IconButton
-              onClick={() => handleOpenModal(params.row, "REJECTED")}
-              color="error"
-            >
-              <ClearIcon />
-            </IconButton>
-          </Tooltip>
-        </Stack>
-      ),
-    },
-  ];
-
-  return (
-    <Box sx={{ p: 3, width: "100%" }}>
-      <DataGrid
-        rows={rows}
-        columns={columns}
-        loading={loading}
-        getRowId={(row) => row.batchId}
-        disableRowSelectionOnClick
-        pageSizeOptions={[5, 10, 25]}
-        disableColumnResize={true}
-        rowHeight={52}
-        initialState={{
-          pagination: {
-            paginationModel: { page: 0, pageSize: 10 },
-          },
-          sorting: { sortModel: [{ field: "requestDate", sort: "desc" }] },
-        }}
-        slots={{
-          noRowsOverlay: CustomNoRowsOverlay,
-        }}
-        sx={{
-          height: 600,
-          width: "100%",
-          "& .MuiDataGrid-cell:focus": { outline: "none" },
-        }}
-      />
-
-      <Dialog
-        open={isModalOpen}
-        onClose={handleCloseModal}
-        fullWidth
-        maxWidth="sm"
-      >
-        <DialogTitle>
-          {modalMode === "ACCEPTED" ? "Approve" : "Reject"} Batch
-        </DialogTitle>
-        <DialogContent>
-          <DialogContentText>
-            Are you sure you want to {modalMode.toLowerCase()} the entire batch{" "}
-            <strong>{selectedBatch?.batchId}</strong>?
-            {modalMode === "REJECTED" && " Remarks are required for rejection."}
-          </DialogContentText>
-
-          <TextField
-            autoFocus={modalMode === "REJECTED"}
-            required={modalMode === "REJECTED"}
-            margin="dense"
-            id="executorRemarks"
-            label="Approver Remarks"
-            type="text"
-            fullWidth
-            variant="standard"
-            value={executorRemarks}
-            onChange={(e) => setExecutorRemarks(e.target.value)}
-            disabled={isSubmitting}
-            InputProps={{
-              inputProps: {
-                maxLength: 200,
-              },
-            }}
-          />
-        </DialogContent>
-        <DialogActions sx={{ p: 2 }}>
-          <Button onClick={handleCloseModal} disabled={isSubmitting}>
-            Cancel
-          </Button>
-          <Button
-            onClick={handleSubmitAction}
-            variant="contained"
-            color={modalMode === "ACCEPTED" ? "success" : "error"}
-            disabled={isSubmitting}
-          >
-            {isSubmitting ? (
-              <CircularProgress size={24} color="inherit" />
-            ) : (
-              `Confirm ${modalMode === "ACCEPTED" ? "Approval" : "Rejection"}`
-            )}
-          </Button>
-        </DialogActions>
-      </Dialog>
-
-      <Dialog
-        open={isViewModalOpen}
-        onClose={handleCloseViewModal}
-        fullWidth
-        maxWidth="xl"
-        sx={{ maxHeight: "70%" }}
-      >
-        <DialogTitle
-          sx={{
-            fontWeight: "bold",
-            display: "flex",
-            alignItems: "center",
-            pb: 2,
-          }}
-        >
-          Batch Details: {viewingBatchId}
-        </DialogTitle>
-        <Divider />
-        <DialogContent sx={{ p: 2 }}>
-          {isViewLoading ? (
-            <Box
-              sx={{
-                display: "flex",
-                justifyContent: "center",
-                alignItems: "center",
-                minHeight: 300,
-              }}
-            >
-              <CircularProgress />
-            </Box>
-          ) : (
-            <>
-              {batchDetails.length > 0 ? (
-                <TableContainer
-                  component={Paper}
-                  sx={{ maxHeight: 400, mt: 1 }}
-                >
-                  <Table
-                    sx={{ minWidth: 650, overflow: "auto" }}
-                    size="small"
-                    stickyHeader
-                  >
-                    <TableHead sx={{ background: "#ffffff66" }}>
-                      <TableRow>
-                        <TableCell padding="checkbox">
-                          <Checkbox
-                            color="primary"
-                            indeterminate={
-                              selectedJournalPrefixes.length > 0 &&
-                              selectedJournalPrefixes.length <
-                                batchDetails.length
-                            }
-                            checked={
-                              batchDetails.length > 0 &&
-                              selectedJournalPrefixes.length ===
-                                batchDetails.length
-                            }
-                            onChange={handleSelectAllClick}
-                          />
-                        </TableCell>
-                        <TableCell align="center">Journal ID</TableCell>
-                        <TableCell align="center">Branch</TableCell>
-                        <TableCell align="center">Currency</TableCell>
-                        <TableCell align="center">CGL</TableCell>
-                        <TableCell align="center">Amount</TableCell>
-                        <TableCell align="center">Txn Type</TableCell>
-                      </TableRow>
-                    </TableHead>
-
-                    <TableBody>
-                      {batchDetails.map((group, groupIndex) => (
-                        <React.Fragment key={group[0].journalPrefix}>
-                          {group.map((row, rowIndex) => {
-                            const isSelected = selectedJournalPrefixes.includes(
-                              row.journalPrefix
-                            );
-                            return (
-                              <TableRow
-                                key={row.id}
-                                hover
-                                onClick={() =>
-                                  handleRowCheckboxClick(
-                                    null,
-                                    row.journalPrefix
-                                  )
-                                }
-                                role="checkbox"
-                                aria-checked={isSelected}
-                                selected={isSelected}
-                              >
-                                <TableCell padding="checkbox">
-                                  {rowIndex === 0 && (
-                                    <Checkbox
-                                      color="primary"
-                                      checked={isSelected}
-                                      onClick={(e) =>
-                                        handleRowCheckboxClick(
-                                          e,
-                                          row.journalPrefix
-                                        )
-                                      }
-                                    />
-                                  )}
-                                </TableCell>
-
-                                <TableCell align="center">
-                                  {rowIndex === 0 ? (
-                                    <>{row.journalPrefix}</>
-                                  ) : (
-                                    ""
-                                  )}
-                                </TableCell>
-
-                                <TableCell align="center">
-                                  {row.payload.branch}
-                                </TableCell>
-                                <TableCell align="center">
-                                  {row.payload.currency}
-                                </TableCell>
-                                <TableCell align="center">
-                                  {row.payload.cgl}
-                                </TableCell>
-                                <TableCell align="center">
-                              
-                                  {formatCurrency(row.amount)}
-                                </TableCell>
-                                <TableCell align="center">
-                              
-                                  <Chip
-                                    label={row.transactionType}
-                                    color={getTxnTypeColor(
-                                      row.transactionType
-                                    )}
-                                    size="small"
-                                  />
-                                </TableCell>
-                              </TableRow>
-                            );
-                          })}
-                        </React.Fragment>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </TableContainer>
-              ) : (
-                <Typography>No pending details found for this batch.</Typography>
-              )}
-
-              <Grid container spacing={2} alignItems="center">
-                <Grid item xs={12} md={12}> 
-                  <TextField
-                    margin="dense"
-                    id="partialExecutorRemarks"
-                    label="Approver Remarks (for selected)"
-                    type="text"
-                    fullWidth
-                    multiline
-                    rows={2}
-                    value={partialExecutorRemarks}
-                    onChange={(e) => setPartialExecutorRemarks(e.target.value)}
-                    disabled={
-                      isPartialSubmitting ||
-                      selectedJournalPrefixes.length === 0
-                    }
-                    InputProps={{
-                      inputProps: {
-                        maxLength: 200,
-                      },
-                    }}
-                  />
-                </Grid>
-                <Grid item xs={12} md={12}> 
-                  <Stack direction="row" spacing={1} justifyContent="flex-end">
-                    <Button
-                      variant="contained"
-                      color="success"
-                      onClick={() => handleSubmitPartialAction("ACCEPTED")}
-                      disabled={
-                        isPartialSubmitting ||
-                        selectedJournalPrefixes.length === 0
-                      }
-                    >
-                      {isPartialSubmitting ? (
-                        <CircularProgress size={24} color="inherit" />
-                      ) : (
-                        "Accept Selected"
-                      )}
-                    </Button>
-                    <Button
-                      variant="contained"
-                      color="error"
-                      onClick={() => handleSubmitPartialAction("REJECTED")}
-                      disabled={
-                        isPartialSubmitting ||
-                        selectedJournalPrefixes.length === 0
-                      }
-                    >
-                      {isPartialSubmitting ? (
-                        <CircularProgress size={24} color="inherit" />
-                      ) : (
-                        "Reject Selected"
-                      )}
-                    </Button>
-                  </Stack>
-                </Grid>
-              </Grid>
-            </>
-          )}
-        </DialogContent>
-        <DialogActions sx={{ p: 2 }}>
-          <Button onClick={handleCloseViewModal}>Close</Button>
-        </DialogActions>
-      </Dialog>
-    </Box>
-  );
-}
-
-
-from this files i need some changes which is listed below in frontend/backend
-
-1) what ever / every remark should have 50 char limit from frontend and backend also
-2) where i am searching branches in the moc posting screen in that on hover it should show search by name and code 
-3) logical problem is there like supoose in credit i am entering 13698.2653 and in debit i am entering 13698.265 it taking that which should not takes that not even 0.1 mismatch should be there 
-4) same cgl should not be there before submitting cheak that cgl is same or not
