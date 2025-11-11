@@ -1,672 +1,626 @@
-import React, { useState, useEffect, useCallback } from "react";
-import {
-  Box,
-  Typography,
-  Chip,
-  Dialog,
-  DialogActions,
-  DialogContent,
-  DialogContentText,
-  DialogTitle,
-  Button,
-  CircularProgress,
-  Tooltip,
-  IconButton,
-  Stack,
-  Grid,
-  Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableHead,
-  TableRow,
-  Paper,
-  Checkbox,
-  Divider,
-} from "@mui/material";
-import { DataGrid } from "@mui/x-data-grid";
-import {
-  Cancel as CancelIcon,
-  DeleteSweep as DeleteSweepIcon,
-  Visibility as VisibilityIcon,
-} from "@mui/icons-material";
-import AccountCircleIcon from "@mui/icons-material/AccountCircle";
-import InfoIcon from "@mui/icons-material/Info";
-import DeleteIcon from '@mui/icons-material/Delete';
+package com.tcs.fincore.MOCService.Service;
 
-import useApi from "../../../hooks/useApi";
-import useCustomSnackbar from "../../../utils/useCustomSnackbar";
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.MOCService.Dto.*;
+import com.tcs.fincore.MOCService.Exception.ResourceNotFoundException;
+import com.tcs.fincore.MOCService.Models.GlTransaction;
+import com.tcs.fincore.MOCService.Models.MocRequest;
+import com.tcs.fincore.MOCService.Models.enums.RequestStatus;
+import com.tcs.fincore.MOCService.Repository.GlTransactionRepository;
+import com.tcs.fincore.MOCService.Repository.MocRequestRepository;
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.data.domain.Sort;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
 
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
 
-const formatCurrency = (num) => {
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class MocRequestServiceImpl implements MocRequestService {
 
-  return Number(num).toFixed(4);
-};
+    private final MocRequestRepository mocRequestRepository;
+    private final GlTransactionRepository glTransactionRepository; 
+    private final ObjectMapper objectMapper;
+    private final SequenceService sequenceService; 
 
-// --- UPDATED LOGIC ---
-const getTxnTypeColor = (txnType) => {
-  // Credit is negative (error/red), Debit is positive (success/green)
-  return txnType === "Credit" ? "error" : "success";
-};
-// --- END OF UPDATE ---
+    @Override
+    @Transactional
+    public List<MocRequest> createBatchRequest(BatchRequestDto batchDto, String creatorId) throws JsonProcessingException {
+        
+        String batchId = sequenceService.getNextBatchId();
+        log.info("Creating new MOC batch with Batch ID: {}", batchId);
 
+       
+        LocalDate postingDate = LocalDate.now();
+        
+        List<MocRequest> requestsToSave = new ArrayList<>();
+        String commonRemarks = batchDto.getCommonBatchRemarks();
 
-function CustomNoRowsOverlay() {
-  return (
-    <Stack height="100%" alignItems="center" justifyContent="center">
-      <InfoIcon sx={{ fontSize: 48, color: "text.secondary", mb: 2 }} />
-      <Typography variant="h6">No Pending Requests Found</Typography>
-      <Typography>You do not have any MOC requests awaiting processing.</Typography>
-    </Stack>
-  );
-}
+        Map<String, List<BatchRequestDto.MocRequestRow>> groupedRows = batchDto.getRows().stream()
+                .collect(Collectors.groupingBy(row -> row.getBranch() + ":" + row.getCurrency()));
+        
+        log.info("Batch {} contains {} distinct Branch-Currency groups.", batchId, groupedRows.size());
 
-export default function JournalPostingStatus() {
-  const { callApi } = useApi();
-  const showSnackBar = useCustomSnackbar();
-
-  const [loading, setLoading] = useState(true);
-  const [rows, setRows] = useState([]);
-
-  const [isModalOpen, setIsModalOpen] = useState(false);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [selectedBatch, setSelectedBatch] = useState(null);
-
-  const [isViewModalOpen, setIsViewModalOpen] = useState(false);
-  const [isViewLoading, setIsViewLoading] = useState(false);
-
-  const [batchDetails, setBatchDetails] = useState([]);
-  const [viewingBatchId, setViewingBatchId] = useState(null);
-
-  const [selectedJournalPrefixes, setSelectedJournalPrefixes] = useState([]);
-  const [isPartialSubmitting, setIsPartialSubmitting] = useState(false);
-
-  const fetchMyPendingBatches = useCallback(async () => {
-    setLoading(true);
-    try {
-      const myRequests = await callApi("MS/moc/my-requests", null, "GET");
-      const pendingRequests = Array.isArray(myRequests)
-        ? myRequests.filter((req) => req.requestStatus === "PENDING")
-        : [];
-
-      if (pendingRequests.length === 0) {
-        setRows([]);
-        setLoading(false);
-        return;
-      }
-
-      const groupedBatches = new Map();
-      for (const request of pendingRequests) {
-        const batchId = request.batchId;
-
-        if (!groupedBatches.has(batchId)) {
-          groupedBatches.set(batchId, {
-            id: batchId,
-            batchId: batchId,
-            creatorId: request.creatorId,
-            requestStatus: request.requestStatus,
-            requestDate: request.requestDate,
-            commonBatchRemarks: request.commonBatchRemarks,
-            totalDebit: 0,
-            totalCredit: 0,
-            requestCount: 0,
-          });
-        }
-
-        const batchDetails = groupedBatches.get(batchId);
-        batchDetails.requestCount++;
-
-        try {
-          // --- UPDATED LOGIC ---
-          // Negative amount is Credit, Positive is Debit
-          const payload = JSON.parse(request.payload);
-          const amount = parseFloat(payload.amount) || 0;
-          if (amount < 0) { // Negative is Credit
-            batchDetails.totalCredit += Math.abs(amount);
-          } else { // Positive is Debit
-            batchDetails.totalDebit += amount;
-          }
-          // --- END OF UPDATE ---
-        } catch (e) {
-          console.error(`Failed to parse payload for request ${request.id}`, e);
-        }
-      }
-      setRows(Array.from(groupedBatches.values()));
-    } catch (err) {
-      console.error("Failed to fetch user's pending requests:", err);
-      const errorMsg =
-        err.response?.data?.message || "Failed to load your pending requests.";
-      showSnackBar(errorMsg, "error");
-    } finally {
-      setLoading(false);
-    }
-  }, [callApi, showSnackBar]);
-
-  useEffect(() => {
-    fetchMyPendingBatches();
-  }, [fetchMyPendingBatches]);
-
-  const handleOpenModal = (batch) => {
-    setSelectedBatch(batch);
-    setIsModalOpen(true);
-  };
-
-  const handleCloseModal = () => {
-    if (isSubmitting) return;
-    setIsModalOpen(false);
-    setSelectedBatch(null);
-  };
-
-  const handleOpenViewModal = async (batchId) => {
-    setIsViewModalOpen(true);
-    setIsViewLoading(true);
-    setViewingBatchId(batchId);
-    try {
-      const data = await callApi(`MS/moc/by-batch/${batchId}`, null, "GET");
-
-      if (Array.isArray(data)) {
-        const journalGroups = new Map();
-
-        const processedData = data
-          .map((req) => {
-            if (req.requestStatus !== "PENDING") {
-              return null;
-            }
-            try {
-              // --- UPDATED LOGIC ---
-              // Negative amount is Credit, Positive is Debit
-              const payload = JSON.parse(req.payload);
-              const prefix = req.journalId.split("-")[0];
-              const amount = parseFloat(payload.amount) || 0;
-              return {
-                ...req,
-                payload,
-                journalPrefix: prefix,
-                amount: Math.abs(amount), // Store absolute amount for display
-                transactionType: amount < 0 ? "Credit" : "Debit", // Derive type
-              };
-              // --- END OF UPDATE ---
-            } catch (e) {
-              console.error("Failed to parse payload for req:", req.id, e);
-              return null;
-            }
-          })
-          .filter(Boolean);
-
-        processedData.sort((a, b) => a.journalId.localeCompare(b.journalId));
-
-        for (const row of processedData) {
-          const prefix = row.journalPrefix;
-          if (!journalGroups.has(prefix)) {
-            journalGroups.set(prefix, []);
-          }
-          journalGroups.get(prefix).push(row);
-        }
-
-        setBatchDetails(Array.from(journalGroups.values()));
-      } else {
-        setBatchDetails([]);
-        showSnackBar("No pending details found for this batch.", "info");
-      }
-    } catch (error) {
-      console.error("Failed to fetch batch details:", error);
-      const errorMsg =
-        error.response?.data?.message || "Failed to load batch details.";
-      showSnackBar(errorMsg, "error");
-      setBatchDetails([]);
-    } finally {
-      setIsViewLoading(false);
-    }
-  };
-
-  const handleCloseViewModal = () => {
-    setIsViewModalOpen(false);
-    setBatchDetails([]);
-    setViewingBatchId(null);
-    setSelectedJournalPrefixes([]);
-    setIsPartialSubmitting(false);
-  };
-
-  const handleSubmitBatchCancel = async () => {
-    setIsSubmitting(true);
-    try {
-      await callApi(
-        `MS/moc/my-requests/by-batch/${selectedBatch.batchId}`,
-        null,
-        "DELETE"
-      );
-      showSnackBar(
-        `Batch ${selectedBatch.batchId} successfully canceled.`,
-        "success"
-      );
-      handleCloseModal();
-      fetchMyPendingBatches();
-    } catch (error) {
-      console.error("Failed to cancel batch:", error);
-      const errorMsg =
-        error.response?.data?.message || "Failed to cancel batch.";
-      showSnackBar(errorMsg, "error");
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  const handleCancelSelectedJournals = async () => {
-    if (selectedJournalPrefixes.length === 0) {
-      showSnackBar(
-        "Please select at least one journal group to cancel.",
-        "warning"
-      );
-      return;
-    }
-
-    setIsPartialSubmitting(true);
-
-    try {
-      await callApi(
-        "MS/moc/my-requests/by-journal",
-        selectedJournalPrefixes,
-        "DELETE"
-      );
-      showSnackBar("Selected journal entries successfully canceled.", "success");
-      handleCloseViewModal();
-      fetchMyPendingBatches();
-    } catch (error) {
-      console.error("Failed to process partial batch:", error);
-      const errorMsg =
-        error.response?.data?.message || "Failed to cancel selected entries.";
-      showSnackBar(errorMsg, "error");
-    } finally {
-      setIsPartialSubmitting(false);
-    }
-  };
-
-  const handleSelectAllClick = (event) => {
-    if (event.target.checked) {
-      const newSelecteds = batchDetails.map((group) => group[0].journalPrefix);
-      setSelectedJournalPrefixes(newSelecteds);
-      return;
-    }
-    setSelectedJournalPrefixes([]);
-  };
-
-  const handleRowCheckboxClick = (event, prefix) => {
-    if (event) {
-      event.stopPropagation();
-    }
-
-    const selectedIndex = selectedJournalPrefixes.indexOf(prefix);
-    let newSelected = [];
-
-    if (selectedIndex === -1) {
-      newSelected = newSelected.concat(selectedJournalPrefixes, prefix);
-    } else if (selectedIndex === 0) {
-      newSelected = newSelected.concat(selectedJournalPrefixes.slice(1));
-    } else if (selectedIndex === selectedJournalPrefixes.length - 1) {
-      newSelected = newSelected.concat(selectedJournalPrefixes.slice(0, -1));
-    } else if (selectedIndex > 0) {
-      newSelected = newSelected.concat(
-        selectedJournalPrefixes.slice(0, selectedIndex),
-        selectedJournalPrefixes.slice(selectedIndex + 1)
-      );
-    }
-    setSelectedJournalPrefixes(newSelected);
-  };
-
-  const columns = [
-    {
-      field: "batchId",
-      headerName: "Batch ID",
-      width: "125",
-      align: "center",
-      headerAlign: "center",
-    },
-    {
-      field: "requestStatus",
-      headerName: "Status",
-      width: "125",
-      align: "center",
-      headerAlign: "center",
-      renderCell: (params) => (
-        <Chip label={params.value} color="warning" size="small" />
-      ),
-    },
-    {
-      field: "creatorId",
-      headerName: "Creator",
-      width: "150",
-      align: "center",
-      headerAlign: "center",
-      renderCell: (params) => (
-        <Chip icon={<AccountCircleIcon />} label={params.value} size="small" />
-      ),
-    },
-    {
-      field: "requestDate",
-      headerName: "Submitted On",
-      width: "200",
-      align: "center",
-      headerAlign: "center",
-      renderCell: (params) => (
-        <Box>
-          {new Date(params.value).toLocaleString("en-IN", {
-            dateStyle: "medium",
-            timeStyle: "short",
-          })}
-        </Box>
-      ),
-    },
-    {
-      field: "commonBatchRemarks",
-      headerName: "Creator Remarks",
-      width: "200",
-      align: "center",
-      headerAlign: "center",
-    },
-    {
-      field: "requestCount",
-      headerName: "Entries",
-      width: "100",
-      align: "center",
-      headerAlign: "center",
-    },
-    {
-      field: "totalCredit",
-      headerName: "Total Credit",
-      width: "250",
-      align: "right",
-      headerAlign: "center",
-
-      renderCell: (params) => (
-        <Typography marginTop={"5%"}>{formatCurrency(params.value)}</Typography>
-      ),
-    },
-    {
-      field: "totalDebit",
-      headerName: "Total Debit",
-      width: "250",
-      align: "right",
-      headerAlign: "center",
-      renderCell: (params) => (
-        <Typography marginTop={"5%"}>{formatCurrency(params.value)}</Typography>
-      ),
-    },
-    {
-      field: "actions",
-      headerName: "Actions",
-      flex: 0.8,
-      minWidth: 130,
-      align: "center",
-      headerAlign: "center",
-      sortable: false,
-      renderCell: (params) => (
-        <Stack direction="row" spacing={0.5} marginTop={"5%"}>
-          <Tooltip title="View Details">
-            <IconButton
-              onClick={() => handleOpenViewModal(params.row.batchId)}
-              color="primary"
-            >
-              <VisibilityIcon />
-            </IconButton>
-          </Tooltip>
-          <Tooltip title="Cancel Entire Batch">
-            <IconButton
-              onClick={() => handleOpenModal(params.row)}
-            >
-              <DeleteIcon />
-            </IconButton>
-          </Tooltip>
-        </Stack>
-      ),
-    },
-  ];
-
-  return (
-    <Box sx={{ p: 3, width: "100%" }}>
-      <DataGrid
-        rows={rows}
-        columns={columns}
-        loading={loading}
-        getRowId={(row) => row.batchId}
-        disableRowSelectionOnClick
-        pageSizeOptions={[5, 10, 25]}
-        disableColumnResize={true}
-        rowHeight={52}
-        initialState={{
-          pagination: {
-            paginationModel: { page: 0, pageSize: 10 },
-          },
-          sorting: { sortModel: [{ field: "requestDate", sort: "desc" }] },
-        }}
-        slots={{
-          noRowsOverlay: CustomNoRowsOverlay,
-        }}
-        sx={{
-          height: 600,
-          width: "100%",
-          "& .MuiDataGrid-cell:focus": { outline: "none" },
-        }}
-      />
-
-      <Dialog
-        open={isModalOpen}
-        onClose={handleCloseModal}
-        fullWidth
-        maxWidth="sm"
-      >
-        <DialogTitle sx={{ display: "flex", alignItems: "center" }}>
-          <DeleteSweepIcon sx={{ mr: 1, color: "error.main" }} />
-          Confirm Batch Cancellation
-        </DialogTitle>
-        <DialogContent>
-          <DialogContentText>
-            Are you sure you want to cancel all your pending requests in batch{" "}
-            <strong>{selectedBatch?.batchId}</strong>?
-            <br />
-            <br />
-            This will permanently delete {selectedBatch?.requestCount}{" "}
-            entry/entries created by you and cannot be undone.
-          </DialogContentText>
-        </DialogContent>
-        <DialogActions sx={{ p: 2 }}>
-          <Button onClick={handleCloseModal} disabled={isSubmitting}>
-            Back
-          </Button>
-          <Button
-            onClick={handleSubmitBatchCancel}
-            variant="contained"
-            color="error"
-            disabled={isSubmitting}
-          >
-            {isSubmitting ? (
-              <CircularProgress size={24} color="inherit" />
-            ) : (
-              "Confirm Cancel"
-            )}
-          </Button>
-        </DialogActions>
-      </Dialog>
-
-      <Dialog
-        open={isViewModalOpen}
-        onClose={handleCloseViewModal}
-        fullWidth
-        maxWidth="xl"
-        sx={{ maxHeight: "70%" }}
-      >
-        <DialogTitle
-          sx={{
-            fontWeight: "bold",
-            display: "flex",
-            alignItems: "center",
-            pb: 2,
-          }}
-        >
-          Batch Details: {viewingBatchId}
-        </DialogTitle>
-        <Divider />
-        <DialogContent sx={{ p: 2 }}>
-          {isViewLoading ? (
-            <Box
-              sx={{
-                display: "flex",
-                justifyContent: "center",
-                alignItems: "center",
-                minHeight: 300,
-              }}
-            >
-              <CircularProgress />
-            </Box>
-          ) : (
-            <>
-              {batchDetails.length > 0 ? (
-                <TableContainer
-                  component={Paper}
-                  sx={{ maxHeight: 400, mt: 1 }}
-                >
-                  <Table
-                    sx={{ minWidth: 650, overflow: "auto" }}
-                    size="small"
-                    stickyHeader
-                  >
-                    <TableHead sx={{ background: "#ffffff66" }}>
-                      <TableRow>
-                        <TableCell padding="checkbox">
-                          <Checkbox
-                            color="primary"
-                            indeterminate={
-                              selectedJournalPrefixes.length > 0 &&
-                              selectedJournalPrefixes.length <
-                                batchDetails.length
-                            }
-                            checked={
-                              batchDetails.length > 0 &&
-                              selectedJournalPrefixes.length ===
-                                batchDetails.length
-                            }
-                            onChange={handleSelectAllClick}
-                          />
-                        </TableCell>
-                        <TableCell align="center">Journal ID</TableCell>
-                        <TableCell align="center">Branch</TableCell>
-                        <TableCell align="center">Currency</TableCell>
-                        <TableCell align="center">CGL</TableCell>
-                        <TableCell align="center">Amount</TableCell>
-                        <TableCell align="center">Txn Type</TableCell>
-                      </TableRow>
-                    </TableHead>
-
-                    <TableBody>
-                      {batchDetails.map((group, groupIndex) => (
-                        <React.Fragment key={group[0].journalPrefix}>
-                          {group.map((row, rowIndex) => {
-                            const isSelected = selectedJournalPrefixes.includes(
-                              row.journalPrefix
-                            );
-                            return (
-                              <TableRow
-                                key={row.id}
-                                hover
-                                onClick={() =>
-                                  handleRowCheckboxClick(null, row.journalPrefix)
-                                }
-                                role="checkbox"
-                                aria-checked={isSelected}
-                                selected={isSelected}
-                              >
-                                <TableCell padding="checkbox">
-                                  {rowIndex === 0 && (
-                                    <Checkbox
-                                      color="primary"
-                                      checked={isSelected}
-                                      onClick={(e) =>
-                                        handleRowCheckboxClick(
-                                          e,
-                                          row.journalPrefix
-                                        )
-                                      }
-                                    />
-                                  )}
-                                </TableCell>
-
-                                <TableCell align="center">
-                                  {rowIndex === 0 ? (
-                                    <>{row.journalPrefix}</>
-                                  ) : (
-                                    ""
-                                  )}
-                                </TableCell>
-
-                                <TableCell align="center">
-                                  {row.payload.branch}
-                                </TableCell>
-                                <TableCell align="center">
-                                  {row.payload.currency}
-                                </TableCell>
-                                <TableCell align="center">
-                                  {row.payload.cgl}
-                                </TableCell>
-                                <TableCell align="center">
-                                  {/* This now works b/c amount is absolute */}
-                                  {formatCurrency(row.amount)}
-                                </TableCell>
-                                <TableCell align="center">
-                                  {/* This now works b/c transactionType is derived */}
-                                  <Chip
-                                    label={row.transactionType}
-                                    color={getTxnTypeColor(
-                                      row.transactionType
-                                    )}
-                                    size="small"
-                                  />
-                                </TableCell>
-                              </TableRow>
-                            );
-                          })}
-                        </React.Fragment>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </TableContainer>
-              ) : (
-                <Typography>No pending details found for this batch.</Typography>
-              )}
-
-              <Grid container spacing={2} alignItems="center">
-                <Grid item xs={12} md={6}>
+        for (Map.Entry<String, List<BatchRequestDto.MocRequestRow>> entry : groupedRows.entrySet()) {
+            
+            String journalIdPrefix = sequenceService.getNextJournalIdPrefix();
+            int journalSequence = 1;
+            List<BatchRequestDto.MocRequestRow> rowsInGroup = entry.getValue();
+            
+            for (BatchRequestDto.MocRequestRow rowDto : rowsInGroup) {
+                
+                String journalId = String.format("%s-%03d", journalIdPrefix, journalSequence);
+                
+                CreateMocRequestDto payloadDto = new CreateMocRequestDto();
+                
              
-                </Grid>
-                <Grid item xs={12} md={6}>
-                  <Stack
-                    direction="row"
-                    spacing={1}
-                    justifyContent="flex-end"
-                    sx={{ mt: 2 }}
-                  >
-                    <Button
-                      variant="contained"
-                      onClick={handleCancelSelectedJournals}
-                      disabled={
-                        isPartialSubmitting ||
-                        selectedJournalPrefixes.length === 0
-                      }
-                    >
-                      {isPartialSubmitting ? (
-                        <CircularProgress size={24} color="inherit" />
-                      ) : (
-                        "Cancel Selected"
-                      )}
-                    </Button>
-                  </Stack>
-                </Grid>
-              </Grid>
-            </>
-          )}
-        </DialogContent>
-        <DialogActions sx={{ p: 2 }}>
-          <Button onClick={handleCloseViewModal}>Close</Button>
-        </DialogActions>
-      </Dialog>
-    </Box>
-  );
+                payloadDto.setPDate(postingDate); 
+              
+                payloadDto.setChangeType(rowDto.getChangeType());
+                payloadDto.setMasterMocId(rowDto.getMasterMocId());
+                payloadDto.setBranch(rowDto.getBranch());
+                payloadDto.setCurrency(rowDto.getCurrency());
+                payloadDto.setCgl(rowDto.getCgl());
+                payloadDto.setAmount(rowDto.getAmount()); // This is now pos/neg
+                payloadDto.setProductType(rowDto.getProductType());
+                payloadDto.setRemarks(rowDto.getRemarks());
+                payloadDto.setArFlag(rowDto.getArFlag());
+                payloadDto.setAcClassification(rowDto.getAcClassification());
+                payloadDto.setBatchId(batchId); 
+                payloadDto.setJournalId(journalId); 
+                payloadDto.setCommonBatchRemarks(commonRemarks);
+                payloadDto.setTransactionCount(journalSequence); 
+                
+                MocRequest request = new MocRequest();
+                request.setCreatorId(creatorId);
+                request.setChangeType(rowDto.getChangeType());
+                request.setRequestStatus(RequestStatus.PENDING);
+                request.setBatchId(batchId);
+                request.setJournalId(journalId);
+                request.setCommonBatchRemarks(commonRemarks);
+                request.setPayload(objectMapper.writeValueAsString(payloadDto));
+
+                requestsToSave.add(request);
+
+                journalSequence++; 
+            }
+        }
+        return mocRequestRepository.saveAll(requestsToSave);
+    }
+  
+   
+
+    @Override
+    @Transactional
+    public Optional<MocRequest> updateRequestStatus(ProcessMocRequestDto dto, String executorId) throws JsonProcessingException {
+        MocRequest request = mocRequestRepository.findById(dto.getRequestId())
+                .orElseThrow(() -> new ResourceNotFoundException("MOC Request with ID " + dto.getRequestId() + " not found."));
+
+        if (executorId.equals(request.getCreatorId())) {
+            throw new IllegalStateException("User cannot approve or reject their own MOC request.");
+        }
+
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            throw new IllegalStateException("MOC Request has already been processed.");
+        }
+
+        request.setExecutorId(executorId);
+        request.setExecutorRemarks(dto.getRemarks());
+        request.setExecutionDate(LocalDateTime.now());
+        request.setRequestStatus(dto.getStatus());
+
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            log.info("MOC Request {} ACCEPTED. Processing for Batch ID: {}", dto.getRequestId(), request.getBatchId());
+            processApproval(request); 
+        } else {
+            log.info("MOC Request {} REJECTED.", dto.getRequestId());
+        }
+
+        return Optional.of(mocRequestRepository.save(request));
+    }
+    
+    private void processApproval(MocRequest request) throws JsonProcessingException {
+        CreateMocRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateMocRequestDto.class);
+
+        switch (request.getChangeType()) {
+            case ADD:
+                GlTransaction newGlTxn = new GlTransaction();
+                
+                newGlTxn.setBatchId(payloadDto.getBatchId());
+                newGlTxn.setJournalId(payloadDto.getJournalId());
+                
+                if (payloadDto.getPDate() != null) {
+                    newGlTxn.setPostDate(payloadDto.getPDate().atStartOfDay());
+                }
+                
+                newGlTxn.setBranchCode(payloadDto.getBranch());
+                newGlTxn.setCurrency(payloadDto.getCurrency());
+                newGlTxn.setCgl(payloadDto.getCgl());
+                newGlTxn.setNarration(payloadDto.getRemarks());
+                
+                // --- UPDATED LOGIC ---
+                // Store the negative value in the Credit column as requested.
+                BigDecimal amount = payloadDto.getAmount();
+                if (amount.signum() < 0) { // Negative amount is Credit
+                    newGlTxn.setCreditAmount(amount); // <-- Stores the negative value
+                    newGlTxn.setDebitAmount(BigDecimal.ZERO);
+                } else { // Positive or zero amount is Debit
+                    newGlTxn.setDebitAmount(amount);
+                    newGlTxn.setCreditAmount(BigDecimal.ZERO);
+                }
+                // --- END OF UPDATE ---
+                
+                newGlTxn.setTransactionCount(payloadDto.getTransactionCount());
+                newGlTxn.setSourceFlag("J"); // Hardcoded as requested
+                
+                glTransactionRepository.save(newGlTxn);
+                log.info("Successfully ADDED new GL_TRANSACTION record (Batch ID: {}, Journal ID: {}).", payloadDto.getBatchId(), payloadDto.getJournalId());
+                break;
+            case UPDATE:
+                log.warn("UPDATE ChangeType not yet implemented for GL_TRANSACTIONS. Request {} skipped.", request.getId());
+                break;
+            case DELETE:
+                log.warn("DELETE ChangeType not yet implemented for GL_TRANSACTIONS. Request {} skipped.", request.getId());
+                break;
+        }
+    }
+
+    @Override
+    public List<MocRequest> getMyRequests() {
+        log.info("Fetching ALL MOC requests for 'My Requests' screen.");
+        return mocRequestRepository.findAll(Sort.by(Sort.Direction.DESC, "requestDate"));
+    }
+
+    @Override
+    public List<MocRequest> getPendingRequests() {
+        return mocRequestRepository.findByRequestStatus(RequestStatus.PENDING);
+    }
+    
+    @Override
+    @Transactional
+    public List<MocRequest> processBulkRequests(BulkProcessMocRequestDto dto, String executorId) throws JsonProcessingException {
+
+        boolean hasBatchId = StringUtils.hasText(dto.getBatchId());
+        boolean hasJournalPrefixes = dto.getJournalIdPrefixes() != null && !dto.getJournalIdPrefixes().isEmpty();
+
+        if (!hasBatchId && !hasJournalPrefixes) {
+            throw new IllegalArgumentException("Either batchId or a list of journalIdPrefixes must be provided.");
+        }
+        if (hasBatchId && hasJournalPrefixes) {
+            throw new IllegalArgumentException("Provide either batchId or journalIdPrefixes, not both.");
+        }
+
+        List<MocRequest> requestsToProcess;
+        if (hasBatchId) {
+            log.info("Processing bulk request by Batch ID: {} for user: {}", dto.getBatchId(), executorId);
+            requestsToProcess = mocRequestRepository.findByBatchIdAndRequestStatus(dto.getBatchId(), RequestStatus.PENDING);
+        } else {
+            log.info("Processing bulk request by Journal Prefixes: {} for user: {}", dto.getJournalIdPrefixes().size(), executorId);
+            requestsToProcess = new ArrayList<>();
+            for (String prefix : dto.getJournalIdPrefixes()) {
+                requestsToProcess.addAll(
+                    mocRequestRepository.findByJournalIdStartingWithAndRequestStatus(prefix, RequestStatus.PENDING)
+                );
+            }
+        }
+
+        if (requestsToProcess.isEmpty()) {
+            log.warn("No pending requests found for the given criteria.");
+            return Collections.emptyList();
+        }
+
+        List<MocRequest> processedRequests = new ArrayList<>();
+        
+        for (MocRequest request : requestsToProcess) {
+            
+            if (executorId.equals(request.getCreatorId())) {
+                log.warn("Skipping request {}: User {} cannot approve/reject their own request.", request.getId(), executorId);
+                continue; 
+            }
+          
+            if (request.getRequestStatus() != RequestStatus.PENDING) {
+                log.warn("Skipping request {}: It is not in PENDING status.", request.getId());
+                continue;
+            }
+
+            request.setExecutorId(executorId);
+            request.setExecutorRemarks(dto.getRemarks());
+            request.setExecutionDate(LocalDateTime.now());
+            request.setRequestStatus(dto.getStatus());
+        
+            if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+                log.info("MOC Request {} ACCEPTED. Processing...", request.getId());
+                processApproval(request); 
+            } else {
+                log.info("MOC Request {} REJECTED.", request.getId());
+            }
+            processedRequests.add(request);
+        }
+     
+        return mocRequestRepository.saveAll(processedRequests);
+    }
+    
+    @Override
+    public List<MocRequest> getRequestsByBatchId(String batchId) {
+        log.info("Fetching all MOC requests for Batch ID: {}", batchId);
+        List<MocRequest> requests = mocRequestRepository.findByBatchId(batchId);
+        
+        if (requests.isEmpty()) {
+            log.warn("No requests found for Batch ID: {}", batchId);
+          
+            throw new ResourceNotFoundException("No MOC requests found for Batch ID: " + batchId);
+        }
+      
+        return requests;
+    }
+   
+    @Override
+    @Transactional
+    public void cancelMyRequest(Long requestId, String userId) {
+        MocRequest request = mocRequestRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("MOC Request with ID " + requestId + " not found."));
+
+        if (!userId.equals(request.getCreatorId())) {
+            log.warn("User {} attempted to cancel request {} owned by {}", userId, requestId, request.getCreatorId());
+            throw new IllegalStateException("You are not authorized to cancel this request.");
+        }
+
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            log.warn("User {} attempted to cancel request {} which is already in status {}", userId, requestId, request.getRequestStatus());
+            throw new IllegalStateException("Cannot cancel a request that has already been processed.");
+        }
+
+        mocRequestRepository.delete(request);
+        log.info("User {} successfully canceled MOC request {}", userId, requestId);
+    }
+
+    @Override
+    @Transactional
+    public void cancelMyRequestsByJournalPrefix(String journalIdPrefix, String userId) {
+        log.info("User {} attempting to cancel all requests with journal prefix: {}", userId, journalIdPrefix);
+
+       
+        List<MocRequest> requestsToCancel = mocRequestRepository.findByJournalIdStartingWithAndCreatorIdAndRequestStatus(
+                journalIdPrefix, userId, RequestStatus.PENDING);
+
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found for you with journal prefix: " + journalIdPrefix);
+        }
+        
+      
+        mocRequestRepository.deleteAll(requestsToCancel);
+        log.info("User {} successfully bulk-canceled {} requests for journal prefix {}", userId, requestsToCancel.size(), journalIdPrefix);
+    }
+    @Override
+    public List<MocRequestStatusDto> getMocRequestStatusList() {
+        log.info("Fetching all MOC requests for status list");
+        
+        List<MocRequest> allRequests = mocRequestRepository.findAll();
+        
+        return allRequests.stream()
+                .map(MocRequestStatusDto::new)
+                .collect(Collectors.toList());
+    }
+    
+    @Override
+    @Transactional
+    public void cancelMyRequestsByBatchId(String batchId, String userId) {
+        log.info("User {} attempting to cancel PENDING requests created by them in batch ID: {}", userId, batchId);
+
+        List<MEntry<String, List<BatchRequestDto.MocRequestRow>> entry : groupedRows.entrySet()) {
+            
+            String journalIdPrefix = sequenceService.getNextJournalIdPrefix();
+            int journalSequence = 1;
+            List<BatchRequestDto.MocRequestRow> rowsInGroup = entry.getValue();
+            
+            for (BatchRequestDto.MocRequestRow rowDto : rowsInGroup) {
+                
+                String journalId = String.format("%s-%03d", journalIdPrefix, journalSequence);
+                
+                CreateMocRequestDto payloadDto = new CreateMocRequestDto();
+                
+             
+                payloadDto.setPDate(postingDate); 
+              
+                payloadDto.setChangeType(rowDto.getChangeType());
+                payloadDto.setMasterMocId(rowDto.getMasterMocId());
+                payloadDto.setBranch(rowDto.getBranch());
+                payloadDto.setCurrency(rowDto.getCurrency());
+                payloadDto.setCgl(rowDto.getCgl());
+                payloadDto.setAmount(rowDto.getAmount()); // This is now pos/neg
+                payloadDto.setProductType(rowDto.getProductType());
+                payloadDto.setRemarks(rowDto.getRemarks());
+                payloadDto.setArFlag(rowDto.getArFlag());
+                payloadDto.setAcClassification(rowDto.getAcClassification());
+                payloadDto.setBatchId(batchId); 
+                payloadDto.setJournalId(journalId); 
+                payloadDto.setCommonBatchRemarks(commonRemarks);
+                payloadDto.setTransactionCount(journalSequence); 
+                
+                MocRequest request = new MocRequest();
+                request.setCreatorId(creatorId);
+                request.setChangeType(rowDto.getChangeType());
+                request.setRequestStatus(RequestStatus.PENDING);
+                request.setBatchId(batchId);
+                request.setJournalId(journalId);
+                request.setCommonBatchRemarks(commonRemarks);
+                request.setPayload(objectMapper.writeValueAsString(payloadDto));
+
+                requestsToSave.add(request);
+
+                journalSequence++; 
+            }
+        }
+        return mocRequestRepository.saveAll(requestsToSave);
+    }
+  
+   
+
+    @Override
+    @Transactional
+    public Optional<MocRequest> updateRequestStatus(ProcessMocRequestDto dto, String executorId) throws JsonProcessingException {
+        MocRequest request = mocRequestRepository.findById(dto.getRequestId())
+                .orElseThrow(() -> new ResourceNotFoundException("MOC Request with ID " + dto.getRequestId() + " not found."));
+
+        if (executorId.equals(request.getCreatorId())) {
+            throw new IllegalStateException("User cannot approve or reject their own MOC request.");
+        }
+
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            throw new IllegalStateException("MOC Request has already been processed.");
+        }
+
+        request.setExecutorId(executorId);
+        request.setExecutorRemarks(dto.getRemarks());
+        request.setExecutionDate(LocalDateTime.now());
+        request.setRequestStatus(dto.getStatus());
+
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            log.info("MOC Request {} ACCEPTED. Processing for Batch ID: {}", dto.getRequestId(), request.getBatchId());
+            processApproval(request); 
+        } else {
+            log.info("MOC Request {} REJECTED.", dto.getRequestId());
+        }
+
+        return Optional.of(mocRequestRepository.save(request));
+    }
+    
+    private void processApproval(MocRequest request) throws JsonProcessingException {
+        CreateMocRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateMocRequestDto.class);
+
+        switch (request.getChangeType()) {
+            case ADD:
+                GlTransaction newGlTxn = new GlTransaction();
+                
+                newGlTxn.setBatchId(payloadDto.getBatchId());
+                newGlTxn.setJournalId(payloadDto.getJournalId());
+                
+                if (payloadDto.getPDate() != null) {
+                    newGlTxn.setPostDate(payloadDto.getPDate().atStartOfDay());
+                }
+                
+                newGlTxn.setBranchCode(payloadDto.getBranch());
+                newGlTxn.setCurrency(payloadDto.getCurrency());
+                newGlTxn.setCgl(payloadDto.getCgl());
+                newGlTxn.setNarration(payloadDto.getRemarks());
+                
+                // --- UPDATED LOGIC ---
+                // Store the negative value in the Credit column as requested.
+                BigDecimal amount = payloadDto.getAmount();
+                if (amount.signum() < 0) { // Negative amount is Credit
+                    newGlTxn.setCreditAmount(amount); // <-- Stores the negative value
+                    newGlTxn.setDebitAmount(BigDecimal.ZERO);
+                } else { // Positive or zero amount is Debit
+                    newGlTxn.setDebitAmount(amount);
+                    newGlTxn.setCreditAmount(BigDecimal.ZERO);
+                }
+                // --- END OF UPDATE ---
+                
+                newGlTxn.setTransactionCount(payloadDto.getTransactionCount());
+                newGlTxn.setSourceFlag("J"); // Hardcoded as requested
+                
+                glTransactionRepository.save(newGlTxn);
+                log.info("Successfully ADDED new GL_TRANSACTION record (Batch ID: {}, Journal ID: {}).", payloadDto.getBatchId(), payloadDto.getJournalId());
+                break;
+            case UPDATE:
+                log.warn("UPDATE ChangeType not yet implemented for GL_TRANSACTIONS. Request {} skipped.", request.getId());
+                break;
+            case DELETE:
+                log.warn("DELETE ChangeType not yet implemented for GL_TRANSACTIONS. Request {} skipped.", request.getId());
+                break;
+        }
+    }
+
+    @Override
+    public List<MocRequest> getMyRequests() {
+        log.info("Fetching ALL MOC requests for 'My Requests' screen.");
+        return mocRequestRepository.findAll(Sort.by(Sort.Direction.DESC, "requestDate"));
+    }
+
+    @Override
+    public List<MocRequest> getPendingRequests() {
+        return mocRequestRepository.findByRequestStatus(RequestStatus.PENDING);
+    }
+    
+    @Override
+    @Transactional
+    public List<MocRequest> processBulkRequests(BulkProcessMocRequestDto dto, String executorId) throws JsonProcessingException {
+
+        boolean hasBatchId = StringUtils.hasText(dto.getBatchId());
+        boolean hasJournalPrefixes = dto.getJournalIdPrefixes() != null && !dto.getJournalIdPrefixes().isEmpty();
+
+        if (!hasBatchId && !hasJournalPrefixes) {
+            throw new IllegalArgumentException("Either batchId or a list of journalIdPrefixes must be provided.");
+        }
+        if (hasBatchId && hasJournalPrefixes) {
+            throw new IllegalArgumentException("Provide either batchId or journalIdPrefixes, not both.");
+        }
+
+        List<MocRequest> requestsToProcess;
+        if (hasBatchId) {
+            log.info("Processing bulk request by Batch ID: {} for user: {}", dto.getBatchId(), executorId);
+            requestsToProcess = mocRequestRepository.findByBatchIdAndRequestStatus(dto.getBatchId(), RequestStatus.PENDING);
+        } else {
+            log.info("Processing bulk request by Journal Prefixes: {} for user: {}", dto.getJournalIdPrefixes().size(), executorId);
+            requestsToProcess = new ArrayList<>();
+            for (String prefix : dto.getJournalIdPrefixes()) {
+                requestsToProcess.addAll(
+                    mocRequestRepository.findByJournalIdStartingWithAndRequestStatus(prefix, RequestStatus.PENDING)
+                );
+            }
+        }
+
+        if (requestsToProcess.isEmpty()) {
+            log.warn("No pending requests found for the given criteria.");
+            return Collections.emptyList();
+        }
+
+        List<MocRequest> processedRequests = new ArrayList<>();
+        
+        for (MocRequest request : requestsToProcess) {
+            
+            if (executorId.equals(request.getCreatorId())) {
+                log.warn("Skipping request {}: User {} cannot approve/reject their own request.", request.getId(), executorId);
+                continue; 
+            }
+          
+            if (request.getRequestStatus() != RequestStatus.PENDING) {
+                log.warn("Skipping request {}: It is not in PENDING status.", request.getId());
+                continue;
+            }
+
+            request.setExecutorId(executorId);
+            request.setExecutorRemarks(dto.getRemarks());
+            request.setExecutionDate(LocalDateTime.now());
+            request.setRequestStatus(dto.getStatus());
+        
+            if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+                log.info("MOC Request {} ACCEPTED. Processing...", request.getId());
+                processApproval(request); 
+            } else {
+                log.info("MOC Request {} REJECTED.", request.getId());
+            }
+            processedRequests.add(request);
+        }
+     
+        return mocRequestRepository.saveAll(processedRequests);
+    }
+    
+    @Override
+    public List<MocRequest> getRequestsByBatchId(String batchId) {
+        log.info("Fetching all MOC requests for Batch ID: {}", batchId);
+        List<MocRequest> requests = mocRequestRepository.findByBatchId(batchId);
+        
+        if (requests.isEmpty()) {
+            log.warn("No requests found for Batch ID: {}", batchId);
+          
+            throw new ResourceNotFoundException("No MOC requests found for Batch ID: " + batchId);
+        }
+      
+        return requests;
+    }
+   
+    @Override
+    @Transactional
+    public void cancelMyRequest(Long requestId, String userId) {
+        MocRequest request = mocRequestRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("MOC Request with ID " + requestId + " not found."));
+
+        if (!userId.equals(request.getCreatorId())) {
+            log.warn("User {} attempted to cancel request {} owned by {}", userId, requestId, request.getCreatorId());
+            throw new IllegalStateException("You are not authorized to cancel this request.");
+        }
+
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            log.warn("User {} attempted to cancel request {} which is already in status {}", userId, requestId, request.getRequestStatus());
+            throw new IllegalStateException("Cannot cancel a request that has already been processed.");
+        }
+
+        mocRequestRepository.delete(request);
+        log.info("User {} successfully canceled MOC request {}", userId, requestId);
+    }
+
+    @Override
+    @Transactional
+    public void cancelMyRequestsByJournalPrefix(String journalIdPrefix, String userId) {
+        log.info("User {} attempting to cancel all requests with journal prefix: {}", userId, journalIdPrefix);
+
+       
+        List<MocRequest> requestsToCancel = mocRequestRepository.findByJournalIdStartingWithAndCreatorIdAndRequestStatus(
+                journalIdPrefix, userId, RequestStatus.PENDING);
+
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found for you with journal prefix: " + journalIdPrefix);
+        }
+        
+      
+        mocRequestRepository.deleteAll(requestsToCancel);
+        log.info("User {} successfully bulk-canceled {} requests for journal prefix {}", userId, requestsToCancel.size(), journalIdPrefix);
+    }
+    @Override
+    public List<MocRequestStatusDto> getMocRequestStatusList() {
+        log.info("Fetching all MOC requests for status list");
+        
+        List<MocRequest> allRequests = mocRequestRepository.findAll();
+        
+        return allRequests.stream()
+                .map(MocRequestStatusDto::new)
+                .collect(Collectors.toList());
+    }
+    
+    @Override
+    @Transactional
+    public void cancelMyRequestsByBatchId(String batchId, String userId) {
+        log.info("User {} attempting to cancel PENDING requests created by them in batch ID: {}", userId, batchId);
+
+        List<MocRequest> requestsToCancel = mocRequestRepository.findByBatchIdAndCreatorIdAndRequestStatus(
+                batchId, userId, RequestStatus.PENDING);
+
+        if (requestsToCancel.isEmpty()) {
+            log.warn("No pending requests found for user {} in batch ID {}", userId, batchId);
+            throw new ResourceNotFoundException("No pending requests found for you in this batch.");
+        }
+
+        mocRequestRepository.deleteAll(requestsToCancel);
+        log.info("User {} successfully bulk-canceled {} requests for batch ID {}", userId, requestsToCancel.size(), batchId);
+    }
+
+    @Override
+    @Transactional
+    public void cancelMyRequestsByJournalPrefixes(List<String> journalIdPrefixes, String userId) {
+        log.info("User {} attempting to bulk-cancel PENDING requests for journal prefixes: {}", userId, journalIdPrefixes.size());
+        
+        List<MocRequest> requestsToCancel = new ArrayList<>();
+        for (String prefix : journalIdPrefixes) {
+            List<MocRequest> requestsForPrefix = mocRequestRepository.findByJournalIdStartingWithAndCreatorIdAndRequestStatus(
+                    prefix, userId, RequestStatus.PENDING);
+            
+            if (!requestsForPrefix.isEmpty()) {
+                 requestsToCancel.addAll(requestsForPrefix);
+            } else {
+                 log.warn("No pending requests found for user {} with journal prefix {}", userId, prefix);
+            }
+        }
+
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found for you with the specified journal prefixes.");
+        }
+
+        mocRequestRepository.deleteAll(requestsToCancel);
+        log.info("User {} successfully bulk-canceled {} requests for {} journal prefixes.", userId, requestsToCancel.size(), journalIdPrefixes.size());
+    }
 }
