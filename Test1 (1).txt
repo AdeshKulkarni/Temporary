@@ -1,57 +1,374 @@
-package com.tcs.fincore.MOCService.Models;
+package com.tcs.fincore.MOCService.Service;
 
-import jakarta.persistence.*;
-import lombok.Data;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.MOCService.Dto.*;
+import com.tcs.fincore.MOCService.Exception.ResourceNotFoundException;
+import com.tcs.fincore.MOCService.Models.GlTransaction;
+import com.tcs.fincore.MOCService.Models.MocRequest;
+import com.tcs.fincore.MOCService.Models.enums.RequestStatus;
+import com.tcs.fincore.MOCService.Repository.GlTransactionRepository;
+import com.tcs.fincore.MOCService.Repository.MocRequestRepository;
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.data.domain.Sort;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
 
-@Entity
-@Table(name = "GL_TRANSACTIONS")
-@Data
-public class GlTransaction {
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class MocRequestServiceImpl implements MocRequestService {
 
-    @Id
-    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "GL_TRANSACTIONS_SEQ")
-    @SequenceGenerator(name = "GL_TRANSACTIONS_SEQ", sequenceName = "GL_TRANSACTIONS_SEQ", allocationSize = 1)
-    @Column(name = "TRANSACTION_ID")
-    private Long transactionId;
+    private final MocRequestRepository mocRequestRepository;
+    private final GlTransactionRepository glTransactionRepository; 
+    private final ObjectMapper objectMapper;
+    private final SequenceService sequenceService; 
 
-    @Column(name = "BATCH_ID", length = 50) 
-    private String batchId;
+    @Override
+    @Transactional
+    public List<MocRequest> createBatchRequest(BatchRequestDto batchDto, String creatorId) throws JsonProcessingException {
+        
+        String batchId = sequenceService.getNextBatchId();
+        log.info("Creating new MOC batch with Batch ID: {}", batchId);
+       
+        LocalDate postingDate = LocalDate.now();
+        
+        List<MocRequest> requestsToSave = new ArrayList<>();
+        String commonRemarks = batchDto.getCommonBatchRemarks();
 
-    @Column(name = "JOURNAL_ID", length = 50)
-    private String journalId;
+        Map<String, List<BatchRequestDto.MocRequestRow>> groupedRows = batchDto.getRows().stream()
+                .collect(Collectors.groupingBy(row -> row.getBranch() + ":" + row.getCurrency()));
+        
+        log.info("Batch {} contains {} distinct Branch-Currency groups.", batchId, groupedRows.size());
+
+        for (Map.Entry<String, List<BatchRequestDto.MocRequestRow>> entry : groupedRows.entrySet()) {
+            
+            String journalIdPrefix = sequenceService.getNextJournalIdPrefix();
+            int journalSequence = 1;
+            List<BatchRequestDto.MocRequestRow> rowsInGroup = entry.getValue();
+            
+            for (BatchRequestDto.MocRequestRow rowDto : rowsInGroup) {
+                
+                String journalId = String.format("%s-%03d", journalIdPrefix, journalSequence);
+                
+                CreateMocRequestDto payloadDto = new CreateMocRequestDto();
+                
+                payloadDto.setPDate(postingDate); 
+                payloadDto.setChangeType(rowDto.getChangeType());
+                payloadDto.setMasterMocId(rowDto.getMasterMocId());
+                payloadDto.setBranch(rowDto.getBranch());
+                payloadDto.setCurrency(rowDto.getCurrency());
+                payloadDto.setCgl(rowDto.getCgl());
+                
+                // This is the correct assignment
+                payloadDto.setAmount(rowDto.getAmount()); 
+
+                payloadDto.setProductType(rowDto.getProductType());
+                payloadDto.setRemarks(rowDto.getRemarks());
+                payloadDto.setArFlag(rowDto.getArFlag());
+                payloadDto.setAcClassification(rowDto.getAcClassification());
+                payloadDto.setBatchId(batchId); 
+                payloadDto.setJournalId(journalId); 
+                payloadDto.setCommonBatchRemarks(commonRemarks);
+                payloadDto.setTransactionCount(journalSequence); 
+                
+                MocRequest request = new MocRequest();
+                request.setCreatorId(creatorId);
+                request.setChangeType(rowDto.getChangeType());
+                request.setRequestStatus(RequestStatus.PENDING);
+                request.setBatchId(batchId);
+                request.setJournalId(journalId);
+                request.setCommonBatchRemarks(commonRemarks);
+                request.setPayload(objectMapper.writeValueAsString(payloadDto));
+
+                requestsToSave.add(request);
+
+                journalSequence++; 
+            }
+        }
+        log.info("Saving {} MocRequest entries for Batch ID: {}", requestsToSave.size(), batchId);
+        return mocRequestRepository.saveAll(requestsToSave);
+    }
+  
    
-    @Column(name = "TRANSACTION_DATE", insertable = false, updatable = false)
-    @Temporal(TemporalType.DATE)
-    private LocalDate transactionDate;
 
-    @Column(name = "POST_DATE")
-    @Temporal(TemporalType.TIMESTAMP)
-    private LocalDateTime postDate;
+    @Override
+    @Transactional
+    public Optional<MocRequest> updateRequestStatus(ProcessMocRequestDto dto, String executorId) throws JsonProcessingException {
+        log.debug("Updating single request: {}", dto.getRequestId());
+        MocRequest request = mocRequestRepository.findById(dto.getRequestId())
+                .orElseThrow(() -> new ResourceNotFoundException("MOC Request with ID " + dto.getRequestId() + " not found."));
 
-    @Column(name = "BRANCH_CODE", length = 50)
-    private String branchCode;
+        if (executorId.equals(request.getCreatorId())) {
+            throw new IllegalStateException("User cannot approve or reject their own MOC request.");
+        }
 
-    @Column(name = "CURRENCY", length = 3)
-    private String currency;
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            throw new IllegalStateException("MOC Request has already been processed.");
+        }
 
-    @Column(name = "CGL", length = 50)
-    private String cgl;
+        request.setExecutorId(executorId);
+        request.setExecutorRemarks(dto.getRemarks());
+        request.setExecutionDate(LocalDateTime.now());
+        request.setRequestStatus(dto.getStatus());
 
-    @Column(name = "NARRATION", length = 40)
-    private String narration;
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            log.info("MOC Request {} ACCEPTED. Processing for Batch ID: {}", dto.getRequestId(), request.getBatchId());
+            processApproval(request); 
+        } else {
+            log.info("MOC Request {} REJECTED.", dto.getRequestId());
+        }
 
-    @Column(name = "DEBIT_AMOUNT", precision = 25, scale = 4)
-    private BigDecimal debitAmount;
+        return Optional.of(mocRequestRepository.save(request));
+    }
+    
+    private void processApproval(MocRequest request) throws JsonProcessingException {
+        log.info("--- Inside processApproval for MocRequest ID: {} ---", request.getId());
+        CreateMocRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateMocRequestDto.class);
 
-    @Column(name = "CREDIT_AMOUNT", precision = 25, scale = 4)
-    private BigDecimal creditAmount;
+        switch (request.getChangeType()) {
+            case ADD:
+                GlTransaction newGlTxn = new GlTransaction();
+                
+                newGlTxn.setBatchId(payloadDto.getBatchId());
+                newGlTxn.setJournalId(payloadDto.getJournalId());
+                
+                if (payloadDto.getPDate() != null) {
+                    newGlTxn.setPostDate(payloadDto.getPDate().atStartOfDay());
+                }
+                
+                newGlTxn.setBranchCode(payloadDto.getBranch());
+                newGlTxn.setCurrency(payloadDto.getCurrency());
+                newGlTxn.setCgl(payloadDto.getCgl());
+                newGlTxn.setNarration(payloadDto.getRemarks());
+                
+                BigDecimal amount = payloadDto.getAmount();
+                if (amount.signum() < 0) { // Negative amount is Credit
+                    newGlTxn.setCreditAmount(amount);
+                    newGlTxn.setDebitAmount(BigDecimal.ZERO);
+                    log.debug("Setting CREDIT_AMOUNT: {}", amount);
+                } else { // Positive or zero amount is Debit
+                    newGlTxn.setDebitAmount(amount);
+                    newGlTxn.setCreditAmount(BigDecimal.ZERO);
+                    log.debug("Setting DEBIT_AMOUNT: {}", amount);
+                }
+                
+                newGlTxn.setTransactionCount(payloadDto.getTransactionCount());
+                newGlTxn.setSourceFlag("J"); 
+                
+                log.info("Attempting to save GL entry for Journal ID: {}", payloadDto.getJournalId());
+                glTransactionRepository.save(newGlTxn);
+                log.info("Successfully SAVED new GL_TRANSACTION record for Journal ID: {}", payloadDto.getJournalId());
+                break;
+            case UPDATE:
+                log.warn("UPDATE ChangeType not yet implemented for GL_TRANSACTIONS. Request {} skipped.", request.getId());
+                break;
+            case DELETE:
+                log.warn("DELETE ChangeType not yet implemented for GL_TRANSACTIONS. Request {} skipped.", request.getId());
+                break;
+        }
+        log.info("--- Exiting processApproval for MocRequest ID: {} ---", request.getId());
+    }
 
-    @Column(name = "TRANSACTION_COUNT")
-    private Integer transactionCount;
+    @Override
+    public List<MocRequest> getMyRequests() {
+        log.info("Fetching ALL MOC requests for 'My Requests' screen.");
+        return mocRequestRepository.findAll(Sort.by(Sort.Direction.DESC, "requestDate"));
+    }
 
-    @Column(name = "SOURCE_FLAG", length = 1)
-    private String sourceFlag;
+    @Override
+    public List<MocRequest> getPendingRequests() {
+        return mocRequestRepository.findByRequestStatus(RequestStatus.PENDING);
+    }
+    
+    @Override
+    @Transactional
+    public List<MocRequest> processBulkRequests(BulkProcessMocRequestDto dto, String executorId) throws JsonProcessingException {
+        
+        log.info("Starting processBulkRequests for user: {}", executorId);
+
+        boolean hasBatchId = StringUtils.hasText(dto.getBatchId());
+        boolean hasJournalPrefixes = dto.getJournalIdPrefixes() != null && !dto.getJournalIdPrefixes().isEmpty();
+
+        if (!hasBatchId && !hasJournalPrefixes) {
+            throw new IllegalArgumentException("Either batchId or a list of journalIdPrefixes must be provided.");
+        }
+        if (hasBatchId && hasJournalPrefixes) {
+            throw new IllegalArgumentException("Provide either batchId or journalIdPrefixes, not both.");
+        }
+
+        List<MocRequest> requestsToProcess;
+        if (hasBatchId) {
+            log.info("Processing by Batch ID: {}", dto.getBatchId());
+            requestsToProcess = mocRequestRepository.findByBatchIdAndRequestStatus(dto.getBatchId(), RequestStatus.PENDING);
+        } else {
+            log.info("Processing by Journal Prefixes count: {}", dto.getJournalIdPrefixes().size());
+            requestsToProcess = new ArrayList<>();
+            for (String prefix : dto.getJournalIdPrefixes()) {
+                log.debug("Finding requests for prefix: {}", prefix);
+                List<MocRequest> requestsForPrefix = mocRequestRepository.findByJournalIdStartingWithAndRequestStatus(prefix, RequestStatus.PENDING);
+                log.debug("Found {} requests for prefix {}", requestsForPrefix.size(), prefix);
+                requestsToProcess.addAll(requestsForPrefix);
+            }
+        }
+
+        log.info("Found {} total pending requests to process.", requestsToProcess.size());
+
+        if (requestsToProcess.isEmpty()) {
+            log.warn("No pending requests found for the given criteria.");
+            return Collections.emptyList();
+        }
+
+        List<MocRequest> processedRequests = new ArrayList<>();
+        
+        int count = 1;
+        for (MocRequest request : requestsToProcess) {
+            log.info("Processing loop item {} of {}. Request ID: {}", count, requestsToProcess.size(), request.getId());
+            
+            if (executorId.equals(request.getCreatorId())) {
+                log.warn("Skipping request {}: User {} cannot approve/reject their own request.", request.getId(), executorId);
+                count++;
+                continue; 
+            }
+          
+            if (request.getRequestStatus() != RequestStatus.PENDING) {
+                log.warn("Skipping request {}: It is not in PENDING status.", request.getId());
+                count++;
+                continue;
+            }
+
+            request.setExecutorId(executorId);
+            request.setExecutorRemarks(dto.getRemarks());
+            request.setExecutionDate(LocalDateTime.now());
+            request.setRequestStatus(dto.getStatus());
+        
+            if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+                log.info("Request {} marked ACCEPTED. Calling processApproval...", request.getId());
+                processApproval(request); 
+            } else {
+                log.info("Request {} marked REJECTED.", request.getId());
+            }
+            processedRequests.add(request);
+            count++;
+        }
+     
+        log.info("Saving all {} processed MocRequest statuses...", processedRequests.size());
+        List<MocRequest> savedRequests = mocRequestRepository.saveAll(processedRequests);
+        log.info("Finished processBulkRequests. Transaction committing.");
+        return savedRequests;
+    }
+    
+    @Override
+    public List<MocRequest> getRequestsByBatchId(String batchId) {
+        log.info("Fetching all MOC requests for Batch ID: {}", batchId);
+        List<MocRequest> requests = mocRequestRepository.findByBatchId(batchId);
+        
+        if (requests.isEmpty()) {
+            log.warn("No requests found for Batch ID: {}", batchId);
+          
+            throw new ResourceNotFoundException("No MOC requests found for Batch ID: " + batchId);
+        }
+      
+        return requests;
+    }
+   
+    @Override
+    @Transactional
+    public void cancelMyRequest(Long requestId, String userId) {
+        MocRequest request = mocRequestRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("MOC Request with ID " + requestId + " not found."));
+
+        if (!userId.equals(request.getCreatorId())) {
+            log.warn("User {} attempted to cancel request {} owned by {}", userId, requestId, request.getCreatorId());
+            throw new IllegalStateException("You are not authorized to cancel this request.");
+        }
+
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            log.warn("User {} attempted to cancel request {} which is already in status {}", userId, requestId, request.getRequestStatus());
+            throw new IllegalStateException("Cannot cancel a request that has already been processed.");
+        }
+
+        mocRequestRepository.delete(request);
+        log.info("User {} successfully canceled MOC request {}", userId, requestId);
+    }
+
+    @Override
+    @Transactional
+    public void cancelMyRequestsByJournalPrefix(String journalIdPrefix, String userId) {
+        log.info("User {} attempting to cancel all requests with journal prefix: {}", userId, journalIdPrefix);
+       
+        List<MocRequest> requestsToCancel = mocRequestRepository.findByJournalIdStartingWithAndCreatorIdAndRequestStatus(
+                journalIdPrefix, userId, RequestStatus.PENDING);
+
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found for you with journal prefix: " + journalIdPrefix);
+        }
+      
+        mocRequestRepository.deleteAll(requestsToCancel);
+        log.info("User {} successfully bulk-canceled {} requests for journal prefix {}", userId, requestsToCancel.size(), journalIdPrefix);
+    }
+
+    @Override
+    public List<MocRequestStatusDto> getMocRequestStatusList() {
+        log.info("Fetching all MOC requests for status list");
+        List<MocRequest> allRequests = mocRequestRepository.findAll();
+        return allRequests.stream()
+                .map(MocRequestStatusDto::new)
+                .collect(Collectors.toList());
+    }
+    
+    @Override
+    @Transactional
+    public void cancelMyRequestsByBatchId(String batchId, String userId) {
+        log.info("User {} attempting to cancel PENDING requests created by them in batch ID: {}", userId, batchId);
+
+        List<MocRequest> requestsToCancel = mocRequestRepository.findByBatchIdAndCreatorIdAndRequestStatus(
+                batchId, userId, RequestStatus.PENDING);
+
+        if (requestsToCancel.isEmpty()) {
+            log.warn("No pending requests found for user {} in batch ID {}", userId, batchId);
+            throw new ResourceNotFoundException("No pending requests found for you in this batch.");
+        }
+
+        mocRequestRepository.deleteAll(requestsToCancel);
+        log.info("User {} successfully bulk-canceled {} requests for batch ID {}", userId, requestsToCancel.size(), batchId);
+    }
+
+    @Override
+    @Transactional
+    public void cancelMyRequestsByJournalPrefixes(List<String> journalIdPrefixes, String userId) {
+        log.info("User {} attempting to bulk-cancel PENDING requests for journal prefixes: {}", userId, journalIdPrefixes.size());
+        
+        List<MocRequest> requestsToCancel = new ArrayList<>();
+        for (String prefix : journalIdPrefixes) {
+            List<MocRequest> requestsForPrefix = mocRequestRepository.findByJournalIdStartingWithAndCreatorIdAndRequestStatus(
+                    prefix, userId, RequestStatus.PENDING);
+            
+            if (!requestsForPrefix.isEmpty()) {
+                 requestsToCancel.addAll(requestsForPrefix);
+            } else {
+                 log.warn("No pending requests found for user {} with journal prefix {}", userId, prefix);
+            }
+        }
+
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found for you with the specified journal prefixes.");
+        }
+
+        mocRequestRepository.deleteAll(requestsToCancel);
+        log.info("User {} successfully bulk-canceled {} requests for {} journal prefixes.", userId, requestsToCancel.size(), journalIdPrefixes.size());
+    }
 }
