@@ -14,10 +14,10 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Sort;
-import org.springframework.data.jpa.domain.Specification; // <-- 1. ADD THIS IMPORT
+import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
-import jakarta.persistence.criteria.Predicate; // <-- 2. ADD THIS IMPORT
+import jakarta.persistence.criteria.Predicate;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -134,6 +134,7 @@ public class MocRequestServiceImpl implements MocRequestService {
         return Optional.of(mocRequestRepository.save(request));
     }
     
+    // This method is now only used for single-request updates (if you keep that feature)
     private void processApproval(MocRequest request) throws JsonProcessingException {
         log.info("--- Inside processApproval for MocRequest ID: {} ---", request.getId());
         CreateMocRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateMocRequestDto.class);
@@ -215,34 +216,17 @@ public class MocRequestServiceImpl implements MocRequestService {
             requestsToProcess = mocRequestRepository.findByBatchIdAndRequestStatus(dto.getBatchId(), RequestStatus.PENDING);
         
         } else {
-            // --- START OF FIX: Replaced N+1 loop with a single query ---
             log.info("Processing by Journal Prefixes count: {}", dto.getJournalIdPrefixes().size());
-            
-            // 1. Create the Specification builder
             Specification<MocRequest> spec = (root, query, criteriaBuilder) -> {
-                
-                // 2. Create a list to hold all the 'LIKE' predicates
                 List<Predicate> predicates = new ArrayList<>();
-                
-                // 3. Loop over the prefixes and create a 'LIKE' for each
                 for (String prefix : dto.getJournalIdPrefixes()) {
                     predicates.add(criteriaBuilder.like(root.get("journalId"), prefix + "%"));
                 }
-                
-                // 4. Combine all 'LIKE' predicates with 'OR'
-                // This creates: (journalId LIKE 'prefix1%' OR journalId LIKE 'prefix2%' ...)
                 Predicate journalIdOrPredicates = criteriaBuilder.or(predicates.toArray(new Predicate[0]));
-                
-                // 5. Create the 'status = PENDING' predicate
                 Predicate statusPredicate = criteriaBuilder.equal(root.get("requestStatus"), RequestStatus.PENDING);
-                
-                // 6. Combine the two main conditions with 'AND'
                 return criteriaBuilder.and(journalIdOrPredicates, statusPredicate);
             };
-
-            // 7. Execute the single query
             requestsToProcess = mocRequestRepository.findAll(spec);
-            // --- END OF FIX ---
         }
 
         log.info("Found {} total pending requests to process.", requestsToProcess.size());
@@ -252,7 +236,11 @@ public class MocRequestServiceImpl implements MocRequestService {
             return Collections.emptyList();
         }
 
+        // --- START OF OPTIMIZATION ---
+        
+        // 1. Create lists to hold the objects for bulk operations
         List<MocRequest> processedRequests = new ArrayList<>();
+        List<GlTransaction> transactionsToSave = new ArrayList<>();
         
         int count = 1;
         for (MocRequest request : requestsToProcess) {
@@ -270,23 +258,67 @@ public class MocRequestServiceImpl implements MocRequestService {
                 continue;
             }
 
+            // 2. Update the status of the MocRequest in memory
             request.setExecutorId(executorId);
             request.setExecutorRemarks(dto.getRemarks());
             request.setExecutionDate(LocalDateTime.now());
             request.setRequestStatus(dto.getStatus());
         
+            // 3. If ACCEPTED, build the GlTransaction object and add it to the list
             if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
-                log.info("Request {} marked ACCEPTED. Calling processApproval...", request.getId());
-                processApproval(request); 
+                log.info("Request {} marked ACCEPTED. Building GlTransaction...", request.getId());
+                
+                // This is the logic moved from processApproval()
+                CreateMocRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateMocRequestDto.class);
+                
+                if (payloadDto.getChangeType() == CreateMocRequestDto.ChangeType.ADD) {
+                    GlTransaction newGlTxn = new GlTransaction();
+                    newGlTxn.setBatchId(payloadDto.getBatchId());
+                    newGlTxn.setJournalId(payloadDto.getJournalId());
+                    if (payloadDto.getPDate() != null) {
+                        newGlTxn.setPostDate(payloadDto.getPDate().atStartOfDay());
+                    }
+                    newGlTxn.setBranchCode(payloadDto.getBranch());
+                    newGlTxn.setCurrency(payloadDto.getCurrency());
+                    newGlTxn.setCgl(payloadDto.getCgl());
+                    newGlTxn.setNarration(payloadDto.getRemarks());
+                    
+                    BigDecimal amount = payloadDto.getAmount();
+                    if (amount.signum() < 0) { // Negative amount is Credit
+                        newGlTxn.setCreditAmount(amount);
+                        newGlTxn.setDebitAmount(BigDecimal.ZERO);
+                    } else { // Positive or zero amount is Debit
+                        newGlTxn.setDebitAmount(amount);
+                        newGlTxn.setCreditAmount(BigDecimal.ZERO);
+                    }
+                    newGlTxn.setTransactionCount(payloadDto.getTransactionCount());
+                    newGlTxn.setSourceFlag("J"); 
+                    
+                    // 4. Add the new object to the list instead of saving it
+                    transactionsToSave.add(newGlTxn);
+                }
+                
             } else {
                 log.info("Request {} marked REJECTED.", request.getId());
             }
+            
+            // 5. Add the updated MocRequest to its list
             processedRequests.add(request);
             count++;
         }
      
+        // 6. Run the bulk operations ONCE, outside the loop
+        if (!transactionsToSave.isEmpty()) {
+            log.info("Saving {} new GL_TRANSACTION entries in a single batch...", transactionsToSave.size());
+            glTransactionRepository.saveAll(transactionsToSave);
+            log.info("Successfully saved all GL entries.");
+        }
+        
         log.info("Saving all {} processed MocRequest statuses...", processedRequests.size());
         List<MocRequest> savedRequests = mocRequestRepository.saveAll(processedRequests);
+        
+        // --- END OF OPTIMIZATION ---
+        
         log.info("Finished processBulkRequests. Transaction committing.");
         return savedRequests;
     }
@@ -372,9 +404,6 @@ public class MocRequestServiceImpl implements MocRequestService {
     public void cancelMyRequestsByJournalPrefixes(List<String> journalIdPrefixes, String userId) {
         log.info("User {} attempting to bulk-cancel PENDING requests for journal prefixes: {}", userId, journalIdPrefixes.size());
         
-        List<MocRequest> requestsToCancel = new ArrayList<>();
-        
-        // --- We must also update this loop to use a Specification ---
         Specification<MocRequest> spec = (root, query, criteriaBuilder) -> {
             List<Predicate> predicates = new ArrayList<>();
             for (String prefix : journalIdPrefixes) {
@@ -387,8 +416,7 @@ public class MocRequestServiceImpl implements MocRequestService {
             return criteriaBuilder.and(journalIdOrPredicates, statusPredicate, creatorPredicate);
         };
         
-        requestsToCancel = mocRequestRepository.findAll(spec);
-        // --- End of optimized query ---
+        List<MocRequest> requestsToCancel = mocRequestRepository.findAll(spec);
 
         if (requestsToCancel.isEmpty()) {
             throw new ResourceNotFoundException("No pending requests found for you with the specified journal prefixes.");
