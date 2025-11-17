@@ -1,4 +1,569 @@
-SELECT COLUMN_NAME, DATA_TYPE, DATA_LENGTH
-FROM ALL_TAB_COLUMNS
-WHERE TABLE_NAME = 'GL_TRANSACTIONS'
-  AND OWNER = 'FTWOAHM';
+package com.tcs.fincore.MOCService.Service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.MOCService.Dto.*;
+import com.tcs.fincore.MOCService.Exception.ResourceNotFoundException;
+import com.tcs.fincore.MOCService.Models.GlTransaction;
+import com.tcs.fincore.MOCService.Models.MocRequest;
+import com.tcs.fincore.MOCService.Models.enums.RequestStatus;
+import com.tcs.fincore.MOCService.Models.enums.ChangeType;
+import com.tcs.fincore.MOCService.Repository.GlTransactionRepository;
+import com.tcs.fincore.MOCService.Repository.MocRequestRepository;
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.jpa.domain.Specification;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+import jakarta.persistence.criteria.Predicate;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class MocRequestServiceImpl implements MocRequestService {
+
+    private final MocRequestRepository mocRequestRepository;
+    private final GlTransactionRepository glTransactionRepository; 
+    private final ObjectMapper objectMapper;
+    private final SequenceService sequenceService;
+    
+    // --- 1. INJECT NEW SERVICES ---
+    private final NotificationWriterService notificationWriterService;
+    private final PermissionConfigService permissionConfigService;
+    
+    private static final String EVENT_SOURCE = "MOCService";
+    private static final String JOURNAL_AUTH_TYPE = "JOURNAL_AUTH";
+    private static final String JOURNAL_POSTING_URL = "/Journal-Posting-Status"; 
+
+    @Override
+    @Transactional
+    public List<MocRequest> createBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+        
+        String batchId = sequenceService.getNextBatchId();
+        log.info("Creating new MOC batch with Batch ID: {}", batchId);
+       
+        LocalDate postingDate = LocalDate.now();
+        
+        List<MocRequest> requestsToSave = new ArrayList<>();
+        String commonRemarks = batchDto.getCommonBatchRemarks();
+
+        Map<String, List<BatchRequestDto.MocRequestRow>> groupedRows = batchDto.getRows().stream()
+                .collect(Collectors.groupingBy(row -> row.getBranch() + ":" + row.getCurrency()));
+        
+        log.info("Batch {} contains {} distinct Branch-Currency groups.", batchId, groupedRows.size());
+
+        for (Map.Entry<String, List<BatchRequestDto.MocRequestRow>> entry : groupedRows.entrySet()) {
+            
+            String journalIdPrefix = sequenceService.getNextJournalIdPrefix();
+            int journalSequence = 1;
+            List<BatchRequestDto.MocRequestRow> rowsInGroup = entry.getValue();
+            
+            for (BatchRequestDto.MocRequestRow rowDto : rowsInGroup) {
+                
+                String journalId = String.format("%s-%03d", journalIdPrefix, journalSequence);
+                
+                CreateMocRequestDto payloadDto = new CreateMocRequestDto();
+                
+                payloadDto.setPDate(postingDate); 
+                payloadDto.setChangeType(rowDto.getChangeType());
+                payloadDto.setMasterMocId(rowDto.getMasterMocId());
+                payloadDto.setBranch(rowDto.getBranch());
+                payloadDto.setCurrency(rowDto.getCurrency());
+                payloadDto.setCgl(rowDto.getCgl());
+                payloadDto.setAmount(rowDto.getAmount()); 
+                payloadDto.setProductType(rowDto.getProductType());
+                payloadDto.setRemarks(rowDto.getRemarks());
+                payloadDto.setArFlag(rowDto.getArFlag());
+                payloadDto.setAcClassification(rowDto.getAcClassification());
+                payloadDto.setBatchId(batchId); 
+                payloadDto.setJournalId(journalId); 
+                payloadDto.setCommonBatchRemarks(commonRemarks);
+                payloadDto.setTransactionCount(journalSequence); 
+                
+                MocRequest request = new MocRequest();
+                request.setCreatorId(creatorId);
+                request.setCreatorRole(creatorRole); // <-- 2. SAVE CREATOR ROLE
+                request.setChangeType(rowDto.getChangeType());
+                request.setRequestStatus(RequestStatus.PENDING);
+                request.setBatchId(batchId);
+                request.setJournalId(journalId);
+                request.setCommonBatchRemarks(commonRemarks);
+                request.setPayload(objectMapper.writeValueAsString(payloadDto));
+
+                requestsToSave.add(request);
+
+                journalSequence++; 
+            }
+        }
+        log.info("Saving {} MocRequest entries for Batch ID: {}", requestsToSave.size(), batchId);
+        List<MocRequest> savedRequests = mocRequestRepository.saveAll(requestsToSave);
+        
+        // --- 3. SEND NOTIFICATION TO APPROVERS ---
+        try {
+            // Get config from cache (fast)
+            NotificationConfigDto config = permissionConfigService.getConfig(JOURNAL_AUTH_TYPE);
+            
+            String message = String.format("New Journal request (Batch: %s) by user %s is pending approval.",
+                                           batchId, creatorId);
+
+            notificationWriterService.createNotification(
+                null,                   // userId (null for group)
+                config.getTargetRoles(),// "51,55" etc.
+                message,
+                config.getTargetUrl(),  // "/Journal-Authrization"
+                batchId,                // Aggregate ID
+                EVENT_SOURCE
+            );
+            log.info("Successfully created 1-to-many notification for Batch ID: {}", batchId);
+
+        } catch (Exception e) {
+            // CRITICAL: Log error but re-throw to roll back the transaction
+            log.error("CRITICAL: Failed to create 'pending' notification for Batch ID: {}. Rolling back transaction.", batchId, e);
+            throw new RuntimeException("Failed to create notification event, rolling back batch creation.", e);
+        }
+        // --- END OF NOTIFICATION LOGIC ---
+        
+        return savedRequests;
+    }
+  
+   
+
+    @Override
+    @Transactional
+    public Optional<MocRequest> updateRequestStatus(ProcessMocRequestDto dto, String executorId, Integer executorRole) throws JsonProcessingException {
+        log.debug("Updating single request: {}", dto.getRequestId());
+        MocRequest request = mocRequestRepository.findById(dto.getRequestId())
+                .orElseThrow(() -> new ResourceNotFoundException("MOC Request with ID " + dto.getRequestId() + " not found."));
+
+        // --- 4. UPDATED SELF-APPROVAL CHECK ---
+        boolean isCreator = executorId.equals(request.getCreatorId());
+        boolean isSameRole = executorRole != null && executorRole.equals(request.getCreatorRole());
+
+        if (isCreator && isSameRole) {
+            log.warn("SECURITY VIOLATION: User {} (Role: {}) attempted to approve/reject their own request (ID: {}).", 
+                     executorId, executorRole, request.getId());
+            throw new IllegalStateException("User cannot approve or reject their own request with the same role.");
+        }
+        // --- END OF CHECK ---
+
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            throw new IllegalStateException("MOC Request has already been processed.");
+        }
+
+        request.setExecutorId(executorId);
+        request.setExecutorRemarks(dto.getRemarks());
+        request.setExecutionDate(LocalDateTime.now());
+        request.setRequestStatus(dto.getStatus());
+
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            log.info("MOC Request {} ACCEPTED. Processing for Batch ID: {}", dto.getRequestId(), request.getBatchId());
+            processApproval(request); 
+            // Send notification to creator
+            sendCreatorNotification(request, true);
+        } else {
+            log.info("MOC Request {} REJECTED.", dto.getRequestId());
+            // Send notification to creator
+            sendCreatorNotification(request, false);
+        }
+
+        return Optional.of(mocRequestRepository.save(request));
+    }
+    
+    // This method is only used for single-request updates
+    private void processApproval(MocRequest request) throws JsonProcessingException {
+        log.info("--- Inside processApproval for MocRequest ID: {} ---", request.getId());
+        CreateMocRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateMocRequestDto.class);
+
+        
+        if (payloadDto.getChangeType() == ChangeType.ADD) {
+       
+            GlTransaction newGlTxn = new GlTransaction();
+            
+            newGlTxn.setBatchId(payloadDto.getBatchId());
+            newGlTxn.setJournalId(payloadDto.getJournalId());
+            
+            if (payloadDto.getPDate() != null) {
+                newGlTxn.setPostDate(payloadDto.getPDate().atStartOfDay());
+            }
+            
+            newGlTxn.setBranchCode(payloadDto.getBranch());
+            newGlTxn.setCurrency(payloadDto.getCurrency());
+            newGlTxn.setCgl(payloadDto.getCgl());
+            newGlTxn.setNarration(payloadDto.getRemarks());
+            
+            BigDecimal amount = payloadDto.getAmount();
+            if (amount.signum() < 0) { // Negative amount is Credit
+                newGlTxn.setCreditAmount(amount);
+                newGlTxn.setDebitAmount(BigDecimal.ZERO);
+                log.debug("Setting CREDIT_AMOUNT: {}", amount);
+            } else { // Positive or zero amount is Debit
+                newGlTxn.setDebitAmount(amount);
+                newGlTxn.setCreditAmount(BigDecimal.ZERO);
+                log.debug("Setting DEBIT_AMOUNT: {}", amount);
+            }
+            
+            newGlTxn.setTransactionCount(payloadDto.getTransactionCount());
+            newGlTxn.setSourceFlag("J"); 
+            
+            log.info("Attempting to save GL entry for Journal ID: {}", payloadDto.getJournalId());
+            glTransactionRepository.save(newGlTxn);
+            log.info("Successfully SAVED new GL_TRANSACTION record for Journal ID: {}", payloadDto.getJournalId());
+        
+        } else if (payloadDto.getChangeType() == ChangeType.UPDATE) {
+            log.warn("UPDATE ChangeType not yet implemented for GL_TRANSACTIONS. Request {} skipped.", request.getId());
+        
+        } else if (payloadDto.getChangeType() == ChangeType.DELETE) {
+            log.warn("DELETE ChangeType not yet implemented for GL_TRANSACTIONS. Request {} skipped.", request.getId());
+        }
+        
+        log.info("--- Exiting processApproval for MocRequest ID: {} ---", request.getId());
+    }
+
+    @Override
+    public List<MocRequest> getMyRequests() {
+        log.info("Fetching ALL MOC requests for 'My Requests' screen.");
+        return mocRequestRepository.findAll(Sort.by(Sort.Direction.DESC, "requestDate"));
+    }
+
+    // --- 5. UPDATED PENDING REQUESTS LOGIC ---
+    @Override
+    public List<MocRequest> getPendingRequests(String userId, Integer userRole) {
+        // Find all pending requests
+        List<MocRequest> allPending = mocRequestRepository.findByRequestStatus(RequestStatus.PENDING);
+        
+        // Filter out requests where the creatorId AND creatorRole match the current user
+        return allPending.stream()
+            .filter(request -> {
+                boolean isCreator = String.valueOf(request.getCreatorId()).equals(String.valueOf(userId));
+                boolean isSameRole = request.getCreatorRole() != null && request.getCreatorRole().equals(userRole);
+                
+                // Keep the request if it's NOT (created by me AND with the same role)
+                return !(isCreator && isSameRole);
+            })
+            .collect(Collectors.toList());
+    }
+    
+    @Override
+    @Transactional
+    public List<MocRequest> processBulkRequests(BulkProcessMocRequestDto dto, String executorId, Integer executorRole) throws JsonProcessingException {
+        
+        log.info("Starting processBulkRequests for user: {}", executorId);
+
+        boolean hasBatchId = StringUtils.hasText(dto.getBatchId());
+        boolean hasJournalPrefixes = dto.getJournalIdPrefixes() != null && !dto.getJournalIdPrefixes().isEmpty();
+
+        if (!hasBatchId && !hasJournalPrefixes) {
+            throw new IllegalArgumentException("Either batchId or a list of journalIdPrefixes must be provided.");
+        }
+        if (hasBatchId && hasJournalPrefixes) {
+            throw new IllegalArgumentException("Provide either batchId or journalIdPrefixes, not both.");
+        }
+
+        List<MocRequest> requestsToProcess;
+        if (hasBatchId) {
+            log.info("Processing by Batch ID: {}", dto.getBatchId());
+            requestsToProcess = mocRequestRepository.findByBatchIdAndRequestStatus(dto.getBatchId(), RequestStatus.PENDING);
+        
+        } else {
+            log.info("Processing by Journal Prefixes count: {}", dto.getJournalIdPrefixes().size());
+            Specification<MocRequest> spec = (root, query, criteriaBuilder) -> {
+                List<Predicate> predicates = new ArrayList<>();
+                for (String prefix : dto.getJournalIdPrefixes()) {
+                    predicates.add(criteriaBuilder.like(root.get("journalId"), prefix + "%"));
+                }
+                Predicate journalIdOrPredicates = criteriaBuilder.or(predicates.toArray(new Predicate[0]));
+                Predicate statusPredicate = criteriaBuilder.equal(root.get("requestStatus"), RequestStatus.PENDING);
+                return criteriaBuilder.and(journalIdOrPredicates, statusPredicate);
+            };
+            requestsToProcess = mocRequestRepository.findAll(spec);
+        }
+
+        log.info("Found {} total pending requests to process.", requestsToProcess.size());
+
+        if (requestsToProcess.isEmpty()) {
+            log.warn("No pending requests found for the given criteria.");
+            return Collections.emptyList();
+        }
+        
+        // --- 1. Get creator info from the first request ---
+        // We assume all requests in this bulk operation have the same creator.
+        MocRequest firstRequest = requestsToProcess.get(0);
+        String creatorId = firstRequest.getCreatorId();
+        
+        List<MocRequest> processedRequests = new ArrayList<>();
+        List<GlTransaction> transactionsToSave = new ArrayList<>();
+        
+        
+        int count = 1;
+        for (MocRequest request : requestsToProcess) {
+            log.info("Processing loop item {} of {}. Request ID: {}", count, requestsToProcess.size(), request.getId());
+            
+            // --- 6. UPDATED SELF-APPROVAL CHECK ---
+            boolean isCreator = executorId.equals(request.getCreatorId());
+            boolean isSameRole = executorRole != null && executorRole.equals(request.getCreatorRole());
+
+            if (isCreator && isSameRole) {
+                log.warn("Skipping request {}: User {} (Role: {}) cannot approve/reject their own request.", 
+                         request.getId(), executorId, executorRole);
+                count++;
+                continue; 
+            }
+            // --- END OF CHECK ---
+          
+            if (request.getRequestStatus() != RequestStatus.PENDING) {
+                log.warn("Skipping request {}: It is not in PENDING status.", request.getId());
+                count++;
+                continue;
+            }
+
+            request.setExecutorId(executorId);
+            request.setExecutorRemarks(dto.getRemarks());
+            request.setExecutionDate(LocalDateTime.now());
+            request.setRequestStatus(dto.getStatus());
+        
+            if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+                log.info("Request {} marked ACCEPTED. Building GlTransaction...", request.getId());
+                
+                CreateMocRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateMocRequestDto.class);
+                
+                if (payloadDto.getChangeType() == ChangeType.ADD) {
+                    GlTransaction newGlTxn = new GlTransaction();
+                    newGlTxn.setBatchId(payloadDto.getBatchId());
+                    newGlTxn.setJournalId(payloadDto.getJournalId());
+                    if (payloadDto.getPDate() != null) {
+                        newGlTxn.setPostDate(payloadDto.getPDate().atStartOfDay());
+                    }
+                    newGlTxn.setBranchCode(payloadDto.getBranch());
+                    newGlTxn.setCurrency(payloadDto.getCurrency());
+                    newGlTxn.setCgl(payloadDto.getCgl());
+                    newGlTxn.setNarration(payloadDto.getRemarks());
+                    
+                    BigDecimal amount = payloadDto.getAmount();
+                    if (amount.signum() < 0) { // Negative amount is Credit
+                        newGlTxn.setCreditAmount(amount);
+                        newGlTxn.setDebitAmount(BigDecimal.ZERO);
+                    } else { // Positive or zero amount is Debit
+                        newGlTxn.setDebitAmount(amount);
+                        newGlTxn.setCreditAmount(BigDecimal.ZERO);
+                    }
+                    newGlTxn.setTransactionCount(payloadDto.getTransactionCount());
+                    newGlTxn.setSourceFlag("J"); 
+                    
+                    transactionsToSave.add(newGlTxn);
+                }
+                
+                // --- 7. NOTIFICATION REMOVED FROM LOOP ---
+                // sendCreatorNotification(request, true); // <-- DELETED
+                
+            } else {
+                log.info("Request {} marked REJECTED.", request.getId());
+                // --- 8. NOTIFICATION REMOVED FROM LOOP ---
+                // sendCreatorNotification(request, false); // <-- DELETED
+            }
+            
+            processedRequests.add(request);
+            count++;
+        }
+     
+        if (!transactionsToSave.isEmpty()) {
+            log.info("Saving {} new GL_TRANSACTION entries in a single batch...", transactionsToSave.size());
+            glTransactionRepository.saveAll(transactionsToSave);
+            log.info("Successfully saved all GL entries.");
+        }
+        
+        log.info("Saving all {} processed MocRequest statuses...", processedRequests.size());
+        List<MocRequest> savedRequests = mocRequestRepository.saveAll(processedRequests);
+        
+        // --- 9. NEW: Send ONE notification after successful save ---
+        try {
+            boolean isApproved = RequestStatus.ACCEPTED.equals(dto.getStatus());
+            String status = isApproved ? "approved" : "rejected";
+            String message;
+            String aggregateId;
+
+            if (hasBatchId) {
+                aggregateId = dto.getBatchId();
+                message = String.format("Your MOC batch (ID: %s) with %d entries has been %s by user %s.",
+                                        aggregateId, savedRequests.size(), status, executorId);
+            } else { // hasJournalPrefixes
+                // Use the first prefix as the "main" ID for the message
+                aggregateId = dto.getJournalIdPrefixes().get(0); 
+                message = String.format("Your %d MOC requests (Journals: %s,...) have been %s by user %s.",
+                                        savedRequests.size(), aggregateId, status, executorId);
+            }
+
+            if (!isApproved && StringUtils.hasText(dto.getRemarks())) {
+                message += " Reason: " + dto.getRemarks();
+            }
+
+            notificationWriterService.createNotification(
+                creatorId,              // Send to the specific creator
+                null,                   // No role
+                message,
+                JOURNAL_POSTING_URL,    // Link to their "my status" page
+                aggregateId,            // Use batchId or first journal prefix
+                EVENT_SOURCE
+            );
+            log.info("Successfully sent 1-to-1 bulk notification to user {} for aggregateId {}", creatorId, aggregateId);
+
+        } catch (Exception e) {
+            // Log the error but DO NOT re-throw. The transaction must commit.
+            log.error("CRITICAL (but non-blocking): Failed to send creator bulk notification for creator {}", 
+                      creatorId, e);
+        }
+        // --- END OF NEW NOTIFICATION LOGIC ---
+        
+        log.info("Finished processBulkRequests. Transaction committing.");
+        return savedRequests;
+    }
+    
+    // --- 9. NEW HELPER METHOD FOR CREATOR NOTIFICATIONS ---
+    /**
+     * Sends a 1-to-1 notification to the creator of the request.
+     * This is wrapped in a try/catch block so that a notification failure
+     * does NOT roll back the primary transaction (approval/rejection).
+     */
+    private void sendCreatorNotification(MocRequest request, boolean isApproved) {
+        try {
+            String status = isApproved ? "approved" : "rejected";
+            String message = String.format("Your MOC request (Journal: %s) has been %s by user %s.",
+                                           request.getJournalId(), status, request.getExecutorId());
+
+            if (!isApproved && StringUtils.hasText(request.getExecutorRemarks())) {
+                message += " Reason: " + request.getExecutorRemarks();
+            }
+
+            notificationWriterService.createNotification(
+                request.getCreatorId(), // Send to the specific creator
+                null,                   // No role
+                message,
+                JOURNAL_POSTING_URL,    // Link to their "my status" page
+                request.getId().toString(),
+                EVENT_SOURCE
+            );
+        } catch (Exception e) {
+            // Log the error but DO NOT re-throw. The transaction must commit.
+            log.error("CRITICAL (but non-blocking): Failed to send creator notification for MOC Request ID: {}", 
+                      request.getId(), e);
+        }
+    }
+    
+    
+    @Override
+    public List<MocRequest> getRequestsByBatchId(String batchId) {
+        log.info("Fetching all MOC requests for Batch ID: {}", batchId);
+        List<MocRequest> requests = mocRequestRepository.findByBatchId(batchId);
+        
+        if (requests.isEmpty()) {
+            log.warn("No requests found for Batch ID: {}", batchId);
+          
+            throw new ResourceNotFoundException("No MOC requests found for Batch ID: " + batchId);
+        }
+      
+        return requests;
+    }
+   
+    @Override
+    @Transactional
+    public void cancelMyRequest(Long requestId, String userId) {
+        MocRequest request = mocRequestRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("MOC Request with ID " + requestId + " not found."));
+
+        if (!userId.equals(request.getCreatorId())) {
+            log.warn("User {} attempted to cancel request {} owned by {}", userId, requestId, request.getCreatorId());
+            throw new IllegalStateException("You are not authorized to cancel this request.");
+        }
+
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            log.warn("User {} attempted to cancel request {} which is already in status {}", userId, requestId, request.getRequestStatus());
+            throw new IllegalStateException("Cannot cancel a request that has already been processed.");
+        }
+
+        mocRequestRepository.delete(request);
+        log.info("User {} successfully canceled MOC request {}", userId, requestId);
+    }
+
+    @Override
+    @Transactional
+    public void cancelMyRequestsByJournalPrefix(String journalIdPrefix, String userId) {
+        log.info("User {} attempting to cancel all requests with journal prefix: {}", userId, journalIdPrefix);
+       
+        List<MocRequest> requestsToCancel = mocRequestRepository.findByJournalIdStartingWithAndCreatorIdAndRequestStatus(
+                journalIdPrefix, userId, RequestStatus.PENDING);
+
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found for you with journal prefix: " + journalIdPrefix);
+        }
+      
+        mocRequestRepository.deleteAll(requestsToCancel);
+        
+        log.info("User {} successfully bulk-canceled {} requests for journal prefix {}", userId, requestsToCancel.size(), journalIdPrefix);
+    }
+
+    @Override
+    public List<MocRequestStatusDto> getMocRequestStatusList() {
+        log.info("Fetching all MOC requests for status list");
+        List<MocRequest> allRequests = mocRequestRepository.findAll();
+        return allRequests.stream()
+                .map(MocRequestStatusDto::new)
+                .collect(Collectors.toList());
+    }
+    
+    @Override
+    @Transactional
+    public void cancelMyRequestsByBatchId(String batchId, String userId) {
+        log.info("User {} attempting to cancel PENDING requests created by them in batch ID: {}", userId, batchId);
+
+        List<MocRequest> requestsToCancel = mocRequestRepository.findByBatchIdAndCreatorIdAndRequestStatus(
+                batchId, userId, RequestStatus.PENDING);
+        
+
+        if (requestsToCancel.isEmpty()) {
+            log.warn("No pending requests found for user {} in batch ID {}", userId, batchId);
+            throw new ResourceNotFoundException("No pending requests found for you in this batch.");
+        }
+
+        mocRequestRepository.deleteAll(requestsToCancel);
+        log.info("User {} successfully bulk-canceled {} requests for batch ID {}", userId, requestsToCancel.size(), batchId);
+    }
+
+    @Override
+    @Transactional
+    public void cancelMyRequestsByJournalPrefixes(List<String> journalIdPrefixes, String userId) {
+        log.info("User {} attempting to bulk-cancel PENDING requests for journal prefixes: {}", userId, journalIdPrefixes.size());
+        
+        Specification<MocRequest> spec = (root, query, criteriaBuilder) -> {
+            List<Predicate> predicates = new ArrayList<>();
+            for (String prefix : journalIdPrefixes) {
+                predicates.add(criteriaBuilder.like(root.get("journalId"), prefix + "%"));
+            }
+            Predicate journalIdOrPredicates = criteriaBuilder.or(predicates.toArray(new Predicate[0]));
+            Predicate statusPredicate = criteriaBuilder.equal(root.get("requestStatus"), RequestStatus.PENDING);
+            Predicate creatorPredicate = criteriaBuilder.equal(root.get("creatorId"), userId);
+            
+            return criteriaBuilder.and(journalIdOrPredicates, statusPredicate, creatorPredicate);
+        };
+        
+        List<MocRequest> requestsToCancel = mocRequestRepository.findAll(spec);
+
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found for you with the specified journal prefixes.");
+        }
+
+        mocRequestRepository.deleteAll(requestsToCancel);
+        log.info("User {} successfully bulk-canceled {} requests for {} journal prefixes.", userId, requestsToCancel.size(), journalIdPrefixes.size());
+    }
+}
