@@ -1,85 +1,543 @@
-I apologize for the confusion. I used MENU_ITEMS because the Java Entity file (Permissions.java) you provided in the first prompt was explicitly annotated with @Table(name = "MENU_ITEMS").
-However, since your Database Table is actually named PERMISSIONS, the Java code must be updated to match the Database, otherwise, you will get ORA-00942.
-Here are the corrected files. You must update both the Entity and the Repository.
-1. Update Permissions.java (Model)
-Crucial Fix: Change the @Table name from "MENU_ITEMS" to "PERMISSIONS".
+The error ORA-14300: partitioning key maps to a partition outside maximum permitted... is a Database Schema Issue, not a Java code error.
+What is happening?
+Your Oracle table GL_TRANSACTIONS is Partitioned (likely by Date, e.g., POST_DATE or TRANSACTION_DATE).
+ * The database behaves like a set of buckets (e.g., "Jan 2024", "Feb 2024"...).
+ * You are trying to insert a transaction for November 2025.
+ * The database does not have a bucket (partition) defined for Nov 2025 yet.
+You have two steps to fix this. Step 1 is mandatory (SQL). Step 2 is a code improvement.
+Step 1: The Database Fix (Mandatory)
+You must execute a SQL command in your database to add a partition for the current date range.
+Run this in your SQL Editor (SQL Developer / PLSQL):
+-- OPTION A: Add a "Catch-All" partition (Recommended for Dev)
+-- This ensures you never face this error again, regardless of the date.
+ALTER TABLE GL_TRANSACTIONS 
+ADD PARTITION P_MAX VALUES LESS THAN (MAXVALUE);
+
+-- OR --
+
+-- OPTION B: Add a specific partition for 2025/2026 if you want to be specific
+-- (Only use this if Option A fails saying high bound must be higher)
+ALTER TABLE GL_TRANSACTIONS 
+ADD PARTITION P_2026 VALUES LESS THAN (TO_DATE('01-JAN-2026', 'DD-MON-YYYY'));
+
+Step 2: The Java Code Fix
+I noticed in your GlTransaction entity, transactionDate was set to insertable = false. This relies on the Database default value. It is safer to set this explicitly in Java to ensure the Date matching the partition key is exactly what we expect.
+Here are the updated files to handle the dates correctly.
+1. Update GlTransaction.java (Model)
+Change: I removed insertable = false, updatable = false from transactionDate so we can set it manually.
 package com.fincore.JournalService.Models;
 
 import jakarta.persistence.*;
-import lombok.*;
+import lombok.Data;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
 
 @Entity
-@Table(name = "PERMISSIONS") // <--- UPDATED: Was "MENU_ITEMS" in your code, changed to match DB
-@Getter
-@Setter
-@NoArgsConstructor
-@AllArgsConstructor
-@ToString
-public class Permissions {
+@Table(name = "GL_TRANSACTIONS")
+@Data
+public class GlTransaction {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "menu_item_seq_gen")
-    @SequenceGenerator(name = "menu_item_seq_gen", sequenceName = "MENU_ITEMS_SEQ", allocationSize = 1)
-    @Column(name = "MENU_ID", nullable = false)
-    private int menuId;
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "GL_TRANSACTIONS_SEQ")
+    @SequenceGenerator(name = "GL_TRANSACTIONS_SEQ", sequenceName = "GL_TRANSACTIONS_SEQ", allocationSize = 1)
+    @Column(name = "TRANSACTION_ID")
+    private Long transactionId;
 
-    @Column(name = "MENU_TITLE", nullable = false, length = 100)
-    private String menuTitle;
+    @Column(name = "BATCH_ID", length = 50) 
+    private String batchId;
 
-    @Column(name = "MENU_ICON", length = 100)
-    private String menuIcon;
+    @Column(name = "JOURNAL_ID", length = 50)
+    private String journalId;
+   
+    // UPDATED: Removed 'insertable = false' so we can set this in Java
+    @Column(name = "TRANSACTION_DATE")
+    @Temporal(TemporalType.DATE)
+    private LocalDate transactionDate;
 
-    @Column(name = "MENU_SUBMENU", length = 100)
-    private String menuSubmenu;
+    @Column(name = "POST_DATE")
+    @Temporal(TemporalType.TIMESTAMP)
+    private LocalDateTime postDate;
 
-    @Column(name = "MENU_ACTION", nullable = false, length = 200)
-    private String menuAction;
+    @Column(name = "BRANCH_CODE", length = 50)
+    private String branchCode;
 
-    @Column(name = "MENU_URL", nullable = false, length = 200)
-    private String menuUrl;
+    @Column(name = "CURRENCY", length = 3)
+    private String currency;
 
-    @Column(name = "MENU_COMPONENT_PATH", nullable = false, length = 200)
-    private String menuComponentPath;
+    @Column(name = "CGL", length = 10)
+    private String cgl;
 
-    @Column(name = "MENU_DESCRIPTION", nullable = false, length = 255)
-    private String menuDescription;
+    @Column(name = "NARRATION", length = 40)
+    private String narration;
 
-    @Column(name = "MENU_DEPENDANT")
-    private int menuDependant;
+    @Column(name = "DEBIT_AMOUNT", precision = 25, scale = 4)
+    private BigDecimal debitAmount;
 
-    @Column(name = "MAPPED_REQUEST_TYPE", length = 50)
-    private String mappedRequestType;
+    @Column(name = "CREDIT_AMOUNT", precision = 25, scale = 4)
+    private BigDecimal creditAmount;
+
+    @Column(name = "TRANSACTION_COUNT")
+    private Integer transactionCount;
+
+    @Column(name = "SOURCE_FLAG", length = 1)
+    private String sourceFlag;
 }
 
-2. Update PermissionRepository.java
-Crucial Fix: The Native Query now explicitly joins PERMISSIONS, ROLE_PERMISSIONS, and ROLES.
-package com.fincore.JournalService.Repository;
+2. Update JournalRequestServiceImpl.java
+Change: In processApproval, I am now explicitly setting transactionDate to ensure it matches the postDate.
+package com.fincore.JournalService.Service;
 
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Query;
-import org.springframework.data.repository.query.Param;
-import org.springframework.stereotype.Repository;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.JournalService.Dto.*;
+import com.fincore.JournalService.Exception.ResourceNotFoundException;
+import com.fincore.JournalService.Models.GlTransaction;
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Models.enums.ChangeType;
+import com.fincore.JournalService.Models.enums.RequestStatus;
+import com.fincore.JournalService.Repository.GlTransactionRepository;
+import com.fincore.JournalService.Repository.JournalRequestRepository;
 
-import com.fincore.JournalService.Models.Permissions;
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.jpa.domain.Specification;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+import jakarta.persistence.criteria.Predicate;
 
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
 
-@Repository
-public interface PermissionRepository extends JpaRepository<Permissions, Integer> {
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class JournalRequestServiceImpl implements JournalRequestService {
 
-    @Query(value = """
-       SELECT p.MENU_URL, rp.ROLE_ID
-       FROM PERMISSIONS p
-       JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
-       JOIN ROLES r ON rp.ROLE_ID = r.ROLE_ID
-       WHERE p.MAPPED_REQUEST_TYPE = :requestType
-         AND (p.MENU_ACTION LIKE '%approve%' OR p.MENU_ACTION LIKE '%reject%')
-         AND r.ROLE_STATUS = 'ACTIVE'
-   """, nativeQuery = true)
-    List<Object[]> findUrlAndRolesByRequestType(@Param("requestType") String requestType);
+    private final JournalRequestRepository journalRequestRepository;
+    private final GlTransactionRepository glTransactionRepository; 
+    private final ObjectMapper objectMapper;
+    private final SequenceService sequenceService;
+    
+    private final NotificationWriterService notificationWriterService;
+    private final PermissionConfigService permissionConfigService;
+    
+    private static final String EVENT_SOURCE = "JournalService";
+    private static final String JOURNAL_AUTH_TYPE = "JOURNAL_AUTH"; 
+    private static final String JOURNAL_POSTING_URL = "/Journal-Posting-Status"; 
+
+    @Override
+    @Transactional
+    public List<JournalRequest> createBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+        
+        String batchId = sequenceService.getNextBatchId();
+        log.info("Creating new Journal batch with Batch ID: {}", batchId);
+       
+        LocalDate postingDate = LocalDate.now();
+        
+        List<JournalRequest> requestsToSave = new ArrayList<>();
+        String commonRemarks = batchDto.getCommonBatchRemarks();
+
+        Map<String, List<BatchRequestDto.JournalRequestRow>> groupedRows = batchDto.getRows().stream()
+                .collect(Collectors.groupingBy(row -> row.getBranch() + ":" + row.getCurrency()));
+        
+        log.info("Batch {} contains {} distinct Branch-Currency groups.", batchId, groupedRows.size());
+
+        for (Map.Entry<String, List<BatchRequestDto.JournalRequestRow>> entry : groupedRows.entrySet()) {
+            
+            String journalIdPrefix = sequenceService.getNextJournalIdPrefix();
+            int journalSequence = 1;
+            List<BatchRequestDto.JournalRequestRow> rowsInGroup = entry.getValue();
+            
+            for (BatchRequestDto.JournalRequestRow rowDto : rowsInGroup) {
+                
+                String journalId = String.format("%s-%03d", journalIdPrefix, journalSequence);
+                
+                CreateJournalRequestDto payloadDto = new CreateJournalRequestDto();
+                
+                payloadDto.setPDate(postingDate); 
+                payloadDto.setChangeType(rowDto.getChangeType());
+                payloadDto.setMasterJournalId(rowDto.getMasterJournalId());
+                payloadDto.setBranch(rowDto.getBranch());
+                payloadDto.setCurrency(rowDto.getCurrency());
+                payloadDto.setCgl(rowDto.getCgl());
+                payloadDto.setAmount(rowDto.getAmount()); 
+                payloadDto.setProductType(rowDto.getProductType());
+                payloadDto.setRemarks(rowDto.getRemarks());
+                payloadDto.setArFlag(rowDto.getArFlag());
+                payloadDto.setAcClassification(rowDto.getAcClassification());
+                payloadDto.setBatchId(batchId); 
+                payloadDto.setJournalId(journalId); 
+                payloadDto.setCommonBatchRemarks(commonRemarks);
+                payloadDto.setTransactionCount(journalSequence); 
+                
+                JournalRequest request = new JournalRequest();
+                request.setCreatorId(creatorId);
+                request.setCreatorRole(creatorRole);
+                request.setChangeType(rowDto.getChangeType());
+                request.setRequestStatus(RequestStatus.PENDING);
+                request.setBatchId(batchId);
+                request.setJournalId(journalId);
+                request.setCommonBatchRemarks(commonRemarks);
+                request.setPayload(objectMapper.writeValueAsString(payloadDto));
+
+                requestsToSave.add(request);
+
+                journalSequence++; 
+            }
+        }
+        log.info("Saving {} JournalRequest entries for Batch ID: {}", requestsToSave.size(), batchId);
+        List<JournalRequest> savedRequests = journalRequestRepository.saveAll(requestsToSave);
+        
+        try {
+            NotificationConfigDto config = permissionConfigService.getConfig(JOURNAL_AUTH_TYPE);
+            String message = String.format("New Journal request (Batch: %s) by user %s is pending approval.", batchId, creatorId);
+
+            notificationWriterService.createNotification(
+                null,                   
+                config.getTargetRoles(),
+                message,
+                config.getTargetUrl(),  
+                batchId,                
+                EVENT_SOURCE
+            );
+            log.info("Successfully created 1-to-many notification for Batch ID: {}", batchId);
+
+        } catch (Exception e) {
+            log.error("CRITICAL: Failed to create 'pending' notification for Batch ID: {}. Rolling back transaction.", batchId, e);
+            throw new RuntimeException("Failed to create notification event, rolling back batch creation.", e);
+        }
+   
+        return savedRequests;
+    }
+
+    @Override
+    @Transactional
+    public Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto dto, String executorId, Integer executorRole) throws JsonProcessingException {
+        log.debug("Updating single request: {}", dto.getRequestId());
+        JournalRequest request = journalRequestRepository.findById(dto.getRequestId())
+                .orElseThrow(() -> new ResourceNotFoundException("Journal Request with ID " + dto.getRequestId() + " not found."));
+
+        boolean isCreator = executorId.equals(request.getCreatorId());
+        boolean isSameRole = executorRole != null && executorRole.equals(request.getCreatorRole());
+
+        if (isCreator && isSameRole) {
+            log.warn("SECURITY VIOLATION: User {} (Role: {}) attempted to approve/reject their own request (ID: {}).", 
+                     executorId, executorRole, request.getId());
+            throw new IllegalStateException("User cannot approve or reject their own request with the same role.");
+        }
+
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            throw new IllegalStateException("Journal Request has already been processed.");
+        }
+
+        request.setExecutorId(executorId);
+        request.setExecutorRemarks(dto.getRemarks());
+        request.setExecutionDate(LocalDateTime.now());
+        request.setRequestStatus(dto.getStatus());
+
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            log.info("Journal Request {} ACCEPTED. Processing for Batch ID: {}", dto.getRequestId(), request.getBatchId());
+            processApproval(request); 
+            sendCreatorNotification(request, true);
+        } else {
+            log.info("Journal Request {} REJECTED.", dto.getRequestId());
+            sendCreatorNotification(request, false);
+        }
+
+        return Optional.of(journalRequestRepository.save(request));
+    }
+    
+    private void processApproval(JournalRequest request) throws JsonProcessingException {
+        CreateJournalRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateJournalRequestDto.class);
+        
+        if (payloadDto.getChangeType() == ChangeType.ADD) {
+       
+            GlTransaction newGlTxn = new GlTransaction();
+            newGlTxn.setBatchId(payloadDto.getBatchId());
+            newGlTxn.setJournalId(payloadDto.getJournalId());
+            
+            // UPDATED: Explicitly setting Transaction Date to avoid relying on DB defaults
+            if (payloadDto.getPDate() != null) {
+                newGlTxn.setPostDate(payloadDto.getPDate().atStartOfDay());
+                newGlTxn.setTransactionDate(payloadDto.getPDate()); // Set Date explicitly
+            } else {
+                newGlTxn.setPostDate(LocalDateTime.now());
+                newGlTxn.setTransactionDate(LocalDate.now());
+            }
+            
+            newGlTxn.setBranchCode(payloadDto.getBranch());
+            newGlTxn.setCurrency(payloadDto.getCurrency());
+            newGlTxn.setCgl(payloadDto.getCgl());
+            newGlTxn.setNarration(payloadDto.getRemarks());
+            
+            BigDecimal amount = payloadDto.getAmount();
+            if (amount.signum() < 0) { 
+                newGlTxn.setCreditAmount(amount);
+                newGlTxn.setDebitAmount(BigDecimal.ZERO);
+            } else { 
+                newGlTxn.setDebitAmount(amount);
+                newGlTxn.setCreditAmount(BigDecimal.ZERO);
+            }
+            
+            newGlTxn.setTransactionCount(payloadDto.getTransactionCount());
+            newGlTxn.setSourceFlag("J"); 
+            
+            glTransactionRepository.save(newGlTxn);
+        } 
+    }
+
+    @Override
+    public List<JournalRequest> getMyRequests() {
+        return journalRequestRepository.findAll(Sort.by(Sort.Direction.DESC, "requestDate"));
+    }
+
+    @Override
+    public List<JournalRequest> getPendingRequests(String userId, Integer userRole) {
+        List<JournalRequest> allPending = journalRequestRepository.findByRequestStatus(RequestStatus.PENDING);
+        return allPending.stream()
+            .filter(request -> {
+                boolean isCreator = String.valueOf(request.getCreatorId()).equals(String.valueOf(userId));
+                boolean isSameRole = request.getCreatorRole() != null && request.getCreatorRole().equals(userRole);
+                return !(isCreator && isSameRole);
+            })
+            .collect(Collectors.toList());
+    }
+    
+    @Override
+    @Transactional
+    public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) throws JsonProcessingException {
+        log.info("Starting processBulkRequests for user: {}", executorId);
+
+        boolean hasBatchId = StringUtils.hasText(dto.getBatchId());
+        boolean hasJournalPrefixes = dto.getJournalIdPrefixes() != null && !dto.getJournalIdPrefixes().isEmpty();
+
+        if (!hasBatchId && !hasJournalPrefixes) {
+            throw new IllegalArgumentException("Either batchId or a list of journalIdPrefixes must be provided.");
+        }
+
+        List<JournalRequest> requestsToProcess;
+        if (hasBatchId) {
+            requestsToProcess = journalRequestRepository.findByBatchIdAndRequestStatus(dto.getBatchId(), RequestStatus.PENDING);
+        } else {
+            Specification<JournalRequest> spec = (root, query, criteriaBuilder) -> {
+                List<Predicate> predicates = new ArrayList<>();
+                for (String prefix : dto.getJournalIdPrefixes()) {
+                    predicates.add(criteriaBuilder.like(root.get("journalId"), prefix + "%"));
+                }
+                Predicate journalIdOrPredicates = criteriaBuilder.or(predicates.toArray(new Predicate[0]));
+                Predicate statusPredicate = criteriaBuilder.equal(root.get("requestStatus"), RequestStatus.PENDING);
+                return criteriaBuilder.and(journalIdOrPredicates, statusPredicate);
+            };
+            requestsToProcess = journalRequestRepository.findAll(spec);
+        }
+
+        if (requestsToProcess.isEmpty()) {
+            return Collections.emptyList();
+        }
+        
+        List<JournalRequest> processedRequests = new ArrayList<>();
+        List<GlTransaction> transactionsToSave = new ArrayList<>();
+        
+        for (JournalRequest request : requestsToProcess) {
+            boolean isCreator = executorId.equals(request.getCreatorId());
+            boolean isSameRole = executorRole != null && executorRole.equals(request.getCreatorRole());
+
+            if (isCreator && isSameRole) continue;
+            if (request.getRequestStatus() != RequestStatus.PENDING) continue;
+
+            request.setExecutorId(executorId);
+            request.setExecutorRemarks(dto.getRemarks());
+            request.setExecutionDate(LocalDateTime.now());
+            request.setRequestStatus(dto.getStatus());
+        
+            if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+                CreateJournalRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateJournalRequestDto.class);
+                
+                if (payloadDto.getChangeType() == ChangeType.ADD) {
+                    GlTransaction newGlTxn = new GlTransaction();
+                    newGlTxn.setBatchId(payloadDto.getBatchId());
+                    newGlTxn.setJournalId(payloadDto.getJournalId());
+                    
+                    // UPDATED: Explicitly setting Transaction Date
+                    if (payloadDto.getPDate() != null) {
+                        newGlTxn.setPostDate(payloadDto.getPDate().atStartOfDay());
+                        newGlTxn.setTransactionDate(payloadDto.getPDate());
+                    } else {
+                        newGlTxn.setPostDate(LocalDateTime.now());
+                        newGlTxn.setTransactionDate(LocalDate.now());
+                    }
+
+                    newGlTxn.setBranchCode(payloadDto.getBranch());
+                    newGlTxn.setCurrency(payloadDto.getCurrency());
+                    newGlTxn.setCgl(payloadDto.getCgl());
+                    newGlTxn.setNarration(payloadDto.getRemarks());
+                    
+                    BigDecimal amount = payloadDto.getAmount();
+                    if (amount.signum() < 0) { 
+                        newGlTxn.setCreditAmount(amount);
+                        newGlTxn.setDebitAmount(BigDecimal.ZERO);
+                    } else { 
+                        newGlTxn.setDebitAmount(amount);
+                        newGlTxn.setCreditAmount(BigDecimal.ZERO);
+                    }
+                    newGlTxn.setTransactionCount(payloadDto.getTransactionCount());
+                    newGlTxn.setSourceFlag("J"); 
+                    
+                    transactionsToSave.add(newGlTxn);
+                }
+            }
+            processedRequests.add(request);
+        }
+     
+        if (!transactionsToSave.isEmpty()) {
+            glTransactionRepository.saveAll(transactionsToSave);
+        }
+        
+        List<JournalRequest> savedRequests = journalRequestRepository.saveAll(processedRequests);
+        
+        try {
+            boolean isApproved = RequestStatus.ACCEPTED.equals(dto.getStatus());
+            String status = isApproved ? "approved" : "rejected";
+            String message;
+            String aggregateId;
+
+            if (hasBatchId) {
+                aggregateId = dto.getBatchId();
+                message = String.format("Your Journal batch (ID: %s) with %d entries has been %s by user %s.",
+                                        aggregateId, savedRequests.size(), status, executorId);
+            } else { 
+                aggregateId = dto.getJournalIdPrefixes().get(0); 
+                message = String.format("Your %d Journal requests (Journals: %s,...) have been %s by user %s.",
+                                        savedRequests.size(), aggregateId, status, executorId);
+            }
+
+            if (!isApproved && StringUtils.hasText(dto.getRemarks())) {
+                message += " Reason: " + dto.getRemarks();
+            }
+
+            String creatorId = requestsToProcess.get(0).getCreatorId();
+            notificationWriterService.createNotification(
+                creatorId,              
+                null,                   
+                message,
+                JOURNAL_POSTING_URL,    
+                aggregateId,            
+                EVENT_SOURCE
+            );
+        } catch (Exception e) {
+            log.error("Failed to send creator bulk notification", e);
+        }
+        
+        return savedRequests;
+    }
+    
+    private void sendCreatorNotification(JournalRequest request, boolean isApproved) {
+        try {
+            String status = isApproved ? "approved" : "rejected";
+            String message = String.format("Your Journal request (Journal: %s) has been %s by user %s.",
+                                           request.getJournalId(), status, request.getExecutorId());
+
+            if (!isApproved && StringUtils.hasText(request.getExecutorRemarks())) {
+                message += " Reason: " + request.getExecutorRemarks();
+            }
+
+            notificationWriterService.createNotification(
+                request.getCreatorId(),
+                null,                   
+                message,
+                JOURNAL_POSTING_URL,    
+                request.getId().toString(),
+                EVENT_SOURCE
+            );
+        } catch (Exception e) {
+            log.error("Failed to send creator notification", e);
+        }
+    }
+    
+    @Override
+    public List<JournalRequest> getRequestsByBatchId(String batchId) {
+        List<JournalRequest> requests = journalRequestRepository.findByBatchId(batchId);
+        if (requests.isEmpty()) {
+            throw new ResourceNotFoundException("No Journal requests found for Batch ID: " + batchId);
+        }
+        return requests;
+    }
+   
+    @Override
+    @Transactional
+    public void cancelMyRequest(Long requestId, String userId) {
+        JournalRequest request = journalRequestRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("Journal Request with ID " + requestId + " not found."));
+
+        if (!userId.equals(request.getCreatorId())) {
+            throw new IllegalStateException("You are not authorized to cancel this request.");
+        }
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            throw new IllegalStateException("Cannot cancel a request that has already been processed.");
+        }
+        journalRequestRepository.delete(request);
+    }
+
+    @Override
+    @Transactional
+    public void cancelMyRequestsByJournalPrefix(String journalIdPrefix, String userId) {
+        List<JournalRequest> requestsToCancel = journalRequestRepository.findByJournalIdStartingWithAndCreatorIdAndRequestStatus(
+                journalIdPrefix, userId, RequestStatus.PENDING);
+
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found for you with journal prefix: " + journalIdPrefix);
+        }
+        journalRequestRepository.deleteAll(requestsToCancel);
+    }
+
+    @Override
+    public List<JournalRequestStatusDto> getJournalRequestStatusList() {
+        return journalRequestRepository.findAll().stream()
+                .map(JournalRequestStatusDto::new)
+                .collect(Collectors.toList());
+    }
+    
+    @Override
+    @Transactional
+    public void cancelMyRequestsByBatchId(String batchId, String userId) {
+        List<JournalRequest> requestsToCancel = journalRequestRepository.findByBatchIdAndCreatorIdAndRequestStatus(
+                batchId, userId, RequestStatus.PENDING);
+        
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found for you in this batch.");
+        }
+        journalRequestRepository.deleteAll(requestsToCancel);
+    }
+
+    @Override
+    @Transactional
+    public void cancelMyRequestsByJournalPrefixes(List<String> journalIdPrefixes, String userId) {
+        Specification<JournalRequest> spec = (root, query, criteriaBuilder) -> {
+            List<Predicate> predicates = new ArrayList<>();
+            for (String prefix : journalIdPrefixes) {
+                predicates.add(criteriaBuilder.like(root.get("journalId"), prefix + "%"));
+            }
+            Predicate journalIdOrPredicates = criteriaBuilder.or(predicates.toArray(new Predicate[0]));
+            Predicate statusPredicate = criteriaBuilder.equal(root.get("requestStatus"), RequestStatus.PENDING);
+            Predicate creatorPredicate = criteriaBuilder.equal(root.get("creatorId"), userId);
+            return criteriaBuilder.and(journalIdOrPredicates, statusPredicate, creatorPredicate);
+        };
+        
+        List<JournalRequest> requestsToCancel = journalRequestRepository.findAll(spec);
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found for you with the specified journal prefixes.");
+        }
+        journalRequestRepository.deleteAll(requestsToCancel);
+    }
 }
 
-Summary of Changes made to fix ORA-00942:
- * Model: Permissions.java -> Changed @Table(name="MENU_ITEMS") to @Table(name="PERMISSIONS").
- * Repository: PermissionRepository.java -> Updated the SQL to select FROM PERMISSIONS p and join ROLE_PERMISSIONS rp on p.MENU_ID = rp.PERMISSION_ID.
-This aligns your Java code exactly with the DB Schema you just provided.
