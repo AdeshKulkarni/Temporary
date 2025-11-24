@@ -1,88 +1,579 @@
-I understand. You provided a Common Request Service implementation (generic), but you want me to adapt these specific files to work exclusively inside your Journal Service.
-I will refactor the code to:
- * Change all packages to com.fincore.JournalService....
- * Remove references to CommonReq.
- * Update the NotificationWriterService to handle JournalRequest logic (Batch approvals/rejections) instead of generic requests.
-Here are the modified files ready for your JournalService.
-1. RedisConfig.java
-Package updated. Kept your specific object mapping logic.
+below are the files from the Journal Service including frontend and backend
+
+
 package com.fincore.JournalService.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
-import com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
-import org.springframework.cache.CacheManager;
-import org.springframework.cache.annotation.EnableCaching;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.data.redis.cache.RedisCacheConfiguration;
-import org.springframework.data.redis.cache.RedisCacheManager;
-import org.springframework.data.redis.connection.RedisConnectionFactory;
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
-import org.springframework.data.redis.serializer.Jackson2JsonRedisSerializer;
-import org.springframework.data.redis.serializer.RedisSerializationContext;
-import org.springframework.data.redis.serializer.StringRedisSerializer;
+import org.springframework.context.annotation.Primary;
 
-import java.time.Duration;
+@Configuration
+public class AppConfig {
+
+	@Bean
+	@Primary
+	public ObjectMapper objectMapper() {
+		ObjectMapper mapper = new ObjectMapper();
+
+		mapper.registerModule(new JavaTimeModule());
+
+		mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+
+		return mapper;
+	}
+}
+
+package com.fincore.JournalService.config;
+
+
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.cache.concurrent.ConcurrentMapCacheManager;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
 
 @Configuration
 @EnableCaching
-public class RedisConfig {
+public class CacheConfig {
 
     @Bean
-    public CacheManager cacheManager(RedisConnectionFactory connectionFactory) {
-        // 1. Create a specialized ObjectMapper for Redis
-        ObjectMapper redisObjectMapper = new ObjectMapper();
-        redisObjectMapper.registerModule(new JavaTimeModule());
-        
-        // Explicitly verify and enable "Type Info" for polymorphic deserialization
-        redisObjectMapper.activateDefaultTyping(
-                BasicPolymorphicTypeValidator.builder()
-                        .allowIfBaseType(Object.class)
-                        .build(),
-                ObjectMapper.DefaultTyping.NON_FINAL
-        );
-        
-        GenericJackson2JsonRedisSerializer serializer = new GenericJackson2JsonRedisSerializer(redisObjectMapper);
+    public ConcurrentMapCacheManager cacheManager() {
+      
+        return new ConcurrentMapCacheManager("notification_configs");
+    }
+}
+package com.fincore.JournalService.config;
 
-        RedisCacheConfiguration cacheConfig = RedisCacheConfiguration.defaultCacheConfig()
-                .entryTtl(Duration.ofHours(24)) 
-                .disableCachingNullValues() 
-                .serializeKeysWith(RedisSerializationContext.SerializationPair.fromSerializer(new StringRedisSerializer()))
-                .serializeValuesWith(RedisSerializationContext.SerializationPair.fromSerializer(serializer));
+import jakarta.persistence.AttributeConverter;
+import jakarta.persistence.Converter;
+import java.util.stream.Stream;
 
-        return RedisCacheManager.builder(connectionFactory)
-                .cacheDefaults(cacheConfig)
-                .build();
+import com.fincore.JournalService.Models.enums.RequestStatus;
+
+@Converter(autoApply = false) // autoApply makes it work for all RequestStatus fields
+public class RequestStatusConverter implements AttributeConverter<RequestStatus, String> {
+
+    @Override
+    public String convertToDatabaseColumn(RequestStatus status) {
+        if (status == null) {
+            return null;
+        }
+        return status.getCode(); // Converts PENDING to "P"
     }
 
-    @Bean
-    public ObjectMapper objectMapper() {
-        ObjectMapper mapper = new ObjectMapper();
-        mapper.registerModule(new JavaTimeModule());
-        mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS); 
-        return mapper;
-    }
-
-    @Bean
-    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory connectionFactory, ObjectMapper objectMapper) {
-        RedisTemplate<String, Object> template = new RedisTemplate<>();
-        template.setConnectionFactory(connectionFactory);
-
-        Jackson2JsonRedisSerializer<Object> serializer =
-                new Jackson2JsonRedisSerializer<>(objectMapper, Object.class);
-
-        template.setValueSerializer(serializer);
-        template.setKeySerializer(new StringRedisSerializer()); 
-
-        return template;
+    @Override
+    public RequestStatus convertToEntityAttribute(String code) {
+        if (code == null) {
+            return null;
+        }
+        // Finds the Enum constant that matches the code from the DB
+        return Stream.of(RequestStatus.values())
+                .filter(c -> c.getCode().equals(code))
+                .findFirst()
+                .orElseThrow(IllegalArgumentException::new);
     }
 }
 
-2. NotificationConfigDto.java
-Package updated.
+package com.fincore.JournalService.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+                // 1. Disable CSRF, not needed for stateless REST APIs
+                .csrf(csrf -> csrf.disable())
+
+                // 2. Define authorization rules
+                .authorizeHttpRequests(authz -> authz
+                      
+                        .requestMatchers("/**").permitAll() // Allows access to all your API endpoints
+//                        .requestMatchers("/actuator/**").permitAll() // Allows access to Spring Actuator
+                        .anyRequest().authenticated() // Secure any other endpoints not listed
+                )
+
+                // 3. Set session management to stateless, essential for REST APIs
+                .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS));
+
+        
+
+        return http.build();
+    }
+}
+
+package com.fincore.JournalService.Controllers;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import com.fincore.JournalService.Dto.BranchDto;
+import com.fincore.JournalService.Service.BranchService;
+
+import java.util.Collections; 
+import java.util.List;
+import java.util.Map;
+
+@RestController
+@RequestMapping("branches")
+@RequiredArgsConstructor
+public class BranchController {
+
+	private final BranchService branchService;
+
+	@GetMapping("/map")
+	public Map<String, String> getBranchMap() {
+		return branchService.getBranchCodeAndNameMap();
+	}
+
+	@GetMapping("/search")
+	public List<BranchDto> searchBranches(@RequestParam String query) {
+       
+        if (query == null || query.trim().isEmpty()) {
+            return Collections.emptyList();
+        }
+     
+		return branchService.searchBranches(query);
+	}
+}
+
+package com.fincore.JournalService.Controllers;
+
+
+import lombok.RequiredArgsConstructor;
+
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import com.fincore.JournalService.Dto.CglDto;
+import com.fincore.JournalService.Service.CglService;
+
+import java.util.List;
+
+
+@RestController
+@RequestMapping("/api/cgls")
+@RequiredArgsConstructor 
+public class CglController {
+
+	  private final CglService cglService;
+
+      
+      @GetMapping("/search")
+      public ResponseEntity<List<CglDto>> searchCgls(
+           
+              @RequestParam(value = "query", required = false, defaultValue = "") String query) {
+          
+       
+          return ResponseEntity.ok(cglService.searchCgls(query));
+      }
+}
+
+package com.fincore.JournalService.Controllers;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fincore.JournalService.Dto.BatchRequestDto;
+import com.fincore.JournalService.Dto.BulkProcessJournalRequestDto;
+import com.fincore.JournalService.Dto.JournalRequestStatusDto;
+import com.fincore.JournalService.Dto.ProcessJournalRequestDto;
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Service.JournalRequestService;
+import com.fincore.commonutilities.jwt.JwtUtil;
+
+import io.jsonwebtoken.Claims; 
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.List;
+
+@RestController
+@RequestMapping("journals") 
+@RequiredArgsConstructor 
+@Slf4j
+public class JournalRequestController {
+
+    private final JournalRequestService journalRequestService;
+
+    @GetMapping("/current-posting-date")
+    public String getCurrentPostingDate() {
+        return LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE);
+    }
+    
+    @PostMapping("/create-batch")
+    @ResponseStatus(HttpStatus.CREATED)
+    public List<JournalRequest> createBatchRequest(
+            @Valid @RequestBody BatchRequestDto batchDto,
+            @RequestHeader("Authorization") String token) throws JsonProcessingException {
+        
+        String userId = JwtUtil.getUserIdFromToken(token);
+        JsonNode claims = JwtUtil.getClaimsFromToken(token); 
+        Integer userRole = claims.get("role").asInt(); 
+        
+        log.info("Received Journal batch request creation call from user: {}, role: {}", userId, userRole);
+        
+        return journalRequestService.createBatchRequest(batchDto, userId, userRole);
+    }
+
+
+    @PatchMapping("/update-request")
+    public JournalRequest updateRequestStatus(
+            @RequestHeader("Authorization") String token,
+            @RequestBody ProcessJournalRequestDto processRequestDto) throws JsonProcessingException {
+                
+        String executorId = JwtUtil.getUserIdFromToken(token);
+        JsonNode claims = JwtUtil.getClaimsFromToken(token); 
+        Integer executorRole = claims.get("role").asInt(); 
+      
+        log.info("Received Journal update request call from user: {}, role: {}", executorId, executorRole);
+        
+        return journalRequestService.updateRequestStatus(processRequestDto, executorId, executorRole).get();
+    }
+
+    @GetMapping("/my-requests")
+    public List<JournalRequest> getMyRequests() {
+        log.info("Received request for 'my-requests' (now returning ALL requests).");
+        return journalRequestService.getMyRequests();
+    }
+
+    @GetMapping("/pending-requests")
+    public List<JournalRequest> getPendingRequests(@RequestHeader("Authorization") String token) {
+        String userId = JwtUtil.getUserIdFromToken(token);
+        JsonNode claims = JwtUtil.getClaimsFromToken(token); 
+        Integer userRole = claims.get("role").asInt(); 
+      
+        return journalRequestService.getPendingRequests(userId, userRole);
+    }
+    
+    @PostMapping("/process-bulk")
+    public List<JournalRequest> processBulkRequests(
+            @RequestHeader("Authorization") String token,
+            @Valid @RequestBody BulkProcessJournalRequestDto processRequestDto) throws JsonProcessingException {
+        
+        String executorId = JwtUtil.getUserIdFromToken(token);
+        JsonNode claims = JwtUtil.getClaimsFromToken(token); 
+        Integer executorRole = claims.get("role").asInt(); 
+       
+        log.info("Received bulk Journal process call from user: {}, role: {}", executorId, executorRole);
+        
+        return journalRequestService.processBulkRequests(processRequestDto, executorId, executorRole);
+    }
+    
+    @GetMapping("/by-batch/{batchId}")
+    public ResponseEntity<List<JournalRequest>> getRequestsByBatchId(@PathVariable String batchId) {
+        log.info("Received request for all Journal data by Batch ID: {}", batchId);
+        List<JournalRequest> requests = journalRequestService.getRequestsByBatchId(batchId);
+        return ResponseEntity.ok(requests);
+    }
+
+    @DeleteMapping("/my-request/{requestId}")
+    public ResponseEntity<Void> cancelMyRequest(
+            @RequestHeader("Authorization") String token,
+            @PathVariable Long requestId) {
+        
+        String userId = JwtUtil.getUserIdFromToken(token);
+        log.info("Received request from user {} to cancel Journal request {}", userId, requestId);
+        journalRequestService.cancelMyRequest(requestId, userId);
+        return ResponseEntity.noContent().build(); 
+    }
+
+    @DeleteMapping("/my-requests/by-journal/{journalIdPrefix}")
+    public ResponseEntity<Void> cancelMyRequestsByJournal(
+            @RequestHeader("Authorization") String token,
+            @PathVariable String journalIdPrefix) {
+        
+        String userId = JwtUtil.getUserIdFromToken(token);
+        log.info("Received request from user {} to bulk-cancel Journal requests with journal prefix {}", userId, journalIdPrefix);
+        journalRequestService.cancelMyRequestsByJournalPrefix(journalIdPrefix, userId);
+        return ResponseEntity.noContent().build(); 
+    }
+    
+    @DeleteMapping("/my-requests/by-batch/{batchId}")
+    public ResponseEntity<Void> cancelMyRequestsByBatch(
+            @RequestHeader("Authorization") String token,
+            @PathVariable String batchId) throws JsonProcessingException {
+        
+        String userId = JwtUtil.getUserIdFromToken(token);
+        log.info("Received request from user {} to bulk-cancel Journal requests with batch ID {}", userId, batchId);
+        journalRequestService.cancelMyRequestsByBatchId(batchId, userId);
+        return ResponseEntity.noContent().build(); 
+    }
+
+    @DeleteMapping("/my-requests/by-journal-list")
+    public ResponseEntity<Void> cancelMyRequestsByJournalPrefixes(
+            @RequestHeader("Authorization") String token,
+            @RequestBody List<String> journalIdPrefixes) throws JsonProcessingException {
+        
+        String userId = JwtUtil.getUserIdFromToken(token);
+        log.info("Received request from user {} to bulk-cancel Journal requests with journal prefixes: {}", userId, journalIdPrefixes.size());
+        journalRequestService.cancelMyRequestsByJournalPrefixes(journalIdPrefixes, userId);
+        return ResponseEntity.noContent().build(); 
+    }
+    
+    @GetMapping("/status")
+    public ResponseEntity<List<JournalRequestStatusDto>> getJournalStatusList() {
+        log.info("Received request for Journal status list");
+        return ResponseEntity.ok(journalRequestService.getJournalRequestStatusList());
+    }
+}
+
+package com.fincore.JournalService.Controllers;
+
+import jakarta.persistence.AttributeConverter;
+import jakarta.persistence.Converter;
+import java.util.stream.Stream;
+
+import com.fincore.JournalService.Models.enums.RequestStatus;
+
+@Converter(autoApply = true) // autoApply makes it work for all RequestStatus fields
+public class RequestStatusConverter implements AttributeConverter<RequestStatus, String> {
+
+    @Override
+    public String convertToDatabaseColumn(RequestStatus status) {
+        if (status == null) {
+            return null;
+        }
+        return status.getCode(); // Converts PENDING to "P"
+    }
+
+    @Override
+    public RequestStatus convertToEntityAttribute(String code) {
+        if (code == null) {
+            return null;
+        }
+        // Finds the Enum constant that matches the code from the DB
+        return Stream.of(RequestStatus.values())
+                .filter(c -> c.getCode().equals(code))
+                .findFirst()
+                .orElseThrow(IllegalArgumentException::new);
+    }
+}
+
+
+
+package com.fincore.JournalService.Dto;
+
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
+import java.math.BigDecimal;
+import lombok.Data;
+import java.util.List;
+
+import com.fincore.JournalService.Models.enums.ChangeType;
+
+@Data
+public class BatchRequestDto {
+
+    @Data
+    public static class JournalRequestRow {
+        @NotNull
+        private ChangeType changeType = ChangeType.ADD; 
+        
+        private Long masterJournalId; 
+
+        @NotNull @Size(min = 1, max = 50) 
+        private String branch; 
+
+        @NotNull @Size(min = 3, max = 3) 
+        private String currency;
+
+        @NotNull @Size(min = 1, max = 10)
+        private String cgl;
+
+        @NotNull
+        private BigDecimal amount; 
+       
+        @Size(max = 20) 
+        private String productType;
+        
+        @Size(max = 40) 
+        private String remarks;
+        
+        @Size(min = 1, max = 1)
+        private String arFlag = "A"; 
+        
+        @Size(min = 1, max = 1) 
+        private String acClassification; 
+    }
+
+    @Size(max = 200)
+    private String commonBatchRemarks;
+
+    @Valid
+    @NotNull
+    private List<JournalRequestRow> rows;
+}
+
+package com.fincore.JournalService.Dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class BranchDto {
+    private String code;
+    private String name;
+}
+
+package com.fincore.JournalService.Dto;
+
+import java.util.List;
+
+import com.fincore.JournalService.Models.enums.RequestStatus;
+
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
+import lombok.Data;
+
+@Data
+public class BulkProcessJournalRequestDto {
+     
+    private String batchId;
+    
+    private List<String> journalIdPrefixes;
+
+    @NotNull
+    private RequestStatus status; 
+    
+    @Size(max = 50)
+    private String remarks;
+}
+
+package com.fincore.JournalService.Dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class CglDto {
+    private String cglNumber;
+    private String description;
+}
+
+package com.fincore.JournalService.Dto;
+
+import lombok.Data;
+import lombok.Getter;
+import lombok.Setter;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+
+import com.fincore.JournalService.Models.enums.ChangeType;
+
+@Data
+@Getter
+@Setter
+public class CreateJournalRequestDto {
+
+    @NotNull
+    private ChangeType changeType;
+  
+    private Long masterJournalId; 
+
+    @NotNull 
+    private LocalDate pDate;
+    
+    @NotNull @Size(min = 1, max = 50) 
+    private String branch; 
+
+    @NotNull @Size(min = 3, max = 3) 
+    private String currency;
+
+    @NotNull @Size(min = 1, max = 50)
+    private String cgl;
+
+    @NotNull
+    private BigDecimal amount; 
+    
+    @Size(max = 20) 
+    private String productType;
+    
+    @Size(max = 50) 
+    private String remarks;
+    
+    @Size(min = 1, max = 1)
+    private String arFlag;
+    
+    @Size(min = 1, max = 1) 
+    private String acClassification; 
+
+    @NotNull @Size(min = 1, max = 50) 
+    private String batchId;
+
+    @NotNull @Size(min = 1, max = 50) 
+    private String journalId;
+    
+    @Size(max = 50)
+    private String commonBatchRemarks;
+    
+    private Integer transactionCount;
+}
+
+package com.fincore.JournalService.Dto;
+
+import lombok.Data;
+import java.time.LocalDateTime;
+
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Models.enums.RequestStatus;
+
+@Data
+public class JournalRequestStatusDto {
+
+    private RequestStatus requestStatus;
+    private LocalDateTime requestDate;
+    private String creatorId;
+    private String executorId;
+    private String executorRemarks;
+    private String batchId;
+    private String journalId;
+
+    // A helper constructor 
+    public JournalRequestStatusDto(JournalRequest request) {
+        this.requestStatus = request.getRequestStatus();
+        this.requestDate = request.getRequestDate();
+        this.creatorId = request.getCreatorId();
+        this.executorId = request.getExecutorId();
+        this.executorRemarks = request.getExecutorRemarks();
+        this.batchId = request.getBatchId();
+        this.journalId = request.getJournalId();
+    }
+}
+
+
 package com.fincore.JournalService.Dto;
 
 import lombok.AllArgsConstructor;
@@ -94,11 +585,434 @@ import lombok.NoArgsConstructor;
 @NoArgsConstructor
 public class NotificationConfigDto {
     private String targetUrl;
-    private String targetRoles; // e.g., "51,52,55"
+    private String targetRoles; // Comma separated string: "51,52,55"
 }
 
-3. Notifications.java (Entity)
-Package updated. Maps to your specific Journal Service table.
+package com.fincore.JournalService.Dto;
+
+import com.fincore.JournalService.Models.enums.RequestStatus;
+
+import jakarta.persistence.Column;
+import jakarta.validation.constraints.Size;
+import lombok.Data;
+import lombok.Getter;
+import lombok.Setter;
+
+@Data
+@Getter
+@Setter
+public class ProcessJournalRequestDto {
+	@Column(nullable = false)
+    private Long requestId;
+    
+    @Column(nullable = false)
+    private RequestStatus status; 
+    
+    @Size(max = 50)
+    private String remarks;
+
+}
+
+
+package com.fincore.JournalService.Exception;
+
+
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.ResponseStatus;
+
+@ResponseStatus(HttpStatus.NOT_FOUND)
+public class ResourceNotFoundException extends RuntimeException {
+    public ResourceNotFoundException(String message) {
+        super(message);
+    }
+}
+
+
+package com.fincore.JournalService.Models.enums;
+
+import lombok.Getter;
+
+import java.util.Arrays;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+@Getter
+public enum AcClassification {
+	  ASSET('A', "Asset"),
+	    LIABILITY('L', "Liability"),
+	    INCOME('I', "Income"),
+	    EXPENSE('E', "Expense"),
+	    MEMO('M', "Memo A/c");
+
+	    private final char code;
+	    private final String description;
+
+	    AcClassification(char code, String description) {
+	        this.code = code;
+	        this.description = description;
+	    }
+
+	  
+	    public static Map<String, String> getClassificationMap() {
+	        return Arrays.stream(AcClassification.values())
+	                .collect(Collectors.toMap(
+	                        ac -> String.valueOf(ac.getCode()), 
+	                        AcClassification::getDescription
+	                ));
+	    }
+}
+
+
+
+package com.fincore.JournalService.Models.enums;
+
+import lombok.Getter;
+
+@Getter
+public enum ChangeType {
+	    ADD("A"),
+	    UPDATE("U"),
+	    DELETE("D");
+
+	    private final String code;
+
+	    ChangeType(String code) {
+	        this.code = code;
+	    }
+}
+
+
+package com.fincore.JournalService.Models.enums;
+
+
+import lombok.Getter;
+
+@Getter
+public enum RequestStatus {
+    PENDING("P"),
+    ACCEPTED("A"),
+    REJECTED("R");
+
+    private final String code;
+
+    RequestStatus(String code) {
+        this.code = code;
+    }
+}
+
+package com.fincore.JournalService.Models;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Data;
+import java.time.LocalDate;
+
+
+@Entity
+@Table(name = "BRANCH_MASTER")
+@Data
+public class BranchMaster {
+
+    @Id
+    @Column(name = "CODE" )
+    private String code;
+
+    @Column(name = "NAME")
+    private String name;
+
+    @Column(name = "CIRCLE_CODE")
+    private String circleCode;
+
+    @Column(name = "STATE")
+    private String state;
+
+    @Column(name = "CITY")
+    private String city;
+
+    @Column(name = "ADDRESS")
+    private String address;
+
+    @Column(name = "PINCODE")
+    private String pincode;
+
+    @Column(name = "PHONE_NUMBER")
+    private String phoneNumber;
+
+    @Column(name = "EMAIL_ID")
+    private String emailId;
+
+    @Column(name = "NMR_CODE" )
+    private String nmrCode;
+
+    @Column(name = "STATUS")
+    private Integer status;
+
+    @Column(name = "OPEN_DATE")
+    private LocalDate openDate;
+
+    @Column(name = "CLOSE_DATE")
+    private LocalDate closeDate;
+
+    @Column(name = "MERGE_DATE")
+    private LocalDate mergeDate;
+
+    @Column(name = "MERGED_WITH_BRANCH" )
+    private String mergedWithBranch;
+
+    @Column(name = "LAST_CHANGE_DATE")
+    private LocalDate lastChangeDate;
+
+    @Column(name = "CPC_FLAG")
+    private Boolean cpcFlag;
+
+    @Column(name = "FOOD_CREDIT_FLAG")
+    private Boolean foodCreditFlag;
+
+    @Column(name = "CURR_CHEST_FLAG")
+    private Boolean currChestFlag;
+
+    @Column(name = "BRANCH_TYPE")
+    private String branchType;
+}
+
+package com.fincore.JournalService.Models;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Data;
+import java.time.LocalDate;
+
+
+@Entity
+@Table(name = "CGL_MASTER")
+@Data
+public class CglMaster {
+
+    @Id
+    @Column(name = "CGL_NUMBER", length = 10, updatable = false, insertable = false)
+    private String cglNumber;
+
+    @Column(name = "COMP_1", length = 4, nullable = false)
+    private String comp1;
+
+    @Column(name = "SEGMENT_CODE", length = 4, nullable = false)
+    private String segmentCode;
+
+    @Column(name = "COMP_2", length = 2, nullable = false)
+    private String comp2;
+
+    @Column(name = "DESCRIPTION", length = 100, nullable = false)
+    private String description;
+
+    @Column(name = "AC_CLASSIFICATION", length = 1, nullable = false)
+    private String acClassification;
+
+    @Column(name = "BAL_FWD", nullable = false)
+    private Boolean balFwd = false;
+
+    @Column(name = "DEF_BAL_TYPE", length = 1, nullable = false)
+    private String defBalType;
+
+    @Column(name = "STATUS", nullable = false)
+    private Boolean status = true;
+
+    @Column(name = "OPEN_DATE", nullable = false)
+    private LocalDate openDate;
+
+    @Column(name = "CLOSE_DATE")
+    private LocalDate closeDate;
+
+    @Column(name = "BAL_COMPARE", nullable = false)
+    private Boolean balCompare = true;
+
+    @Column(name = "MANUAL_POSTING", nullable = false)
+    private Boolean manualPosting = true;
+}
+
+package com.fincore.JournalService.Models;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "GL_TRANSACTIONS")
+@Data
+public class GlTransaction {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "GL_TRANSACTIONS_SEQ")
+    @SequenceGenerator(name = "GL_TRANSACTIONS_SEQ", sequenceName = "GL_TRANSACTIONS_SEQ", allocationSize = 1)
+    @Column(name = "TRANSACTION_ID")
+    private Long transactionId;
+
+    @Column(name = "BATCH_ID", length = 50) 
+    private String batchId;
+
+    @Column(name = "JOURNAL_ID", length = 50)
+    private String journalId;
+   
+    @Column(name = "TRANSACTION_DATE", insertable = false, updatable = false)
+    @Temporal(TemporalType.DATE)
+    private LocalDate transactionDate;
+
+    @Column(name = "POST_DATE")
+    @Temporal(TemporalType.TIMESTAMP)
+    private LocalDateTime postDate;
+
+    @Column(name = "BRANCH_CODE", length = 50)
+    private String branchCode;
+
+    @Column(name = "CURRENCY", length = 3)
+    private String currency;
+
+    @Column(name = "CGL", length = 10)
+    private String cgl;
+
+    @Column(name = "NARRATION", length = 40)
+    private String narration;
+
+    @Column(name = "DEBIT_AMOUNT", precision = 25, scale = 4)
+    private BigDecimal debitAmount;
+
+    @Column(name = "CREDIT_AMOUNT", precision = 25, scale = 4)
+    private BigDecimal creditAmount;
+
+    @Column(name = "TRANSACTION_COUNT")
+    private Integer transactionCount;
+
+    @Column(name = "SOURCE_FLAG", length = 1)
+    private String sourceFlag;
+}
+
+package com.fincore.JournalService.Models;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import java.time.LocalDateTime;
+
+import com.fincore.JournalService.Models.enums.ChangeType;
+import com.fincore.JournalService.Models.enums.RequestStatus;
+
+@Entity
+@Table(name = "JOURNAL_REQUEST")
+@Data
+public class JournalRequest {
+	 @Id
+     @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "JOURNAL_REQUEST_SEQ")
+     @SequenceGenerator(name = "JOURNAL_REQUEST_SEQ", sequenceName = "JOURNAL_REQUEST_SEQ", allocationSize = 1)
+     @Column(name = "REQ_ID")
+     private Long id;
+
+     @Enumerated(EnumType.STRING)
+     @Column(name = "REQ_STATUS", length = 10)
+     private RequestStatus requestStatus;
+
+     @Enumerated(EnumType.STRING)
+     @Column(name = "CHANGE_TYPE", length = 10)
+     private ChangeType changeType;
+
+     @Column(name = "REQ_DATE", updatable = false)
+     private LocalDateTime requestDate = LocalDateTime.now();
+
+     @Column(name = "CREATOR_ID", length = 12, updatable = false)
+     private String creatorId;
+
+     @Column(name = "CREATOR_ROLE", updatable = false)
+     private Integer creatorRole;
+
+     @Column(name = "EXECUTOR_ID", length = 12)
+     private String executorId;
+
+     @Column(name = "EXECUTION_DATE")
+     private LocalDateTime executionDate;
+
+     @Column(name = "EXECUTOR_REMARKS", length = 50)
+     private String executorRemarks;
+
+     @Lob
+     @Column(name = "PAYLOAD")
+     private String payload;
+
+     @Column(name = "BATCH_ID", length = 50)
+     private String batchId;
+
+     @Column(name = "JOURNAL_ID", length = 50) 
+     private String journalId;
+     
+     @Column(name = "COMMON_BATCH_REMARKS" , length = 50)
+     private String commonBatchRemarks;
+}
+
+
+
+
+package com.fincore.JournalService.Models;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import jakarta.persistence.*;
+import lombok.Data;
+
+@Entity
+@Table(name = "MASTER_JOURNAL")
+@Data
+public class MasterJournal {
+      @Id
+      @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "MASTER_JOURNAL_SEQ")
+      @SequenceGenerator(name = "MASTER_JOURNAL_SEQ", sequenceName = "MASTER_JOURNAL_SEQ", allocationSize = 1)
+      @Column(name = "JOURNAL_ID")
+      private Long id;
+
+      @Column(name = "JOURNAL_PDATE")
+      private LocalDate pDate;
+
+      @Column(name = "JOURNAL_BRANCH", length = 50)
+      private String branch;
+
+      @Column(name = "CURRENCY", length = 3)
+      private String currency;
+
+      @Column(name = "JOURNAL_CGL", length = 50)
+      private String cgl;
+
+      @Column(name = "JOURNAL_AMT")
+      private BigDecimal amount;
+
+      @Column(name = "TXN_TYPE", length = 20)
+      private String transactionType;
+
+      @Column(name = "PRODUCT_TYPE", length = 20)
+      private String productType;
+
+      @Column(name = "REMARKS", length = 50)
+      private String remarks;
+
+      @Column(name = "AR_FLAG", length = 1)
+      private String arFlag;
+      
+      @Column(name= "AC_CLASSIFICATION")
+      private String acClassification;
+
+      @Column(name = "BATCH_ID", length = 50)
+      private String batchId;
+
+      @Column(name = "JOURNAL_ID_REF", length = 50) // Renamed to avoid conflict with PK if needed, or just JOURNAL_ID
+      private String journalId;
+      
+      @Column(name = "COMMON_BATCH_REMARKS" , length = 50)
+      private String commonBatchRemarks;
+}
+
+
+
+
 package com.fincore.JournalService.Models;
 
 import jakarta.persistence.*;
@@ -111,20 +1025,21 @@ import org.springframework.data.jpa.domain.support.AuditingEntityListener;
 
 import java.io.Serializable;
 import java.time.Instant;
+import java.util.Objects;
 import java.util.UUID;
 
 @Entity
-@Table(name = "NOTIFICATIONS")
+@Table(name = "notification_table")
 @Builder
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
 @EntityListeners(AuditingEntityListener.class)
-public class Notifications implements Serializable {
+public class NotificationTable implements Serializable {
 
     @Id
     @GeneratedValue(strategy = GenerationType.UUID)
-    @Column(name = "EVENT_ID", nullable = false, updatable = false)
+    @Column(name = "EVENT_ID", updatable = false, nullable = false)
     private UUID eventId;
 
     @Column(name = "USER_ID", length = 255)
@@ -150,15 +1065,13 @@ public class Notifications implements Serializable {
     private String targetRole;
 }
 
-4. Permissions.java (Entity)
-Package updated.
 package com.fincore.JournalService.Models;
 
 import jakarta.persistence.*;
 import lombok.*;
 
 @Entity
-@Table(name = "MENU_ITEMS") // Maps to your existing table
+@Table(name = "MENU_ITEMS")
 @Getter
 @Setter
 @NoArgsConstructor
@@ -167,7 +1080,9 @@ import lombok.*;
 public class Permissions {
 
     @Id
-    @Column(name = "MENU_ID")
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "menu_item_seq_gen")
+    @SequenceGenerator(name = "menu_item_seq_gen", sequenceName = "MENU_ITEMS_SEQ", allocationSize = 1)
+    @Column(name = "MENU_ID", nullable = false)
     private int menuId;
 
     @Column(name = "MENU_TITLE", nullable = false, length = 100)
@@ -197,29 +1112,120 @@ public class Permissions {
     @Column(name = "MAPPED_REQUEST_TYPE", length = 50)
     private String mappedRequestType;
 }
+package com.fincore.JournalService.Repository;
 
-5. NotificationRepository.java
-Package updated.
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.JournalService.Models.BranchMaster;
+
+import java.util.List;
+
+
+@Repository
+public interface BranchMasterRepository extends JpaRepository<BranchMaster, String> {
+
+   
+    List<BranchMaster> findByNameContainingIgnoreCaseOrCodeContainingIgnoreCase(String name, String code);
+   
+}
+
+
+package com.fincore.JournalService.Repository;
+
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.JournalService.Models.CglMaster;
+
+import java.util.List;
+
+
+@Repository
+public interface CglMasterRepository extends JpaRepository<CglMaster, String> {
+
+    List<CglMaster> findByCglNumberContainingOrDescriptionContainingIgnoreCase(String cglNumber, String description);
+}
+
 package com.fincore.JournalService.Repository;
 
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;
-import com.fincore.JournalService.Models.Notifications;
+
+import com.fincore.JournalService.Models.GlTransaction;
+
+@Repository
+public interface GlTransactionRepository extends JpaRepository<GlTransaction, Long> {
+}
+
+package com.fincore.JournalService.Repository;
+
+import java.util.List;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.JpaSpecificationExecutor; 
+import org.springframework.stereotype.Repository;
+
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Models.enums.RequestStatus;
+
+@Repository
+public interface JournalRequestRepository extends JpaRepository<JournalRequest, Long>, JpaSpecificationExecutor<JournalRequest> { 
+    
+    List<JournalRequest> findByJournalIdAndRequestStatus(String journalId, RequestStatus status);
+    
+    List<JournalRequest> findByCreatorId(String creatorId);
+    List<JournalRequest> findByRequestStatus(RequestStatus status);
+    List<JournalRequest> findByBatchIdAndRequestStatus(String batchId, RequestStatus status);
+
+    List<JournalRequest> findByJournalIdInAndRequestStatus(List<String> journalIds, RequestStatus status);
+    
+    List<JournalRequest> findByJournalIdStartingWithAndRequestStatus(String journalIdPrefix, RequestStatus status);
+    
+    List<JournalRequest> findByBatchId(String batchId);
+
+    List<JournalRequest> findByJournalIdStartingWith(String journalIdPrefix);
+
+    List<JournalRequest> findByBatchIdAndCreatorIdAndRequestStatus(String batchId, String creatorId, RequestStatus status);
+    List<JournalRequest> findByJournalIdStartingWithAndCreatorIdAndRequestStatus(String journalIdPrefix, String creatorId, RequestStatus status);
+}
+
+
+
+package com.fincore.JournalService.Repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.JournalService.Models.MasterJournal;
+
+@Repository
+public interface MasterJournalRepository extends JpaRepository<MasterJournal, Long>{
+
+}
+
+
+package com.fincore.JournalService.Repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.JournalService.Models.NotificationTable;
+
 import java.util.UUID;
 
 @Repository
-public interface NotificationRepository extends JpaRepository<Notifications, UUID>{
+public interface NotificationRepository extends JpaRepository<NotificationTable, UUID>{
 }
-
-6. PermissionRepository.java
-Package updated.
 package com.fincore.JournalService.Repository;
 
-import com.fincore.JournalService.Models.Permissions;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
+
+import com.fincore.JournalService.Models.Permissions;
 
 import java.util.List;
 
@@ -228,9 +1234,9 @@ public interface PermissionRepository extends JpaRepository<Permissions, Integer
 
     @Query(value = """
        SELECT p.MENU_URL, rp.ROLE_ID
-       FROM MENU_ITEMS p
+       FROM PERMISSIONS p
        JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
-       JOIN ROLES r ON rp.ROLE_ID = r.ROLE_ID
+       JOIN FTWOAHM.ROLES r ON rp.ROLE_ID = r.ROLE_ID
        WHERE p.MAPPED_REQUEST_TYPE = :requestType
          AND (p.MENU_ACTION LIKE '%approve%' OR p.MENU_ACTION LIKE '%reject%')
          AND r.ROLE_STATUS = 'ACTIVE'
@@ -238,17 +1244,688 @@ public interface PermissionRepository extends JpaRepository<Permissions, Integer
     List<Object[]> findUrlAndRolesByRequestType(@Param("requestType") String requestType);
 }
 
-7. NotificationWriterService.java
-CRITICAL UPDATE: Replaced CommonReq logic with logic specific to Journal Requests and Batches.
+
 package com.fincore.JournalService.Service;
 
-import com.fincore.JournalService.Models.Notifications;
-import com.fincore.JournalService.Repository.NotificationRepository;
+
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import com.fincore.JournalService.Dto.BranchDto;
+import com.fincore.JournalService.Models.BranchMaster;
+import com.fincore.JournalService.Repository.BranchMasterRepository;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class BranchService {
+
+    private final BranchMasterRepository branchMasterRepository;
+
+  
+    public Map<String, String> getBranchCodeAndNameMap() {
+        log.info("Fetching all branches to create a code-name map.");
+        List<BranchMaster> branches = branchMasterRepository.findAll();
+
+      
+        Map<String, String> branchMap = branches.stream()
+                .collect(Collectors.toMap(BranchMaster::getCode, BranchMaster::getName));
+        
+        log.info("Successfully created map with {} branch entries.", branchMap.size());
+        return branchMap;
+    }
+
+ 
+    public List<BranchDto> searchBranches(String query) {
+        log.info("Searching for branches where name OR code contains: '{}'", query);
+
+        List<BranchMaster> byNameOrCode = branchMasterRepository
+                .findByNameContainingIgnoreCaseOrCodeContainingIgnoreCase(query, query);
+
+    
+        return byNameOrCode.stream()
+                .map(branch -> new BranchDto(branch.getCode(), branch.getName()))
+                .collect(Collectors.toList());
+    }
+  
+}
+package com.fincore.JournalService.Service;
+
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import org.springframework.util.StringUtils;
+
+import com.fincore.JournalService.Dto.CglDto;
+import com.fincore.JournalService.Models.CglMaster;
+import com.fincore.JournalService.Repository.CglMasterRepository;
+
+import java.util.List;
+
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class CglService {
+
+	  private final CglMasterRepository cglMasterRepository;
+
+      private CglDto convertToDto(CglMaster cgl) {
+          return new CglDto(cgl.getCglNumber(), cgl.getDescription());
+      }
+
+  
+      
+      public List<CglDto> searchCgls(String query) {
+        
+          boolean hasQuery = StringUtils.hasText(query); 
+          
+          if (!hasQuery) {
+              log.info("No CGL query provided.");
+              return List.of(); 
+          }
+
+          log.info("Searching CGLs by query '{}'", query);
+        
+          List<CglMaster> results = cglMasterRepository
+                  .findByCglNumberContainingOrDescriptionContainingIgnoreCase(query, query);
+          
+          return results.stream()
+                  .map(this::convertToDto)
+                  .collect(Collectors.toList());
+      }
+    
+      
+}
+package com.fincore.JournalService.Service;
+
+import java.util.List;
+import java.util.Optional;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fincore.JournalService.Dto.BatchRequestDto;
+import com.fincore.JournalService.Dto.BulkProcessJournalRequestDto;
+import com.fincore.JournalService.Dto.JournalRequestStatusDto;
+import com.fincore.JournalService.Dto.ProcessJournalRequestDto;
+import com.fincore.JournalService.Models.JournalRequest;
+
+public interface JournalRequestService {
+	
+    List<JournalRequest> createBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException;
+
+	Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto dto, String executorId, Integer executorRole) throws JsonProcessingException;
+	
+	List<JournalRequest> getMyRequests();
+     
+	List<JournalRequest> getPendingRequests(String userId, Integer userRole);
+    
+	List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) throws JsonProcessingException;
+    
+	List<JournalRequest> getRequestsByBatchId(String batchId);
+    
+	void cancelMyRequest(Long requestId, String userId);
+    
+    void cancelMyRequestsByJournalPrefix(String journalIdPrefix, String userId);
+
+    List<JournalRequestStatusDto> getJournalRequestStatusList();
+ 
+    void cancelMyRequestsByBatchId(String batchId, String userId);
+    void cancelMyRequestsByJournalPrefixes(List<String> journalIdPrefixes, String userId);
+}
+
+package com.fincore.JournalService.Service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.JournalService.Dto.*;
+import com.fincore.JournalService.Exception.ResourceNotFoundException;
+import com.fincore.JournalService.Models.GlTransaction;
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Models.enums.ChangeType;
+import com.fincore.JournalService.Models.enums.RequestStatus;
+import com.fincore.JournalService.Repository.GlTransactionRepository;
+import com.fincore.JournalService.Repository.JournalRequestRepository;
+
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.jpa.domain.Specification;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+import jakarta.persistence.criteria.Predicate;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class JournalRequestServiceImpl implements JournalRequestService {
+
+    private final JournalRequestRepository journalRequestRepository;
+    private final GlTransactionRepository glTransactionRepository; 
+    private final ObjectMapper objectMapper;
+    private final SequenceService sequenceService;
+    
+    private final NotificationWriterService notificationWriterService;
+    private final PermissionConfigService permissionConfigService;
+    
+    private static final String EVENT_SOURCE = "JournalService";
+    private static final String JOURNAL_AUTH_TYPE = "JOURNAL_AUTH";
+    private static final String JOURNAL_POSTING_URL = "/Journal-Posting-Status"; 
+
+    @Override
+    @Transactional
+    public List<JournalRequest> createBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+        
+        String batchId = sequenceService.getNextBatchId();
+        log.info("Creating new Journal batch with Batch ID: {}", batchId);
+       
+        LocalDate postingDate = LocalDate.now();
+        
+        List<JournalRequest> requestsToSave = new ArrayList<>();
+        String commonRemarks = batchDto.getCommonBatchRemarks();
+
+        Map<String, List<BatchRequestDto.JournalRequestRow>> groupedRows = batchDto.getRows().stream()
+                .collect(Collectors.groupingBy(row -> row.getBranch() + ":" + row.getCurrency()));
+        
+        log.info("Batch {} contains {} distinct Branch-Currency groups.", batchId, groupedRows.size());
+
+        for (Map.Entry<String, List<BatchRequestDto.JournalRequestRow>> entry : groupedRows.entrySet()) {
+            
+            String journalIdPrefix = sequenceService.getNextJournalIdPrefix();
+            int journalSequence = 1;
+            List<BatchRequestDto.JournalRequestRow> rowsInGroup = entry.getValue();
+            
+            for (BatchRequestDto.JournalRequestRow rowDto : rowsInGroup) {
+                
+                String journalId = String.format("%s-%03d", journalIdPrefix, journalSequence);
+                
+                CreateJournalRequestDto payloadDto = new CreateJournalRequestDto();
+                
+                payloadDto.setPDate(postingDate); 
+                payloadDto.setChangeType(rowDto.getChangeType());
+                payloadDto.setMasterJournalId(rowDto.getMasterJournalId());
+                payloadDto.setBranch(rowDto.getBranch());
+                payloadDto.setCurrency(rowDto.getCurrency());
+                payloadDto.setCgl(rowDto.getCgl());
+                payloadDto.setAmount(rowDto.getAmount()); 
+                payloadDto.setProductType(rowDto.getProductType());
+                payloadDto.setRemarks(rowDto.getRemarks());
+                payloadDto.setArFlag(rowDto.getArFlag());
+                payloadDto.setAcClassification(rowDto.getAcClassification());
+                payloadDto.setBatchId(batchId); 
+                payloadDto.setJournalId(journalId); 
+                payloadDto.setCommonBatchRemarks(commonRemarks);
+                payloadDto.setTransactionCount(journalSequence); 
+                
+                JournalRequest request = new JournalRequest();
+                request.setCreatorId(creatorId);
+                request.setCreatorRole(creatorRole);
+                request.setChangeType(rowDto.getChangeType());
+                request.setRequestStatus(RequestStatus.PENDING);
+                request.setBatchId(batchId);
+                request.setJournalId(journalId);
+                request.setCommonBatchRemarks(commonRemarks);
+                request.setPayload(objectMapper.writeValueAsString(payloadDto));
+
+                requestsToSave.add(request);
+
+                journalSequence++; 
+            }
+        }
+        log.info("Saving {} JournalRequest entries for Batch ID: {}", requestsToSave.size(), batchId);
+        List<JournalRequest> savedRequests = journalRequestRepository.saveAll(requestsToSave);
+        
+        
+        try {
+            // Get config from cache 
+            NotificationConfigDto config = permissionConfigService.getConfig(JOURNAL_AUTH_TYPE);
+            
+            String message = String.format("New Journal request (Batch: %s) by user %s is pending approval.",
+                                           batchId, creatorId);
+
+            notificationWriterService.createNotification(
+                null,                   // userId (null for group)
+                config.getTargetRoles(),// "51,55" etc.
+                message,
+                config.getTargetUrl(),  // "/Journal-Authrization"
+                batchId,                // Aggregate ID
+                EVENT_SOURCE
+            );
+            log.info("Successfully created 1-to-many notification for Batch ID: {}", batchId);
+
+        } catch (Exception e) {
+            log.error("CRITICAL: Failed to create 'pending' notification for Batch ID: {}. Rolling back transaction.", batchId, e);
+            throw new RuntimeException("Failed to create notification event, rolling back batch creation.", e);
+        }
+   
+        return savedRequests;
+    }
+
+    @Override
+    @Transactional
+    public Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto dto, String executorId, Integer executorRole) throws JsonProcessingException {
+        log.debug("Updating single request: {}", dto.getRequestId());
+        JournalRequest request = journalRequestRepository.findById(dto.getRequestId())
+                .orElseThrow(() -> new ResourceNotFoundException("Journal Request with ID " + dto.getRequestId() + " not found."));
+
+        boolean isCreator = executorId.equals(request.getCreatorId());
+        boolean isSameRole = executorRole != null && executorRole.equals(request.getCreatorRole());
+
+        if (isCreator && isSameRole) {
+            log.warn("SECURITY VIOLATION: User {} (Role: {}) attempted to approve/reject their own request (ID: {}).", 
+                     executorId, executorRole, request.getId());
+            throw new IllegalStateException("User cannot approve or reject their own request with the same role.");
+        }
+
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            throw new IllegalStateException("Journal Request has already been processed.");
+        }
+
+        request.setExecutorId(executorId);
+        request.setExecutorRemarks(dto.getRemarks());
+        request.setExecutionDate(LocalDateTime.now());
+        request.setRequestStatus(dto.getStatus());
+
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            log.info("Journal Request {} ACCEPTED. Processing for Batch ID: {}", dto.getRequestId(), request.getBatchId());
+            processApproval(request); 
+            // Send notification to creator
+            sendCreatorNotification(request, true);
+        } else {
+            log.info("Journal Request {} REJECTED.", dto.getRequestId());
+            // Send notification to creator
+            sendCreatorNotification(request, false);
+        }
+
+        return Optional.of(journalRequestRepository.save(request));
+    }
+    
+    private void processApproval(JournalRequest request) throws JsonProcessingException {
+        log.info("--- Inside processApproval for JournalRequest ID: {} ---", request.getId());
+        CreateJournalRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateJournalRequestDto.class);
+        
+        if (payloadDto.getChangeType() == ChangeType.ADD) {
+       
+            GlTransaction newGlTxn = new GlTransaction();
+            
+            newGlTxn.setBatchId(payloadDto.getBatchId());
+            newGlTxn.setJournalId(payloadDto.getJournalId());
+            
+            if (payloadDto.getPDate() != null) {
+                newGlTxn.setPostDate(payloadDto.getPDate().atStartOfDay());
+            }
+            
+            newGlTxn.setBranchCode(payloadDto.getBranch());
+            newGlTxn.setCurrency(payloadDto.getCurrency());
+            newGlTxn.setCgl(payloadDto.getCgl());
+            newGlTxn.setNarration(payloadDto.getRemarks());
+            
+            BigDecimal amount = payloadDto.getAmount();
+            if (amount.signum() < 0) { // Negative amount is Credit
+                newGlTxn.setCreditAmount(amount);
+                newGlTxn.setDebitAmount(BigDecimal.ZERO);
+                log.debug("Setting CREDIT_AMOUNT: {}", amount);
+            } else { // Positive or zero amount is Debit
+                newGlTxn.setDebitAmount(amount);
+                newGlTxn.setCreditAmount(BigDecimal.ZERO);
+                log.debug("Setting DEBIT_AMOUNT: {}", amount);
+            }
+            
+            newGlTxn.setTransactionCount(payloadDto.getTransactionCount());
+            newGlTxn.setSourceFlag("J"); 
+            
+            log.info("Attempting to save GL entry for Journal ID: {}", payloadDto.getJournalId());
+            glTransactionRepository.save(newGlTxn);
+            log.info("Successfully SAVED new GL_TRANSACTION record for Journal ID: {}", payloadDto.getJournalId());
+        
+        } else if (payloadDto.getChangeType() == ChangeType.UPDATE) {
+            log.warn("UPDATE ChangeType not yet implemented for GL_TRANSACTIONS. Request {} skipped.", request.getId());
+        
+        } else if (payloadDto.getChangeType() == ChangeType.DELETE) {
+            log.warn("DELETE ChangeType not yet implemented for GL_TRANSACTIONS. Request {} skipped.", request.getId());
+        }
+        
+        log.info("--- Exiting processApproval for JournalRequest ID: {} ---", request.getId());
+    }
+
+    @Override
+    public List<JournalRequest> getMyRequests() {
+        log.info("Fetching ALL Journal requests for 'My Requests' screen.");
+        return journalRequestRepository.findAll(Sort.by(Sort.Direction.DESC, "requestDate"));
+    }
+
+    @Override
+    public List<JournalRequest> getPendingRequests(String userId, Integer userRole) {
+        List<JournalRequest> allPending = journalRequestRepository.findByRequestStatus(RequestStatus.PENDING);
+        
+        return allPending.stream()
+            .filter(request -> {
+                boolean isCreator = String.valueOf(request.getCreatorId()).equals(String.valueOf(userId));
+                boolean isSameRole = request.getCreatorRole() != null && request.getCreatorRole().equals(userRole);
+                return !(isCreator && isSameRole);
+            })
+            .collect(Collectors.toList());
+    }
+    
+    @Override
+    @Transactional
+    public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) throws JsonProcessingException {
+        
+        log.info("Starting processBulkRequests for user: {}", executorId);
+
+        boolean hasBatchId = StringUtils.hasText(dto.getBatchId());
+        boolean hasJournalPrefixes = dto.getJournalIdPrefixes() != null && !dto.getJournalIdPrefixes().isEmpty();
+
+        if (!hasBatchId && !hasJournalPrefixes) {
+            throw new IllegalArgumentException("Either batchId or a list of journalIdPrefixes must be provided.");
+        }
+        if (hasBatchId && hasJournalPrefixes) {
+            throw new IllegalArgumentException("Provide either batchId or journalIdPrefixes, not both.");
+        }
+
+        List<JournalRequest> requestsToProcess;
+        if (hasBatchId) {
+            log.info("Processing by Batch ID: {}", dto.getBatchId());
+            requestsToProcess = journalRequestRepository.findByBatchIdAndRequestStatus(dto.getBatchId(), RequestStatus.PENDING);
+        
+        } else {
+            log.info("Processing by Journal Prefixes count: {}", dto.getJournalIdPrefixes().size());
+            Specification<JournalRequest> spec = (root, query, criteriaBuilder) -> {
+                List<Predicate> predicates = new ArrayList<>();
+                for (String prefix : dto.getJournalIdPrefixes()) {
+                    predicates.add(criteriaBuilder.like(root.get("journalId"), prefix + "%"));
+                }
+                Predicate journalIdOrPredicates = criteriaBuilder.or(predicates.toArray(new Predicate[0]));
+                Predicate statusPredicate = criteriaBuilder.equal(root.get("requestStatus"), RequestStatus.PENDING);
+                return criteriaBuilder.and(journalIdOrPredicates, statusPredicate);
+            };
+            requestsToProcess = journalRequestRepository.findAll(spec);
+        }
+
+        log.info("Found {} total pending requests to process.", requestsToProcess.size());
+
+        if (requestsToProcess.isEmpty()) {
+            log.warn("No pending requests found for the given criteria.");
+            return Collections.emptyList();
+        }
+        
+        JournalRequest firstRequest = requestsToProcess.get(0);
+        String creatorId = firstRequest.getCreatorId();
+        
+        List<JournalRequest> processedRequests = new ArrayList<>();
+        List<GlTransaction> transactionsToSave = new ArrayList<>();
+        
+        int count = 1;
+        for (JournalRequest request : requestsToProcess) {
+            log.info("Processing loop item {} of {}. Request ID: {}", count, requestsToProcess.size(), request.getId());
+            
+            boolean isCreator = executorId.equals(request.getCreatorId());
+            boolean isSameRole = executorRole != null && executorRole.equals(request.getCreatorRole());
+
+            if (isCreator && isSameRole) {
+                log.warn("Skipping request {}: User {} (Role: {}) cannot approve/reject their own request.", 
+                         request.getId(), executorId, executorRole);
+                count++;
+                continue; 
+            }
+           
+            if (request.getRequestStatus() != RequestStatus.PENDING) {
+                log.warn("Skipping request {}: It is not in PENDING status.", request.getId());
+                count++;
+                continue;
+            }
+
+            request.setExecutorId(executorId);
+            request.setExecutorRemarks(dto.getRemarks());
+            request.setExecutionDate(LocalDateTime.now());
+            request.setRequestStatus(dto.getStatus());
+        
+            if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+                log.info("Request {} marked ACCEPTED. Building GlTransaction...", request.getId());
+                
+                CreateJournalRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateJournalRequestDto.class);
+                
+                if (payloadDto.getChangeType() == ChangeType.ADD) {
+                    GlTransaction newGlTxn = new GlTransaction();
+                    newGlTxn.setBatchId(payloadDto.getBatchId());
+                    newGlTxn.setJournalId(payloadDto.getJournalId());
+                    if (payloadDto.getPDate() != null) {
+                        newGlTxn.setPostDate(payloadDto.getPDate().atStartOfDay());
+                    }
+                    newGlTxn.setBranchCode(payloadDto.getBranch());
+                    newGlTxn.setCurrency(payloadDto.getCurrency());
+                    newGlTxn.setCgl(payloadDto.getCgl());
+                    newGlTxn.setNarration(payloadDto.getRemarks());
+                    
+                    BigDecimal amount = payloadDto.getAmount();
+                    if (amount.signum() < 0) { // Negative amount is Credit
+                        newGlTxn.setCreditAmount(amount);
+                        newGlTxn.setDebitAmount(BigDecimal.ZERO);
+                    } else { // Positive or zero amount is Debit
+                        newGlTxn.setDebitAmount(amount);
+                        newGlTxn.setCreditAmount(BigDecimal.ZERO);
+                    }
+                    newGlTxn.setTransactionCount(payloadDto.getTransactionCount());
+                    newGlTxn.setSourceFlag("J"); 
+                    
+                    transactionsToSave.add(newGlTxn);
+                }
+            } else {
+                log.info("Request {} marked REJECTED.", request.getId());
+            }
+            
+            processedRequests.add(request);
+            count++;
+        }
+     
+        if (!transactionsToSave.isEmpty()) {
+            log.info("Saving {} new GL_TRANSACTION entries in a single batch...", transactionsToSave.size());
+            glTransactionRepository.saveAll(transactionsToSave);
+            log.info("Successfully saved all GL entries.");
+        }
+        
+        log.info("Saving all {} processed JournalRequest statuses...", processedRequests.size());
+        List<JournalRequest> savedRequests = journalRequestRepository.saveAll(processedRequests);
+        
+        try {
+            boolean isApproved = RequestStatus.ACCEPTED.equals(dto.getStatus());
+            String status = isApproved ? "approved" : "rejected";
+            String message;
+            String aggregateId;
+
+            if (hasBatchId) {
+                aggregateId = dto.getBatchId();
+                message = String.format("Your Journal batch (ID: %s) with %d entries has been %s by user %s.",
+                                        aggregateId, savedRequests.size(), status, executorId);
+            } else { 
+                aggregateId = dto.getJournalIdPrefixes().get(0); 
+                message = String.format("Your %d Journal requests (Journals: %s,...) have been %s by user %s.",
+                                        savedRequests.size(), aggregateId, status, executorId);
+            }
+
+            if (!isApproved && StringUtils.hasText(dto.getRemarks())) {
+                message += " Reason: " + dto.getRemarks();
+            }
+
+            notificationWriterService.createNotification(
+                creatorId,              
+                null,                   
+                message,
+                JOURNAL_POSTING_URL,    
+                aggregateId,            
+                EVENT_SOURCE
+            );
+            log.info("Successfully sent 1-to-1 bulk notification to user {} for aggregateId {}", creatorId, aggregateId);
+
+        } catch (Exception e) {
+            log.error("CRITICAL (but non-blocking): Failed to send creator bulk notification for creator {}", 
+                      creatorId, e);
+        }
+        
+        log.info("Finished processBulkRequests. Transaction committing.");
+        return savedRequests;
+    }
+    
+    private void sendCreatorNotification(JournalRequest request, boolean isApproved) {
+        try {
+            String status = isApproved ? "approved" : "rejected";
+            String message = String.format("Your Journal request (Journal: %s) has been %s by user %s.",
+                                           request.getJournalId(), status, request.getExecutorId());
+
+            if (!isApproved && StringUtils.hasText(request.getExecutorRemarks())) {
+                message += " Reason: " + request.getExecutorRemarks();
+            }
+
+            notificationWriterService.createNotification(
+                request.getCreatorId(),
+                null,                   
+                message,
+                JOURNAL_POSTING_URL,    
+                request.getId().toString(),
+                EVENT_SOURCE
+            );
+        } catch (Exception e) {
+            log.error("CRITICAL (but non-blocking): Failed to send creator notification for Journal Request ID: {}", 
+                      request.getId(), e);
+        }
+    }
+    
+    @Override
+    public List<JournalRequest> getRequestsByBatchId(String batchId) {
+        log.info("Fetching all Journal requests for Batch ID: {}", batchId);
+        List<JournalRequest> requests = journalRequestRepository.findByBatchId(batchId);
+        
+        if (requests.isEmpty()) {
+            log.warn("No requests found for Batch ID: {}", batchId);
+            throw new ResourceNotFoundException("No Journal requests found for Batch ID: " + batchId);
+        }
+        return requests;
+    }
+   
+    @Override
+    @Transactional
+    public void cancelMyRequest(Long requestId, String userId) {
+        JournalRequest request = journalRequestRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("Journal Request with ID " + requestId + " not found."));
+
+        if (!userId.equals(request.getCreatorId())) {
+            log.warn("User {} attempted to cancel request {} owned by {}", userId, requestId, request.getCreatorId());
+            throw new IllegalStateException("You are not authorized to cancel this request.");
+        }
+
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            log.warn("User {} attempted to cancel request {} which is already in status {}", userId, requestId, request.getRequestStatus());
+            throw new IllegalStateException("Cannot cancel a request that has already been processed.");
+        }
+
+        journalRequestRepository.delete(request);
+        log.info("User {} successfully canceled Journal request {}", userId, requestId);
+    }
+
+    @Override
+    @Transactional
+    public void cancelMyRequestsByJournalPrefix(String journalIdPrefix, String userId) {
+        log.info("User {} attempting to cancel all requests with journal prefix: {}", userId, journalIdPrefix);
+       
+        List<JournalRequest> requestsToCancel = journalRequestRepository.findByJournalIdStartingWithAndCreatorIdAndRequestStatus(
+                journalIdPrefix, userId, RequestStatus.PENDING);
+
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found for you with journal prefix: " + journalIdPrefix);
+        }
+      
+        journalRequestRepository.deleteAll(requestsToCancel);
+        log.info("User {} successfully bulk-canceled {} requests for journal prefix {}", userId, requestsToCancel.size(), journalIdPrefix);
+    }
+
+    @Override
+    public List<JournalRequestStatusDto> getJournalRequestStatusList() {
+        log.info("Fetching all Journal requests for status list");
+        List<JournalRequest> allRequests = journalRequestRepository.findAll();
+        return allRequests.stream()
+                .map(JournalRequestStatusDto::new)
+                .collect(Collectors.toList());
+    }
+    
+    @Override
+    @Transactional
+    public void cancelMyRequestsByBatchId(String batchId, String userId) {
+        log.info("User {} attempting to cancel PENDING requests created by them in batch ID: {}", userId, batchId);
+
+        List<JournalRequest> requestsToCancel = journalRequestRepository.findByBatchIdAndCreatorIdAndRequestStatus(
+                batchId, userId, RequestStatus.PENDING);
+        
+        if (requestsToCancel.isEmpty()) {
+            log.warn("No pending requests found for user {} in batch ID {}", userId, batchId);
+            throw new ResourceNotFoundException("No pending requests found for you in this batch.");
+        }
+
+        journalRequestRepository.deleteAll(requestsToCancel);
+        log.info("User {} successfully bulk-canceled {} requests for batch ID {}", userId, requestsToCancel.size(), batchId);
+    }
+
+    @Override
+    @Transactional
+    public void cancelMyRequestsByJournalPrefixes(List<String> journalIdPrefixes, String userId) {
+        log.info("User {} attempting to bulk-cancel PENDING requests for journal prefixes: {}", userId, journalIdPrefixes.size());
+        
+        Specification<JournalRequest> spec = (root, query, criteriaBuilder) -> {
+            List<Predicate> predicates = new ArrayList<>();
+            for (String prefix : journalIdPrefixes) {
+                predicates.add(criteriaBuilder.like(root.get("journalId"), prefix + "%"));
+            }
+            Predicate journalIdOrPredicates = criteriaBuilder.or(predicates.toArray(new Predicate[0]));
+            Predicate statusPredicate = criteriaBuilder.equal(root.get("requestStatus"), RequestStatus.PENDING);
+            Predicate creatorPredicate = criteriaBuilder.equal(root.get("creatorId"), userId);
+            
+            return criteriaBuilder.and(journalIdOrPredicates, statusPredicate, creatorPredicate);
+        };
+        
+        List<JournalRequest> requestsToCancel = journalRequestRepository.findAll(spec);
+
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found for you with the specified journal prefixes.");
+        }
+
+        journalRequestRepository.deleteAll(requestsToCancel);
+        log.info("User {} successfully bulk-canceled {} requests for {} journal prefixes.", userId, requestsToCancel.size(), journalIdPrefixes.size());
+    }
+}
+
+
+
+
+package com.fincore.JournalService.Service;
+
+import lombok.RequiredArgsConstructor;
+import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+
+import com.fincore.JournalService.Models.NotificationTable;
+import com.fincore.JournalService.Repository.NotificationRepository;
 
 @Service
 @RequiredArgsConstructor
@@ -256,10 +1933,9 @@ import org.springframework.transaction.annotation.Transactional;
 public class NotificationWriterService {
 
     private final NotificationRepository notificationRepository;
-    private static final String EVENT_SOURCE = "JournalService";
 
-    @Transactional(propagation = Propagation.MANDATORY)
-    public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId) {
+    @Transactional(propagation = Propagation.MANDATORY) 
+    public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
 
         if (userId == null && targetRole == null) {
             log.warn("Skipping notification creation: Both userId and targetRole are null. AggregateID: {}", aggregateId);
@@ -271,14 +1947,1749 @@ public class NotificationWriterService {
             throw new IllegalArgumentException("Notification message cannot be null or blank.");
         }
 
-        Notifications notification = Notifications.builder()
+        NotificationTable notification = NotificationTable.builder()
                 .userId(userId)
                 .targetRole(targetRole)
                 .message(message)
                 .linkUrl(linkUrl)
                 .aggregateId(aggregateId)
-                .eventSource(EVENT_SOURCE) // Hardcoded to JournalService
+                .eventSource(eventSource)
                 .build();
+
+        notificationRepository.save(notification);
+
+        if (userId != null) {
+            log.info("Saved 1-to-1 notification event for user: {} (AggregateID: {})", userId, aggregateId);
+        } else {
+            log.info("Saved 1-to-many notification event for role: {} (AggregateID: {})", targetRole, aggregateId);
+        }
+    }
+}
+package com.fincore.JournalService.Service;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Service;
+
+import com.fincore.JournalService.Dto.NotificationConfigDto;
+import com.fincore.JournalService.Repository.PermissionRepository;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class PermissionConfigService {
+
+    private final PermissionRepository permissionRepository;
+
+    @Cacheable(value = "notification_configs", key = "#requestType")
+    public NotificationConfigDto getConfig(String requestType) {
+
+        log.info("Cache Miss: Fetching DB permissions for MOC notification type: {}", requestType);
+
+        List<Object[]> results = permissionRepository.findUrlAndRolesByRequestType(requestType);
+
+        if (results.isEmpty()) {
+            log.warn("No notification config found for request type {}. Using defaults.", requestType);
+            return new NotificationConfigDto("/dashboard", null); // Default to no roles
+        }
+
+        String url = (String) results.get(0)[0];
+        if (url == null) url = "/dashboard";
+
+        String roles = results.stream()
+                .map(row -> String.valueOf(row[1])) // Role ID
+                .distinct()
+                .collect(Collectors.joining(","));
+
+        if (roles.isEmpty()) {
+             log.warn("No roles found for request type {}. Notification will not be sent to a group.", requestType);
+             return new NotificationConfigDto(url, null);
+        }
+        
+        log.info("Fetched Notification Config for {}: URL=[{}], Roles=[{}]", requestType, url, roles);
+        return new NotificationConfigDto(url, roles);
+    }
+}
+
+
+package com.fincore.JournalService.Service;
+
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import jakarta.transaction.Transactional;
+
+@Service
+@RequiredArgsConstructor
+public class SequenceService {
+
+    @PersistenceContext
+    private EntityManager entityManager;
+
+    /**
+     * Pads the given number with leading zeros to a total length of 7.
+     */
+    private String padToSevenDigits(Long id) {
+        if (id == null) {
+            throw new IllegalStateException("Sequence query returned null");
+        }
+        return String.format("%07d", id);
+    }
+
+    /**
+     * Gets the next BATCH_ID from the BATCH_SEQ sequence. 
+     */
+    @Transactional
+    public String getNextBatchId() {
+        Number nextId = (Number) entityManager
+                .createNativeQuery("select BATCH_SEQ.nextval from dual")
+                .getSingleResult();
+        
+        return padToSevenDigits(nextId.longValue());
+    }
+
+    /**
+     * Gets the next JOURNAL_ID prefix from the JRNL_SEQ sequence.
+     */
+    @Transactional
+    public String getNextJournalIdPrefix() {
+        
+      
+        Number nextId = (Number) entityManager
+                .createNativeQuery("select JRNL_SEQ.nextval from dual")
+                .getSingleResult();
+      
+
+        return padToSevenDigits(nextId.longValue());
+    }
+}
+
+package com.fincore.JournalService;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.cache.annotation.EnableCaching;
+
+@SpringBootApplication
+@EnableCaching
+public class JournalServiceApplication {
+
+	public static void main(String[] args) {
+		SpringApplication.run(JournalServiceApplication.class, args);
+	}
+
+}
+
+frontend
+import React, { useState, useEffect, useCallback } from "react";
+import {
+  Box,
+  Typography,
+  Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  Button,
+  CircularProgress,
+  Tooltip,
+  IconButton,
+  Stack,
+  Grid,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Paper,
+  Checkbox,
+} from "@mui/material";
+import { DataGrid } from "@mui/x-data-grid";
+import {
+  DeleteSweep as DeleteSweepIcon,
+  Visibility as VisibilityIcon,
+  Close as CloseIcon,
+} from "@mui/icons-material";
+import AccountCircleIcon from "@mui/icons-material/AccountCircle";
+import InfoIcon from "@mui/icons-material/Info";
+import DeleteIcon from "@mui/icons-material/Delete";
+
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
+
+const formatCurrency = (num) => {
+  return Number(num).toFixed(4);
+};
+
+const getTxnTypeColor = (txnType) => {
+  return txnType === "Credit" ? "error" : "success";
+};
+
+const getStatusChipColor = (status) => {
+  switch (status) {
+    case "ACCEPTED":
+      return "success";
+    case "REJECTED":
+      return "error";
+    case "PENDING":
+    default:
+      return "warning";
+  }
+};
+
+const cellBorderStyle = {
+  border: (theme) => `1px solid ${theme.palette.divider}`,
+};
+
+function CustomNoRowsOverlay() {
+  return (
+    <Stack height="100%" alignItems="center" justifyContent="center">
+      <InfoIcon sx={{ fontSize: 48, color: "text.secondary", mb: 2 }} />
+      <Typography variant="h6">No Journal Requests Found</Typography>
+      <Typography>You have not created any Journal requests.</Typography>
+    </Stack>
+  );
+}
+
+export default function JournalPostingStatus() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([]);
+
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [selectedBatch, setSelectedBatch] = useState(null);
+
+  const [isViewModalOpen, setIsViewModalOpen] = useState(false);
+  const [isViewLoading, setIsViewLoading] = useState(false);
+
+  const [batchDetails, setBatchDetails] = useState([]);
+  const [viewingBatchId, setViewingBatchId] = useState(null);
+  const [viewingBatchStatus, setViewingBatchStatus] = useState(null);
+
+  const [selectedJournalPrefixes, setSelectedJournalPrefixes] = useState([]);
+  const [isPartialSubmitting, setIsPartialSubmitting] = useState(false);
+
+  const fetchMyBatches = useCallback(async () => {
+    setLoading(true);
+    try {
+      const myRequests = await callApi("JS/journals/my-requests", null, "GET");
+
+      if (!Array.isArray(myRequests) || myRequests.length === 0) {
+        setRows([]);
+        setLoading(false);
+        return;
+      }
+
+      const groupedBatches = new Map();
+      for (const request of myRequests) {
+        const batchId = request.batchId;
+
+        if (!groupedBatches.has(batchId)) {
+          groupedBatches.set(batchId, {
+            id: batchId,
+            batchId: batchId,
+            creatorId: request.creatorId,
+            requestStatus: request.requestStatus,
+            requestDate: request.requestDate,
+            commonBatchRemarks: request.commonBatchRemarks,
+            executorId: request.executorId,
+            executionDate: request.executionDate,
+            executorRemarks: request.executorRemarks,
+            totalDebit: 0,
+            totalCredit: 0,
+            requestCount: 0,
+          });
+        }
+
+        const batchDetails = groupedBatches.get(batchId);
+        batchDetails.requestCount++;
+
+        try {
+          const payload = JSON.parse(request.payload);
+          const amount = parseFloat(payload.amount) || 0;
+          if (amount < 0) {
+            batchDetails.totalCredit += Math.abs(amount);
+          } else {
+            batchDetails.totalDebit += amount;
+          }
+        } catch (e) {
+          console.error(`Failed to parse payload for request ${request.id}`, e);
+        }
+      }
+      setRows(Array.from(groupedBatches.values()));
+    } catch (err) {
+      console.error("Failed to fetch user's requests:", err);
+      const errorMsg =
+        err.response?.data?.message || "Failed to load your requests.";
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setLoading(false);
+    }
+  }, [callApi, showSnackBar]);
+
+  useEffect(() => {
+    fetchMyBatches();
+  }, [fetchMyBatches]);
+
+  const handleOpenModal = (batch) => {
+    setSelectedBatch(batch);
+    setIsModalOpen(true);
+  };
+
+  const handleCloseModal = () => {
+    if (isSubmitting) return;
+    setIsModalOpen(false);
+    setSelectedBatch(null);
+  };
+
+  const handleOpenViewModal = async (batchId, status) => {
+    setIsViewModalOpen(true);
+    setIsViewLoading(true);
+    setViewingBatchId(batchId);
+    setViewingBatchStatus(status);
+    try {
+      const data = await callApi(
+        `JS/journals/by-batch/${batchId}`,
+        null,
+        "GET"
+      );
+
+      if (Array.isArray(data)) {
+        const journalGroups = new Map();
+
+        const processedData = data
+          .map((req) => {
+            try {
+              const payload = JSON.parse(req.payload);
+              const prefix = req.journalId.split("-")[0];
+              const amount = parseFloat(payload.amount) || 0;
+              return {
+                ...req,
+                payload,
+                journalPrefix: prefix,
+                amount: Math.abs(amount),
+                transactionType: amount < 0 ? "Credit" : "Debit",
+              };
+            } catch (e) {
+              console.error("Failed to parse payload for req:", req.id, e);
+              return null;
+            }
+          })
+          .filter(Boolean);
+
+        processedData.sort((a, b) => a.journalId.localeCompare(b.journalId));
+
+        for (const row of processedData) {
+          const prefix = row.journalPrefix;
+          if (!journalGroups.has(prefix)) {
+            journalGroups.set(prefix, []);
+          }
+          journalGroups.get(prefix).push(row);
+        }
+
+        setBatchDetails(Array.from(journalGroups.values()));
+      } else {
+        setBatchDetails([]);
+        showSnackBar("No details found for this batch.", "info");
+      }
+    } catch (error) {
+      console.error("Failed to fetch batch details:", error);
+      const errorMsg =
+        error.response?.data?.message || "Failed to load batch details.";
+      showSnackBar(errorMsg, "error");
+      setBatchDetails([]);
+    } finally {
+      setIsViewLoading(false);
+    }
+  };
+
+  const handleCloseViewModal = () => {
+    setIsViewModalOpen(false);
+    setBatchDetails([]);
+    setViewingBatchId(null);
+    setSelectedJournalPrefixes([]);
+    setIsPartialSubmitting(false);
+    setViewingBatchStatus(null);
+  };
+
+  const handleSubmitBatchCancel = async () => {
+    setIsSubmitting(true);
+    try {
+      await callApi(
+        `JS/journals/my-requests/by-batch/${selectedBatch.batchId}`,
+        null,
+        "DELETE"
+      );
+      showSnackBar(
+        `Batch ${selectedBatch.batchId} successfully canceled.`,
+        "success"
+      );
+      handleCloseModal();
+      fetchMyBatches();
+    } catch (error) {
+      console.error("Failed to cancel batch:", error);
+      const errorMsg =
+        error.response?.data?.message || "Failed to cancel batch.";
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleCancelSelectedJournals = async () => {
+    if (selectedJournalPrefixes.length === 0) {
+      showSnackBar(
+        "Please select at least one journal group to cancel.",
+        "warning"
+      );
+      return;
+    }
+
+    setIsPartialSubmitting(true);
+
+    try {
+      await callApi(
+        "JS/journals/my-requests/by-journal-list",
+        selectedJournalPrefixes,
+        "DELETE"
+      );
+      showSnackBar(
+        "Selected journal entries successfully canceled.",
+        "success"
+      );
+      handleCloseViewModal();
+      fetchMyBatches();
+    } catch (error) {
+      console.error("Failed to process partial batch:", error);
+      const errorMsg =
+        error.response?.data?.message || "Failed to cancel selected entries.";
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setIsPartialSubmitting(false);
+    }
+  };
+
+  const handleSelectAllClick = (event) => {
+    if (event.target.checked) {
+      const newSelecteds = batchDetails.map((group) => group[0].journalPrefix);
+      setSelectedJournalPrefixes(newSelecteds);
+      return;
+    }
+    setSelectedJournalPrefixes([]);
+  };
+
+  const handleRowCheckboxClick = (event, prefix) => {
+    if (event) {
+      event.stopPropagation();
+    }
+
+    const selectedIndex = selectedJournalPrefixes.indexOf(prefix);
+    let newSelected = [];
+
+    if (selectedIndex === -1) {
+      newSelected = newSelected.concat(selectedJournalPrefixes, prefix);
+    } else if (selectedIndex === 0) {
+      newSelected = newSelected.concat(selectedJournalPrefixes.slice(1));
+    } else if (selectedIndex === selectedJournalPrefixes.length - 1) {
+      newSelected = newSelected.concat(selectedJournalPrefixes.slice(0, -1));
+    } else if (selectedIndex > 0) {
+      newSelected = newSelected.concat(
+        selectedJournalPrefixes.slice(0, selectedIndex),
+        selectedJournalPrefixes.slice(selectedIndex + 1)
+      );
+    }
+    setSelectedJournalPrefixes(newSelected);
+  };
+
+  const columns = [
+    {
+      field: "batchId",
+      headerName: "Batch ID",
+      width: 125,
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "requestStatus",
+      headerName: "Status",
+      width: 125,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Chip
+          label={params.value}
+          color={getStatusChipColor(params.value)}
+          size="small"
+        />
+      ),
+    },
+    {
+      field: "creatorId",
+      headerName: "Creator",
+      width: 150,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Chip icon={<AccountCircleIcon />} label={params.value} size="small" />
+      ),
+    },
+    {
+      field: "requestDate",
+      headerName: "Submitted On",
+      width: 200,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Box>
+          {new Date(params.value).toLocaleString("en-IN", {
+            dateStyle: "medium",
+            timeStyle: "short",
+          })}
+        </Box>
+      ),
+    },
+    {
+      field: "commonBatchRemarks",
+      headerName: "Creator Remarks",
+      width: 200,
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "requestCount",
+      headerName: "Entries",
+      width: 100,
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "totalCredit",
+      headerName: "Total Credit",
+      width: 250,
+      align: "right",
+      headerAlign: "center",
+
+      renderCell: (params) => (
+        <Typography marginTop={"5%"}>{formatCurrency(params.value)}</Typography>
+      ),
+    },
+    {
+      field: "totalDebit",
+      headerName: "Total Debit",
+      width: 250,
+      align: "right",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Typography marginTop={"5%"}>{formatCurrency(params.value)}</Typography>
+      ),
+    },
+    {
+      field: "actions",
+      headerName: "Actions",
+      flex: 0.8,
+      minWidth: 130,
+      align: "center",
+      headerAlign: "center",
+      sortable: false,
+      renderCell: (params) => {
+        const isPending = params.row.requestStatus === "PENDING";
+        return (
+          <Stack direction="row" spacing={0.5} marginTop={"5%"}>
+            <Tooltip title="View Details">
+              <IconButton
+                onClick={() =>
+                  handleOpenViewModal(
+                    params.row.batchId,
+                    params.row.requestStatus
+                  )
+                }
+                color="primary"
+              >
+                <VisibilityIcon />
+              </IconButton>
+            </Tooltip>
+            <Tooltip
+              title={
+                isPending ? "Cancel Entire Batch" : "Batch already processed"
+              }
+            >
+              <span>
+                <IconButton
+                  onClick={() => handleOpenModal(params.row)}
+                  disabled={!isPending}
+                >
+                  <DeleteIcon />
+                </IconButton>
+              </span>
+            </Tooltip>
+          </Stack>
+        );
+      },
+    },
+  ];
+
+  return (
+    <Box sx={{ p: 3, width: "100%" }}>
+      <DataGrid
+        rows={rows}
+        columns={columns}
+        loading={loading}
+        getRowId={(row) => row.batchId}
+        disableRowSelectionOnClick
+        pageSizeOptions={[5, 10, 25]}
+        disableColumnResize={true}
+        rowHeight={52}
+        initialState={{
+          pagination: {
+            paginationModel: { page: 0, pageSize: 10 },
+          },
+          sorting: { sortModel: [{ field: "requestDate", sort: "desc" }] },
+        }}
+        slots={{
+          noRowsOverlay: CustomNoRowsOverlay,
+        }}
+        sx={{
+          height: 600,
+          width: "100%",
+          "& .MuiDataGrid-cell:focus": { outline: "none" },
+        }}
+      />
+
+      <Dialog
+        open={isModalOpen}
+        onClose={handleCloseModal}
+        fullWidth
+        maxWidth="sm"
+      >
+        <DialogTitle sx={{ display: "flex", alignItems: "center" }}>
+          <DeleteSweepIcon sx={{ mr: 1, color: "error.main" }} />
+          Confirm Batch Cancellation
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            Are you sure you want to cancel all your pending requests in batch{" "}
+            <strong>{selectedBatch?.batchId}</strong>?
+            <br />
+            <br />
+            This will permanently delete {selectedBatch?.requestCount}{" "}
+            entry/entries created by you and cannot be undone.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions sx={{ p: 2 }}>
+          <Button onClick={handleCloseModal} disabled={isSubmitting}>
+            Back
+          </Button>
+          <Button
+            onClick={handleSubmitBatchCancel}
+            variant="contained"
+            color="error"
+            disabled={isSubmitting}
+          >
+            {isSubmitting ? (
+              <CircularProgress size={24} color="inherit" />
+            ) : (
+              "Confirm Cancel"
+            )}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog
+        open={isViewModalOpen}
+        onClose={handleCloseViewModal}
+        fullWidth
+        maxWidth="lg"
+      >
+        <DialogTitle
+          sx={{
+            fontWeight: "bold",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            pb: 2,
+          }}
+        >
+          Batch Details: {viewingBatchId}
+          <IconButton
+            aria-label="close"
+            onClick={handleCloseViewModal}
+            sx={{
+              color: (theme) => theme.palette.grey[500],
+            }}
+          >
+            <CloseIcon />
+          </IconButton>
+        </DialogTitle>
+
+        <DialogContent dividers sx={{ p: 0 }}>
+          {isViewLoading ? (
+            <Box
+              sx={{
+                display: "flex",
+                justifyContent: "center",
+                alignItems: "center",
+                minHeight: "500px",
+              }}
+            >
+              <CircularProgress />
+            </Box>
+          ) : (
+            <>
+              {batchDetails.length > 0 ? (
+                <TableContainer
+                  component={Paper}
+                  sx={{ borderRadius: 0, maxHeight: "60vh" }}
+                >
+                  <Table sx={{ minWidth: 650 }} size="small" stickyHeader>
+                    <TableHead>
+                      <TableRow>
+                        {viewingBatchStatus === "PENDING" && (
+                          <TableCell
+                            padding="checkbox"
+                            sx={{ bgcolor: "#bcabebff", ...cellBorderStyle }}
+                          >
+                            <Checkbox
+                              color="primary"
+                              indeterminate={
+                                selectedJournalPrefixes.length > 0 &&
+                                selectedJournalPrefixes.length <
+                                  batchDetails.length
+                              }
+                              checked={
+                                batchDetails.length > 0 &&
+                                selectedJournalPrefixes.length ===
+                                  batchDetails.length
+                              }
+                              onChange={handleSelectAllClick}
+                            />
+                          </TableCell>
+                        )}
+                        <TableCell
+                          align="center"
+                          sx={{ bgcolor: "#bcabebff", ...cellBorderStyle }}
+                        >
+                          Journal ID
+                        </TableCell>
+                        <TableCell
+                          align="center"
+                          sx={{ bgcolor: "#bcabebff", ...cellBorderStyle }}
+                        >
+                          Status
+                        </TableCell>
+                        <TableCell
+                          align="center"
+                          sx={{ bgcolor: "#bcabebff", ...cellBorderStyle }}
+                        >
+                          Branch
+                        </TableCell>
+                        <TableCell
+                          align="center"
+                          sx={{ bgcolor: "#bcabebff", ...cellBorderStyle }}
+                        >
+                          Currency
+                        </TableCell>
+                        <TableCell
+                          align="center"
+                          sx={{ bgcolor: "#bcabebff", ...cellBorderStyle }}
+                        >
+                          CGL
+                        </TableCell>
+                        <TableCell
+                          align="center"
+                          sx={{ bgcolor: "#bcabebff", ...cellBorderStyle }}
+                        >
+                          Amount
+                        </TableCell>
+                        <TableCell
+                          align="center"
+                          sx={{ bgcolor: "#bcabebff", ...cellBorderStyle }}
+                        >
+                          Txn Type
+                        </TableCell>
+                      </TableRow>
+                    </TableHead>
+
+                    <TableBody>
+                      {batchDetails.map((group, groupIndex) => {
+                        const isSelected = selectedJournalPrefixes.includes(
+                          group[0].journalPrefix
+                        );
+                        const groupRowCount = group.length;
+
+                        return group.map((row, rowIndex) => (
+                          <TableRow
+                            key={row.id}
+                            hover={viewingBatchStatus === "PENDING"}
+                            onClick={() =>
+                              viewingBatchStatus === "PENDING" &&
+                              handleRowCheckboxClick(null, row.journalPrefix)
+                            }
+                            role="checkbox"
+                            aria-checked={isSelected}
+                            selected={
+                              viewingBatchStatus === "PENDING" && isSelected
+                            }
+                            sx={{
+                              cursor:
+                                viewingBatchStatus === "PENDING"
+                                  ? "pointer"
+                                  : "default",
+                              ...(rowIndex === 0 &&
+                                groupIndex > 0 && {
+                                  borderTop: (theme) =>
+                                    `2px solid ${theme.palette.divider}`,
+                                }),
+                            }}
+                          >
+                            {/* --- Added border --- */}
+                            {viewingBatchStatus === "PENDING" &&
+                              rowIndex === 0 && (
+                                <TableCell
+                                  padding="checkbox"
+                                  rowSpan={groupRowCount}
+                                  sx={{
+                                    verticalAlign: "middle",
+                                    ...cellBorderStyle,
+                                  }}
+                                >
+                                  <Checkbox
+                                    color="primary"
+                                    checked={isSelected}
+                                    onClick={(e) =>
+                                      handleRowCheckboxClick(
+                                        e,
+                                        row.journalPrefix
+                                      )
+                                    }
+                                  />
+                                </TableCell>
+                              )}
+                            {rowIndex === 0 && (
+                              <TableCell
+                                align="center"
+                                rowSpan={groupRowCount}
+                                sx={{
+                                  verticalAlign: "middle",
+                                  ...cellBorderStyle,
+                                }}
+                              >
+                                {row.journalPrefix}
+                              </TableCell>
+                            )}
+                            {rowIndex === 0 && (
+                              <TableCell
+                                align="center"
+                                rowSpan={groupRowCount}
+                                sx={{
+                                  verticalAlign: "middle",
+                                  ...cellBorderStyle,
+                                }}
+                              >
+                                <Chip
+                                  label={row.requestStatus}
+                                  color={getStatusChipColor(row.requestStatus)}
+                                  size="small"
+                                />
+                              </TableCell>
+                            )}
+                            <TableCell align="center" sx={cellBorderStyle}>
+                              {row.payload.branch}
+                            </TableCell>
+                            <TableCell align="center" sx={cellBorderStyle}>
+                              {row.payload.currency}
+                            </TableCell>
+                            <TableCell align="center" sx={cellBorderStyle}>
+                              {row.payload.cgl}
+                            </TableCell>
+                            <TableCell align="center" sx={cellBorderStyle}>
+                              {formatCurrency(row.amount)}
+                            </TableCell>
+                            <TableCell align="center" sx={cellBorderStyle}>
+                              <Chip
+                                label={row.transactionType}
+                                color={getTxnTypeColor(row.transactionType)}
+                                size="small"
+                              />
+                            </TableCell>
+                          </TableRow>
+                        ));
+                      })}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              ) : (
+                <Typography sx={{ p: 3 }}>
+                  No details found for this batch.
+                </Typography>
+              )}
+            </>
+          )}
+        </DialogContent>
+
+        <DialogActions sx={{ p: 2, display: "block" }}>
+          <Grid
+            container
+            spacing={2}
+            alignItems="center"
+            justifyContent="flex-end"
+          >
+            <Grid item xs={12} md={6}></Grid>
+            <Grid item xs={12} md={6}>
+              <Stack direction="row" spacing={1} justifyContent="flex-end">
+                {viewingBatchStatus === "PENDING" && (
+                  <Button
+                    variant="contained"
+                    color="error"
+                    onClick={handleCancelSelectedJournals}
+                    disabled={
+                      isPartialSubmitting ||
+                      selectedJournalPrefixes.length === 0
+                    }
+                  >
+                    {isPartialSubmitting ? (
+                      <CircularProgress size={24} color="inherit" />
+                    ) : (
+                      "Cancel Selected"
+                    )}
+                  </Button>
+                )}
+              </Stack>
+            </Grid>
+          </Grid>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
+}
+
+Data Base table 
+
+Journal_Request table 
+
+
+REQ_ID	NUMBER	No		1	
+REQ_STATUS	VARCHAR2(10 BYTE)	No	'P' 	2	
+CHANGE_TYPE	VARCHAR2(10 BYTE)	No		3	
+REQ_DATE	DATE	No	SYSDATE 	4	
+CREATOR_ID	VARCHAR2(12 BYTE)	No		5	
+EXECUTOR_ID	VARCHAR2(12 BYTE)	Yes		6	
+EXECUTION_DATE	DATE	Yes		7	
+EXECUTOR_REMARKS	VARCHAR2(500 BYTE)	Yes		8	
+PAYLOAD	CLOB	Yes		9	
+BATCH_ID	VARCHAR2(50 BYTE)	Yes		10	
+JOURNAL_ID	VARCHAR2(50 BYTE)	Yes		11	
+COMMON_BATCH_REMARKS	VARCHAR2(200 BYTE)	Yes		12	
+CREATOR_ROLE	NUMBER(10,0)	Yes		13	
+
+
+GL_TRANSACTIONS table
+
+
+TRANSACTION_ID	NUMBER(20,0)	No	"FINCORE"."GL_TRANSACTIONS_SEQ"."NEXTVAL"	1	
+BATCH_ID	VARCHAR2(15 BYTE)	Yes		2	
+JOURNAL_ID	VARCHAR2(15 BYTE)	Yes		3	
+TRANSACTION_DATE	DATE	Yes	NULL 	4	
+POST_DATE	TIMESTAMP(6)	Yes		5	
+BRANCH_CODE	VARCHAR2(5 BYTE)	Yes		6	
+CURRENCY	VARCHAR2(3 BYTE)	Yes		7	
+CGL	VARCHAR2(10 BYTE)	Yes		8	
+NARRATION	VARCHAR2(40 BYTE)	Yes		9	
+DEBIT_AMOUNT	NUMBER(25,4)	Yes		10	
+CREDIT_AMOUNT	NUMBER(25,4)	Yes		11	
+TRANSACTION_COUNT	NUMBER(10,0)	Yes		12	
+SOURCE_FLAG	VARCHAR2(1 BYTE)	Yes		13	
+
+Notification table 
+
+EVENT_ID	RAW	No	SYS_GUID()	1	Unique primary key for the outbox event.
+USER_ID	VARCHAR2(255 BYTE)	Yes		2	The ID of the user who should receive this notification.
+MESSAGE	VARCHAR2(1024 BYTE)	No		3	The human-readable message to be displayed.
+LINK_URL	VARCHAR2(1024 BYTE)	Yes		4	The relative URL the user should be taken to when clicking the notification.
+EVENT_SOURCE	VARCHAR2(100 BYTE)	Yes		5	The microservice that generated this event (e.g., REPORT_SERVICE).
+AGGREGATE_ID	VARCHAR2(255 BYTE)	Yes		6	The primary key of the business object (e.g., the Report ID).
+EVENT_TIMESTAMP	TIMESTAMP(6) WITH TIME ZONE	No	CURRENT_TIMESTAMP	7	The timestamp when the event was created.
+TARGET_ROLE	VARCHAR2(100 BYTE)	Yes		8	For 1-to-Many notifications. If USER_ID is null, this role is used.
+
+
+below are the files from common request service 
+package com.tcs.fincore.CommonRequestService.config;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import org.springframework.cache.CacheManager;
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.cache.RedisCacheConfiguration;
+import org.springframework.data.redis.cache.RedisCacheManager;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.Jackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.RedisSerializationContext;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
+
+import java.time.Duration;
+
+/**
+ * Configuration class for setting up Redis integration within the Spring Boot application.
+ *
+ * This class enables Spring's caching mechanism via `@EnableCaching` and customizes
+ * how data is serialized and deserialized when stored in Redis, primarily using JSON
+ * and ensuring correct handling of Java 8 Date/Time API types.
+ */
+@Configuration
+@EnableCaching
+public class RedisConfig {
+
+    /**
+     * Configures and provides a custom `CacheManager` bean for Redis caching operations.
+     *
+     * This manager sets up default cache behavior, including a 24-hour Time-To-Live (TTL)
+     * for entries, prevention of caching `null` values, and specialized JSON serialization.
+     *
+     * The serialization is configured with `GenericJackson2JsonRedisSerializer` and includes
+     * polymorphic type handling (`activateDefaultTyping`) to ensure that cached objects
+     * retain their original class information during deserialization, which is crucial
+     * for generic object caching.
+     *
+     * @param connectionFactory The auto-configured RedisConnectionFactory provided by Spring.
+     * @return A configured RedisCacheManager instance.
+     */
+    @Bean
+    public CacheManager cacheManager(RedisConnectionFactory connectionFactory) {
+        // 1. Create a specialized ObjectMapper for Redis
+        ObjectMapper redisObjectMapper = new ObjectMapper();
+        redisObjectMapper.registerModule(new JavaTimeModule());
+        // --- THIS IS THE FIX / CRUCIAL CONFIGURATION ---
+        // We explicitly verify and enable "Type Info" (polymorphic deserialization)
+        // so Redis saves the Java class name metadata alongside the JSON data.
+        redisObjectMapper.activateDefaultTyping(
+                BasicPolymorphicTypeValidator.builder()
+                        .allowIfBaseType(Object.class)
+                        .build(),
+                ObjectMapper.DefaultTyping.NON_FINAL
+        );
+        // -----------------------
+        GenericJackson2JsonRedisSerializer serializer = new GenericJackson2JsonRedisSerializer(redisObjectMapper);
+
+        // Define the default configuration for all caches managed by this manager
+        RedisCacheConfiguration cacheConfig = RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl(Duration.ofHours(24)) // Set default cache expiration to 24 hours
+                .disableCachingNullValues() // Prevent caching of null results
+                .serializeKeysWith(RedisSerializationContext.SerializationPair.fromSerializer(new StringRedisSerializer()))
+                .serializeValuesWith(RedisSerializationContext.SerializationPair.fromSerializer(serializer));
+
+        return RedisCacheManager.builder(connectionFactory)
+                .cacheDefaults(cacheConfig)
+                .build();
+    }
+
+    /**
+     * Provides a standard `ObjectMapper` bean for general application use outside of the
+     * specific `CacheManager` configuration.
+     *
+     * Ensures proper handling of Java 8 Date/Time types (like `LocalDate`, `Instant`)
+     * in standard JSON marshalling operations elsewhere in the application (e.g., REST controllers).
+     *
+     * @return A configured ObjectMapper instance.
+     */
+    @Bean
+    public ObjectMapper objectMapper() {
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.registerModule(new JavaTimeModule());
+        mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS); // Write dates as ISO-8601 strings
+        return mapper;
+    }
+
+    /**
+     * Configures and provides a custom `RedisTemplate` bean.
+     *
+     * This bean is used for direct, programmatic interaction with Redis (e.g., using `redisTemplate.opsForValue().set(...)`)
+     * rather than using the `@Cacheable` annotations. It uses the application's standard
+     * `ObjectMapper` for serialization, which is suitable for specific key-value operations
+     * where polymorphic typing might not be necessary or is handled explicitly.
+     *
+     * @param connectionFactory The auto-configured RedisConnectionFactory.
+     * @param objectMapper The standard application ObjectMapper bean.
+     * @return A configured RedisTemplate instance for String keys and Object values.
+     */
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory connectionFactory, ObjectMapper objectMapper) {
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(connectionFactory);
+
+        // Use the standard Jackson2JsonRedisSerializer for the value serializer
+        Jackson2JsonRedisSerializer<Object> serializer =
+                new Jackson2JsonRedisSerializer<>(objectMapper, Object.class);
+
+        template.setValueSerializer(serializer);
+        template.setKeySerializer(new StringRedisSerializer()); // Ensure keys are always strings
+
+        return template;
+    }
+
+}
+
+package com.tcs.fincore.CommonRequestService.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+
+/**
+ * Global security configuration for the application.
+ * This class uses Spring Security's Java configuration to define security rules,
+ * such as disabling CSRF, making the session stateless, and defining authorization policies.
+ *
+ * The `@Configuration` annotation marks this class as a source of bean definitions.
+ * The `@EnableWebSecurity` annotation enables Spring Security's web security support and provides
+ * the integration with the Spring MVC.
+ */
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    /**
+     * Configures the security filter chain that defines the application's security policy.
+     * This method customizes the HttpSecurity to define request authorization, session management,
+     * and other security aspects.
+     *
+     * @param http The {@link HttpSecurity} object to configure.
+     * @return The built {@link SecurityFilterChain}.
+     * @throws Exception if an error occurs during configuration.
+     */
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+                // Disable Cross-Site Request Forgery (CSRF) protection.
+                // CSRF is typically not necessary for stateless REST APIs that use tokens (like JWTs)
+                // for authentication, as tokens are usually sent in headers rather than cookies.
+                .csrf(csrf -> csrf.disable())
+
+                // Configure authorization rules for HTTP requests.
+                .authorizeHttpRequests(authz -> authz
+                        // Permit all requests for all endpoints ("/**") to temporarily resolve 401 errors.
+                        // NOTE: This is for development/testing purposes. In a production environment,
+                        // specific role-based access control should be implemented.
+                        // Example production rule: .requestMatchers("/api/v1/admin/**").hasRole("ADMIN")
+                        .requestMatchers("/**").permitAll() // Allows access to all application endpoints
+                        .requestMatchers("/actuator/**").permitAll() // Allows access to Spring Boot Actuator endpoints
+                        .anyRequest().authenticated() // Requires authentication for any other request not explicitly matched above
+                )
+
+                // Configure session management to be stateless.
+                // This is crucial for REST APIs that rely on token-based authentication (e.g., JWT)
+                // where the server does not need to maintain session state for clients.
+                .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS));
+
+        // NOTE: In a complete application using JWTs or other token mechanisms, a custom
+        // authentication filter would be added to the filter chain here, for example:
+        // .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
+}
+
+
+package com.tcs.fincore.CommonRequestService.controller;
+
+import java.util.List;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.ResponseStatus;
+import org.springframework.web.bind.annotation.RestController;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.tcs.fincore.CommonRequestService.dto.CreateRequestDto;
+import com.tcs.fincore.CommonRequestService.dto.MyRequestFilterDto;
+import com.tcs.fincore.CommonRequestService.dto.ProcessRequestDto;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.service.RequestService;
+
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+/**
+ * RequestController :-
+ *
+ * This controller handles API requests related to creating, retrieving, and processing common requests within the FinCore Application.
+ * It provides endpoints for users to manage their requests, view pending items, and for approvers to update request statuses.
+ *
+ * @author Shubhankar [v1018405]
+ * @version 1.0
+ * @since 2025-10-01
+ */
+@RestController
+@RequiredArgsConstructor
+@Slf4j
+public class RequestController {
+
+	private final RequestService requestService;
+
+    /**
+     * Creates a new request initiated by a user (maker).
+     *
+     * @param createRequestDto The data transfer object containing the details of the new request.
+     * @param token The authorization token used to identify the user making the request.
+     * @return The created CommonReq entity.
+     * @throws JsonProcessingException If there is an issue processing the request data.
+     */
+	@PostMapping("/create-request")
+	@ResponseStatus(HttpStatus.CREATED)
+	public CommonReq createRequest(
+			@Valid @RequestBody CreateRequestDto createRequestDto,
+			@RequestHeader("Authorization") String token
+	) throws JsonProcessingException {
+		String userId = JwtUtil.getUserIdFromToken(token);
+		log.info("Received request creation call from user: {}", userId);
+		return requestService.createRequest(createRequestDto, userId);
+	}
+
+    /**
+     * Fetches requests created by the current user (maker). Requests can be filtered by `requestType`.
+     *
+     * @param token The authorization token of the user.
+     * @param filterDto An object that may contain a `requestType` for filtering (e.g., `{"requestType": "SEGMENT_CODE"}`).
+     * @return A list of CommonReq entities matching the criteria.
+     */
+	// tab2 master screen
+	@PostMapping("/my-requests")
+	public List<CommonReq> getMyRequests(
+			@RequestHeader("Authorization") String token,
+			@RequestBody MyRequestFilterDto filterDto
+	) {
+		String userId = JwtUtil.getUserIdFromToken(token);
+		log.info(
+				"Received request for fetch data for the user: {} and request type: {}", userId,
+				filterDto.getRequestType()
+		);
+		return requestService.getMyRequests(userId, filterDto.getRequestType());
+	}
+
+    /**
+     * Retrieves a list of requests that are pending approval for the current user (excluding the own requests).
+     *
+     * @param authorizationHeader The authorization token of the user.
+     * @param filterDto An object that contain a `requestType` for filtering pending requests.
+     * @return A list of pending CommonReq entities excluding the own requests.
+     */
+	// accept
+	@PostMapping("/pending-requests")
+	public List<CommonReq> getPendingRequests(
+			@RequestHeader("Authorization") String authorizationHeader,
+			@RequestBody MyRequestFilterDto filterDto
+	) {
+		String userId = JwtUtil.getUserIdFromToken(authorizationHeader);
+		log.info("Received request for pending data for the request type: {}", filterDto.getRequestType());
+		return requestService.getPendingRequests(userId, filterDto.getRequestType());
+	}
+
+    /**
+     * Retrieves all requests present in the system (intended for admin/supervisory roles).
+     *
+     * @param authorizationHeader The authorization token.
+     * @return A list of all CommonReq entities.
+     */
+	@GetMapping("/all-requests")
+	public List<CommonReq> getAllRequests(@RequestHeader("Authorization") String authorizationHeader) {
+		return requestService.getAllRequests();
+	}
+
+
+    /**
+     * Updates the status of a request (Accepts/Rejects) by a checker (approver role).
+     *
+     * @param token The authorization token of the executor (checker).
+     * @param processRequestDto The DTO containing the request ID, new status, and any remarks.
+     * @return The updated CommonReq entity.
+     * @throws JsonProcessingException If there is an issue processing the request data.
+     */
+	@PatchMapping("/update-request")
+	public CommonReq updateRequestStatus(
+			@RequestHeader("Authorization") String token,
+			@RequestBody ProcessRequestDto processRequestDto
+	) throws JsonProcessingException {
+		String executorId = JwtUtil.getUserIdFromToken(token);
+		// The service layer throws a ResourceNotFoundException if the optional is
+		// empty,
+		// which is caught by the GlobalExceptionHandler.
+		return requestService.updateRequestStatus(processRequestDto, executorId).get();
+	}
+}
+
+package com.tcs.fincore.CommonRequestService.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+/**
+ * Data Transfer Object (DTO) for managing notification configuration settings.
+ * This class encapsulates the target URL and the roles associated with a specific notification.
+ */
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class NotificationConfigDto {
+
+    /**
+     * The URL where the notification or related information is targeted or linked.
+     * This field specifies the destination for the notification.
+     */
+    private String targetUrl;
+
+    /**
+     * A comma-separated string of role identifiers (e.g., "51,52,55").
+     * These roles define the specific user groups or permissions that the notification applies to.
+     */
+    private String targetRoles;
+
+}
+
+
+package com.tcs.fincore.CommonRequestService.dto;
+
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import jakarta.validation.constraints.Size;
+import jakarta.validation.constraints.NotNull;
+import lombok.Data;
+
+/**
+ * Data Transfer Object (DTO) used for processing an existing request within the system.
+ * This class encapsulates the necessary information to update the status and add remarks
+ * for a specific request ID.
+ */
+@Data
+public class ProcessRequestDto {
+
+    /**
+     * The unique identifier for the request being processed.
+     * This field is mandatory and must not be null.
+     */
+    @NotNull(message = "Request Id cannot be null")
+    private Long requestId;
+
+    /**
+     * The new status to be assigned to the request.
+     * This field uses the {@link RequestStatus} enum and is mandatory.
+     */
+    @NotNull(message = "Status cannot be null")
+    private RequestStatus status;
+
+    /**
+     * Optional remarks or comments regarding the status update.
+     * This field is constrained to a maximum of 500 characters.
+     */
+    @Size(max = 500, message = "Remarks cannot exceed 500 characters")
+    private String remarks;
+}
+
+
+package com.tcs.fincore.CommonRequestService.model;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp; // Import this
+import org.springframework.data.jpa.domain.support.AuditingEntityListener;
+
+import java.io.Serializable;
+import java.time.Instant; // This is the correct type
+import java.util.Objects;
+import java.util.UUID;
+
+/**
+ * Represents an event in the outbox system, intended for notification purposes.
+ * This entity maps to the {@code notification_table} in the database. It captures all necessary details
+ * for a notification to be processed and displayed to a user or a group of users (via roles).
+ * <p>
+ * The {@code @CreationTimestamp} annotation ensures that the {@code eventTimestamp} is automatically
+ * populated upon entity creation, providing an accurate record of when the event occurred.
+ * </p>
+ */
+@Entity
+@Table(name = "notifications")
+@Builder
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@EntityListeners(AuditingEntityListener.class)
+public class NotificationTable implements Serializable {
+
+    /**
+     * Unique primary key for the outbox event.
+     * Uses a generated {@link UUID} strategy, which is suitable for Oracle's SYS_GUID() or RAW(16) columns.
+     */
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    @Column(name = "EVENT_ID", updatable = false, nullable = false)
+    private UUID eventId;
+
+    /**
+     * The ID of the user who should receive this notification (for 1-to-1 notifications).
+     * This field is used when targeting a specific user.
+     */
+    @Column(name = "USER_ID", length = 255)
+    private String userId;
+
+    /**
+     * The human-readable message to be displayed in the UI.
+     * This is the main content of the notification.
+     */
+    @Column(name = "MESSAGE", length = 1024, nullable = false)
+    private String message;
+
+    /**
+     * The relative URL the user should be taken to when clicking the notification.
+     * Provides a direct link to the relevant business object or view.
+     */
+    @Column(name = "LINK_URL", length = 1024)
+    private String linkUrl;
+
+    /**
+     * The microservice that generated this event.
+     * Helps in tracing the origin of the notification within a microservice architecture.
+     */
+    @Column(name = "EVENT_SOURCE", length = 100)
+    private String eventSource;
+
+    /**
+     * The primary key of the related business object (e.g., the Common Request ID).
+     * Used to link the notification back to the original business data.
+     */
+    @Column(name = "AGGREGATE_ID", length = 255)
+    private String aggregateId;
+
+    /**
+     * The timestamp when the event was created.
+     * Automatically populated using {@link CreationTimestamp} and stored as an {@link Instant}.
+     * The column is both non-nullable and non-updatable after creation.
+     */
+    @CreationTimestamp
+    @Column(name = "EVENT_TIMESTAMP", nullable = false, updatable = false)
+    private Instant eventTimestamp;
+
+    /**
+     * For 1-to-Many notifications. If {@code userId} is null, this role is used to determine the recipients.
+     * Enables broadcasting notifications to all users within a specific role.
+     */
+    @Column(name = "TARGET_ROLE", length = 100)
+    private String targetRole;
+
+
+    /**
+     * Compares this NotificationTable entity with another object for equality based solely on the {@code eventId}.
+     *
+     * @param o The object to compare with.
+     * @return true if the objects are equal (have the same eventId), false otherwise.
+     */
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        NotificationTable that = (NotificationTable) o;
+        return Objects.equals(eventId, that.eventId);
+    }
+
+    /**
+     * Generates a hash code for the NotificationTable entity based solely on the {@code eventId}.
+     *
+     * @return The hash code.
+     */
+    @Override
+    public int hashCode() {
+        return Objects.hash(eventId);
+    }
+
+
+    /**
+     * Provides a string representation of the NotificationTable entity, primarily for logging and debugging purposes.
+     *
+     * @return A string containing key fields of the entity.
+     */
+    @Override
+    public String toString() {
+        return "NotificationTable{" +
+                "eventId='" + eventId + '\'' +
+                ", userId='" + userId + '\'' +
+                ", targetRole='" + targetRole + '\'' +
+                ", eventSource='" + eventSource + '\'' +
+                ", aggregateId='" + aggregateId + '\'' +
+                ", eventTimestamp=" + eventTimestamp +
+                '}';
+    }
+}
+
+package com.tcs.fincore.CommonRequestService.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.*;
+
+/**
+ * Represents the PERMISSIONS entity in the database.
+ * This class is a JPA entity that maps to the 'PERMISSIONS' table and uses Lombok annotations
+ * to automatically generate getters, setters, constructors, and a toString method.
+ */
+@Entity
+@Table(name = "PERMISSIONS")
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@ToString
+public class Permissions {
+
+    /**
+     * The unique identifier for the menu item.
+     * This field is the primary key of the PERMISSIONS table.
+     */
+    @Id
+    @Column(name = "MENU_ID")
+    private int menuId;
+
+    /**
+     * The title of the menu item.
+     * Cannot be null.
+     */
+    @Column(name = "MENU_TITLE", nullable = false, length = 100)
+    private String menuTitle;
+
+    /**
+     * The icon associated with the menu item, if any.
+     */
+    @Column(name = "MENU_ICON", length = 100)
+    private String menuIcon;
+
+    /**
+     * Indicates the submenu the item belongs to, if any.
+     */
+    @Column(name = "MENU_SUBMENU", length = 100)
+    private String menuSubmenu;
+
+    /**
+     * The action associated with the menu item.
+     * Cannot be null.
+     */
+    @Column(name = "MENU_ACTION", nullable = false, length = 200)
+    private String menuAction;
+
+    /**
+     * The URL path for the menu item.
+     * Cannot be null.
+     */
+    @Column(name = "MENU_URL", nullable = false, length = 200)
+    private String menuUrl;
+
+    /**
+     * The component path in the frontend application associated with the menu item.
+     * Cannot be null.
+     */
+    @Column(name = "MENU_COMPONENT_PATH", nullable = false, length = 200)
+    private String menuComponentPath;
+
+    /**
+     * A brief description of the menu item and its purpose.
+     * Cannot be null.
+     */
+    @Column(name = "MENU_DESCRIPTION", nullable = false, length = 255)
+    private String menuDescription;
+
+    /**
+     * The ID of a parent or dependent menu item, if applicable.
+     */
+    @Column(name = "MENU_DEPENDANT")
+    private int menuDependant;
+
+    /**
+     * The type of request mapped to this permission, if any.
+     */
+    @Column(name = "MAPPED_REQUEST_TYPE", length = 50)
+    private String mappedRequestType;
+}
+
+
+package com.tcs.fincore.CommonRequestService.repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.tcs.fincore.CommonRequestService.model.NotificationTable;
+
+import java.util.UUID;
+
+/**
+ * Repository interface for managing {@link NotificationTable} entities.
+ *
+ * This interface extends {@link JpaRepository} to provide standard CRUD (Create, Read, Update, Delete)
+ * operations and querying capabilities for the {@link NotificationTable} entity. The primary key
+ * type for the entity is {@link UUID}.
+ *
+ * Spring Data JPA automatically provides an implementation of this interface at runtime,
+ * allowing data access methods to be used without manual boilerplate code.
+ *
+ * @author [Author Name/Team Name - Optional]
+ * @since [Date or Version - Optional]
+ */
+@Repository
+public interface NotificationRepository extends JpaRepository<NotificationTable, UUID>{
+
+}
+
+package com.tcs.fincore.CommonRequestService.repository;
+
+import com.tcs.fincore.CommonRequestService.model.Permissions;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+
+/**
+ * Repository interface for managing {@link Permissions} entities.
+ * <p>
+ * This interface extends {@link JpaRepository} to provide standard CRUD operations
+ * and defines custom queries for fetching permission and role-related data
+ * from the underlying database, primarily for authorization and caching mechanisms.
+ * </p>
+ */
+@Repository
+public interface PermissionRepository extends JpaRepository<Permissions, Integer> {
+
+    /**
+     * Fetches both the Target URL and the authorized Role IDs in a single database call.
+     * This query retrieves menu URLs and associated active role IDs for 'approve' or 'reject' actions,
+     * filtered by a specific request type.
+     *
+     * @param requestType The mapped request type string (e.g., 'SEGMENT_CODE')
+     * @return A list of arrays where index [0] is MENU_URL (String) and index [1] is ROLE_ID (Number)
+     */
+    @Query(value = """
+       SELECT p.MENU_URL, rp.ROLE_ID
+       FROM PERMISSIONS p
+       JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
+       JOIN ROLES r ON rp.ROLE_ID = r.ROLE_ID
+       WHERE p.MAPPED_REQUEST_TYPE = :requestType
+         AND (p.MENU_ACTION LIKE '%approve%' OR p.MENU_ACTION LIKE '%reject%')
+         AND r.ROLE_STATUS = 'ACTIVE'
+   """, nativeQuery = true)
+    List<Object[]> findUrlAndRolesByRequestType(@Param("requestType") String requestType);
+
+
+    /**
+     * Finds a single menu URL associated with a specific request type.
+     * This query limits the result to the first matching entry found in the database.
+     *
+     * @param requestType The mapped request type string (e.g., 'SEGMENT_CODE')
+     * @return The MENU_URL as a String, or null if not found
+     */
+    @Query(value = "SELECT MENU_URL FROM PERMISSIONS WHERE MAPPED_REQUEST_TYPE = :requestType AND ROWNUM = 1", nativeQuery = true)
+    String findUrlByRequestType(@Param("requestType") String requestType);
+
+    /**
+     * INVALIDATION QUERY (Used by RoleManagementService):
+     * Used to find which Cache Key (MAPPED_REQUEST_TYPE) to evict when a Permission (Menu ID) is updated.
+     *
+     * @param permissionId The Menu ID being modified
+     * @return The cache key (e.g., 'CGL_CODE') or null
+     */
+    @Query(value = "SELECT MAPPED_REQUEST_TYPE FROM PERMISSIONS WHERE MENU_ID = :permissionId", nativeQuery = true)
+    String findRequestTypeByPermissionId(@Param("permissionId") Long permissionId);
+}
+
+
+package com.tcs.fincore.CommonRequestService.service;
+
+
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.NotificationTable;
+import com.tcs.fincore.CommonRequestService.repository.NotificationRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.SneakyThrows;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+/**
+ * A service to create and save Notification events to the outbox table.
+ * This is designed to be called from within a parent @Transactional method
+ * in RequestServiceImpl to ensure atomic operations.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class NotificationWriterService {
+
+    private final NotificationRepository notificationRepository;
+
+    /**
+     * Creates and saves a notification outbox event.
+     * This method joins the existing transaction from the calling service.
+     *
+     * @param userId       The specific user to notify (for 1-to-1). Null if using targetRole.
+     * @param targetRole   The role to notify (for 1-to-many). Null if using userId.
+     * @param message      The human-readable message.
+     * @param linkUrl      The frontend link for the notification.
+     * @param aggregateId  The ID of the business object (e.g., the CommonReq ID).
+     * @param eventSource  The name of this service.
+     */
+    @Transactional(propagation = Propagation.MANDATORY) // Ensures this is only called from within an existing transaction
+    public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
+
+        if (userId == null && targetRole == null) {
+            log.warn("Skipping notification creation: Both userId and targetRole are null. AggregateID: {}", aggregateId);
+            // In a real scenario, you might want to throw an exception here
+            // if one of them is strictly required, to roll back the parent transaction.
+            return;
+        }
+
+        if (message == null || message.isBlank()) {
+            log.warn("Skipping notification creation: Message is null or blank. AggregateID: {}", aggregateId);
+            // Throwing an exception ensures the parent transaction rolls back.
+            throw new IllegalArgumentException("Notification message cannot be null or blank.");
+        }
+
+        NotificationTable notification = NotificationTable.builder()
+                .userId(userId)
+                .targetRole(targetRole)
+                .message(message)
+                .linkUrl(linkUrl)
+                .aggregateId(aggregateId)
+                .eventSource(eventSource)
+                .build();
+
+        // The EVENT_ID (UUID) and EVENT_TIMESTAMP (CreationTimestamp)
+        // will be set automatically by the NotificationTable entity.
 
         notificationRepository.save(notification);
 
@@ -289,38 +3700,48 @@ public class NotificationWriterService {
         }
     }
 
-    // --- Helper methods specific to Journal Service ---
 
-    /**
-     * Called when a new Batch is created. Notifies Approvers (via Roles).
-     */
-    public void createBatchPendingNotification(String batchId, String creatorId, String targetRoles, String targetUrl) {
-        String message = String.format("New Journal Batch (%s) by user %s is pending approval.", batchId, creatorId);
-        
-        // Note: targetRoles comes from PermissionConfigService
-        createNotification(null, targetRoles, message, targetUrl, batchId);
+    @SneakyThrows
+    public void createRequestApprovedNotification(CommonReq request, String approverId) {
+        // 2. Prepare the success notification message
+        String notificationMessage = "Your " + request.getReqType().name().toLowerCase() +" "+request.getChangeType().name()
+                + " request for '" + request.getTargetId() + "' has been approved by " + approverId;
+
+        createNotification(
+                request.getCreatorId(),
+                null,
+                notificationMessage,
+                "/my-requests", // Or specific link
+                request.getId().toString(),
+                "CommonRequestService"
+        );
     }
 
-    /**
-     * Called when a Batch or Request is processed. Notifies the Creator (via User ID).
-     */
-    public void createProcessedNotification(String aggregateId, String creatorId, String status, String approverId, String remarks, String url) {
-        String message = String.format("Your Journal request (%s) has been %s by %s.", aggregateId, status, approverId);
-        
-        if (remarks != null && !remarks.isBlank()) {
-            message += " Reason: " + remarks;
+    @SneakyThrows
+    public void createRequestRejectedNotification(CommonReq request, String rejectorId, String reason) {
+        // 2. Prepare the rejection notification message
+        String notificationMessage = "Your " + request.getReqType().name().toLowerCase() +" "+request.getChangeType().name()
+                + " request for '" + request.getTargetId() + "' was rejected by " + rejectorId;
+        if (reason != null && reason.isBlank()) {
+            notificationMessage += " Reason: " + reason;
         }
 
-        createNotification(creatorId, null, message, url, aggregateId);
+        createNotification(
+                request.getCreatorId(),
+                null,
+                notificationMessage,
+                "/my-requests",
+                request.getId().toString(),
+                "CommonRequestService"
+        );
     }
 }
 
-8. PermissionConfigService.java
-Package updated. Replaced Java 21 getFirst() with generic get(0).
-package com.fincore.JournalService.Service;
+package com.tcs.fincore.CommonRequestService.service;
 
-import com.fincore.JournalService.Dto.NotificationConfigDto;
-import com.fincore.JournalService.Repository.PermissionRepository;
+import com.tcs.fincore.CommonRequestService.dto.NotificationConfigDto;
+
+import com.tcs.fincore.CommonRequestService.repository.PermissionRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.annotation.Cacheable;
@@ -335,35 +3756,49 @@ public class PermissionConfigService {
 
     private final PermissionRepository permissionRepository;
 
+    /**
+     * This method is Cached.
+     * - First call: Hits DB (approx 10ms).
+     * - Subsequent calls: Hits Memory
+     * - Key: The RequestType string (e.g., "SEGMENT_CODE").
+     */
     @Cacheable(value = "notification_configs", key = "#requestType")
     public NotificationConfigDto getConfig(String requestType) {
 
         log.info("Cache Miss: Fetching DB permissions for type: {}", requestType);
 
+        // 1. Single DB Call
         List<Object[]> results = permissionRepository.findUrlAndRolesByRequestType(requestType);
 
         if (results.isEmpty()) {
-            log.warn("No URL and roles found for request type {}. Using defaults.", requestType);
-            // Default fallback
-            return new NotificationConfigDto("/dashboard", null); 
+            // Return default fallback logic if no config found
+            log.info("No URL and roles found for request type {}. Using defaults, need to change this in code later", requestType);
+            return new NotificationConfigDto("/dashboard", "ALL_USERS");
         }
 
-        log.info("Fetched Url and roles from db for the request type {}", requestType);
+        log.info("Fetched Url and roles from db for the request type {} : {}", requestType, results.getFirst()[0]);
 
-        // Safe access for Java 17 (replaced getFirst())
-        String url = (String) results.get(0)[0]; 
+        // 2. Process logic in Java
+        // The URL is the same for all rows (index 0)
+        String url = (String) results.get(0)[0];
 
         if (url == null) url = "/dashboard";
+        // Collect all Role IDs (index 1) into a comma-separated string.
 
-        // Collect all Role IDs into a comma-separated string
         String roles = results.stream()
-                .map(row -> String.valueOf(row[1])) 
+                .map(row -> String.valueOf(row[1])) // Role ID
                 .distinct()
                 .collect(Collectors.joining(","));
 
-        if (roles.isEmpty()) roles = null;
+        if (roles.isEmpty()) roles = "ALL_USERS";
 
         return new NotificationConfigDto(url, roles);
     }
 }
+
+above is the files from common request service actually they implement the notification in that so i also need to implement that but there is just one thing difference like they implement that for common i want to implement for journal posting i taking the refernce i already try to create that but its not working it giving me error cheak all the code compare and tell me i am going correct if not give mi all updated files if any files dont required to update dont give mi that just give mi the updated files
+
+
+
+
 
