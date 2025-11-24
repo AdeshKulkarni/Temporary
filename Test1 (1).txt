@@ -1,133 +1,490 @@
+package com.tcs.fincore.CommonRequestService.config;
 
-You must execute these SQL scripts to create the missing sequences and rename the table in your database.
-1. Create the Missing Sequences
-The error ORA-02289 happens because Java is looking for JOURNAL_REQUEST_SEQ, but it doesn't exist in the DB. Run this:
--- 1. Create Sequence for Journal Requests
-CREATE SEQUENCE "FTWOAHM"."JOURNAL_REQUEST_SEQ" 
-MINVALUE 1 
-MAXVALUE 999999999999999999999999999 
-INCREMENT BY 1 
-START WITH 1 
-NOCACHE 
-NOORDER 
-NOCYCLE;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import org.springframework.cache.CacheManager;
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.cache.RedisCacheConfiguration;
+import org.springframework.data.redis.cache.RedisCacheManager;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.Jackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.RedisSerializationContext;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
 
--- 2. Create Sequence for Master Journal (if missing)
-CREATE SEQUENCE "FTWOAHM"."MASTER_JOURNAL_SEQ" 
-MINVALUE 1 
-MAXVALUE 999999999999999999999999999 
-INCREMENT BY 1 
-START WITH 1 
-NOCACHE 
-NOORDER 
-NOCYCLE;
+import java.time.Duration;
 
--- 3. Ensure Batch and Journal Prefix sequences exist
--- (Only run these if you haven't already, or if you want to ensure they exist)
-CREATE SEQUENCE "FINCORE"."BATCH_SEQ" MINVALUE 1 MAXVALUE 999999999 INCREMENT BY 1 START WITH 1 NOCACHE NOORDER NOCYCLE;
-CREATE SEQUENCE "FINCORE"."JRNL_SEQ" MINVALUE 1 MAXVALUE 999999999 INCREMENT BY 1 START WITH 1 NOCACHE NOORDER NOCYCLE;
+/**
+ * Configuration class for setting up Redis integration within the Spring Boot application.
+ *
+ * This class enables Spring's caching mechanism via `@EnableCaching` and customizes
+ * how data is serialized and deserialized when stored in Redis, primarily using JSON
+ * and ensuring correct handling of Java 8 Date/Time API types.
+ */
+@Configuration
+@EnableCaching
+public class RedisConfig {
 
-2. Rename/Create the Notifications Table
-Run ONE of the following blocks (depending on if the old table exists or not).
-Option A: If notification_table already exists and has data:
-ALTER TABLE "FTWOAHM"."notification_table" RENAME TO "NOTIFICATIONS";
+    /**
+     * Configures and provides a custom `CacheManager` bean for Redis caching operations.
+     *
+     * This manager sets up default cache behavior, including a 24-hour Time-To-Live (TTL)
+     * for entries, prevention of caching `null` values, and specialized JSON serialization.
+     *
+     * The serialization is configured with `GenericJackson2JsonRedisSerializer` and includes
+     * polymorphic type handling (`activateDefaultTyping`) to ensure that cached objects
+     * retain their original class information during deserialization, which is crucial
+     * for generic object caching.
+     *
+     * @param connectionFactory The auto-configured RedisConnectionFactory provided by Spring.
+     * @return A configured RedisCacheManager instance.
+     */
+    @Bean
+    public CacheManager cacheManager(RedisConnectionFactory connectionFactory) {
+        // 1. Create a specialized ObjectMapper for Redis
+        ObjectMapper redisObjectMapper = new ObjectMapper();
+        redisObjectMapper.registerModule(new JavaTimeModule());
+        // --- THIS IS THE FIX / CRUCIAL CONFIGURATION ---
+        // We explicitly verify and enable "Type Info" (polymorphic deserialization)
+        // so Redis saves the Java class name metadata alongside the JSON data.
+        redisObjectMapper.activateDefaultTyping(
+                BasicPolymorphicTypeValidator.builder()
+                        .allowIfBaseType(Object.class)
+                        .build(),
+                ObjectMapper.DefaultTyping.NON_FINAL
+        );
+        // -----------------------
+        GenericJackson2JsonRedisSerializer serializer = new GenericJackson2JsonRedisSerializer(redisObjectMapper);
 
-Option B: If the table does not exist (Create new):
-CREATE TABLE "FTWOAHM"."NOTIFICATIONS" (
-    "EVENT_ID" RAW(16) NOT NULL ENABLE, 
-    "AGGREGATE_ID" VARCHAR2(255 CHAR), 
-    "EVENT_SOURCE" VARCHAR2(100 CHAR), 
-    "EVENT_TIMESTAMP" TIMESTAMP (6) NOT NULL ENABLE, 
-    "LINK_URL" VARCHAR2(1024 CHAR), 
-    "MESSAGE" VARCHAR2(1024 CHAR) NOT NULL ENABLE, 
-    "TARGET_ROLE" VARCHAR2(100 CHAR), 
-    "USER_ID" VARCHAR2(255 CHAR), 
-    PRIMARY KEY ("EVENT_ID")
-);
+        // Define the default configuration for all caches managed by this manager
+        RedisCacheConfiguration cacheConfig = RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl(Duration.ofHours(24)) // Set default cache expiration to 24 hours
+                .disableCachingNullValues() // Prevent caching of null results
+                .serializeKeysWith(RedisSerializationContext.SerializationPair.fromSerializer(new StringRedisSerializer()))
+                .serializeValuesWith(RedisSerializationContext.SerializationPair.fromSerializer(serializer));
 
-🛠️ Step 2: Java Code Updates
-Here are the only files you need to update/rename to complete the NotificationTable \rightarrow Notifications change.
-1. Rename NotificationTable.java to Notifications.java
-Action: Rename the file in com.fincore.JournalService.Models and paste this code.
-package com.fincore.JournalService.Models;
+        return RedisCacheManager.builder(connectionFactory)
+                .cacheDefaults(cacheConfig)
+                .build();
+    }
+
+    /**
+     * Provides a standard `ObjectMapper` bean for general application use outside of the
+     * specific `CacheManager` configuration.
+     *
+     * Ensures proper handling of Java 8 Date/Time types (like `LocalDate`, `Instant`)
+     * in standard JSON marshalling operations elsewhere in the application (e.g., REST controllers).
+     *
+     * @return A configured ObjectMapper instance.
+     */
+    @Bean
+    public ObjectMapper objectMapper() {
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.registerModule(new JavaTimeModule());
+        mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS); // Write dates as ISO-8601 strings
+        return mapper;
+    }
+
+    /**
+     * Configures and provides a custom `RedisTemplate` bean.
+     *
+     * This bean is used for direct, programmatic interaction with Redis (e.g., using `redisTemplate.opsForValue().set(...)`)
+     * rather than using the `@Cacheable` annotations. It uses the application's standard
+     * `ObjectMapper` for serialization, which is suitable for specific key-value operations
+     * where polymorphic typing might not be necessary or is handled explicitly.
+     *
+     * @param connectionFactory The auto-configured RedisConnectionFactory.
+     * @param objectMapper The standard application ObjectMapper bean.
+     * @return A configured RedisTemplate instance for String keys and Object values.
+     */
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory connectionFactory, ObjectMapper objectMapper) {
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(connectionFactory);
+
+        // Use the standard Jackson2JsonRedisSerializer for the value serializer
+        Jackson2JsonRedisSerializer<Object> serializer =
+                new Jackson2JsonRedisSerializer<>(objectMapper, Object.class);
+
+        template.setValueSerializer(serializer);
+        template.setKeySerializer(new StringRedisSerializer()); // Ensure keys are always strings
+
+        return template;
+    }
+
+}
+
+package com.tcs.fincore.CommonRequestService.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+/**
+ * Data Transfer Object (DTO) for managing notification configuration settings.
+ * This class encapsulates the target URL and the roles associated with a specific notification.
+ */
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class NotificationConfigDto {
+
+    /**
+     * The URL where the notification or related information is targeted or linked.
+     * This field specifies the destination for the notification.
+     */
+    private String targetUrl;
+
+    /**
+     * A comma-separated string of role identifiers (e.g., "51,52,55").
+     * These roles define the specific user groups or permissions that the notification applies to.
+     */
+    private String targetRoles;
+
+}
+
+package com.tcs.fincore.CommonRequestService.model;
 
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
-import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.CreationTimestamp; // Import this
 import org.springframework.data.jpa.domain.support.AuditingEntityListener;
 
 import java.io.Serializable;
-import java.time.Instant;
+import java.time.Instant; // This is the correct type
+import java.util.Objects;
 import java.util.UUID;
 
+/**
+ * Represents an event in the outbox system, intended for notification purposes.
+ * This entity maps to the {@code notification_table} in the database. It captures all necessary details
+ * for a notification to be processed and displayed to a user or a group of users (via roles).
+ * <p>
+ * The {@code @CreationTimestamp} annotation ensures that the {@code eventTimestamp} is automatically
+ * populated upon entity creation, providing an accurate record of when the event occurred.
+ * </p>
+ */
 @Entity
-@Table(name = "NOTIFICATIONS") // Table name changed here
+@Table(name = "notifications")
 @Builder
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
 @EntityListeners(AuditingEntityListener.class)
-public class Notifications implements Serializable { // Class name changed to Notifications
+public class NotificationTable implements Serializable {
 
+    /**
+     * Unique primary key for the outbox event.
+     * Uses a generated {@link UUID} strategy, which is suitable for Oracle's SYS_GUID() or RAW(16) columns.
+     */
     @Id
     @GeneratedValue(strategy = GenerationType.UUID)
     @Column(name = "EVENT_ID", updatable = false, nullable = false)
     private UUID eventId;
 
+    /**
+     * The ID of the user who should receive this notification (for 1-to-1 notifications).
+     * This field is used when targeting a specific user.
+     */
     @Column(name = "USER_ID", length = 255)
     private String userId;
 
+    /**
+     * The human-readable message to be displayed in the UI.
+     * This is the main content of the notification.
+     */
     @Column(name = "MESSAGE", length = 1024, nullable = false)
     private String message;
 
+    /**
+     * The relative URL the user should be taken to when clicking the notification.
+     * Provides a direct link to the relevant business object or view.
+     */
     @Column(name = "LINK_URL", length = 1024)
     private String linkUrl;
 
+    /**
+     * The microservice that generated this event.
+     * Helps in tracing the origin of the notification within a microservice architecture.
+     */
     @Column(name = "EVENT_SOURCE", length = 100)
     private String eventSource;
 
+    /**
+     * The primary key of the related business object (e.g., the Common Request ID).
+     * Used to link the notification back to the original business data.
+     */
     @Column(name = "AGGREGATE_ID", length = 255)
     private String aggregateId;
 
+    /**
+     * The timestamp when the event was created.
+     * Automatically populated using {@link CreationTimestamp} and stored as an {@link Instant}.
+     * The column is both non-nullable and non-updatable after creation.
+     */
     @CreationTimestamp
     @Column(name = "EVENT_TIMESTAMP", nullable = false, updatable = false)
     private Instant eventTimestamp;
 
+    /**
+     * For 1-to-Many notifications. If {@code userId} is null, this role is used to determine the recipients.
+     * Enables broadcasting notifications to all users within a specific role.
+     */
     @Column(name = "TARGET_ROLE", length = 100)
     private String targetRole;
+
+
+    /**
+     * Compares this NotificationTable entity with another object for equality based solely on the {@code eventId}.
+     *
+     * @param o The object to compare with.
+     * @return true if the objects are equal (have the same eventId), false otherwise.
+     */
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        NotificationTable that = (NotificationTable) o;
+        return Objects.equals(eventId, that.eventId);
+    }
+
+    /**
+     * Generates a hash code for the NotificationTable entity based solely on the {@code eventId}.
+     *
+     * @return The hash code.
+     */
+    @Override
+    public int hashCode() {
+        return Objects.hash(eventId);
+    }
+
+
+    /**
+     * Provides a string representation of the NotificationTable entity, primarily for logging and debugging purposes.
+     *
+     * @return A string containing key fields of the entity.
+     */
+    @Override
+    public String toString() {
+        return "NotificationTable{" +
+                "eventId='" + eventId + '\'' +
+                ", userId='" + userId + '\'' +
+                ", targetRole='" + targetRole + '\'' +
+                ", eventSource='" + eventSource + '\'' +
+                ", aggregateId='" + aggregateId + '\'' +
+                ", eventTimestamp=" + eventTimestamp +
+                '}';
+    }
 }
 
-2. Update NotificationRepository.java
-Action: Update the generic type in the repository interface.
-package com.fincore.JournalService.Repository;
+
+package com.tcs.fincore.CommonRequestService.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.*;
+
+/**
+ * Represents the PERMISSIONS entity in the database.
+ * This class is a JPA entity that maps to the 'PERMISSIONS' table and uses Lombok annotations
+ * to automatically generate getters, setters, constructors, and a toString method.
+ */
+@Entity
+@Table(name = "PERMISSIONS")
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@ToString
+public class Permissions {
+
+    /**
+     * The unique identifier for the menu item.
+     * This field is the primary key of the PERMISSIONS table.
+     */
+    @Id
+    @Column(name = "MENU_ID")
+    private int menuId;
+
+    /**
+     * The title of the menu item.
+     * Cannot be null.
+     */
+    @Column(name = "MENU_TITLE", nullable = false, length = 100)
+    private String menuTitle;
+
+    /**
+     * The icon associated with the menu item, if any.
+     */
+    @Column(name = "MENU_ICON", length = 100)
+    private String menuIcon;
+
+    /**
+     * Indicates the submenu the item belongs to, if any.
+     */
+    @Column(name = "MENU_SUBMENU", length = 100)
+    private String menuSubmenu;
+
+    /**
+     * The action associated with the menu item.
+     * Cannot be null.
+     */
+    @Column(name = "MENU_ACTION", nullable = false, length = 200)
+    private String menuAction;
+
+    /**
+     * The URL path for the menu item.
+     * Cannot be null.
+     */
+    @Column(name = "MENU_URL", nullable = false, length = 200)
+    private String menuUrl;
+
+    /**
+     * The component path in the frontend application associated with the menu item.
+     * Cannot be null.
+     */
+    @Column(name = "MENU_COMPONENT_PATH", nullable = false, length = 200)
+    private String menuComponentPath;
+
+    /**
+     * A brief description of the menu item and its purpose.
+     * Cannot be null.
+     */
+    @Column(name = "MENU_DESCRIPTION", nullable = false, length = 255)
+    private String menuDescription;
+
+    /**
+     * The ID of a parent or dependent menu item, if applicable.
+     */
+    @Column(name = "MENU_DEPENDANT")
+    private int menuDependant;
+
+    /**
+     * The type of request mapped to this permission, if any.
+     */
+    @Column(name = "MAPPED_REQUEST_TYPE", length = 50)
+    private String mappedRequestType;
+}
+
+package com.tcs.fincore.CommonRequestService.repository;
 
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;
 
-import com.fincore.JournalService.Models.Notifications; // Updated Import
+import com.tcs.fincore.CommonRequestService.model.NotificationTable;
 
 import java.util.UUID;
 
+/**
+ * Repository interface for managing {@link NotificationTable} entities.
+ *
+ * This interface extends {@link JpaRepository} to provide standard CRUD (Create, Read, Update, Delete)
+ * operations and querying capabilities for the {@link NotificationTable} entity. The primary key
+ * type for the entity is {@link UUID}.
+ *
+ * Spring Data JPA automatically provides an implementation of this interface at runtime,
+ * allowing data access methods to be used without manual boilerplate code.
+ *
+ * @author [Author Name/Team Name - Optional]
+ * @since [Date or Version - Optional]
+ */
 @Repository
-public interface NotificationRepository extends JpaRepository<Notifications, UUID> { // Updated Type
+public interface NotificationRepository extends JpaRepository<NotificationTable, UUID>{
+
 }
 
-3. Update NotificationWriterService.java
-Action: Update the builder to use the new Notifications class.
-package com.fincore.JournalService.Service;
+package com.tcs.fincore.CommonRequestService.repository;
 
+import com.tcs.fincore.CommonRequestService.model.Permissions;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+
+/**
+ * Repository interface for managing {@link Permissions} entities.
+ * <p>
+ * This interface extends {@link JpaRepository} to provide standard CRUD operations
+ * and defines custom queries for fetching permission and role-related data
+ * from the underlying database, primarily for authorization and caching mechanisms.
+ * </p>
+ */
+@Repository
+public interface PermissionRepository extends JpaRepository<Permissions, Integer> {
+
+    /**
+     * Fetches both the Target URL and the authorized Role IDs in a single database call.
+     * This query retrieves menu URLs and associated active role IDs for 'approve' or 'reject' actions,
+     * filtered by a specific request type.
+     *
+     * @param requestType The mapped request type string (e.g., 'SEGMENT_CODE')
+     * @return A list of arrays where index [0] is MENU_URL (String) and index [1] is ROLE_ID (Number)
+     */
+    @Query(value = """
+       SELECT p.MENU_URL, rp.ROLE_ID
+       FROM PERMISSIONS p
+       JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
+       JOIN ROLES r ON rp.ROLE_ID = r.ROLE_ID
+       WHERE p.MAPPED_REQUEST_TYPE = :requestType
+         AND (p.MENU_ACTION LIKE '%approve%' OR p.MENU_ACTION LIKE '%reject%')
+         AND r.ROLE_STATUS = 'ACTIVE'
+   """, nativeQuery = true)
+    List<Object[]> findUrlAndRolesByRequestType(@Param("requestType") String requestType);
+
+
+    /**
+     * Finds a single menu URL associated with a specific request type.
+     * This query limits the result to the first matching entry found in the database.
+     *
+     * @param requestType The mapped request type string (e.g., 'SEGMENT_CODE')
+     * @return The MENU_URL as a String, or null if not found
+     */
+    @Query(value = "SELECT MENU_URL FROM PERMISSIONS WHERE MAPPED_REQUEST_TYPE = :requestType AND ROWNUM = 1", nativeQuery = true)
+    String findUrlByRequestType(@Param("requestType") String requestType);
+
+    /**
+     * INVALIDATION QUERY (Used by RoleManagementService):
+     * Used to find which Cache Key (MAPPED_REQUEST_TYPE) to evict when a Permission (Menu ID) is updated.
+     *
+     * @param permissionId The Menu ID being modified
+     * @return The cache key (e.g., 'CGL_CODE') or null
+     */
+    @Query(value = "SELECT MAPPED_REQUEST_TYPE FROM PERMISSIONS WHERE MENU_ID = :permissionId", nativeQuery = true)
+    String findRequestTypeByPermissionId(@Param("permissionId") Long permissionId);
+}
+
+
+package com.tcs.fincore.CommonRequestService.service;
+
+
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.NotificationTable;
+import com.tcs.fincore.CommonRequestService.repository.NotificationRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
-import com.fincore.JournalService.Models.Notifications; // Updated Import
-import com.fincore.JournalService.Repository.NotificationRepository;
-
+/**
+ * A service to create and save Notification events to the outbox table.
+ * This is designed to be called from within a parent @Transactional method
+ * in RequestServiceImpl to ensure atomic operations.
+ */
 @Service
 @RequiredArgsConstructor
 @Slf4j
@@ -135,21 +492,34 @@ public class NotificationWriterService {
 
     private final NotificationRepository notificationRepository;
 
-    @Transactional(propagation = Propagation.MANDATORY) 
+    /**
+     * Creates and saves a notification outbox event.
+     * This method joins the existing transaction from the calling service.
+     *
+     * @param userId       The specific user to notify (for 1-to-1). Null if using targetRole.
+     * @param targetRole   The role to notify (for 1-to-many). Null if using userId.
+     * @param message      The human-readable message.
+     * @param linkUrl      The frontend link for the notification.
+     * @param aggregateId  The ID of the business object (e.g., the CommonReq ID).
+     * @param eventSource  The name of this service.
+     */
+    @Transactional(propagation = Propagation.MANDATORY) // Ensures this is only called from within an existing transaction
     public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
 
         if (userId == null && targetRole == null) {
             log.warn("Skipping notification creation: Both userId and targetRole are null. AggregateID: {}", aggregateId);
+            // In a real scenario, you might want to throw an exception here
+            // if one of them is strictly required, to roll back the parent transaction.
             return;
         }
 
         if (message == null || message.isBlank()) {
             log.warn("Skipping notification creation: Message is null or blank. AggregateID: {}", aggregateId);
+            // Throwing an exception ensures the parent transaction rolls back.
             throw new IllegalArgumentException("Notification message cannot be null or blank.");
         }
 
-        // Updated Builder to use Notifications
-        Notifications notification = Notifications.builder()
+        NotificationTable notification = NotificationTable.builder()
                 .userId(userId)
                 .targetRole(targetRole)
                 .message(message)
@@ -158,14 +528,117 @@ public class NotificationWriterService {
                 .eventSource(eventSource)
                 .build();
 
+        // The EVENT_ID (UUID) and EVENT_TIMESTAMP (CreationTimestamp)
+        // will be set automatically by the NotificationTable entity.
+
         notificationRepository.save(notification);
 
-        if (userId != null) {
-            log.info("Saved 1-to-1 notification event for user: {} (AggregateID: {})", userId, aggregateId);
-        } else {
+        if (targetRole != null) {
             log.info("Saved 1-to-many notification event for role: {} (AggregateID: {})", targetRole, aggregateId);
+        } else {
+            log.info("Saved 1-to-1 notification event for user: {} (AggregateID: {})", userId, aggregateId);
         }
+    }
+
+
+    @SneakyThrows
+    public void createRequestApprovedNotification(CommonReq request, String approverId) {
+        // 2. Prepare the success notification message
+        String notificationMessage = "Your " + request.getReqType().name().toLowerCase() +" "+request.getChangeType().name()
+                + " request for '" + request.getTargetId() + "' has been approved by " + approverId;
+
+        createNotification(
+                request.getCreatorId(),
+                null,
+                notificationMessage,
+                "/my-requests", // Or specific link
+                request.getId().toString(),
+                "CommonRequestService"
+        );
+    }
+
+    @SneakyThrows
+    public void createRequestRejectedNotification(CommonReq request, String rejectorId, String reason) {
+        // 2. Prepare the rejection notification message
+        String notificationMessage = "Your " + request.getReqType().name().toLowerCase() +" "+request.getChangeType().name()
+                + " request for '" + request.getTargetId() + "' was rejected by " + rejectorId;
+        if (reason != null && reason.isBlank()) {
+            notificationMessage += " Reason: " + reason;
+        }
+
+        createNotification(
+                request.getCreatorId(),
+                null,
+                notificationMessage,
+                "/my-requests",
+                request.getId().toString(),
+                "CommonRequestService"
+        );
     }
 }
 
-this are the files from where i need we created notification feature cheak once and create or modify filess accordinly
+
+
+package com.tcs.fincore.CommonRequestService.service;
+
+import com.tcs.fincore.CommonRequestService.dto.NotificationConfigDto;
+
+import com.tcs.fincore.CommonRequestService.repository.PermissionRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Service;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class PermissionConfigService {
+
+    private final PermissionRepository permissionRepository;
+
+    /**
+     * This method is Cached.
+     * - First call: Hits DB (approx 10ms).
+     * - Subsequent calls: Hits Memory
+     * - Key: The RequestType string (e.g., "SEGMENT_CODE").
+     */
+    @Cacheable(value = "notification_configs", key = "#requestType")
+    public NotificationConfigDto getConfig(String requestType) {
+
+        log.info("Cache Miss: Fetching DB permissions for type: {}", requestType);
+
+        // 1. Single DB Call
+        List<Object[]> results = permissionRepository.findUrlAndRolesByRequestType(requestType);
+
+        if (results.isEmpty()) {
+            // Return default fallback logic if no config found
+            log.info("No URL and roles found for request type {}. Using defaults, need to change this in code later", requestType);
+            return new NotificationConfigDto("/dashboard", "ALL_USERS");
+        }
+
+        log.info("Fetched Url and roles from db for the request type {} : {}", requestType, results.getFirst()[0]);
+
+        // 2. Process logic in Java
+        // The URL is the same for all rows (index 0)
+        String url = (String) results.get(0)[0];
+
+        if (url == null) url = "/dashboard";
+        // Collect all Role IDs (index 1) into a comma-separated string.
+
+        String roles = results.stream()
+                .map(row -> String.valueOf(row[1])) // Role ID
+                .distinct()
+                .collect(Collectors.joining(","));
+
+        if (roles.isEmpty()) roles = "ALL_USERS";
+
+        return new NotificationConfigDto(url, roles);
+    }
+}
+
+
+this are the all files in which we takes refarance and create a notification feature see in that any kind of problem is there or any thing wrong is there in that and give mi updated modiofyed code accordinly
+
+
