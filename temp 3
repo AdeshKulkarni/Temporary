@@ -422,4 +422,167 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                     if (payloadDto.getPDate() != null) {
                         newGlTxn.setPostDate(payloadDto.getPDate().atStartOfDay());
                     }
-                    newGlTxn.setBra
+                    newGlTxn.setBranchCode(payloadDto.getBranch());
+                    newGlTxn.setCurrency(payloadDto.getCurrency());
+                    newGlTxn.setCgl(payloadDto.getCgl());
+                    newGlTxn.setNarration(payloadDto.getRemarks());
+                    
+                    BigDecimal amount = payloadDto.getAmount();
+                    if (amount.signum() < 0) { 
+                        newGlTxn.setCreditAmount(amount);
+                        newGlTxn.setDebitAmount(BigDecimal.ZERO);
+                    } else { 
+                        newGlTxn.setDebitAmount(amount);
+                        newGlTxn.setCreditAmount(BigDecimal.ZERO);
+                    }
+                    newGlTxn.setTransactionCount(payloadDto.getTransactionCount());
+                    newGlTxn.setSourceFlag("J"); 
+                    
+                    transactionsToSave.add(newGlTxn);
+                }
+            }
+            processedRequests.add(request);
+        }
+     
+        if (!transactionsToSave.isEmpty()) {
+            glTransactionRepository.saveAll(transactionsToSave);
+        }
+        
+        List<JournalRequest> savedRequests = journalRequestRepository.saveAll(processedRequests);
+        
+        // --- 1-to-1 Notification to Creator ---
+        try {
+            boolean isApproved = RequestStatus.ACCEPTED.equals(dto.getStatus());
+            String status = isApproved ? "approved" : "rejected";
+            String message;
+            String aggregateId;
+
+            if (hasBatchId) {
+                aggregateId = dto.getBatchId();
+                message = String.format("Your Journal batch (ID: %s) with %d entries has been %s by user %s.",
+                                        aggregateId, savedRequests.size(), status, executorId);
+            } else { 
+                aggregateId = dto.getJournalIdPrefixes().get(0); 
+                message = String.format("Your %d Journal requests (Journals: %s,...) have been %s by user %s.",
+                                        savedRequests.size(), aggregateId, status, executorId);
+            }
+
+            if (!isApproved && StringUtils.hasText(dto.getRemarks())) {
+                message += " Reason: " + dto.getRemarks();
+            }
+
+            notificationWriterService.createNotification(
+                creatorId,              
+                null,                   
+                message,
+                JOURNAL_POSTING_URL,    
+                aggregateId,            
+                EVENT_SOURCE
+            );
+        } catch (Exception e) {
+            log.error("Failed to send creator bulk notification for creator {}", creatorId, e);
+        }
+        
+        return savedRequests;
+    }
+    
+    private void sendCreatorNotification(JournalRequest request, boolean isApproved) {
+        try {
+            String status = isApproved ? "approved" : "rejected";
+            String message = String.format("Your Journal request (Journal: %s) has been %s by user %s.",
+                                           request.getJournalId(), status, request.getExecutorId());
+
+            if (!isApproved && StringUtils.hasText(request.getExecutorRemarks())) {
+                message += " Reason: " + request.getExecutorRemarks();
+            }
+
+            notificationWriterService.createNotification(
+                request.getCreatorId(),
+                null,                   
+                message,
+                JOURNAL_POSTING_URL,    
+                request.getId().toString(),
+                EVENT_SOURCE
+            );
+        } catch (Exception e) {
+            log.error("Failed to send creator notification for Journal Request ID: {}", request.getId(), e);
+        }
+    }
+    
+    @Override
+    public List<JournalRequest> getRequestsByBatchId(String batchId) {
+        List<JournalRequest> requests = journalRequestRepository.findByBatchId(batchId);
+        if (requests.isEmpty()) {
+            throw new ResourceNotFoundException("No Journal requests found for Batch ID: " + batchId);
+        }
+        return requests;
+    }
+   
+    @Override
+    @Transactional
+    public void cancelMyRequest(Long requestId, String userId) {
+        JournalRequest request = journalRequestRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("Journal Request with ID " + requestId + " not found."));
+
+        if (!userId.equals(request.getCreatorId())) {
+            throw new IllegalStateException("You are not authorized to cancel this request.");
+        }
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            throw new IllegalStateException("Cannot cancel a request that has already been processed.");
+        }
+        journalRequestRepository.delete(request);
+    }
+
+    @Override
+    @Transactional
+    public void cancelMyRequestsByJournalPrefix(String journalIdPrefix, String userId) {
+        List<JournalRequest> requestsToCancel = journalRequestRepository.findByJournalIdStartingWithAndCreatorIdAndRequestStatus(
+                journalIdPrefix, userId, RequestStatus.PENDING);
+
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found for you with journal prefix: " + journalIdPrefix);
+        }
+        journalRequestRepository.deleteAll(requestsToCancel);
+    }
+
+    @Override
+    public List<JournalRequestStatusDto> getJournalRequestStatusList() {
+        return journalRequestRepository.findAll().stream()
+                .map(JournalRequestStatusDto::new)
+                .collect(Collectors.toList());
+    }
+    
+    @Override
+    @Transactional
+    public void cancelMyRequestsByBatchId(String batchId, String userId) {
+        List<JournalRequest> requestsToCancel = journalRequestRepository.findByBatchIdAndCreatorIdAndRequestStatus(
+                batchId, userId, RequestStatus.PENDING);
+        
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found for you in this batch.");
+        }
+        journalRequestRepository.deleteAll(requestsToCancel);
+    }
+
+    @Override
+    @Transactional
+    public void cancelMyRequestsByJournalPrefixes(List<String> journalIdPrefixes, String userId) {
+        Specification<JournalRequest> spec = (root, query, criteriaBuilder) -> {
+            List<Predicate> predicates = new ArrayList<>();
+            for (String prefix : journalIdPrefixes) {
+                predicates.add(criteriaBuilder.like(root.get("journalId"), prefix + "%"));
+            }
+            Predicate journalIdOrPredicates = criteriaBuilder.or(predicates.toArray(new Predicate[0]));
+            Predicate statusPredicate = criteriaBuilder.equal(root.get("requestStatus"), RequestStatus.PENDING);
+            Predicate creatorPredicate = criteriaBuilder.equal(root.get("creatorId"), userId);
+            return criteriaBuilder.and(journalIdOrPredicates, statusPredicate, creatorPredicate);
+        };
+        
+        List<JournalRequest> requestsToCancel = journalRequestRepository.findAll(spec);
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found for you with the specified journal prefixes.");
+        }
+        journalRequestRepository.deleteAll(requestsToCancel);
+    }
+}
+
