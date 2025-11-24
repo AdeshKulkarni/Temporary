@@ -1,163 +1,12 @@
-This looks like a very solid implementation of an "Outbox Pattern" for notifications using Spring Boot, JPA, and Redis. You have correctly separated concerns (Config, DTO, Entity, Service, Repo).
-However, there is one critical logical bug in your NotificationWriterService regarding string validation, and a few potential safety/best-practice improvements regarding list handling and Java versions.
-Here is the analysis and the updated code.
-🔍 Key Issues Found & Fixed
- * Logic Bug in createRequestRejectedNotification:
-   * Original: if (reason != null && reason.isBlank())
-   * Issue: isBlank() returns true if the string is empty or whitespace. Your logic currently adds the reason only if it IS blank (which creates a nonsense message).
-   * Fix: Changed to !reason.isBlank().
- * Java Version Compatibility (PermissionConfigService):
-   * Issue: You used results.getFirst(). This method was introduced in Java 21. If your project runs on Java 17 or 11 (common enterprise standards), this will crash.
-   * Fix: Changed to results.get(0) for broader compatibility.
- * Redis Serialization Safety:
-   * Issue: While your RedisConfig is good, using Object.class as the base for polymorphic typing allows any class to be deserialized.
-   * Fix: I kept your configuration as it is required for generic caching, but ensure your Redis instance is secured, as this is a standard trade-off for flexibility.
- * Database Consistency:
-   * Observation: In NotificationTable, you are using GenerationType.UUID. Ensure your database column is set to RAW(16) (if Oracle) or UUID (if Postgres) to avoid mapping errors.
-✅ Updated Code
-1. NotificationWriterService.java (Logic Bug Fixed)
-package com.tcs.fincore.CommonRequestService.service;
-
-import com.tcs.fincore.CommonRequestService.model.CommonReq;
-import com.tcs.fincore.CommonRequestService.model.NotificationTable;
-import com.tcs.fincore.CommonRequestService.repository.NotificationRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.SneakyThrows;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Propagation;
-import org.springframework.transaction.annotation.Transactional;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class NotificationWriterService {
-
-    private final NotificationRepository notificationRepository;
-
-    @Transactional(propagation = Propagation.MANDATORY)
-    public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
-
-        // Validation: Must have a target (User OR Role)
-        if (userId == null && targetRole == null) {
-            log.warn("Skipping notification creation: Both userId and targetRole are null. AggregateID: {}", aggregateId);
-            return;
-        }
-
-        if (message == null || message.isBlank()) {
-            log.warn("Skipping notification creation: Message is null or blank. AggregateID: {}", aggregateId);
-            throw new IllegalArgumentException("Notification message cannot be null or blank.");
-        }
-
-        NotificationTable notification = NotificationTable.builder()
-                .userId(userId)
-                .targetRole(targetRole)
-                .message(message)
-                .linkUrl(linkUrl)
-                .aggregateId(aggregateId)
-                .eventSource(eventSource)
-                .build();
-
-        notificationRepository.save(notification);
-
-        if (targetRole != null) {
-            log.info("Saved 1-to-many notification event for role: {} (AggregateID: {})", targetRole, aggregateId);
-        } else {
-            log.info("Saved 1-to-1 notification event for user: {} (AggregateID: {})", userId, aggregateId);
-        }
-    }
-
-    @SneakyThrows
-    public void createRequestApprovedNotification(CommonReq request, String approverId) {
-        String notificationMessage = "Your " + request.getReqType().name().toLowerCase() + " " 
-                + request.getChangeType().name()
-                + " request for '" + request.getTargetId() + "' has been approved by " + approverId;
-
-        createNotification(
-                request.getCreatorId(),
-                null,
-                notificationMessage,
-                "/my-requests", 
-                request.getId().toString(),
-                "CommonRequestService"
-        );
-    }
-
-    @SneakyThrows
-    public void createRequestRejectedNotification(CommonReq request, String rejectorId, String reason) {
-        String notificationMessage = "Your " + request.getReqType().name().toLowerCase() + " " 
-                + request.getChangeType().name()
-                + " request for '" + request.getTargetId() + "' was rejected by " + rejectorId;
-
-        // --- FIX: Added '!' to ensure we only append if reason is NOT blank ---
-        if (reason != null && !reason.isBlank()) {
-            notificationMessage += " Reason: " + reason;
-        }
-
-        createNotification(
-                request.getCreatorId(),
-                null,
-                notificationMessage,
-                "/my-requests",
-                request.getId().toString(),
-                "CommonRequestService"
-        );
-    }
-}
-
-2. PermissionConfigService.java (List Access Safety)
-package com.tcs.fincore.CommonRequestService.service;
-
-import com.tcs.fincore.CommonRequestService.dto.NotificationConfigDto;
-import com.tcs.fincore.CommonRequestService.repository.PermissionRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.cache.annotation.Cacheable;
-import org.springframework.stereotype.Service;
-import java.util.List;
-import java.util.stream.Collectors;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class PermissionConfigService {
-
-    private final PermissionRepository permissionRepository;
-
-    @Cacheable(value = "notification_configs", key = "#requestType")
-    public NotificationConfigDto getConfig(String requestType) {
-
-        log.info("Cache Miss: Fetching DB permissions for type: {}", requestType);
-
-        List<Object[]> results = permissionRepository.findUrlAndRolesByRequestType(requestType);
-
-        if (results.isEmpty()) {
-            log.warn("No URL and roles found for request type {}. Using defaults.", requestType);
-            return new NotificationConfigDto("/dashboard", "ALL_USERS");
-        }
-
-        // --- FIX: Changed getFirst() to get(0) for Java 17 compatibility ---
-        log.info("Fetched Url and roles from db for the request type {} : {}", requestType, results.get(0)[0]);
-
-        // The URL is the same for all rows (index 0)
-        String url = (String) results.get(0)[0];
-        if (url == null) url = "/dashboard";
-
-        // Collect all Role IDs (index 1) into a comma-separated string.
-        String roles = results.stream()
-                .map(row -> String.valueOf(row[1])) 
-                .distinct()
-                .collect(Collectors.joining(","));
-
-        if (roles.isEmpty()) roles = "ALL_USERS";
-
-        return new NotificationConfigDto(url, roles);
-    }
-}
-
-3. RedisConfig.java (Minor Comment Update)
-Your Redis config is actually correct for Spring Boot 3+ / Jackson 2.10+. Just ensuring imports are standard.
-package com.tcs.fincore.CommonRequestService.config;
+I understand. You provided a Common Request Service implementation (generic), but you want me to adapt these specific files to work exclusively inside your Journal Service.
+I will refactor the code to:
+ * Change all packages to com.fincore.JournalService....
+ * Remove references to CommonReq.
+ * Update the NotificationWriterService to handle JournalRequest logic (Batch approvals/rejections) instead of generic requests.
+Here are the modified files ready for your JournalService.
+1. RedisConfig.java
+Package updated. Kept your specific object mapping logic.
+package com.fincore.JournalService.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
@@ -184,17 +33,18 @@ public class RedisConfig {
 
     @Bean
     public CacheManager cacheManager(RedisConnectionFactory connectionFactory) {
+        // 1. Create a specialized ObjectMapper for Redis
         ObjectMapper redisObjectMapper = new ObjectMapper();
         redisObjectMapper.registerModule(new JavaTimeModule());
         
-        // Configuration to allow polymorphic type handling (saving class info in Redis)
+        // Explicitly verify and enable "Type Info" for polymorphic deserialization
         redisObjectMapper.activateDefaultTyping(
                 BasicPolymorphicTypeValidator.builder()
                         .allowIfBaseType(Object.class)
                         .build(),
                 ObjectMapper.DefaultTyping.NON_FINAL
         );
-
+        
         GenericJackson2JsonRedisSerializer serializer = new GenericJackson2JsonRedisSerializer(redisObjectMapper);
 
         RedisCacheConfiguration cacheConfig = RedisCacheConfiguration.defaultCacheConfig()
@@ -212,7 +62,7 @@ public class RedisConfig {
     public ObjectMapper objectMapper() {
         ObjectMapper mapper = new ObjectMapper();
         mapper.registerModule(new JavaTimeModule());
-        mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+        mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS); 
         return mapper;
     }
 
@@ -231,5 +81,289 @@ public class RedisConfig {
     }
 }
 
-Next Step:
-Would you like me to create a Unit Test for the PermissionConfigService to verify that the Caching logic works and correctly handles the List<Object[]> transformation?
+2. NotificationConfigDto.java
+Package updated.
+package com.fincore.JournalService.Dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class NotificationConfigDto {
+    private String targetUrl;
+    private String targetRoles; // e.g., "51,52,55"
+}
+
+3. Notifications.java (Entity)
+Package updated. Maps to your specific Journal Service table.
+package com.fincore.JournalService.Models;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+import org.springframework.data.jpa.domain.support.AuditingEntityListener;
+
+import java.io.Serializable;
+import java.time.Instant;
+import java.util.UUID;
+
+@Entity
+@Table(name = "NOTIFICATIONS")
+@Builder
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@EntityListeners(AuditingEntityListener.class)
+public class Notifications implements Serializable {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    @Column(name = "EVENT_ID", nullable = false, updatable = false)
+    private UUID eventId;
+
+    @Column(name = "USER_ID", length = 255)
+    private String userId;
+
+    @Column(name = "MESSAGE", length = 1024, nullable = false)
+    private String message;
+
+    @Column(name = "LINK_URL", length = 1024)
+    private String linkUrl;
+
+    @Column(name = "EVENT_SOURCE", length = 100)
+    private String eventSource;
+
+    @Column(name = "AGGREGATE_ID", length = 255)
+    private String aggregateId;
+
+    @CreationTimestamp
+    @Column(name = "EVENT_TIMESTAMP", nullable = false, updatable = false)
+    private Instant eventTimestamp;
+
+    @Column(name = "TARGET_ROLE", length = 100)
+    private String targetRole;
+}
+
+4. Permissions.java (Entity)
+Package updated.
+package com.fincore.JournalService.Models;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+@Entity
+@Table(name = "MENU_ITEMS") // Maps to your existing table
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@ToString
+public class Permissions {
+
+    @Id
+    @Column(name = "MENU_ID")
+    private int menuId;
+
+    @Column(name = "MENU_TITLE", nullable = false, length = 100)
+    private String menuTitle;
+
+    @Column(name = "MENU_ICON", length = 100)
+    private String menuIcon;
+
+    @Column(name = "MENU_SUBMENU", length = 100)
+    private String menuSubmenu;
+
+    @Column(name = "MENU_ACTION", nullable = false, length = 200)
+    private String menuAction;
+
+    @Column(name = "MENU_URL", nullable = false, length = 200)
+    private String menuUrl;
+
+    @Column(name = "MENU_COMPONENT_PATH", nullable = false, length = 200)
+    private String menuComponentPath;
+
+    @Column(name = "MENU_DESCRIPTION", nullable = false, length = 255)
+    private String menuDescription;
+
+    @Column(name = "MENU_DEPENDANT")
+    private int menuDependant;
+
+    @Column(name = "MAPPED_REQUEST_TYPE", length = 50)
+    private String mappedRequestType;
+}
+
+5. NotificationRepository.java
+Package updated.
+package com.fincore.JournalService.Repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+import com.fincore.JournalService.Models.Notifications;
+import java.util.UUID;
+
+@Repository
+public interface NotificationRepository extends JpaRepository<Notifications, UUID>{
+}
+
+6. PermissionRepository.java
+Package updated.
+package com.fincore.JournalService.Repository;
+
+import com.fincore.JournalService.Models.Permissions;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public interface PermissionRepository extends JpaRepository<Permissions, Integer> {
+
+    @Query(value = """
+       SELECT p.MENU_URL, rp.ROLE_ID
+       FROM MENU_ITEMS p
+       JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
+       JOIN ROLES r ON rp.ROLE_ID = r.ROLE_ID
+       WHERE p.MAPPED_REQUEST_TYPE = :requestType
+         AND (p.MENU_ACTION LIKE '%approve%' OR p.MENU_ACTION LIKE '%reject%')
+         AND r.ROLE_STATUS = 'ACTIVE'
+   """, nativeQuery = true)
+    List<Object[]> findUrlAndRolesByRequestType(@Param("requestType") String requestType);
+}
+
+7. NotificationWriterService.java
+CRITICAL UPDATE: Replaced CommonReq logic with logic specific to Journal Requests and Batches.
+package com.fincore.JournalService.Service;
+
+import com.fincore.JournalService.Models.Notifications;
+import com.fincore.JournalService.Repository.NotificationRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class NotificationWriterService {
+
+    private final NotificationRepository notificationRepository;
+    private static final String EVENT_SOURCE = "JournalService";
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId) {
+
+        if (userId == null && targetRole == null) {
+            log.warn("Skipping notification creation: Both userId and targetRole are null. AggregateID: {}", aggregateId);
+            return;
+        }
+
+        if (message == null || message.isBlank()) {
+            log.warn("Skipping notification creation: Message is null or blank. AggregateID: {}", aggregateId);
+            throw new IllegalArgumentException("Notification message cannot be null or blank.");
+        }
+
+        Notifications notification = Notifications.builder()
+                .userId(userId)
+                .targetRole(targetRole)
+                .message(message)
+                .linkUrl(linkUrl)
+                .aggregateId(aggregateId)
+                .eventSource(EVENT_SOURCE) // Hardcoded to JournalService
+                .build();
+
+        notificationRepository.save(notification);
+
+        if (targetRole != null) {
+            log.info("Saved 1-to-many notification event for role: {} (AggregateID: {})", targetRole, aggregateId);
+        } else {
+            log.info("Saved 1-to-1 notification event for user: {} (AggregateID: {})", userId, aggregateId);
+        }
+    }
+
+    // --- Helper methods specific to Journal Service ---
+
+    /**
+     * Called when a new Batch is created. Notifies Approvers (via Roles).
+     */
+    public void createBatchPendingNotification(String batchId, String creatorId, String targetRoles, String targetUrl) {
+        String message = String.format("New Journal Batch (%s) by user %s is pending approval.", batchId, creatorId);
+        
+        // Note: targetRoles comes from PermissionConfigService
+        createNotification(null, targetRoles, message, targetUrl, batchId);
+    }
+
+    /**
+     * Called when a Batch or Request is processed. Notifies the Creator (via User ID).
+     */
+    public void createProcessedNotification(String aggregateId, String creatorId, String status, String approverId, String remarks, String url) {
+        String message = String.format("Your Journal request (%s) has been %s by %s.", aggregateId, status, approverId);
+        
+        if (remarks != null && !remarks.isBlank()) {
+            message += " Reason: " + remarks;
+        }
+
+        createNotification(creatorId, null, message, url, aggregateId);
+    }
+}
+
+8. PermissionConfigService.java
+Package updated. Replaced Java 21 getFirst() with generic get(0).
+package com.fincore.JournalService.Service;
+
+import com.fincore.JournalService.Dto.NotificationConfigDto;
+import com.fincore.JournalService.Repository.PermissionRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Service;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class PermissionConfigService {
+
+    private final PermissionRepository permissionRepository;
+
+    @Cacheable(value = "notification_configs", key = "#requestType")
+    public NotificationConfigDto getConfig(String requestType) {
+
+        log.info("Cache Miss: Fetching DB permissions for type: {}", requestType);
+
+        List<Object[]> results = permissionRepository.findUrlAndRolesByRequestType(requestType);
+
+        if (results.isEmpty()) {
+            log.warn("No URL and roles found for request type {}. Using defaults.", requestType);
+            // Default fallback
+            return new NotificationConfigDto("/dashboard", null); 
+        }
+
+        log.info("Fetched Url and roles from db for the request type {}", requestType);
+
+        // Safe access for Java 17 (replaced getFirst())
+        String url = (String) results.get(0)[0]; 
+
+        if (url == null) url = "/dashboard";
+
+        // Collect all Role IDs into a comma-separated string
+        String roles = results.stream()
+                .map(row -> String.valueOf(row[1])) 
+                .distinct()
+                .collect(Collectors.joining(","));
+
+        if (roles.isEmpty()) roles = null;
+
+        return new NotificationConfigDto(url, roles);
+    }
+}
+
