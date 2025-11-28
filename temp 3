@@ -55,29 +55,22 @@ public class JournalBulkValidationService {
         
         // 1. Fetch Master Data
         Set<String> validBranches = branchRepo.findAll().stream()
-                .map(BranchMaster::getCode)
-                .map(String::trim)
-                .collect(Collectors.toSet());
+                .map(BranchMaster::getCode).map(String::trim).collect(Collectors.toSet());
         
         Set<String> validCgls = cglRepo.findAll().stream()
-                .map(CglMaster::getCglNumber)
-                .map(String::trim)
-                .collect(Collectors.toSet());
+                .map(CglMaster::getCglNumber).map(String::trim).collect(Collectors.toSet());
         
         Set<String> validCurrencies = currencyRepo.findAll().stream()
-                .map(CurrencyMaster::getCurrencyCode)
-                .map(String::trim)
-                .collect(Collectors.toSet());
+                .map(CurrencyMaster::getCurrencyCode).map(String::trim).collect(Collectors.toSet());
 
         List<ExcelRowData> parsedRows = new ArrayList<>();
         Workbook workbook = new XSSFWorkbook(file.getInputStream());
         Sheet sheet = workbook.getSheetAt(0);
 
-        // Map for Balancing Check: Key = "BRANCH_CURRENCY"
         Map<String, BigDecimal> balanceMap = new HashMap<>();
 
         for (Row row : sheet) {
-            if (row.getRowNum() == 0) continue; // Skip Header
+            if (row.getRowNum() == 0) continue; 
             if (isRowEmpty(row)) continue;
 
             ExcelRowData data = new ExcelRowData();
@@ -88,47 +81,47 @@ public class JournalBulkValidationService {
             data.currency = getCellValueAsString(row.getCell(1)).toUpperCase().trim(); 
             data.cgl = parseCode(row.getCell(2));        
             
-            // Raw Strings
-            String amountRaw = getCellValueAsString(row.getCell(3)).trim(); // Column D (Amount)
-            String typeRaw = getCellValueAsString(row.getCell(4)).trim();   // Column E (Type)
+            String amountRaw = getCellValueAsString(row.getCell(3)).trim(); // Column D
+            String typeRaw = getCellValueAsString(row.getCell(4)).trim();   // Column E
             data.remarks = getCellValueAsString(row.getCell(5));
 
-            data.txnType = typeRaw; // Store raw type for report
+            data.txnType = typeRaw; 
 
             // --- 1. MASTER VALIDATION ---
-            if (!validBranches.contains(data.branch)) {
-                data.errors.add("Invalid Branch Code (" + data.branch + ")");
-            }
-            if (!validCurrencies.contains(data.currency)) {
-                data.errors.add("Invalid Currency (" + data.currency + ")");
-            }
-            if (!validCgls.contains(data.cgl)) {
-                data.errors.add("Invalid CGL (" + data.cgl + ")");
-            }
+            if (!validBranches.contains(data.branch)) data.errors.add("Invalid Branch Code (" + data.branch + ")");
+            if (!validCurrencies.contains(data.currency)) data.errors.add("Invalid Currency (" + data.currency + ")");
+            if (!validCgls.contains(data.cgl)) data.errors.add("Invalid CGL (" + data.cgl + ")");
 
-            // --- 2. AMOUNT PARSING LOGIC (Handles '25.36 CR' inside Amount Col) ---
+            // --- 2. ROBUST AMOUNT & TYPE PARSING ---
             try {
                 boolean isCredit = false;
+                String upperAmount = amountRaw.toUpperCase();
+                String upperType = typeRaw.toUpperCase();
 
-                // Check Explicit Type Column (Col E)
-                if (!typeRaw.isEmpty()) {
-                    if (typeRaw.equalsIgnoreCase("Credit") || typeRaw.equalsIgnoreCase("C") || typeRaw.equalsIgnoreCase("CR") || typeRaw.equalsIgnoreCase("Cr")) {
-                        isCredit = true;
-                    }
-                } 
-                // Check Implicit Suffix in Amount Column (Col D)
-                else {
-                    if (amountRaw.toUpperCase().endsWith("CR") || amountRaw.toUpperCase().contains(" CR")) {
-                        isCredit = true;
-                    }
+                // Rule A: Check Transaction Type Column (Starts with C = Credit, e.g., "Cr", "Credit", "Cradit")
+                if (!upperType.isEmpty()) {
+                    if (upperType.startsWith("C")) isCredit = true;
+                }
+                
+                // Rule B: Check Amount Column Suffix (Overrides Type if explicitly marked)
+                if (upperAmount.endsWith("CR") || upperAmount.contains(" CR")) isCredit = true;
+                if (upperAmount.endsWith("DR") || upperAmount.contains(" DR")) isCredit = false;
+
+                // Rule C: Check Accounting Format parenthesis "(500.00)" -> Credit
+                if (amountRaw.startsWith("(") && amountRaw.endsWith(")")) {
+                    isCredit = true;
                 }
 
-                // Clean the Amount String (Remove CR, DR, commas, spaces)
-                String cleanAmountStr = amountRaw.toUpperCase()
-                        .replace("CR", "")
-                        .replace("DR", "")
-                        .replace(",", "") // Remove 1,000 commas
-                        .trim();
+                // Rule D: Check Negative Sign in amount "-500.00" -> Credit
+                if (amountRaw.startsWith("-")) {
+                    isCredit = true;
+                }
+
+                // --- CLEANUP ---
+                // Allow digits, decimal point, and negative sign. Remove everything else (CR, DR, commas, parenthesis)
+                String cleanAmountStr = upperAmount.replaceAll("[^0-9.-]", ""); 
+
+                if(cleanAmountStr.isEmpty()) throw new NumberFormatException("Empty Amount");
 
                 BigDecimal amt = new BigDecimal(cleanAmountStr);
 
@@ -136,7 +129,7 @@ public class JournalBulkValidationService {
                     data.errors.add("Amount cannot be Zero");
                 }
                 
-                // Assign Sign: Credits are Negative, Debits are Positive
+                // FINAL CALCULATION: Credits are Negative, Debits are Positive
                 data.amount = isCredit ? amt.abs().negate() : amt.abs();
 
             } catch (Exception e) {
@@ -149,7 +142,7 @@ public class JournalBulkValidationService {
                 data.errors.add("Remarks > 30 chars");
             }
 
-            // --- 4. ACCUMULATE TOTALS FOR BALANCING ---
+            // --- 4. ACCUMULATE TOTALS ---
             if (validBranches.contains(data.branch) && validCurrencies.contains(data.currency)) {
                 String key = data.branch + "_" + data.currency;
                 balanceMap.put(key, balanceMap.getOrDefault(key, BigDecimal.ZERO).add(data.amount));
@@ -158,18 +151,15 @@ public class JournalBulkValidationService {
             parsedRows.add(data);
         }
 
-        // --- 5. POST-VALIDATION: CHECK BALANCING ---
+        // --- 5. CHECK BALANCING ---
         for (ExcelRowData data : parsedRows) {
-            if (!validBranches.contains(data.branch) || !validCurrencies.contains(data.currency)) {
-                continue;
-            }
+            if (!validBranches.contains(data.branch) || !validCurrencies.contains(data.currency)) continue;
 
             String key = data.branch + "_" + data.currency;
             BigDecimal netTotal = balanceMap.getOrDefault(key, BigDecimal.ZERO);
 
-            // Use setScale(4) to handle precision issues (e.g. 0.0000 vs 0)
             if (netTotal.setScale(4, RoundingMode.HALF_UP).compareTo(BigDecimal.ZERO) != 0) {
-                data.errors.add("Total Debit/Credit Mismatch for Branch " + data.branch);
+                data.errors.add("Branch Total Mismatch (Diff: " + netTotal.toPlainString() + ")");
             }
         }
 
@@ -192,13 +182,10 @@ public class JournalBulkValidationService {
         return result;
     }
 
-    // --- HELPER TO CLEAN CODES ---
     private String parseCode(Cell cell) {
         if (cell == null) return "";
         String val = getCellValueAsString(cell).trim();
-        if (val.endsWith(".0")) {
-            return val.substring(0, val.length() - 2);
-        }
+        if (val.endsWith(".0")) return val.substring(0, val.length() - 2);
         return val;
     }
 
@@ -226,17 +213,11 @@ public class JournalBulkValidationService {
             row.createCell(0).setCellValue(data.branch);
             row.createCell(1).setCellValue(data.currency);
             row.createCell(2).setCellValue(data.cgl);
-            
-            // Show absolute value in report
             row.createCell(3).setCellValue(data.amount.abs().toPlainString());
             
-            // Show derived Type if original was empty
-            String typeDisplay = data.txnType;
-            if(typeDisplay == null || typeDisplay.isEmpty()) {
-                typeDisplay = (data.amount.compareTo(BigDecimal.ZERO) < 0) ? "Credit" : "Debit";
-            }
+            // Show Credit/Debit text based on sign
+            String typeDisplay = (data.amount.compareTo(BigDecimal.ZERO) < 0) ? "Credit" : "Debit";
             row.createCell(4).setCellValue(typeDisplay);
-            
             row.createCell(5).setCellValue(data.remarks);
             
             if (!data.errors.isEmpty()) {
@@ -245,9 +226,7 @@ public class JournalBulkValidationService {
                 errorCell.setCellStyle(headerStyle);
             }
         }
-
         for(int i=0; i<7; i++) sheet.autoSizeColumn(i);
-
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         workbook.write(out);
         workbook.close();
@@ -256,20 +235,10 @@ public class JournalBulkValidationService {
 
     private String getCellValueAsString(Cell cell) {
         if (cell == null) return "";
-        if (cell.getCellType() == CellType.STRING) {
-            return cell.getStringCellValue().trim();
-        } else if (cell.getCellType() == CellType.NUMERIC) {
+        if (cell.getCellType() == CellType.STRING) return cell.getStringCellValue().trim();
+        if (cell.getCellType() == CellType.NUMERIC) {
             if (DateUtil.isCellDateFormatted(cell)) return cell.getDateCellValue().toString();
-            DataFormatter formatter = new DataFormatter();
-            return formatter.formatCellValue(cell).trim();
-        } else if (cell.getCellType() == CellType.BOOLEAN) {
-            return String.valueOf(cell.getBooleanCellValue());
-        } else if (cell.getCellType() == CellType.FORMULA) {
-             try {
-                return cell.getStringCellValue();
-             } catch (IllegalStateException e) {
-                return String.valueOf(cell.getNumericCellValue());
-             }
+            return new DataFormatter().formatCellValue(cell).trim();
         }
         return "";
     }
