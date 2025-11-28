@@ -1,136 +1,364 @@
-// useApi.js
-import { useEffect, useRef, useState, useCallback } from "react";
-import axios from "axios";
-import { useNavigate } from "react-router-dom";
-import useCustomSnackbar from "../utils/useCustomSnackbar";
-import { useSelector } from "react-redux";
+Yes, you do need to change the Backend.
+Since your useApi.js is strictly designed to expect JSON responses (default responseType = "json") and has global error handling built for JSON structures, sending a raw binary file (Blob) from the backend will cause issues with that hook.
+The Solution:
+ * Backend: Convert the Error Excel file into a Base64 String and return it inside a JSON object. This keeps the response format compatible with useApi.
+ * Frontend: Use callApi to get the JSON, then convert the Base64 string back to a file and download it.
+Here are the updated files.
+1. Backend: JournalRequestController.java (Updated)
+Update the /bulk-validate endpoint to return the file as a Base64 string inside JSON.
+// Add this import
+import java.util.Base64;
 
+// ... inside JournalRequestController class ...
 
-const useApi = () => {
-  const [data, setData] = useState(null); // Store API response data
-  const [error, setError] = useState(null); // Store error info
-  const [loading, setLoading] = useState(false); // Loading state
-  const navigate = useNavigate();
-  const snackbar = useCustomSnackbar();
-  const token = useSelector((state) => state.auth.token);
+    @PostMapping(value = "/bulk-validate", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<?> validateBulkUpload(@RequestParam("file") MultipartFile file) throws IOException {
+        log.info("Received file for bulk validation: {}", file.getOriginalFilename());
 
-  // Keep track of active requests for cancellation
-  const activeRequestsRef = useRef(new Set());
+        Map<String, Object> result = journalBulkValidationService.validateAndProcessExcel(file);
 
-  /** Refresh token handler (if required) */
-  const refreshToken = async () => {
+        if ("ERROR".equals(result.get("status"))) {
+            byte[] fileContent = (byte[]) result.get("file");
+            long count = (long) result.get("errorCount");
+
+            // CHANGE: Convert Binary Excel to Base64 String
+            // This allows your frontend 'useApi' (which expects JSON) to receive the file without crashing.
+            String base64File = Base64.getEncoder().encodeToString(fileContent);
+
+            // Return 200 OK even for validation errors so 'useApi' doesn't trigger global error handling
+            // We handle the 'ERROR' status in the frontend component.
+            return ResponseEntity.ok(Map.of(
+                "status", "ERROR",
+                "message", "Validation failed. Found " + count + " errors.",
+                "errorCount", count,
+                "errorReportBase64", base64File
+            ));
+        }
+
+        // Success Case
+        return ResponseEntity.ok(Map.of(
+            "status", "SUCCESS",
+            "message", result.get("message")
+        ));
+    }
+
+2. Frontend: JournalBulkUpload.jsx (Updated)
+This uses your provided useApi hook. Note that we pass "multipart/form-data" as the content type.
+import React, { useState, useRef } from "react";
+import {
+  Box,
+  Typography,
+  Paper,
+  Grid,
+  TextField,
+  Button,
+  CircularProgress,
+  Chip,
+  Divider,
+  Alert,
+} from "@mui/material";
+import {
+  CloudUpload as CloudUploadIcon,
+  RestartAlt as RestartAltIcon,
+  Description as DescriptionIcon,
+  CheckCircle as CheckCircleIcon,
+  Error as ErrorIcon,
+} from "@mui/icons-material";
+
+// Import styles
+import {
+  mainContainerStyle,
+  uploadBoxStyle,
+  controlPanelStyle,
+} from "./JournalBulkStyle";
+
+// Import your specific hook
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
+
+const JournalBulkUpload = () => {
+  // 1. Init useApi
+  const { callApi, loading } = useApi(); 
+  const showSnackBar = useCustomSnackbar();
+  
+  const [selectedDate, setSelectedDate] = useState("");
+  const [file, setFile] = useState(null);
+  
+  // Local UI Error state (for displaying the red alert box)
+  const [uiError, setUiError] = useState("");
+  const [errorCount, setErrorCount] = useState(0);
+
+  const fileInputRef = useRef(null);
+
+  // --- Helper: Convert Base64 to Excel File & Download ---
+  const downloadBase64File = (base64String, fileName) => {
     try {
-      await axios.post("/LS/refresh-token", {}, { withCredentials: true });
-    } catch (err) {
-      console.error("Token refresh failed", err);
+      // Decode Base64 string
+      const byteCharacters = atob(base64String);
+      const byteNumbers = new Array(byteCharacters.length);
+      for (let i = 0; i < byteCharacters.length; i++) {
+        byteNumbers[i] = byteCharacters.charCodeAt(i);
+      }
+      const byteArray = new Uint8Array(byteNumbers);
+      
+      // Create Blob
+      const blob = new Blob([byteArray], {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      });
+
+      // Trigger Download
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.setAttribute("download", fileName);
+      document.body.appendChild(link);
+      link.click();
+      link.parentNode.removeChild(link);
+      window.URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error("Failed to download file", e);
+      showSnackBar("Failed to download error report.", "error");
     }
   };
 
-  /** Cancel all ongoing requests */
-  const cancelAllRequests = () => {
-    activeRequestsRef.current.forEach((controller) => {
-      if (controller && !controller.signal.aborted) {
-        controller.abort();
-      }
-    });
-    activeRequestsRef.current.clear();
-    setLoading(false);
+  const handleDateChange = (e) => {
+    setSelectedDate(e.target.value);
+    setUiError("");
+    setErrorCount(0);
   };
 
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => cancelAllRequests();
-  }, []);
-
-  /**
-   * Generic API caller
-   * @param {string} url - API endpoint
-   * @param {object|null} payload - Request body or query params
-   * @param {string} method - HTTP method (GET, POST, PUT, PATCH, DELETE)
-   * @param {string} responseType - Axios response type
-   * @param {string} contentType - Content-Type header
-   * @param {object} extraConfig - Additional axios config
-   */
-  const callApi = useCallback(
-    async (
-      url,
-      payload = null,
-      method = "GET",
-      responseType = "json",
-      contentType = "application/json",
-      extraConfig = {}
-    ) => {
-      const controller = new AbortController();
-      activeRequestsRef.current.add(controller);
-      setLoading(true);
-      setError(null);
-
-      try {
-        const headers = {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": contentType,
-        };
-
-        const config = {
-          method: method.toUpperCase(),
-          url,
-          headers,
-          responseType,
-          withCredentials: true,
-          signal: controller.signal,
-          ...extraConfig,
-        };
-
-        // Attach payload depending on method type
-        if (payload !== null) {
-          if (method.toUpperCase() === "GET") {
-            config.params = payload;
-          } else {
-            config.data = payload;
-          }
-        }
-
-        const response = await axios(config);
-
-        if (!controller.signal.aborted) {
-          setData(response.data);
-          return response.data; // Return API data directly
-        }
-      } catch (err) {
-        if (err.status === 440) {
-          navigate("/");
-          window.alert("You have logged in another session");
-        }
-
-        if (
-          err.status === 401 &&
-          err.response?.data?.message === "INVALID_TOKEN"
-        ) {
-          navigate("/");
-        }
-
-        if (!axios.isCancel(err) && !controller.signal.aborted) {
-          console.error("API call error:", err);
-          if (err.response.data?.result?.message) {
-            snackbar(err.response.data?.result?.message, "error");
-          } else if (err.response.data?.message) {
-            snackbar(err.response.data?.message, "error");
-          } else {
-            snackbar(err.response.statusText, "error");
-          }
-          setError(err);
-        }
-
-        if (axios.isCancel(err)) throw err;
-      } finally {
-        activeRequestsRef.current.delete(controller);
-        setLoading(false);
+  const handleFileChange = (e) => {
+    const selectedFile = e.target.files[0];
+    if (selectedFile) {
+      const fileType = selectedFile.name.split(".").pop().toLowerCase();
+      if (fileType !== "xlsx" && fileType !== "xls") {
+        const msg = "Invalid file type. Please upload .xlsx or .xls";
+        setUiError(msg);
+        showSnackBar(msg, "error");
+        setFile(null);
+        return;
       }
-    },
-    [navigate]
-  );
+      setFile(selectedFile);
+      setUiError("");
+      setErrorCount(0);
+    }
+  };
 
-  return { data, error, loading, callApi, cancelAllRequests, refreshToken };
+  const handleUploadBoxClick = () => {
+    fileInputRef.current.click();
+  };
+
+  const resetForm = () => {
+    setFile(null);
+    setSelectedDate("");
+    setUiError("");
+    setErrorCount(0);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const handleValidation = async () => {
+    if (!selectedDate || !file) {
+      const msg = "Please select a Date and upload a File.";
+      setUiError(msg);
+      showSnackBar(msg, "warning");
+      return;
+    }
+
+    setUiError("");
+    setErrorCount(0);
+
+    const formData = new FormData();
+    formData.append("file", file);
+    // formData.append("postingDate", selectedDate); 
+
+    try {
+      // 2. Using callApi with correct arguments
+      // callApi(url, payload, method, responseType, contentType)
+      const response = await callApi(
+        "JS/journals/bulk-validate", 
+        formData, 
+        "POST", 
+        "json", // We expect JSON (containing the Base64 string)
+        "multipart/form-data" // Important for file upload
+      );
+
+      // 3. Handle the JSON Response
+      if (response && response.status === "ERROR") {
+        const count = response.errorCount || 0;
+        setErrorCount(count);
+        
+        const msg = `Validation Failed with ${count} errors. Downloading report...`;
+        setUiError(msg);
+        showSnackBar(msg, "error");
+
+        // Download the file from the Base64 string
+        if (response.errorReportBase64) {
+          downloadBase64File(
+            response.errorReportBase64, 
+            `Error_Report_${new Date().getTime()}.xlsx`
+          );
+        }
+      } else if (response && response.status === "SUCCESS") {
+        showSnackBar(response.message || "File validated successfully!", "success");
+        // Optional: resetForm();
+      } 
+
+    } catch (err) {
+      // callApi handles most network errors, but we catch logic errors here
+      console.error("Validation Flow Error:", err);
+      // Note: useApi already shows snackbar for 4xx/5xx errors
+    }
+  };
+
+  return (
+    <Box sx={mainContainerStyle}>
+      <Paper elevation={3} sx={controlPanelStyle}>
+        <Grid container spacing={3}>
+          {/* 1. Date Picker */}
+          <Grid item xs={12} md={4}>
+            <Typography variant="subtitle2" gutterBottom>
+              1. Select Posting Date
+            </Typography>
+            <TextField
+              type="date"
+              fullWidth
+              size="small"
+              value={selectedDate}
+              onChange={handleDateChange}
+              InputLabelProps={{ shrink: true }}
+            />
+          </Grid>
+
+          {/* 2. File Upload */}
+          <Grid item xs={12} md={4}>
+            <Typography variant="subtitle2" gutterBottom>
+              2. Upload Excel File
+            </Typography>
+            <Box sx={uploadBoxStyle} onClick={handleUploadBoxClick}>
+              <input
+                type="file"
+                hidden
+                accept=".xlsx, .xls"
+                onChange={handleFileChange}
+                ref={fileInputRef}
+              />
+              {file ? (
+                <>
+                  <DescriptionIcon color="success" fontSize="large" />
+                  <Typography variant="body2" sx={{ mt: 1, fontWeight: "bold" }}>
+                    {file.name}
+                  </Typography>
+                  <Typography variant="caption" color="textSecondary">
+                    Click to change
+                  </Typography>
+                </>
+              ) : (
+                <>
+                  <CloudUploadIcon color="action" fontSize="large" />
+                  <Typography variant="body2" sx={{ mt: 1 }}>
+                    Click to Upload Excel
+                  </Typography>
+                  <Typography variant="caption" color="textSecondary">
+                    .xlsx or .xls
+                  </Typography>
+                </>
+              )}
+            </Box>
+          </Grid>
+
+          {/* 3. Actions */}
+          <Grid
+            item
+            xs={12}
+            md={4}
+            sx={{
+              display: "flex",
+              flexDirection: "column",
+              justifyContent: "center",
+              gap: 2,
+            }}
+          >
+            <Button
+              variant="contained"
+              color="primary"
+              onClick={handleValidation}
+              disabled={loading || !file || !selectedDate}
+              startIcon={
+                loading ? <CircularProgress size={20} color="inherit" /> : <CheckCircleIcon />
+              }
+              fullWidth
+            >
+              {loading ? "Validating..." : "Validate & Process"}
+            </Button>
+
+            <Button
+              variant="outlined"
+              color="error"
+              onClick={resetForm}
+              startIcon={<RestartAltIcon />}
+              fullWidth
+            >
+              Reset
+            </Button>
+          </Grid>
+        </Grid>
+
+        <Divider sx={{ my: 3 }} />
+
+        {/* Feedback Section */}
+        <Box>
+          {loading && (
+            <Alert severity="info" icon={<CircularProgress size={20} />}>
+              Uploading and validating file on server...
+            </Alert>
+          )}
+
+          {uiError && (
+            <Alert 
+                severity="error" 
+                sx={{ mt: 1 }}
+                action={
+                    errorCount > 0 && (
+                        <Chip 
+                            icon={<ErrorIcon sx={{color: 'white !important'}}/>} 
+                            label={`${errorCount} Errors`} 
+                            color="error" 
+                            variant="filled"
+                        />
+                    )
+                }
+            >
+              <Typography variant="subtitle2" fontWeight="bold">
+                Validation Failed
+              </Typography>
+              <Typography variant="body2">
+                {uiError}
+              </Typography>
+              {errorCount > 0 && (
+                <Typography variant="caption" display="block" sx={{mt: 1}}>
+                    <strong>Action Required:</strong> An Error Report file has been downloaded. Open it to see specific issues (highlighted in the last column), correct them, and upload again.
+                </Typography>
+              )}
+            </Alert>
+          )}
+        </Box>
+      </Paper>
+      
+      {/* Rules Section */}
+      <Box sx={{ mt: 2, p: 2, bgcolor: "#f5f5f5", borderRadius: 1 }}>
+        <Typography variant="subtitle2" gutterBottom>
+          Validation Rules
+        </Typography>
+        <ul style={{ margin: 0, paddingLeft: "20px", fontSize: "0.875rem", color: "#666" }}>
+            <li><strong>Branch, Currency, CGL:</strong> Must exist in the System Master tables.</li>
+            <li><strong>Amount:</strong> Cannot be zero.</li>
+            <li><strong>Balancing:</strong> Total Debits must equal Total Credits for every Branch.</li>
+            <li><strong>Remarks:</strong> Maximum 30 characters allowed.</li>
+        </ul>
+      </Box>
+    </Box>
+  );
 };
 
-export default useApi;
+export default JournalBulkUpload;
+
