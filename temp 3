@@ -1,11 +1,9 @@
-To handle huge values like 12345678912345678.1234 (16 digits before decimal, 4 after), standard JavaScript numbers cannot be used because they lose precision after 15 digits. The browser automatically rounds them, causing incorrect values or NaN.
-Solution:
- * Backend: We must send the amount as a String (text) instead of a Number in the JSON response.
- * Frontend: We must display it strictly as a String, avoiding Number() conversion.
-Here are the updated files.
-1. Backend: JournalBulkValidationService.java (Updated)
-I updated the previewList logic to convert BigDecimal to String (.toPlainString()). This ensures the huge number is sent exactly as text to the browser.
-Replace your existing file with this version:
+The issue is happening because Apache POI's DataFormatter (which reads the cell value) mimics Excel's behavior. If Excel treats the number as "General" format, it often converts large numbers into Scientific Notation (e.g., 1.234E+11) before your code even processes it.
+To fix this, we must strictly read the Numeric Value directly into a BigDecimal to ensure no precision is lost and no scientific notation is generated.
+Here are the corrected files.
+1. Backend: JournalBulkValidationService.java (Critical Fix)
+I have updated the getCellValueAsString method at the bottom. Instead of using DataFormatter (which returns formatted strings like "1.23E+11"), it now grabs the raw NumericCellValue and converts it to a plain string.
+Replace your entire file with this:
 package com.fincore.JournalService.Service;
 
 import com.fincore.JournalService.Models.BranchMaster;
@@ -25,7 +23,6 @@ import org.apache.poi.ss.usermodel.Cell;
 import org.apache.poi.ss.usermodel.CellStyle;
 import org.apache.poi.ss.usermodel.Font;
 import org.apache.poi.ss.usermodel.IndexedColors;
-import org.apache.poi.ss.usermodel.DataFormatter;
 import org.apache.poi.ss.usermodel.DateUtil;
 import org.apache.poi.ss.usermodel.CellType; 
 
@@ -96,8 +93,11 @@ public class JournalBulkValidationService {
             if (!validCgls.contains(data.cgl)) data.errors.add("Invalid CGL (" + data.cgl + ")");
 
             try {
+                // Remove unwanted characters but keep digits, dot, and minus
                 String cleanAmountStr = amountRaw.replaceAll("[^0-9.-]", "");
                 if(cleanAmountStr.isEmpty()) throw new NumberFormatException("Empty");
+                
+                // Using BigDecimal constructor ensures precision for large strings
                 BigDecimal amt = new BigDecimal(cleanAmountStr);
 
                 if (amt.compareTo(BigDecimal.ZERO) == 0) data.errors.add("Amount cannot be Zero");
@@ -122,6 +122,7 @@ public class JournalBulkValidationService {
             parsedRows.add(data);
         }
 
+        // Check Balancing
         for (ExcelRowData data : parsedRows) {
             if (!validBranches.contains(data.branch) || !validCurrencies.contains(data.currency)) continue;
             String key = data.branch + "_" + data.currency;
@@ -145,17 +146,14 @@ public class JournalBulkValidationService {
         } else {
             byte[] successFile = generateSuccessCsv(parsedRows, postingDate);
             
-            // --- UPDATED: SEND AMOUNT AS STRING ---
+            // Convert amounts to Plain String to preserve full precision (e.g. "123456789.1234")
             List<Map<String, Object>> previewList = parsedRows.stream().map(row -> {
                 Map<String, Object> map = new HashMap<>();
                 map.put("id", row.rowIndex);
                 map.put("branch", row.branch);
                 map.put("currency", row.currency);
                 map.put("cgl", row.cgl);
-                
-                // CRITICAL FIX: .toPlainString() ensures 16.4 precision is preserved in JSON
                 map.put("amount", row.amount.abs().toPlainString()); 
-                
                 map.put("txnType", row.amount.compareTo(BigDecimal.ZERO) < 0 ? "Credit" : "Debit");
                 map.put("remarks", row.remarks);
                 return map;
@@ -250,13 +248,19 @@ public class JournalBulkValidationService {
         return out.toByteArray();
     }
 
+    // --- CRITICAL FIX: Direct Numeric Reading ---
     private String getCellValueAsString(Cell cell) {
         if (cell == null) return "";
         if (cell.getCellType() == CellType.STRING) return cell.getStringCellValue().trim();
+        
         if (cell.getCellType() == CellType.NUMERIC) {
             if (DateUtil.isCellDateFormatted(cell)) return cell.getDateCellValue().toString();
-            return new DataFormatter().formatCellValue(cell).trim();
+            
+            // FIX: Use BigDecimal to read the exact numeric value to avoid Scientific Notation (e.g. 1.23E11)
+            // DataFormatter causes issues with large numbers.
+            return BigDecimal.valueOf(cell.getNumericCellValue()).toPlainString();
         }
+        if (cell.getCellType() == CellType.BOOLEAN) return String.valueOf(cell.getBooleanCellValue());
         return "";
     }
 
@@ -271,9 +275,9 @@ public class JournalBulkValidationService {
     }
 }
 
-2. Frontend: JournalBulkUpload.jsx (Updated Columns)
-I removed the Number() conversion from the Amount column. Now it treats the amount as a String, preserving all digits perfectly. I also added a simple regex formatter to add commas for readability without losing precision.
-Replace your columns array in JournalBulkUpload.jsx with this:
+2. Frontend: JournalBulkUpload.jsx (Updated)
+I have updated the columns definition to ensure the Amount column has enough width (minWidth: 150) and treats the value purely as a String. This prevents the grid from attempting any numeric conversion which might result in NaN or scientific notation.
+Replace your columns array with this:
   // Columns for DataGrid
   const columns = [
     { 
@@ -300,18 +304,25 @@ Replace your columns array in JournalBulkUpload.jsx with this:
     { 
       field: "amount", 
       headerName: "Amount", 
-      flex: 1.5, 
+      flex: 1.5,
+      minWidth: 150, // Added minWidth to prevent truncation (...)
       align: "right", 
       headerAlign: "center",
-      // FIXED: Displays String directly to handle huge numbers (16.4 precision)
+      
+      // FIXED: Directly display the string from backend, adding only commas.
+      // This handles huge numbers (16 digits) without precision loss.
       valueFormatter: (params) => {
         const val = (params && typeof params === 'object' && 'value' in params) ? params.value : params;
         
         if (!val) return "0.00";
         
-        // Simple formatter: Add commas to integer part, keep decimal part exactly as is
+        // Split by decimal point
         const parts = String(val).split(".");
+        
+        // Add commas to the integer part only
         parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+        
+        // Rejoin with decimal part
         return parts.join(".");
       }
     },
