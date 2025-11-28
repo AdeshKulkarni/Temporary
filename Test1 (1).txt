@@ -17,9 +17,9 @@ import org.apache.poi.ss.usermodel.Cell;
 import org.apache.poi.ss.usermodel.CellStyle;
 import org.apache.poi.ss.usermodel.Font;
 import org.apache.poi.ss.usermodel.IndexedColors;
-import org.apache.poi.ss.usermodel.DataFormatter;
 import org.apache.poi.ss.usermodel.DateUtil;
 import org.apache.poi.ss.usermodel.CellType; 
+import org.apache.poi.ss.usermodel.DataFormatter;
 
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
@@ -28,6 +28,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -48,131 +50,81 @@ public class JournalBulkValidationService {
         BigDecimal amount; 
         String txnType;
         String remarks;
+        String productCode;
         List<String> errors = new ArrayList<>();
     }
 
-    public Map<String, Object> validateAndProcessExcel(MultipartFile file) throws IOException {
+    public Map<String, Object> validateAndProcessExcel(MultipartFile file, LocalDate postingDate) throws IOException {
         
-        // 1. Fetch Master Data for fast lookup
         Set<String> validBranches = branchRepo.findAll().stream()
                 .map(BranchMaster::getCode).map(String::trim).collect(Collectors.toSet());
-        
         Set<String> validCgls = cglRepo.findAll().stream()
                 .map(CglMaster::getCglNumber).map(String::trim).collect(Collectors.toSet());
-        
         Set<String> validCurrencies = currencyRepo.findAll().stream()
                 .map(CurrencyMaster::getCurrencyCode).map(String::trim).collect(Collectors.toSet());
 
         List<ExcelRowData> parsedRows = new ArrayList<>();
         Workbook workbook = new XSSFWorkbook(file.getInputStream());
         Sheet sheet = workbook.getSheetAt(0);
-
         Map<String, BigDecimal> balanceMap = new HashMap<>();
 
-        // Iterate through ALL rows (Start from Row 0)
         for (Row row : sheet) {
-            
-            // Skip purely empty rows (e.g. at the end of file)
             if (isRowEmpty(row)) continue;
 
             ExcelRowData data = new ExcelRowData();
             data.rowIndex = row.getRowNum();
 
-            // --- COLUMN MAPPING ---
-            // Col 0 (A) = Branch
             data.branch = parseCode(row.getCell(0));     
-            
-            // Col 1 (B) = Currency
             data.currency = getCellValueAsString(row.getCell(1)).toUpperCase().trim(); 
-            
-            // Col 2 (C) = CGL
             data.cgl = parseCode(row.getCell(2));        
             
-            // Col 3 (D) = Amount
             String amountRaw = getCellValueAsString(row.getCell(3)).trim(); 
-            
-            // Col 4 (E) = Type (CR/DR)
             String typeRaw = getCellValueAsString(row.getCell(4)).trim().toUpperCase(); 
-            
-            // Col 5 (F) = Remarks
             data.remarks = getCellValueAsString(row.getCell(5));
+            data.productCode = parseCode(row.getCell(6)); 
+            data.txnType = typeRaw; 
 
-            data.txnType = typeRaw; // Store original type for reporting
+            if (!validBranches.contains(data.branch)) data.errors.add("Invalid Branch Code (" + data.branch + ")");
+            if (!validCurrencies.contains(data.currency)) data.errors.add("Invalid Currency (" + data.currency + ")");
+            if (!validCgls.contains(data.cgl)) data.errors.add("Invalid CGL (" + data.cgl + ")");
 
-            // --- 1. MASTER VALIDATION ---
-            if (!validBranches.contains(data.branch)) {
-                data.errors.add("Invalid Branch Code (" + data.branch + ")");
-            }
-            if (!validCurrencies.contains(data.currency)) {
-                data.errors.add("Invalid Currency (" + data.currency + ")");
-            }
-            if (!validCgls.contains(data.cgl)) {
-                data.errors.add("Invalid CGL (" + data.cgl + ")");
-            }
-
-            // --- 2. LOGIC FOR AMOUNT & TYPE (CR/DR) ---
-            try {
-                // Cleanup: remove all non-numeric chars except dot(.) and minus(-)
-                String cleanAmountStr = amountRaw.replaceAll("[^0-9.-]", "");
-                
-                if(cleanAmountStr.isEmpty()) {
-                    throw new NumberFormatException("Empty Amount");
+            if (data.productCode != null && !data.productCode.isEmpty()) {
+                if (!data.productCode.matches("\\d{8}")) {
+                    data.errors.add("Product Code must be exactly 8 digits");
                 }
+            }
 
+            try {
+                String cleanAmountStr = amountRaw.replaceAll("[^0-9.-]", "");
+                if(cleanAmountStr.isEmpty()) throw new NumberFormatException("Empty");
                 BigDecimal amt = new BigDecimal(cleanAmountStr);
 
-                if (amt.compareTo(BigDecimal.ZERO) == 0) {
-                    data.errors.add("Amount cannot be Zero");
-                }
+                if (amt.compareTo(BigDecimal.ZERO) == 0) data.errors.add("Amount cannot be Zero");
 
-                // Determine Sign
                 boolean isCredit = false;
-
-                // Check Type Column (E) first
-                if (typeRaw.startsWith("C") || typeRaw.contains("CR")) {
-                    isCredit = true;
-                }
-                
-                // Check Amount Column (D) Suffix
+                if (typeRaw.startsWith("C") || typeRaw.contains("CR")) isCredit = true;
                 if (amountRaw.toUpperCase().contains("CR")) isCredit = true;
-                if (amountRaw.toUpperCase().contains("DR")) isCredit = false;
-
-                // Check explicit negative sign
                 if (amountRaw.startsWith("-")) isCredit = true;
 
-                // Assign Final Amount (Credit = Negative, Debit = Positive)
                 data.amount = isCredit ? amt.abs().negate() : amt.abs();
-
             } catch (Exception e) {
                 data.errors.add("Invalid Amount Format");
                 data.amount = BigDecimal.ZERO;
             }
 
-            // --- 3. REMARK VALIDATION ---
-            if (data.remarks != null && data.remarks.length() > 30) {
-                data.errors.add("Remarks > 30 chars");
-            }
+            if (data.remarks != null && data.remarks.length() > 30) data.errors.add("Remarks > 30 chars");
 
-            // --- 4. ACCUMULATE TOTALS ---
             if (validBranches.contains(data.branch) && validCurrencies.contains(data.currency)) {
                 String key = data.branch + "_" + data.currency;
                 balanceMap.put(key, balanceMap.getOrDefault(key, BigDecimal.ZERO).add(data.amount));
             }
-
             parsedRows.add(data);
         }
 
-        // --- 5. CHECK BALANCING ---
         for (ExcelRowData data : parsedRows) {
-            // Only check balance if masters are valid to avoid confusing errors
-            if (!validBranches.contains(data.branch) || !validCurrencies.contains(data.currency)) {
-                continue;
-            }
-
+            if (!validBranches.contains(data.branch) || !validCurrencies.contains(data.currency)) continue;
             String key = data.branch + "_" + data.currency;
             BigDecimal netTotal = balanceMap.getOrDefault(key, BigDecimal.ZERO);
-
-            // Compare with precision (0.0000)
             if (netTotal.setScale(4, RoundingMode.HALF_UP).compareTo(BigDecimal.ZERO) != 0) {
                 data.errors.add("Branch Total Mismatch (Diff: " + netTotal.toPlainString() + ")");
             }
@@ -181,6 +133,7 @@ public class JournalBulkValidationService {
         long errorCount = parsedRows.stream().filter(r -> !r.errors.isEmpty()).count();
 
         Map<String, Object> result = new HashMap<>();
+        workbook.close();
         
         if (errorCount > 0) {
             byte[] errorFile = generateErrorExcel(parsedRows);
@@ -189,21 +142,74 @@ public class JournalBulkValidationService {
             result.put("file", errorFile);
             result.put("message", "Validation failed. Found " + errorCount + " invalid rows.");
         } else {
+            byte[] successFile = generateSuccessCsv(parsedRows, postingDate);
+            
+            List<Map<String, Object>> previewList = parsedRows.stream().map(row -> {
+                Map<String, Object> map = new HashMap<>();
+                map.put("id", row.rowIndex);
+                map.put("branch", row.branch);
+                map.put("currency", row.currency);
+                map.put("cgl", row.cgl);
+                map.put("amount", row.amount.abs().toPlainString()); 
+                map.put("txnType", row.amount.compareTo(BigDecimal.ZERO) < 0 ? "Credit" : "Debit");
+                map.put("remarks", row.remarks);
+                map.put("productCode", row.productCode);
+                return map;
+            }).collect(Collectors.toList());
+
             result.put("status", "SUCCESS");
-            result.put("message", "Validation Successful! " + parsedRows.size() + " rows ready.");
+            result.put("file", successFile);
+            result.put("previewData", previewList);
+            result.put("message", "Validation Successful!");
         }
 
-        workbook.close();
         return result;
     }
 
-    // --- HELPER TO CLEAN CODES (e.g., 32121.0 -> 32121) ---
+    private byte[] generateSuccessCsv(List<ExcelRowData> rows, LocalDate postingDate) {
+        StringBuilder csv = new StringBuilder();
+        DateTimeFormatter ddMMyyyy = DateTimeFormatter.ofPattern("ddMMyyyy");
+        String col2 = postingDate.format(ddMMyyyy);
+
+        int month = postingDate.getMonthValue();
+        int year = postingDate.getYear();
+        String col3 = (month >= 4) ? String.valueOf(year) : String.valueOf(year - 1);
+        String col4 = (month >= 4) ? String.format("%02d", month - 3) : String.format("%02d", month + 9);
+
+        for (ExcelRowData row : rows) {
+            String col1 = "01";
+            String col5 = String.format("%5s", row.branch).replace(' ', '0');
+            String col6 = (row.currency == null || row.currency.isEmpty()) ? "INR" : row.currency;
+            String col7 = row.cgl;
+
+            BigDecimal absAmt = row.amount.abs();
+            String plainAmt = absAmt.setScale(4, RoundingMode.HALF_UP).toPlainString();
+            String[] parts = plainAmt.split("\\.");
+            String intPart = String.format("%16s", parts[0]).replace(' ', '0');
+            String decPart = parts.length > 1 ? parts[1] : "0000";
+            String col8 = intPart + "." + decPart;
+
+            // --- CHANGED HERE: Return "Cr" or "Dr" ---
+            String col9 = (row.amount.compareTo(BigDecimal.ZERO) < 0) ? "Cr" : "Dr";
+            
+            String col10 = (row.remarks != null) ? row.remarks.replace(",", " ") : "";
+            
+            // Product Code
+            String col11 = (row.productCode != null && !row.productCode.isEmpty()) ? row.productCode : "A";
+            
+            String col12 = "B";
+            String col13 = "C";
+            String col14 = "D";
+
+            csv.append(String.join(",", col1, col2, col3, col4, col5, col6, col7, col8, col9, col10, col11, col12, col13, col14)).append("\n");
+        }
+        return csv.toString().getBytes();
+    }
+
     private String parseCode(Cell cell) {
         if (cell == null) return "";
         String val = getCellValueAsString(cell).trim();
-        if (val.endsWith(".0")) {
-            return val.substring(0, val.length() - 2);
-        }
+        if (val.endsWith(".0")) return val.substring(0, val.length() - 2);
         return val;
     }
 
@@ -217,9 +223,8 @@ public class JournalBulkValidationService {
         font.setColor(IndexedColors.RED.getIndex());
         headerStyle.setFont(font);
 
-        // Even though input has no header, we ADD a header to the Error Report for clarity
         Row header = sheet.createRow(0);
-        String[] headers = {"Branch", "Currency", "CGL", "Amount", "TxnType", "Remarks", "ERRORS"};
+        String[] headers = {"Branch", "Currency", "CGL", "Amount", "TxnType", "Remarks", "Product Code", "ERRORS"};
         for (int i = 0; i < headers.length; i++) {
             Cell cell = header.createCell(i);
             cell.setCellValue(headers[i]);
@@ -232,24 +237,19 @@ public class JournalBulkValidationService {
             row.createCell(0).setCellValue(data.branch);
             row.createCell(1).setCellValue(data.currency);
             row.createCell(2).setCellValue(data.cgl);
-            
-            // Show absolute amount
             row.createCell(3).setCellValue(data.amount.abs().toPlainString());
-            
-            // Derive Debit/Credit string for report clarity
             String typeDisplay = (data.amount.compareTo(BigDecimal.ZERO) < 0) ? "Credit" : "Debit";
             row.createCell(4).setCellValue(typeDisplay);
-            
             row.createCell(5).setCellValue(data.remarks);
-            
+            row.createCell(6).setCellValue(data.productCode);
+
             if (!data.errors.isEmpty()) {
-                Cell errorCell = row.createCell(6);
+                Cell errorCell = row.createCell(7);
                 errorCell.setCellValue(String.join("; ", data.errors));
                 errorCell.setCellStyle(headerStyle);
             }
         }
-        for(int i=0; i<7; i++) sheet.autoSizeColumn(i);
-
+        for(int i=0; i<8; i++) sheet.autoSizeColumn(i);
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         workbook.write(out);
         workbook.close();
@@ -261,9 +261,9 @@ public class JournalBulkValidationService {
         if (cell.getCellType() == CellType.STRING) return cell.getStringCellValue().trim();
         if (cell.getCellType() == CellType.NUMERIC) {
             if (DateUtil.isCellDateFormatted(cell)) return cell.getDateCellValue().toString();
-            DataFormatter formatter = new DataFormatter();
-            return formatter.formatCellValue(cell).trim();
+            return BigDecimal.valueOf(cell.getNumericCellValue()).toPlainString();
         }
+        if (cell.getCellType() == CellType.BOOLEAN) return String.valueOf(cell.getBooleanCellValue());
         return "";
     }
 
