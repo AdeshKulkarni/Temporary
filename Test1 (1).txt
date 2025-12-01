@@ -1,239 +1,24 @@
-Here are the updated files and the data you requested.
-1. Backend Verification (Notification Logic)
-You asked to check if only one notification is generated for the whole bulk batch.
-Yes, the logic I provided in the previous step does exactly that.
-In createBulkBatchRequest, the notification code is outside the loop that processes rows. It runs once after saveAll.
-Here is the JournalRequestServiceImpl.java (Backend). I have double-checked the notification placement.
-package com.fincore.JournalService.Service;
-
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.JournalService.Dto.*;
-import com.fincore.JournalService.Exception.ResourceNotFoundException;
-import com.fincore.JournalService.Models.GlTransaction;
-import com.fincore.JournalService.Models.JournalRequest;
-import com.fincore.JournalService.Models.enums.ChangeType;
-import com.fincore.JournalService.Models.enums.RequestStatus;
-import com.fincore.JournalService.Repository.GlTransactionRepository;
-import com.fincore.JournalService.Repository.JournalRequestRepository;
-
-import jakarta.transaction.Transactional;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.domain.Sort;
-import org.springframework.data.jpa.domain.Specification;
-import org.springframework.stereotype.Service;
-import org.springframework.util.StringUtils;
-import jakarta.persistence.criteria.Predicate;
-
-import java.math.BigDecimal;
-import java.time.LocalDate;
-import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-import java.util.stream.Collectors;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class JournalRequestServiceImpl implements JournalRequestService {
-
-    private final JournalRequestRepository journalRequestRepository;
-    private final GlTransactionRepository glTransactionRepository; 
-    private final ObjectMapper objectMapper;
-    private final SequenceService sequenceService;
-    
-    private final NotificationWriterService notificationWriterService;
-    private final PermissionConfigService permissionConfigService;
-    
-    private static final String EVENT_SOURCE = "JournalService";
-    private static final String JOURNAL_AUTH_TYPE = "JOURNAL_AUTH"; 
-    private static final String JOURNAL_POSTING_URL = "/Journal-Posting-Status"; 
-
-    // ... (Keep existing createBatchRequest, updateRequestStatus, etc.) ...
-
-    // --- OPTIMIZED BULK CREATION METHOD ---
-    @Override
-    @Transactional
-    public String createBulkBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
-        
-        String batchId = sequenceService.getNextBatchId();
-        log.info("Processing BULK Batch ID: {}", batchId);
-       
-        LocalDate postingDate = LocalDate.now();
-        List<JournalRequest> requestsToSave = new ArrayList<>();
-        
-        String commonRemarks = (batchDto.getCommonBatchRemarks() != null && !batchDto.getCommonBatchRemarks().isEmpty()) 
-                                ? batchDto.getCommonBatchRemarks() 
-                                : "Bulk Upload Batch " + batchId;
-
-        // Group rows by Branch+Currency to ensure sequential Journal IDs
-        Map<String, List<BatchRequestDto.JournalRequestRow>> groupedRows = batchDto.getRows().stream()
-                .collect(Collectors.groupingBy(row -> row.getBranch() + ":" + row.getCurrency()));
-
-        for (Map.Entry<String, List<BatchRequestDto.JournalRequestRow>> entry : groupedRows.entrySet()) {
-            
-            String journalIdPrefix = sequenceService.getNextJournalIdPrefix();
-            int journalSequence = 1;
-            List<BatchRequestDto.JournalRequestRow> rowsInGroup = entry.getValue();
-            
-            for (BatchRequestDto.JournalRequestRow rowDto : rowsInGroup) {
-                
-                String journalId = String.format("%s-%03d", journalIdPrefix, journalSequence);
-                
-                CreateJournalRequestDto payloadDto = new CreateJournalRequestDto();
-                payloadDto.setPDate(postingDate); 
-                payloadDto.setChangeType(rowDto.getChangeType());
-                payloadDto.setMasterJournalId(rowDto.getMasterJournalId());
-                payloadDto.setBranch(rowDto.getBranch());
-                payloadDto.setCurrency(rowDto.getCurrency());
-                payloadDto.setCgl(rowDto.getCgl());
-                payloadDto.setAmount(rowDto.getAmount()); 
-                payloadDto.setProductType(rowDto.getProductType());
-                payloadDto.setRemarks(rowDto.getRemarks());
-                payloadDto.setArFlag(rowDto.getArFlag() != null ? rowDto.getArFlag() : "A");
-                payloadDto.setAcClassification(rowDto.getAcClassification() != null ? rowDto.getAcClassification() : "A");
-                
-                payloadDto.setBatchId(batchId); 
-                payloadDto.setJournalId(journalId); 
-                payloadDto.setCommonBatchRemarks(commonRemarks);
-                payloadDto.setTransactionCount(journalSequence); 
-                
-                JournalRequest request = new JournalRequest();
-                request.setCreatorId(creatorId);
-                request.setCreatorRole(creatorRole);
-                request.setChangeType(rowDto.getChangeType()); 
-                request.setRequestStatus(RequestStatus.PENDING);
-                request.setBatchId(batchId);
-                request.setJournalId(journalId);
-                request.setCommonBatchRemarks(commonRemarks);
-                request.setPayload(objectMapper.writeValueAsString(payloadDto));
-
-                requestsToSave.add(request);
-                journalSequence++; 
-            }
-        }
-
-        // 1. SAVE ALL (Database Operation)
-        journalRequestRepository.saveAll(requestsToSave);
-        
-        // 2. SEND NOTIFICATION (Single Notification for the whole batch)
-        try {
-            NotificationConfigDto config = permissionConfigService.getConfig(JOURNAL_AUTH_TYPE);
-            String message = String.format("Bulk Journal Batch %s (%d rows) by %s pending approval.", 
-                                           batchId, requestsToSave.size(), creatorId);
-
-            notificationWriterService.createNotification(
-                null,                   
-                config.getTargetRoles(),
-                message,
-                config.getTargetUrl(),  
-                batchId,                
-                EVENT_SOURCE
-            );
-            log.info("Sent single notification for Bulk Batch ID: {}", batchId);
-        } catch (Exception e) {
-            log.error("Failed to create notification for Bulk Batch: {}", batchId, e);
-        }
-   
-        return batchId; 
-    }
-
-    // ... (Keep the rest of your methods: updateRequestStatus, getMyRequests, etc.) ...
-}
-
-2. 800 Rows Data Generation
-Since I cannot attach a physical .xlsx file, I have generated a CSV format of the data below.
-How to create the 800-row file in Excel:
- * Copy the text below.
- * Paste it into a text file (Notepad) and save as BulkData.csv.
- * Open BulkData.csv in Excel.
- * Since this text block is limited, it contains about 50 rows. To get 800 rows:
-   * Select these 50 rows in Excel.
-   * Copy them.
-   * Paste them 15 more times below the existing data.
-   * (Optional) Modify the "Remarks" column slightly if you want them unique, but for MOC testing, duplicates are fine.
-<!-- end list -->
-32121,USD,1208505003,12345.67,DR,purchase_A,1001A
-32121,USD,8812505008,12345.67,CR,sales_B,1001A
-32121,EUR,1122505001,5432.1,DR,expense_C,1002B
-32121,EUR,5051030601,5432.1,CR,income_D,1002B
-32122,GBP,2051030601,987.65,DR,supplies_E,1003C
-32122,GBP,5051502501,987.65,CR,vendor_F,1003C
-32122,JPY,2051502501,45000,DR,travel_G,1004D
-32122,JPY,5051500501,45000,CR,receipt_H,1004D
-32130,CAD,2051500501,150.25,DR,utility_I,1005E
-32130,CAD,2051270801,150.25,CR,pmt_J,1005E
-32130,AUD,5051270801,890.12,DR,consulting_K,1006F
-32130,AUD,2051260801,890.12,CR,fee_L,1006F
-32131,SGD,5051260801,2345,DR,salary_M,1007G
-32131,SGD,5051250801,2345,CR,payroll_N,1007G
-32131,HKD,2051250801,765.43,DR,marketing_O,1008H
-32131,HKD,5051240801,765.43,CR,advert_P,1008H
-32132,NZD,2051240801,1000,DR,rent_Q,1009I
-32132,NZD,2051220801,1000,CR,landlord_R,1009I
-32132,MXN,5051220801,350.75,DR,repair_S,1010J
-32132,MXN,2051500401,350.75,CR,maintain_T,1010J
-31774,SEK,5051500401,678.9,DR,software_U,1011K
-31774,SEK,5051210801,678.9,CR,vendor_V,1011K
-31774,NOK,2051210801,450,DR,lunch_W,1012L
-31774,NOK,2051230801,450,CR,food_X,1012L
-31776,DKK,5051230801,210.5,DR,phone_Y,1013M
-31776,DKK,2051140801,210.5,CR,telecom_Z,1013M
-31776,ZAR,5051140801,85,DR,sundry_AA,1014N
-31776,ZAR,2051120801,85,CR,misc_BB,1014N
-31777,BRL,5051120801,1200,DR,legal_CC,1015O
-31777,BRL,2051070601,1200,CR,lawyer_DD,1015O
-31777,RUB,5051070601,650,DR,shipping_EE,1016P
-31777,RUB,5051170801,650,CR,logistics_FF,1016P
-31778,CNY,2051170801,300,DR,courier_GG,1017Q
-31778,CNY,5051130801,300,CR,delivery_HH,1017Q
-31778,MYR,2051130801,45.99,DR,office_II,1018R
-31778,MYR,2051500201,45.99,CR,staples_JJ,1018R
-31779,THB,5051500201,7500,DR,bonus_KK,1019S
-31779,THB,5051501101,7500,CR,payroll_LL,1019S
-31779,KRW,2051501101,1500,DR,overtime_MM,1020T
-31779,KRW,5051500101,1500,CR,wages_NN,1020T
-31781,PHP,2051500101,88.25,DR,tea_OO,1021U
-31781,PHP,5051501701,88.25,CR,coffee_PP,1021U
-31781,IDR,2051501701,199.99,DR,water_QQ,1022V
-31781,IDR,2051500701,199.99,CR,H2O_RR,1022V
-31783,SAR,5051500701,500,DR,donation_SS,1023W
-31783,SAR,5057030601,500,CR,charity_TT,1023W
-31783,AED,2057030601,900,DR,gift_UU,1024X
-31783,AED,5057070601,900,CR,present_VV,1024X
-31784,QAR,2057070601,120,DR,fine_WW,1025Y
-31784,QAR,2057505001,120,CR,penalty_ZZ,1025Y
-
-3. Frontend Redesign (Professional UI)
-I have completely redesigned the frontend.
- * Big Upload Area: Centered, large icon, professional dashed border with hover effects.
- * Clean Layout: Date picker is neat, buttons are aligned.
- * Professional Colors: Uses standard business blue tones.
- * Instructions: Added clear instructions inside the upload box.
-JournalBulkStyle.js (Updated Styles)
+Here are the updated frontend files with the layout you requested: Upload Box on top (Full Width), followed by the Date and Actions below. I have also removed hardcoded colors to respect your Material UI Theme.
+1. JournalBulkStyle.js (Theme-Aware Styles)
+I removed specific hex codes (like #f4f6f8, #1a237e) so it picks up your app's dark/light mode and primary colors automatically.
 export const mainContainerStyle = {
-  p: 4,
-  maxWidth: "95%",
+  p: 3,
+  maxWidth: "100%",
   margin: "0 auto",
-  backgroundColor: "#f4f6f8",
   minHeight: "85vh",
-  borderRadius: "16px",
 };
 
 export const controlPanelStyle = {
-  p: 4,
+  p: 3,
   mb: 3,
-  borderRadius: "16px",
-  boxShadow: "0 4px 20px rgba(0,0,0,0.05)",
-  backgroundColor: "#ffffff",
+  borderRadius: 2,
+  // Removes hardcoded background/shadow to use Theme defaults
 };
 
 export const uploadBoxStyle = {
-  border: "2px dashed #e0e0e0",
-  borderRadius: "16px",
+  border: "2px dashed",
+  borderColor: "action.disabled", // Uses theme disabled color
+  borderRadius: 2,
   p: 6,
   display: "flex",
   flexDirection: "column",
@@ -241,35 +26,37 @@ export const uploadBoxStyle = {
   alignItems: "center",
   textAlign: "center",
   cursor: "pointer",
-  backgroundColor: "#fafafa",
-  transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)",
-  height: "250px", // Fixed height for a big look
+  transition: "all 0.3s ease",
+  minHeight: "200px", // Good height for full width
+  bgcolor: "action.hover", // Subtle background from theme
   "&:hover": {
-    backgroundColor: "#f0f7ff",
-    borderColor: "#1976d2",
-    transform: "translateY(-2px)",
-    boxShadow: "0 4px 12px rgba(25, 118, 210, 0.15)",
+    bgcolor: "action.selected",
+    borderColor: "primary.main",
   },
 };
 
 export const iconStyle = {
   fontSize: "64px",
-  color: "#1976d2",
-  marginBottom: "16px",
+  color: "primary.main",
+  marginBottom: 1,
 };
 
 export const headerTextStyle = {
   fontWeight: 600,
-  color: "#333",
   mb: 1,
 };
 
 export const subTextStyle = {
-  color: "#666",
-  fontSize: "0.9rem",
+  color: "text.secondary",
+  fontSize: "0.875rem",
 };
 
-JournalBulkUpload.jsx (Professional Version)
+2. JournalBulkUpload.jsx (New Layout)
+Changes:
+ * Layout: The Upload Box is now the first item in the Grid, spanning full width (xs={12}).
+ * Controls: The Date Picker and Buttons are in a row below the upload box.
+ * Colors: Removed specific colors; uses primary, error, success, and text.secondary.
+<!-- end list -->
 import React, { useState, useRef } from "react";
 import {
   Box,
@@ -280,7 +67,6 @@ import {
   Button,
   CircularProgress,
   Chip,
-  Divider,
   Alert,
   Stack,
 } from "@mui/material";
@@ -507,92 +293,81 @@ const JournalBulkUpload = () => {
 
   return (
     <Box sx={mainContainerStyle}>
-      <Paper elevation={0} sx={controlPanelStyle}>
+      <Paper elevation={2} sx={controlPanelStyle}>
         
-        {/* Header Section */}
-        <Box sx={{ mb: 4 }}>
-            <Typography variant="h5" sx={{ fontWeight: 700, color: "#1a237e" }}>
+        {/* Header Title */}
+        <Box sx={{ mb: 2 }}>
+            <Typography variant="h5" sx={{ fontWeight: 600 }}>
                 Bulk Journal Upload
             </Typography>
-            <Typography variant="body2" sx={{ color: "#666", mt: 1 }}>
+            <Typography variant="body2" color="text.secondary">
                 Upload your journal entries via Excel. Validate data, preview, and submit in bulk.
             </Typography>
         </Box>
 
-        <Grid container spacing={4}>
-          {/* LEFT SIDE: CONTROLS */}
-          <Grid item xs={12} md={4}>
-            <Stack spacing={3}>
-                <Box>
-                    <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 600 }}>1. Posting Date</Typography>
-                    <TextField 
-                        type="date" 
-                        fullWidth 
-                        size="medium" 
-                        value={selectedDate} 
-                        onChange={handleDateChange} 
-                        InputLabelProps={{ shrink: true }} 
-                    />
-                </Box>
-
-                <Box>
-                    <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 600 }}>2. Actions</Typography>
-                    <Stack spacing={2}>
-                        <Button 
-                            variant="contained" 
-                            color="primary" 
-                            size="large"
-                            onClick={handleValidation} 
-                            disabled={loading || !file || !selectedDate || isSubmitting} 
-                            startIcon={loading ? <CircularProgress size={20} color="inherit" /> : <CheckCircleIcon />}
-                            fullWidth
-                            sx={{ py: 1.5, textTransform: "none", fontSize: "1rem" }}
-                        >
-                            {loading ? "Validating File..." : "Validate & Process"}
-                        </Button>
-                        <Button 
-                            variant="outlined" 
-                            color="error" 
-                            onClick={resetForm} 
-                            startIcon={<RestartAltIcon />} 
-                            disabled={isSubmitting}
-                            fullWidth
-                            sx={{ textTransform: "none" }}
-                        >
-                            Reset Form
-                        </Button>
-                    </Stack>
-                </Box>
-            </Stack>
-          </Grid>
-
-          {/* RIGHT SIDE: BIG UPLOAD BOX */}
-          <Grid item xs={12} md={8}>
-            <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 600 }}>3. Upload File</Typography>
+        <Grid container spacing={3}>
+          
+          {/* 1. TOP SECTION: FULL WIDTH UPLOAD */}
+          <Grid item xs={12}>
             <Box sx={uploadBoxStyle} onClick={() => fileInputRef.current.click()}>
               <input type="file" hidden accept=".xlsx, .xls" onChange={handleFileChange} ref={fileInputRef} />
               
               {file ? (
                 <>
-                  <DescriptionIcon sx={{ fontSize: 80, color: "#2e7d32", mb: 2 }} />
+                  <DescriptionIcon color="success" sx={{ fontSize: 60, mb: 1 }} />
                   <Typography variant="h6" sx={headerTextStyle}>{file.name}</Typography>
-                  <Chip label="Ready to Validate" color="success" variant="outlined" size="small" />
-                  <Typography variant="caption" sx={{ mt: 2, color: "#999" }}>Click to replace file</Typography>
+                  <Chip label="File Selected" color="success" variant="outlined" size="small" />
+                  <Typography variant="caption" sx={{ mt: 1, color: "text.disabled" }}>Click to replace</Typography>
                 </>
               ) : (
                 <>
                   <CloudUploadIcon sx={iconStyle} />
-                  <Typography variant="h6" sx={headerTextStyle}>Drag & Drop or Click to Upload</Typography>
-                  <Typography sx={subTextStyle}>Supported formats: .xlsx, .xls</Typography>
-                  <Typography variant="caption" sx={{ mt: 2, color: "#aaa" }}>Max file size: 10MB</Typography>
+                  <Typography variant="h6" sx={headerTextStyle}>Click to Upload Excel File</Typography>
+                  <Typography sx={subTextStyle}>Supported formats: .xlsx, .xls (Max 10MB)</Typography>
                 </>
               )}
             </Box>
           </Grid>
+
+          {/* 2. BOTTOM SECTION: CONTROLS (Row) */}
+          <Grid item xs={12} md={4}>
+             <TextField 
+                label="Posting Date"
+                type="date" 
+                fullWidth 
+                value={selectedDate} 
+                onChange={handleDateChange} 
+                InputLabelProps={{ shrink: true }} 
+             />
+          </Grid>
+
+          <Grid item xs={12} md={8} sx={{ display: "flex", gap: 2, alignItems: "center", justifyContent: "flex-end" }}>
+             <Button 
+                variant="outlined" 
+                color="error" 
+                onClick={resetForm} 
+                startIcon={<RestartAltIcon />} 
+                disabled={isSubmitting}
+             >
+                Reset
+             </Button>
+             
+             <Button 
+                variant="contained" 
+                color="primary" 
+                onClick={handleValidation} 
+                disabled={loading || !file || !selectedDate || isSubmitting} 
+                startIcon={loading ? <CircularProgress size={20} color="inherit" /> : <CheckCircleIcon />}
+                sx={{ px: 4 }}
+             >
+                {loading ? "Validating..." : "Validate & Process"}
+             </Button>
+          </Grid>
+
         </Grid>
 
-        {/* FEEDBACK & ACTIONS */}
-        <Box sx={{ mt: 4 }}>
+        {/* FEEDBACK & ACTIONS (Shows after Validation) */}
+        <Box sx={{ mt: 3 }}>
           {uiError && (
             <Alert severity="error" sx={{ mb: 2 }} action={errorCount > 0 && <Chip label={`${errorCount} Errors`} color="error" size="small"/>}>
               <Typography variant="subtitle2" fontWeight="bold">Validation Failed</Typography>
@@ -601,15 +376,15 @@ const JournalBulkUpload = () => {
           )}
 
           {successFile && !uiError && (
-             <Paper elevation={0} sx={{ p: 3, backgroundColor: "#e8f5e9", border: "1px solid #c8e6c9", borderRadius: 2 }}>
-                <Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" alignItems="center" spacing={2}>
+             <Paper variant="outlined" sx={{ p: 2, bgcolor: "success.light", borderColor: "success.main" }}>
+                <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems="center" spacing={2}>
                     <Box>
-                        <Stack direction="row" alignItems="center" spacing={1} sx={{mb: 0.5}}>
+                        <Stack direction="row" alignItems="center" spacing={1}>
                             <CheckCircleIcon color="success" />
-                            <Typography variant="h6" fontWeight="bold" color="success.main">Validation Successful!</Typography>
+                            <Typography variant="subtitle1" fontWeight="bold">Validation Successful!</Typography>
                         </Stack>
-                        <Typography variant="body2" color="text.secondary">
-                            {previewRows.length} rows are valid and ready for submission.
+                        <Typography variant="body2">
+                            {previewRows.length} rows valid. Ready for submission.
                         </Typography>
                     </Box>
                     <Stack direction="row" spacing={2}>
@@ -619,6 +394,7 @@ const JournalBulkUpload = () => {
                             startIcon={<DownloadIcon />}
                             disabled={isSubmitting}
                             onClick={() => downloadBase64File(successFile, `Processed_Journal_${selectedDate}.csv`, "text/csv")}
+                            sx={{ bgcolor: 'background.paper' }}
                         >
                             Download CSV
                         </Button>
@@ -626,11 +402,9 @@ const JournalBulkUpload = () => {
                         <Button 
                             variant="contained" 
                             color="success" 
-                            size="large"
                             startIcon={isSubmitting ? <CircularProgress size={20} color="inherit" /> : <SendIcon />}
                             onClick={handleSubmitBatch}
                             disabled={isSubmitting}
-                            sx={{ px: 4, fontWeight: "bold" }}
                         >
                             {isSubmitting ? "Creating Batch..." : "Create Batch"}
                         </Button>
@@ -643,9 +417,9 @@ const JournalBulkUpload = () => {
       
       {/* DATA GRID PREVIEW */}
       {previewRows.length > 0 && !uiError && (
-        <Paper elevation={2} sx={{ p: 0, mt: 3, height: 600, width: '100%', borderRadius: 3, overflow: "hidden" }}>
-            <Box sx={{ p: 2, borderBottom: "1px solid #eee", backgroundColor: "#fafafa" }}>
-                <Typography variant="h6" sx={{ fontWeight: 600, color: "#333" }}>Data Preview</Typography>
+        <Paper elevation={2} sx={{ p: 0, mt: 3, height: 600, width: '100%', borderRadius: 2, overflow: "hidden" }}>
+            <Box sx={{ p: 2, borderBottom: 1, borderColor: "divider" }}>
+                <Typography variant="h6" sx={{ fontWeight: 600 }}>Data Preview</Typography>
             </Box>
             <DataGrid
                 rows={previewRows}
@@ -654,17 +428,7 @@ const JournalBulkUpload = () => {
                 rowsPerPageOptions={[10, 25, 50, 100]}
                 disableSelectionOnClick
                 density="comfortable"
-                sx={{ 
-                    border: 'none',
-                    '& .MuiDataGrid-columnHeaders': {
-                        backgroundColor: '#f5f5f5',
-                        fontWeight: 'bold',
-                        color: '#555'
-                    },
-                    '& .MuiDataGrid-row:hover': {
-                        backgroundColor: '#f5f9ff'
-                    }
-                }}
+                sx={{ border: 'none' }}
             />
         </Paper>
       )}
