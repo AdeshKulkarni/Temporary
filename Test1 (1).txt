@@ -1,52 +1,141 @@
-{
-  "commonBatchRemarks": "Bulk upload testing - 20 Transaction Rows",
-  "rows": [
-    {
-      "changeType": "ADD",
-      "branch": "001",
-      "currency": "INR",
-      "cgl": "1001000001",
-      "amount": 5000.00,
-      "productType": "CASH",
-      "remarks": "Cash Deposit - Part 1",
-      "arFlag": "A",
-      "acClassification": "A"
-    },
-    {
-      "changeType": "ADD",
-      "branch": "001",
-      "currency": "INR",
-      "cgl": "1001000002",
-      "amount": 5000.00,
-      "productType": "CASH",
-      "remarks": "Cash Deposit - Part 2",
-      "arFlag": "A",
-      "acClassification": "A"
-    },
-    {
-      "changeType": "ADD",
-      "branch": "001",
-      "currency": "INR",
-      "cgl": "2001000001",
-      "amount": -10000.00,
-      "productType": "LOAN",
-      "remarks": "Loan Disbursement (Credit)",
-      "arFlag": "A",
-      "acClassification": "L"
-    },
-    {
-      "changeType": "ADD",
-      "branch": "002",
-      "currency": "USD",
-      "cgl": "1002000001",
-      "amount": 100.50,
-      "productType": "FOREX",
-      "remarks": "Forex Purchase 1",
-      "arFlag": "A",
-      "acClassification": "A"
-    },
+Based on your requirement to handle 10,000+ rows, using the existing /create-batch endpoint is risky because it tries to return the entire list of created objects in the response, which will crash your browser or timeout the server.
+I have created a New Optimized Endpoint (/create-bulk-batch) that accepts the payload but returns a lightweight summary (Batch ID + Count) instead of the full list.
+Here are the updated files.
+Part 1: Backend Implementation
+1. BatchRequestDto.java (Update)
+Ensure commonBatchRemarks is not strictly @NotNull if you want it optional, or handle "N/A" in service. Assuming you want to keep the DTO as is, we will handle the optional logic in the Service.
+2. JournalRequestController.java (Add New Endpoint)
+Add this new endpoint. It uses the same DTO but processes it efficiently for high volume.
+    // ... existing imports
+    
+    // 1. ADD THIS NEW ENDPOINT FOR BULK SUBMISSION
+    @PostMapping("/create-bulk-batch")
+    @ResponseStatus(HttpStatus.CREATED)
+    public ResponseEntity<Map<String, Object>> createBulkBatchRequest(
+            @RequestBody BatchRequestDto batchDto, // No @Valid here if you want to skip strict validations or handle them manually
+            @RequestHeader("Authorization") String token) throws JsonProcessingException {
+        
+        String userId = JwtUtil.getUserIdFromToken(token);
+        JsonNode claims = JwtUtil.getClaimsFromToken(token); 
+        Integer userRole = claims.get("role").asInt(); 
+        
+        log.info("Received BULK Journal batch request from user: {}. Rows: {}", userId, batchDto.getRows().size());
+        
+        // Call the optimized service method
+        String batchId = journalRequestService.createBulkBatchRequest(batchDto, userId, userRole);
+        
+        // Return lightweight response
+        return ResponseEntity.ok(Map.of(
+            "status", "SUCCESS",
+            "message", "Batch created successfully",
+            "batchId", batchId,
+            "totalRows", batchDto.getRows().size()
+        ));
+    }
 
+3. JournalRequestService.java (Interface Update)
+public interface JournalRequestService {
+    // ... existing methods
+    
+    // Add this new method definition
+    String createBulkBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException;
+}
 
+4. JournalRequestServiceImpl.java (Implementation)
+This method is optimized. It saves all rows but does not try to map them back to entities for the return value, saving huge memory and processing time.
+    @Override
+    @Transactional
+    public String createBulkBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+        
+        String batchId = sequenceService.getNextBatchId();
+        log.info("Processing BULK Batch ID: {}", batchId);
+       
+        LocalDate postingDate = LocalDate.now();
+        List<JournalRequest> requestsToSave = new ArrayList<>();
+        
+        // Handle Optional Common Remarks
+        String commonRemarks = (batchDto.getCommonBatchRemarks() != null && !batchDto.getCommonBatchRemarks().isEmpty()) 
+                                ? batchDto.getCommonBatchRemarks() 
+                                : "Bulk Upload Batch " + batchId;
+
+        // Grouping logic (Same as original, ensures Journal IDs are sequenced per Branch/Currency)
+        Map<String, List<BatchRequestDto.JournalRequestRow>> groupedRows = batchDto.getRows().stream()
+                .collect(Collectors.groupingBy(row -> row.getBranch() + ":" + row.getCurrency()));
+
+        for (Map.Entry<String, List<BatchRequestDto.JournalRequestRow>> entry : groupedRows.entrySet()) {
+            
+            String journalIdPrefix = sequenceService.getNextJournalIdPrefix();
+            int journalSequence = 1;
+            List<BatchRequestDto.JournalRequestRow> rowsInGroup = entry.getValue();
+            
+            for (BatchRequestDto.JournalRequestRow rowDto : rowsInGroup) {
+                
+                String journalId = String.format("%s-%03d", journalIdPrefix, journalSequence);
+                
+                CreateJournalRequestDto payloadDto = new CreateJournalRequestDto();
+                payloadDto.setPDate(postingDate); 
+                payloadDto.setChangeType(rowDto.getChangeType());
+                payloadDto.setMasterJournalId(rowDto.getMasterJournalId());
+                payloadDto.setBranch(rowDto.getBranch());
+                payloadDto.setCurrency(rowDto.getCurrency());
+                payloadDto.setCgl(rowDto.getCgl());
+                payloadDto.setAmount(rowDto.getAmount()); 
+                payloadDto.setProductType(rowDto.getProductType());
+                payloadDto.setRemarks(rowDto.getRemarks());
+                
+                // Default flags if missing
+                payloadDto.setArFlag(rowDto.getArFlag() != null ? rowDto.getArFlag() : "A");
+                payloadDto.setAcClassification(rowDto.getAcClassification() != null ? rowDto.getAcClassification() : "A");
+                
+                payloadDto.setBatchId(batchId); 
+                payloadDto.setJournalId(journalId); 
+                payloadDto.setCommonBatchRemarks(commonRemarks);
+                payloadDto.setTransactionCount(journalSequence); 
+                
+                JournalRequest request = new JournalRequest();
+                request.setCreatorId(creatorId);
+                request.setCreatorRole(creatorRole);
+                request.setChangeType(rowDto.getChangeType()); // Default to ADD
+                request.setRequestStatus(RequestStatus.PENDING);
+                request.setBatchId(batchId);
+                request.setJournalId(journalId);
+                request.setCommonBatchRemarks(commonRemarks);
+                request.setPayload(objectMapper.writeValueAsString(payloadDto));
+
+                requestsToSave.add(request);
+                journalSequence++; 
+            }
+        }
+
+        // BATCH SAVE (Hibernate will handle batching if configured in application.properties)
+        // Even without config, saveAll is faster than looping save
+        journalRequestRepository.saveAll(requestsToSave);
+        
+        // Create Notification (One for the whole batch)
+        try {
+            NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH"); // Ensure string matches constant
+            String message = String.format("Bulk Journal Batch %s (%d rows) by %s pending approval.", 
+                                           batchId, requestsToSave.size(), creatorId);
+
+            notificationWriterService.createNotification(
+                null,                   
+                config.getTargetRoles(),
+                message,
+                config.getTargetUrl(),  
+                batchId,                
+                "JournalService"
+            );
+        } catch (Exception e) {
+            log.error("Failed to create notification for Bulk Batch: {}", batchId, e);
+            // Don't rollback batch for notification failure
+        }
+   
+        return batchId; // Return ID only
+    }
+
+Part 2: Frontend Implementation
+I have updated JournalBulkUpload.jsx to include the Submit logic. It takes the previewRows (which you see in the grid), converts them into the BatchRequestDto JSON format, and sends them to the new API.
+JournalBulkUpload.jsx
 import React, { useState, useRef } from "react";
 import {
   Box,
@@ -67,11 +156,10 @@ import {
   CheckCircle as CheckCircleIcon,
   Error as ErrorIcon,
   Download as DownloadIcon,
+  Send as SendIcon, // Import Send Icon
 } from "@mui/icons-material";
 
-// Import DataGrid
 import { DataGrid } from "@mui/x-data-grid";
-
 import { mainContainerStyle, uploadBoxStyle, controlPanelStyle } from "./JournalBulkStyle";
 import useApi from "../../hooks/useApi";
 import useCustomSnackbar from "../../utils/useCustomSnackbar";
@@ -86,10 +174,14 @@ const JournalBulkUpload = () => {
   const [errorCount, setErrorCount] = useState(0);
   
   const [successFile, setSuccessFile] = useState(null);
-  const [previewRows, setPreviewRows] = useState([]); // State for Grid Data
+  const [previewRows, setPreviewRows] = useState([]); 
+  
+  // State for Submitting the Batch
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const fileInputRef = useRef(null);
 
+  // --- Helper: Download ---
   const downloadBase64File = (base64String, fileName, mimeType) => {
     try {
       const byteCharacters = atob(base64String);
@@ -146,9 +238,11 @@ const JournalBulkUpload = () => {
     setErrorCount(0);
     setSuccessFile(null);
     setPreviewRows([]);
+    setIsSubmitting(false);
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
+  // --- 1. VALIDATION HANDLER (Parses Excel) ---
   const handleValidation = async () => {
     if (!selectedDate || !file) {
       const msg = "Please select a Date and upload a File.";
@@ -182,83 +276,95 @@ const JournalBulkUpload = () => {
       } else if (response && response.status === "SUCCESS") {
         showSnackBar(response.message, "success");
         if (response.successFileBase64) setSuccessFile(response.successFileBase64);
-        if (response.previewData) setPreviewRows(response.previewData); // Set Grid Data
+        if (response.previewData) setPreviewRows(response.previewData); 
       } 
     } catch (err) {
       console.error("Validation Error:", err);
     }
   };
 
-  // Columns for DataGrid
-const columns = [
+  // --- 2. SUBMIT BATCH HANDLER (Creates MOC) ---
+  const handleSubmitBatch = async () => {
+    if (previewRows.length === 0) {
+      showSnackBar("No validated data to submit.", "warning");
+      return;
+    }
+
+    setIsSubmitting(true);
+
+    try {
+      // Map preview data to BatchRequestDto structure
+      const payloadRows = previewRows.map((row) => {
+        // Handle Amount Sign: 
+        // Backend 'previewData' sends amount as Absolute String.
+        // We need to send signed Float/Double to Create API.
+        // If txnType is "Credit", make it negative.
+        let amt = parseFloat(row.amount.replace(/,/g, '')); // Remove commas
+        if (row.txnType === "Credit") {
+          amt = -Math.abs(amt);
+        } else {
+          amt = Math.abs(amt);
+        }
+
+        return {
+          changeType: "ADD",
+          branch: row.branch,
+          currency: row.currency,
+          cgl: row.cgl,
+          amount: amt,
+          productType: row.productCode || "", // Optional
+          remarks: row.remarks || "",
+          arFlag: "A", // Default
+          acClassification: "A" // Default
+        };
+      });
+
+      const finalPayload = {
+        commonBatchRemarks: `Bulk Upload - ${selectedDate}`, // Optional, auto-generated
+        rows: payloadRows
+      };
+
+      // Call the NEW Bulk API
+      const response = await callApi("JS/journals/create-bulk-batch", finalPayload, "POST");
+
+      if (response && response.status === "SUCCESS") {
+        showSnackBar(`Batch Created Successfully! Batch ID: ${response.batchId}`, "success");
+        // Reset form after success
+        resetForm();
+      } 
+
+    } catch (error) {
+      console.error("Batch Creation Failed:", error);
+      showSnackBar("Failed to create batch.", "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  // DataGrid Columns
+  const columns = [
+    { field: "branch", headerName: "Branch", flex: 1, align: "center", headerAlign: "center" },
+    { field: "currency", headerName: "Currency", width: 100, align: "center", headerAlign: "center" },
+    { field: "cgl", headerName: "CGL", flex: 1.5, align: "center", headerAlign: "center" },
+    { field: "productCode", headerName: "Product", width: 100, align: "center", headerAlign: "center", renderCell: (p) => p.value || "-" },
     { 
-      field: "branch", 
-      headerName: "Branch", 
-      flex: 1, 
-      align: "center", 
-      headerAlign: "center" 
-    },
-    { 
-      field: "currency", 
-      headerName: "Currency", 
-      width: 100, 
-      align: "center", 
-      headerAlign: "center" 
-    },
-    { 
-      field: "cgl", 
-      headerName: "CGL", 
-      flex: 1.5, 
-      align: "center", 
-      headerAlign: "center" 
-    },
-    { 
-      field: "productCode", 
-      headerName: "Product Code", 
-      width: 130, 
-      align: "center", 
-      headerAlign: "center",
-      renderCell: (params) => params.value ? params.value : "-"
-    },
-    { 
-      field: "amount", 
-      headerName: "Amount", 
-      flex: 1.5, 
-      minWidth: 150, 
-      align: "right", 
-      headerAlign: "center",
+      field: "amount", headerName: "Amount", flex: 1.5, minWidth: 150, align: "right", headerAlign: "center",
       valueFormatter: (params) => {
         const val = (params && typeof params === 'object' && 'value' in params) ? params.value : params;
-        if (!val) return "0.0000";
+        if (!val) return "0.00";
         const parts = String(val).split(".");
         parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ",");
         return parts.join(".");
       }
     },
     { 
-      field: "txnType", 
-      headerName: "Type", 
-      width: 100, 
-      align: "center", 
-      headerAlign: "center",
+      field: "txnType", headerName: "Type", width: 100, align: "center", headerAlign: "center",
       renderCell: (params) => (
-        <Chip 
-          label={params.value} 
-          color={params.value === "Credit" ? "error" : "success"} 
-          size="small" 
-          variant="outlined"
-        />
+        <Chip label={params.value} color={params.value === "Credit" ? "error" : "success"} size="small" variant="outlined" />
       )
     },
-    { 
-      field: "remarks", 
-      headerName: "Remarks", 
-      flex: 2, 
-      headerAlign: "center" ,
-      align: "center", 
-    },
+    { field: "remarks", headerName: "Remarks", flex: 2, headerAlign: "center" },
   ];
-
 
   return (
     <Box sx={mainContainerStyle}>
@@ -288,16 +394,15 @@ const columns = [
           </Grid>
 
           <Grid item xs={12} md={4} sx={{ display: "flex", flexDirection: "column", justifyContent: "center", gap: 2 }}>
-            <Button variant="contained" color="primary" onClick={handleValidation} disabled={loading || !file || !selectedDate} startIcon={loading ? <CircularProgress size={20} color="inherit" /> : <CheckCircleIcon />}>
+            <Button variant="contained" color="primary" onClick={handleValidation} disabled={loading || !file || !selectedDate || isSubmitting} startIcon={loading ? <CircularProgress size={20} color="inherit" /> : <CheckCircleIcon />}>
               {loading ? "Validating..." : "Validate & Process"}
             </Button>
-            <Button variant="outlined" color="error" onClick={resetForm} startIcon={<RestartAltIcon />}>Reset</Button>
+            <Button variant="outlined" color="error" onClick={resetForm} startIcon={<RestartAltIcon />} disabled={isSubmitting}>Reset</Button>
           </Grid>
         </Grid>
 
         <Divider sx={{ my: 3 }} />
 
-        {/* FEEDBACK SECTION */}
         <Box>
           {loading && <Alert severity="info">Processing file on server...</Alert>}
 
@@ -308,28 +413,45 @@ const columns = [
             </Alert>
           )}
 
+          {/* SUCCESS ACTIONS: Download & Submit */}
           {successFile && !uiError && (
              <Alert severity="success" sx={{ mt: 1, alignItems: "center" }}>
-                <Box sx={{ display: 'flex', justifyContent: 'space-between', width: '100%', alignItems: 'center' }}>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', width: '100%', alignItems: 'center', flexWrap: 'wrap', gap: 2 }}>
                     <Box>
-                        <Typography variant="subtitle2" fontWeight="bold">Success!</Typography>
-                        <Typography variant="body2">File validated. You can review data below or download the file.</Typography>
+                        <Typography variant="subtitle2" fontWeight="bold">Validation Successful!</Typography>
+                        <Typography variant="body2">
+                            {previewRows.length} rows ready. You can download the processed file OR create the batch immediately.
+                        </Typography>
                     </Box>
-                    <Button 
-                        variant="contained" 
-                        color="success" 
-                        startIcon={<DownloadIcon />}
-                        onClick={() => downloadBase64File(successFile, `Processed_Journal_${selectedDate}.csv`, "text/csv")}
-                    >
-                        Download Validated File
-                    </Button>
+                    <Box sx={{ display: 'flex', gap: 2 }}>
+                        <Button 
+                            variant="outlined" 
+                            color="success" 
+                            startIcon={<DownloadIcon />}
+                            disabled={isSubmitting}
+                            onClick={() => downloadBase64File(successFile, `Processed_Journal_${selectedDate}.csv`, "text/csv")}
+                        >
+                            Download CSV
+                        </Button>
+                        
+                        {/* NEW SUBMIT BUTTON */}
+                        <Button 
+                            variant="contained" 
+                            color="success" 
+                            startIcon={isSubmitting ? <CircularProgress size={20} color="inherit" /> : <SendIcon />}
+                            onClick={handleSubmitBatch}
+                            disabled={isSubmitting}
+                        >
+                            {isSubmitting ? "Creating Batch..." : "Create Batch"}
+                        </Button>
+                    </Box>
                 </Box>
              </Alert>
           )}
         </Box>
       </Paper>
       
-      {/* DATA GRID PREVIEW */}
+      {/* DATA GRID */}
       {previewRows.length > 0 && !uiError && (
         <Paper elevation={3} sx={{ p: 2, mt: 3, height: 500, width: '100%' }}>
             <Typography variant="h6" gutterBottom color="primary">Validated Data Preview</Typography>
@@ -350,34 +472,3 @@ const columns = [
 
 export default JournalBulkUpload;
 
-
-
-export const mainContainerStyle = {
-  p: 3,
-  maxWidth: "98%",
-  margin: "0 auto",
-};
-
-export const controlPanelStyle = {
-  p: 3,
-  mb: 3,
-  borderRadius: 2,
-};
-
-export const uploadBoxStyle = {
-  border: "2px dashed #ccc",
-  borderRadius: "8px",
-  p: 3,
-  textAlign: "center",
-  cursor: "pointer",
-  backgroundColor: "#fafafa",
-  transition: "all 0.2s ease-in-out",
-  "&:hover": {
-    backgroundColor: "#f0f8ff",
-    borderColor: "#1976d2",
-  },
-};
-
-
-
-this is the moc create request payload in which used to create a moc using this /journals/create-batch api u know this now i want a api for same but for bulk in that commonBatchRemarks should not be compalasary i hope u understand what ever i am uploading for bulk convert that into above payload and create request but that api should be optimise in bulk there are many moc can be there can be above 10000 so please think if u want to make new api for bulk or u can create with same and give mi updated frontend and backend files
