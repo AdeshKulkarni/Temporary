@@ -1,3 +1,846 @@
+import React, { useState, useEffect, useCallback } from "react";
+import {
+  Box,
+  Typography,
+  Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  TextField,
+  Button,
+  CircularProgress,
+  Tooltip,
+  IconButton,
+  Stack,
+  Grid,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Paper,
+  Checkbox,
+} from "@mui/material";
+import { DataGrid } from "@mui/x-data-grid";
+import {
+  Check as CheckIcon,
+  Clear as ClearIcon,
+  Visibility as VisibilityIcon,
+  Close as CloseIcon,
+} from "@mui/icons-material";
+import AccountCircleIcon from "@mui/icons-material/AccountCircle";
+import InfoIcon from "@mui/icons-material/Info";
+
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
+
+// Import the styles from the separate file
+import {
+  cellBorderStyle,
+  tableHeaderCellStyle,
+  stickyColumnCell,
+  stickyBoxStyle,
+  dialogTitleStyle,
+  loadingContainerStyle,
+  dialogActionsStyle,
+  dataGridContainerStyle,
+  mainContainerStyle,
+  tableContainerStyle,
+} from "./JournalBulkStyle";
+
+const formatCurrency = (num) => {
+  return Number(num).toFixed(4);
+};
+
+const getTxnTypeColor = (txnType) => {
+  return txnType === "Credit" ? "error" : "success";
+};
+
+function CustomNoRowsOverlay() {
+  return (
+    <Stack height="100%" alignItems="center" justifyContent="center">
+      <InfoIcon sx={{ fontSize: 48, color: "text.secondary", mb: 2 }} />
+      <Typography variant="h6">No Pending Requests Found</Typography>
+      <Typography>All Journal requests have been processed.</Typography>
+    </Stack>
+  );
+}
+
+export default function JournalRequestApproval() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+
+  const [currentUserId, setCurrentUserId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([]);
+
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [selectedBatch, setSelectedBatch] = useState(null);
+  const [modalMode, setModalMode] = useState("ACCEPTED");
+  const [executorRemarks, setExecutorRemarks] = useState("");
+
+  const [isViewModalOpen, setIsViewModalOpen] = useState(false);
+  const [isViewLoading, setIsViewLoading] = useState(false);
+
+  const [batchDetails, setBatchDetails] = useState([]);
+  const [viewingBatchId, setViewingBatchId] = useState(null);
+  const [viewingBatchCreatorId, setViewingBatchCreatorId] = useState(null);
+
+  const [selectedJournalPrefixes, setSelectedJournalPrefixes] = useState([]);
+  const [partialExecutorRemarks, setPartialExecutorRemarks] = useState("");
+  const [isPartialSubmitting, setIsPartialSubmitting] = useState(false);
+
+  useEffect(() => {
+    let userIdFound = false;
+    try {
+      const authDataString =
+        sessionStorage.getItem("persist:auth") ||
+        localStorage.getItem("persist:auth");
+
+      if (authDataString) {
+        const authData = JSON.parse(authDataString);
+        const userDataString = authData.user;
+
+        if (userDataString) {
+          const userData = JSON.parse(userDataString);
+          if (userData && userData.userId) {
+            setCurrentUserId(String(userData.userId));
+            userIdFound = true;
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Failed to parse auth data from storage:", error);
+      showSnackBar("Error verifying user. Please refresh the page.", "error");
+    }
+
+    if (!userIdFound) {
+      console.warn(
+        "Could not find 'persist:auth' data in sessionStorage or localStorage."
+      );
+      showSnackBar(
+        "Could not verify user. Action buttons may not work.",
+        "warning"
+      );
+    }
+  }, [showSnackBar]);
+
+  const fetchPendingBatches = useCallback(async () => {
+    setLoading(true);
+    try {
+      const pendingRequests = await callApi(
+        "/JS/journals/pending-requests",
+        null,
+        "GET"
+      );
+
+      if (!Array.isArray(pendingRequests) || pendingRequests.length === 0) {
+        setRows([]);
+        setLoading(false);
+        return;
+      }
+
+      const groupedBatches = new Map();
+      for (const request of pendingRequests) {
+        const batchId = request.batchId;
+
+        if (!groupedBatches.has(batchId)) {
+          groupedBatches.set(batchId, {
+            id: batchId,
+            batchId: batchId,
+            creatorId: request.creatorId,
+            requestStatus: request.requestStatus,
+            requestDate: request.requestDate,
+            commonBatchRemarks: request.commonBatchRemarks,
+            totalDebit: 0,
+            totalCredit: 0,
+            requestCount: 0,
+          });
+        }
+
+        const batchDetails = groupedBatches.get(batchId);
+        batchDetails.requestCount++;
+
+        try {
+          const payload = JSON.parse(request.payload);
+          const amount = parseFloat(payload.amount) || 0;
+
+          if (amount < 0) {
+            batchDetails.totalCredit += Math.abs(amount);
+          } else {
+            batchDetails.totalDebit += amount;
+          }
+        } catch (e) {
+          console.error(`Failed to parse payload for request ${request.id}`, e);
+        }
+      }
+      setRows(Array.from(groupedBatches.values()));
+    } catch (err) {
+      showSnackBar("Failed to load pending requests", "error");
+    } finally {
+      setLoading(false);
+    }
+  }, [callApi, showSnackBar]);
+
+  useEffect(() => {
+    fetchPendingBatches();
+  }, [fetchPendingBatches]);
+
+  const handleOpenModal = (batch, mode) => {
+    setSelectedBatch(batch);
+    setModalMode(mode);
+    setExecutorRemarks("");
+    setIsModalOpen(true);
+  };
+
+  const handleCloseModal = () => {
+    if (isSubmitting) return;
+    setIsModalOpen(false);
+    setSelectedBatch(null);
+  };
+
+  const handleOpenViewModal = async (batchId, creatorId) => {
+    setIsViewModalOpen(true);
+    setIsViewLoading(true);
+    setBatchDetails([]);
+    setViewingBatchId(batchId);
+    setViewingBatchCreatorId(String(creatorId));
+
+    try {
+      const data = await callApi(
+        `/JS/journals/by-batch/${batchId}`,
+        null,
+        "GET"
+      );
+
+      setTimeout(() => {
+        if (Array.isArray(data)) {
+          const journalGroups = new Map();
+
+          const processedData = data
+            .map((req) => {
+              if (req.requestStatus !== "PENDING") {
+                return null;
+              }
+              try {
+                const payload = JSON.parse(req.payload);
+                const prefix = req.journalId.split("-")[0];
+                const amount = parseFloat(payload.amount) || 0;
+
+                return {
+                  ...req,
+                  payload,
+                  journalPrefix: prefix,
+                  amount: Math.abs(amount),
+                  transactionType: amount < 0 ? "Credit" : "Debit",
+                };
+              } catch (e) {
+                console.error("Failed to parse payload for req:", req.id, e);
+                return null;
+              }
+            })
+            .filter(Boolean);
+
+          processedData.sort((a, b) => a.journalId.localeCompare(b.journalId));
+
+          for (const row of processedData) {
+            const prefix = row.journalPrefix;
+            if (!journalGroups.has(prefix)) {
+              journalGroups.set(prefix, []);
+            }
+            journalGroups.get(prefix).push(row);
+          }
+
+          setBatchDetails(Array.from(journalGroups.values()));
+        } else {
+          setBatchDetails([]);
+          showSnackBar("No details found for this batch.", "info");
+        }
+        setIsViewLoading(false);
+      }, 100);
+    } catch (error) {
+      showSnackBar("Failed to load batch details", "error");
+      setBatchDetails([]);
+      setIsViewLoading(false);
+    }
+  };
+
+  const handleCloseViewModal = () => {
+    setIsViewModalOpen(false);
+    setBatchDetails([]);
+    setViewingBatchId(null);
+    setViewingBatchCreatorId(null);
+    setSelectedJournalPrefixes([]);
+    setPartialExecutorRemarks("");
+    setIsPartialSubmitting(false);
+  };
+
+  const handleSubmitAction = async () => {
+    if (modalMode === "REJECTED" && !executorRemarks.trim()) {
+      showSnackBar("Approver remarks are required for rejection.", "warning");
+      return;
+    }
+
+    setIsSubmitting(true);
+    const payload = {
+      batchId: selectedBatch.batchId,
+      status: modalMode,
+      remarks:
+        executorRemarks.trim() ||
+        (modalMode === "ACCEPTED" ? "Accepted" : "Rejected"),
+    };
+
+    try {
+      await callApi("/JS/journals/process-bulk", payload, "POST");
+      handleCloseModal();
+      fetchPendingBatches();
+    } catch (error) {
+      console.error("Failed to process batch:", error);
+      showSnackBar("Failed to process batch", "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleSubmitPartialAction = async (mode) => {
+    if (mode === "REJECTED" && !partialExecutorRemarks.trim()) {
+      showSnackBar("Approver remarks are required for rejection.", "warning");
+      return;
+    }
+
+    if (selectedJournalPrefixes.length === 0) {
+      showSnackBar("Please select at least one entry to process.", "warning");
+      return;
+    }
+
+    setIsPartialSubmitting(true);
+
+    const payload = {
+      journalIdPrefixes: selectedJournalPrefixes,
+      status: mode,
+      remarks:
+        partialExecutorRemarks.trim() ||
+        (mode === "ACCEPTED" ? "Accepted" : "Rejected"),
+    };
+
+    try {
+      await callApi("/JS/journals/process-bulk", payload, "POST");
+      handleCloseViewModal();
+      fetchPendingBatches();
+    } catch (error) {
+      console.error("Failed to process partial batch:", error);
+      showSnackBar("Failed to process partial selection", "error");
+    } finally {
+      setIsPartialSubmitting(false);
+    }
+  };
+
+  const handleSelectAllClick = (event) => {
+    if (event.target.checked) {
+      const newSelecteds = batchDetails.map((group) => group[0].journalPrefix);
+      setSelectedJournalPrefixes(newSelecteds);
+      return;
+    }
+    setSelectedJournalPrefixes([]);
+  };
+
+  const handleRowCheckboxClick = (event, prefix) => {
+    if (event) {
+      event.stopPropagation();
+    }
+
+    const selectedIndex = selectedJournalPrefixes.indexOf(prefix);
+    let newSelected = [];
+
+    if (selectedIndex === -1) {
+      newSelected = newSelected.concat(selectedJournalPrefixes, prefix);
+    } else if (selectedIndex === 0) {
+      newSelected = newSelected.concat(selectedJournalPrefixes.slice(1));
+    } else if (selectedIndex === selectedJournalPrefixes.length - 1) {
+      newSelected = newSelected.concat(selectedJournalPrefixes.slice(0, -1));
+    } else if (selectedIndex > 0) {
+      newSelected = newSelected.concat(
+        selectedJournalPrefixes.slice(0, selectedIndex),
+        selectedJournalPrefixes.slice(selectedIndex + 1)
+      );
+    }
+    setSelectedJournalPrefixes(newSelected);
+  };
+
+  const columns = [
+    {
+      field: "batchId",
+      headerName: "Batch ID",
+      width: 125,
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "requestStatus",
+      headerName: "Status",
+      width: 125,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Chip label={params.value} color="warning" size="small" />
+      ),
+    },
+    {
+      field: "creatorId",
+      headerName: "Creator",
+      width: 150,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Chip icon={<AccountCircleIcon />} label={params.value} size="small" />
+      ),
+    },
+    {
+      field: "requestDate",
+      headerName: "Submitted On",
+      width: 200,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Box>
+          {new Date(params.value).toLocaleString("en-IN", {
+            dateStyle: "medium",
+            timeStyle: "short",
+          })}
+        </Box>
+      ),
+    },
+    {
+      field: "commonBatchRemarks",
+      headerName: "Creator Remarks",
+      width: 200,
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "requestCount",
+      headerName: "Entries",
+      width: 100,
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "totalCredit",
+      headerName: "Total Credit",
+      width: 150,
+      align: "right",
+      headerAlign: "right",
+      renderCell: (params) => (
+        <Typography variant="body2" sx={{ mt: 1.5 }}>
+          {formatCurrency(params.value)}
+        </Typography>
+      ),
+    },
+    {
+      field: "totalDebit",
+      headerName: "Total Debit",
+      width: 150,
+      align: "right",
+      headerAlign: "right",
+      renderCell: (params) => (
+        <Typography variant="body2" sx={{ mt: 1.5 }}>
+          {formatCurrency(params.value)}
+        </Typography>
+      ),
+    },
+    {
+      field: "actions",
+      headerName: "Actions",
+      flex: 0.8,
+      minWidth: 130,
+      align: "center",
+      headerAlign: "center",
+      sortable: false,
+      renderCell: (params) => {
+        const isSelfCreated =
+          currentUserId &&
+          params.row.creatorId &&
+          String(currentUserId) === String(params.row.creatorId);
+
+        const selfCreateTooltip =
+          "You cannot approve or reject your own request";
+
+        return (
+          <Stack direction="row" spacing={0.5} justifyContent="center">
+            <Tooltip title="View Details">
+              <IconButton
+                onClick={() =>
+                  handleOpenViewModal(params.row.batchId, params.row.creatorId)
+                }
+                color="primary"
+              >
+                <VisibilityIcon />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title={isSelfCreated ? selfCreateTooltip : "Accept Batch"}>
+              <span>
+                <IconButton
+                  onClick={() => handleOpenModal(params.row, "ACCEPTED")}
+                  color="success"
+                  disabled={isSelfCreated}
+                >
+                  <CheckIcon />
+                </IconButton>
+              </span>
+            </Tooltip>
+            <Tooltip title={isSelfCreated ? selfCreateTooltip : "Reject Batch"}>
+              <span>
+                <IconButton
+                  onClick={() => handleOpenModal(params.row, "REJECTED")}
+                  color="error"
+                  disabled={isSelfCreated}
+                >
+                  <ClearIcon />
+                </IconButton>
+              </span>
+            </Tooltip>
+          </Stack>
+        );
+      },
+    },
+  ];
+
+  const isViewingSelfCreated =
+    currentUserId &&
+    viewingBatchCreatorId &&
+    String(currentUserId) === String(viewingBatchCreatorId);
+
+  return (
+    <Box sx={mainContainerStyle}>
+      <DataGrid
+        rows={rows}
+        columns={columns}
+        loading={loading}
+        getRowId={(row) => row.batchId}
+        disableRowSelectionOnClick
+        pageSizeOptions={[5, 10, 25]}
+        disableColumnResize={true}
+        rowHeight={52}
+        initialState={{
+          pagination: {
+            paginationModel: { page: 0, pageSize: 10 },
+          },
+          sorting: { sortModel: [{ field: "requestDate", sort: "desc" }] },
+        }}
+        slots={{
+          noRowsOverlay: CustomNoRowsOverlay,
+        }}
+        sx={dataGridContainerStyle}
+      />
+
+      {/* --- Batch Action Modal --- */}
+      <Dialog
+        open={isModalOpen}
+        onClose={handleCloseModal}
+        fullWidth
+        maxWidth="sm"
+      >
+        <DialogTitle>
+          {modalMode === "ACCEPTED" ? "Approve" : "Reject"} Batch
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            Are you sure you want to {modalMode.toLowerCase()} the entire batch{" "}
+            <strong>{selectedBatch?.batchId}</strong>?
+            {modalMode === "REJECTED" && " Remarks are required for rejection."}
+          </DialogContentText>
+
+          <TextField
+            autoFocus={modalMode === "REJECTED"}
+            required={modalMode === "REJECTED"}
+            margin="dense"
+            id="executorRemarks"
+            label="Approver Remarks"
+            type="text"
+            fullWidth
+            variant="standard"
+            value={executorRemarks}
+            onChange={(e) => setExecutorRemarks(e.target.value)}
+            disabled={isSubmitting}
+            InputProps={{
+              inputProps: {
+                maxLength: 200,
+              },
+            }}
+          />
+        </DialogContent>
+        <DialogActions sx={dialogActionsStyle}>
+          <Stack direction="row" spacing={1} justifyContent="flex-end">
+            <Button onClick={handleCloseModal} disabled={isSubmitting}>
+              Cancel
+            </Button>
+            <Button
+              onClick={handleSubmitAction}
+              variant="contained"
+              color={modalMode === "ACCEPTED" ? "success" : "error"}
+              disabled={isSubmitting}
+            >
+              {isSubmitting ? (
+                <CircularProgress size={24} color="inherit" />
+              ) : (
+                `Confirm ${modalMode === "ACCEPTED" ? "Approval" : "Rejection"}`
+              )}
+            </Button>
+          </Stack>
+        </DialogActions>
+      </Dialog>
+
+      {/* --- View Details Modal --- */}
+      <Dialog
+        open={isViewModalOpen}
+        onClose={handleCloseViewModal}
+        fullWidth
+        maxWidth="lg"
+      >
+        <DialogTitle sx={dialogTitleStyle}>
+          Batch Details: {viewingBatchId}
+          <IconButton
+            aria-label="close"
+            onClick={handleCloseViewModal}
+            sx={{
+              color: (theme) => theme.palette.grey[500],
+            }}
+          >
+            <CloseIcon />
+          </IconButton>
+        </DialogTitle>
+
+        <DialogContent dividers sx={{ p: 0 }}>
+          {isViewLoading ? (
+            <Box sx={loadingContainerStyle}>
+              <CircularProgress />
+            </Box>
+          ) : (
+            <>
+              {batchDetails.length > 0 ? (
+                <TableContainer component={Paper} sx={tableContainerStyle}>
+                  <Table sx={{ minWidth: 650 }} size="small" stickyHeader>
+                    <TableHead>
+                      <TableRow>
+                        <TableCell padding="checkbox" sx={tableHeaderCellStyle}>
+                          <Checkbox
+                            color="primary"
+                            indeterminate={
+                              selectedJournalPrefixes.length > 0 &&
+                              selectedJournalPrefixes.length <
+                                batchDetails.length
+                            }
+                            checked={
+                              batchDetails.length > 0 &&
+                              selectedJournalPrefixes.length ===
+                                batchDetails.length
+                            }
+                            onChange={handleSelectAllClick}
+                            disabled={isViewingSelfCreated}
+                          />
+                        </TableCell>
+                        <TableCell align="center" sx={tableHeaderCellStyle}>
+                          Journal ID
+                        </TableCell>
+                        <TableCell align="center" sx={tableHeaderCellStyle}>
+                          Branch
+                        </TableCell>
+                        <TableCell align="center" sx={tableHeaderCellStyle}>
+                          Currency
+                        </TableCell>
+                        <TableCell align="center" sx={tableHeaderCellStyle}>
+                          CGL
+                        </TableCell>
+                        <TableCell align="center" sx={tableHeaderCellStyle}>
+                          Amount
+                        </TableCell>
+                        <TableCell align="center" sx={tableHeaderCellStyle}>
+                          Txn Type
+                        </TableCell>
+                      </TableRow>
+                    </TableHead>
+
+                    <TableBody>
+                      {batchDetails.map((group, groupIndex) => {
+                        const isSelected = selectedJournalPrefixes.includes(
+                          group[0].journalPrefix
+                        );
+                        const groupRowCount = group.length;
+
+                        return group.map((row, rowIndex) => (
+                          <TableRow
+                            key={row.id}
+                            hover={!isViewingSelfCreated}
+                            onClick={() =>
+                              !isViewingSelfCreated &&
+                              handleRowCheckboxClick(null, row.journalPrefix)
+                            }
+                            role="checkbox"
+                            aria-checked={isSelected}
+                            selected={isSelected}
+                            sx={{
+                              cursor: isViewingSelfCreated
+                                ? "not-allowed"
+                                : "pointer",
+                              ...(rowIndex === 0 &&
+                                groupIndex > 0 && {
+                                  borderTop: (theme) =>
+                                    `2px solid ${theme.palette.divider}`,
+                                }),
+                            }}
+                          >
+                            {rowIndex === 0 && (
+                              <TableCell
+                                padding="checkbox"
+                                rowSpan={groupRowCount}
+                                sx={stickyColumnCell}
+                              >
+                                <Box sx={stickyBoxStyle}>
+                                  <Checkbox
+                                    color="primary"
+                                    checked={isSelected}
+                                    disabled={isViewingSelfCreated}
+                                    onClick={(e) =>
+                                      !isViewingSelfCreated &&
+                                      handleRowCheckboxClick(
+                                        e,
+                                        row.journalPrefix
+                                      )
+                                    }
+                                  />
+                                </Box>
+                              </TableCell>
+                            )}
+                            {rowIndex === 0 && (
+                              <TableCell
+                                align="center"
+                                rowSpan={groupRowCount}
+                                sx={stickyColumnCell}
+                              >
+                                <Box sx={stickyBoxStyle}>
+                                  {row.journalPrefix}
+                                </Box>
+                              </TableCell>
+                            )}
+                            <TableCell align="center" sx={cellBorderStyle}>
+                              {row.payload.branch}
+                            </TableCell>
+                            <TableCell align="center" sx={cellBorderStyle}>
+                              {row.payload.currency}
+                            </TableCell>
+                            <TableCell align="center" sx={cellBorderStyle}>
+                              {row.payload.cgl}
+                            </TableCell>
+                            <TableCell align="center" sx={cellBorderStyle}>
+                              {formatCurrency(row.amount)}
+                            </TableCell>
+                            <TableCell align="center" sx={cellBorderStyle}>
+                              <Chip
+                                label={row.transactionType}
+                                color={getTxnTypeColor(row.transactionType)}
+                                size="small"
+                              />
+                            </TableCell>
+                          </TableRow>
+                        ));
+                      })}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              ) : (
+                <Typography sx={{ p: 3 }}>
+                  No pending details found for this batch.
+                </Typography>
+              )}
+            </>
+          )}
+        </DialogContent>
+
+        <DialogActions sx={dialogActionsStyle}>
+          <Grid container spacing={2} alignItems="center">
+            <Grid item xs={12} md={6}>
+              <TextField
+                margin="dense"
+                id="partialExecutorRemarks"
+                label="Approver Remarks (for selected)"
+                type="text"
+                fullWidth
+                size="small"
+                value={partialExecutorRemarks}
+                onChange={(e) => setPartialExecutorRemarks(e.target.value)}
+                disabled={
+                  isPartialSubmitting ||
+                  selectedJournalPrefixes.length === 0 ||
+                  isViewingSelfCreated
+                }
+                InputProps={{
+                  inputProps: {
+                    maxLength: 200,
+                  },
+                }}
+              />
+            </Grid>
+            <Grid item xs={12} md={6}>
+              <Stack direction="row" spacing={1} justifyContent="flex-end">
+                <Button
+                  variant="contained"
+                  color="success"
+                  onClick={() => handleSubmitPartialAction("ACCEPTED")}
+                  disabled={
+                    isPartialSubmitting ||
+                    selectedJournalPrefixes.length === 0 ||
+                    isViewingSelfCreated
+                  }
+                >
+                  {isPartialSubmitting ? (
+                    <CircularProgress size={24} color="inherit" />
+                  ) : (
+                    "Accept Selected"
+                  )}
+                </Button>
+                <Button
+                  variant="contained"
+                  color="error"
+                  onClick={() => handleSubmitPartialAction("REJECTED")}
+                  disabled={
+                    isPartialSubmitting ||
+                    selectedJournalPrefixes.length === 0 ||
+                    isViewingSelfCreated
+                  }
+                >
+                  {isPartialSubmitting ? (
+                    <CircularProgress size={24} color="inherit" />
+                  ) : (
+                    "Reject Selected"
+                  )}
+                </Button>
+              </Stack>
+            </Grid>
+            {isViewingSelfCreated && (
+              <Grid item xs={12}>
+                <Typography
+                  color="error"
+                  variant="body2"
+                  textAlign="center"
+                  sx={{ pt: 1, width: "100%" }}
+                >
+                  You cannot approve or reject entries from your own request.
+                </Typography>
+              </Grid>
+            )}
+          </Grid>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
+}
+
+
+
 import { alpha } from "@mui/material/styles";
 
 // --- Main Containers ---
@@ -18,7 +861,7 @@ export const loadingContainerStyle = {
 export const stickyBoxStyle = {
   position: "sticky",
   top: 0,
-  zIndex: 2, // Ensure it stays above content
+  zIndex: 2, 
   backgroundColor: "background.paper",
   paddingBottom: 1,
   marginBottom: 2,
@@ -53,10 +896,9 @@ export const stickyColumnCell = {
   right: 0,
   backgroundColor: "background.paper",
   zIndex: 1,
-  boxShadow: "-2px 0px 5px rgba(0,0,0,0.05)", // Optional shadow for separation
+  boxShadow: "-2px 0px 5px rgba(0,0,0,0.05)", 
 };
 
-// --- Dialog Styles ---
 export const dialogTitleStyle = {
   m: 0,
   p: 2,
@@ -76,7 +918,6 @@ export const dialogContentStyle = {
   paddingTop: "20px !important",
 };
 
-// --- Filter/Search Box Styles ---
 export const filterContainerStyle = {
   display: "flex",
   justifyContent: "space-between",
@@ -94,3 +935,2069 @@ export const searchFieldStyle = {
 };
 
 
+
+import React, { useState, useRef } from "react";
+import {
+  Box,
+  Typography,
+  Paper,
+  TextField,
+  Button,
+  CircularProgress,
+  Chip,
+  Alert,
+  Stack,
+} from "@mui/material";
+import {
+  CloudUpload as CloudUploadIcon,
+  RestartAlt as RestartAltIcon,
+  Description as DescriptionIcon,
+  CheckCircle as CheckCircleIcon,
+  Error as ErrorIcon,
+  Download as DownloadIcon,
+  Send as SendIcon,
+} from "@mui/icons-material";
+
+import { DataGrid } from "@mui/x-data-grid";
+
+import {
+  mainContainerStyle,
+  uploadBoxStyle,
+  controlPanelStyle,
+  iconStyle,
+  headerTextStyle,
+  subTextStyle,
+} from "./JournalBulkStyle";
+
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
+
+const JournalBulkUpload = () => {
+  const { callApi, loading } = useApi();
+  const showSnackBar = useCustomSnackbar();
+
+  const [selectedDate, setSelectedDate] = useState("");
+  const [file, setFile] = useState(null);
+  const [isCsvInput, setIsCsvInput] = useState(false);
+
+  const [uiError, setUiError] = useState("");
+  const [errorCount, setErrorCount] = useState(0);
+
+  const [successFile, setSuccessFile] = useState(null);
+  const [previewRows, setPreviewRows] = useState([]);
+
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const fileInputRef = useRef(null);
+
+  const downloadBase64File = (base64String, fileName, mimeType) => {
+    try {
+      const byteCharacters = atob(base64String);
+      const byteNumbers = new Array(byteCharacters.length);
+      for (let i = 0; i < byteCharacters.length; i++) {
+        byteNumbers[i] = byteCharacters.charCodeAt(i);
+      }
+      const byteArray = new Uint8Array(byteNumbers);
+      const blob = new Blob([byteArray], { type: mimeType });
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.setAttribute("download", fileName);
+      document.body.appendChild(link);
+      link.click();
+      link.parentNode.removeChild(link);
+      window.URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error("Failed to download", e);
+      showSnackBar("Failed to download file.", "error");
+    }
+  };
+
+  const handleDateChange = (e) => {
+    setSelectedDate(e.target.value);
+    setUiError("");
+    setSuccessFile(null);
+    setPreviewRows([]);
+  };
+
+  const handleFileChange = (e) => {
+    const selectedFile = e.target.files[0];
+    if (selectedFile) {
+      const name = selectedFile.name.toLowerCase();
+      if (
+        !name.endsWith(".xlsx") &&
+        !name.endsWith(".xls") &&
+        !name.endsWith(".csv")
+      ) {
+        const msg = "Invalid file type. Supported: .xlsx, .xls, .csv";
+        setUiError(msg);
+        showSnackBar(msg, "error");
+        setFile(null);
+        return;
+      }
+      setFile(selectedFile);
+      // Check if it's CSV
+      setIsCsvInput(name.endsWith(".csv"));
+
+      setUiError("");
+      setErrorCount(0);
+      setSuccessFile(null);
+      setPreviewRows([]);
+    }
+  };
+
+  const resetForm = () => {
+    setFile(null);
+    setSelectedDate("");
+    setUiError("");
+    setErrorCount(0);
+    setSuccessFile(null);
+    setPreviewRows([]);
+    setIsSubmitting(false);
+    setIsCsvInput(false);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const handleValidation = async () => {
+    if (!selectedDate || !file) {
+      const msg = "Please select a Date and upload a File.";
+      setUiError(msg);
+      showSnackBar(msg, "warning");
+      return;
+    }
+
+    setUiError("");
+    setErrorCount(0);
+    setSuccessFile(null);
+    setPreviewRows([]);
+
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("postingDate", selectedDate);
+
+    try {
+      const response = await callApi(
+        "/JS/journals/bulk-validate",
+        formData,
+        "POST",
+        "json",
+        "multipart/form-data"
+      );
+
+      if (response && response.status === "ERROR") {
+        const count = response.errorCount || 0;
+        setErrorCount(count);
+        const msg = `Validation Failed with ${count} errors. Downloading report...`;
+        setUiError(msg);
+        showSnackBar(msg, "error");
+
+        if (response.errorReportBase64) {
+          downloadBase64File(
+            response.errorReportBase64,
+            `Error_Report.xlsx`,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+          );
+        }
+      } else if (response && response.status === "SUCCESS") {
+        showSnackBar(response.message, "success");
+        if (response.successFileBase64)
+          setSuccessFile(response.successFileBase64);
+        if (response.previewData) setPreviewRows(response.previewData);
+      }
+    } catch (err) {
+      console.error("Validation Error:", err);
+    }
+  };
+
+  const handleSubmitBatch = async () => {
+    if (previewRows.length === 0) {
+      showSnackBar("No validated data to submit.", "warning");
+      return;
+    }
+
+    setIsSubmitting(true);
+
+    try {
+      const payloadRows = previewRows.map((row) => {
+        // Handle Amount: Remove commas from string, then parse
+        let amt = parseFloat(row.amount.replace(/,/g, ""));
+        if (row.txnType === "Credit") {
+          amt = -Math.abs(amt);
+        } else {
+          amt = Math.abs(amt);
+        }
+
+        return {
+          changeType: "ADD",
+          branch: row.branch,
+          currency: row.currency,
+          cgl: row.cgl,
+          amount: amt,
+          productType: row.productCode || "",
+          remarks: row.remarks || "",
+          arFlag: "A",
+          acClassification: "A",
+        };
+      });
+
+      const finalPayload = {
+        commonBatchRemarks: `Bulk Upload - ${selectedDate}`,
+        rows: payloadRows,
+      };
+
+      const response = await callApi(
+        "/JS/journals/create-bulk-batch",
+        finalPayload,
+        "POST"
+      );
+
+      if (response && response.status === "SUCCESS") {
+        showSnackBar(
+          `Batch Created Successfully! Batch ID: ${response.batchId}`,
+          "success"
+        );
+        resetForm();
+      }
+    } catch (error) {
+      console.error("Batch Creation Failed:", error);
+      showSnackBar("Failed to create batch.", "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const columns = [
+    {
+      field: "branch",
+      headerName: "Branch",
+      flex: 1,
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "currency",
+      headerName: "Currency",
+      width: 100,
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "cgl",
+      headerName: "CGL",
+      flex: 1.5,
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "productCode",
+      headerName: "Product",
+      width: 120,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (p) => p.value || "-",
+    },
+    {
+      field: "amount",
+      headerName: "Amount",
+      flex: 1.5,
+      minWidth: 150,
+      align: "right",
+      headerAlign: "center",
+      valueFormatter: (params) => {
+        const val =
+          params && typeof params === "object" && "value" in params
+            ? params.value
+            : params;
+        if (!val) return "0.00";
+        // Convert to string and add commas (preserve full string precision)
+        const parts = String(val).split(".");
+        parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+        return parts.join(".");
+      },
+    },
+    {
+      field: "txnType",
+      headerName: "Type",
+      width: 100,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Chip
+          label={params.value}
+          color={params.value === "Credit" ? "error" : "success"}
+          size="small"
+          variant="filled"
+          sx={{ fontWeight: "bold", width: "80px" }}
+        />
+      ),
+    },
+    {
+      field: "remarks",
+      headerName: "Remarks",
+      flex: 2,
+      align: "center",
+      headerAlign: "center",
+    },
+  ];
+
+  return (
+    <Box sx={mainContainerStyle}>
+      <Paper elevation={1} sx={controlPanelStyle}>
+        <TextField
+          type="date"
+          sx={{ alignItems: "center" }}
+          size="small"
+          value={selectedDate}
+          onChange={handleDateChange}
+        />
+
+        <br />
+
+        <Box sx={uploadBoxStyle} onClick={() => fileInputRef.current.click()}>
+          <input
+            type="file"
+            hidden
+            accept=".xlsx, .xls, .csv"
+            onChange={handleFileChange}
+            ref={fileInputRef}
+          />
+
+          {file ? (
+            <>
+              <DescriptionIcon color="success" sx={{ fontSize: 60, mb: 1 }} />
+              <Typography variant="h6" sx={headerTextStyle}>
+                {file.name}
+              </Typography>
+              <Chip
+                label="Ready"
+                color="success"
+                size="small"
+                variant="outlined"
+              />
+              <Typography
+                variant="caption"
+                sx={{ mt: 1, color: "text.disabled" }}
+              >
+                Click to change
+              </Typography>
+            </>
+          ) : (
+            <>
+              <CloudUploadIcon sx={iconStyle} />
+              <Typography variant="h6" sx={headerTextStyle}>
+                Click to Upload
+              </Typography>
+              <Typography sx={subTextStyle}>
+                Supported: .xlsx, .xls, .csv (Max 10MB)
+              </Typography>
+            </>
+          )}
+        </Box>
+
+        <br />
+        <Stack
+          direction="row"
+          sx={{ display: "flex", justifyContent: "center" }}
+          spacing={2}
+        >
+          <Button
+            variant="contained"
+            sx={{ cursor: "pointer" }}
+            onClick={handleValidation}
+            disabled={loading || !file || !selectedDate || isSubmitting}
+            startIcon={
+              loading ? (
+                <CircularProgress size={20} color="inherit" />
+              ) : (
+                <CheckCircleIcon />
+              )
+            }
+            size="large"
+          >
+            {loading ? "Validating..." : "Validate & Process"}
+          </Button>
+
+          <Button
+            variant="outlined"
+            color="error"
+            onClick={resetForm}
+            startIcon={<RestartAltIcon />}
+            disabled={isSubmitting}
+            size="large"
+          >
+            Reset
+          </Button>
+        </Stack>
+
+        <Box sx={{ mt: 3 }}>
+          {/* ERROR ALERT */}
+          {uiError && (
+            <Alert
+              severity="error"
+              sx={{ mb: 2, border: "1px solid #ee0404ff" }}
+            >
+              <Typography variant="subtitle2" fontWeight="bold">
+                Validation Failed
+              </Typography>
+              <Typography variant="body2">{uiError}</Typography>
+            </Alert>
+          )}
+
+          {/* SUCCESS PANEL */}
+          {!uiError && previewRows.length > 0 && (
+            <Paper
+              variant="outlined"
+              sx={{ p: 2, borderColor: "success.main" }}
+            >
+              <Stack
+                direction={{ xs: "column", sm: "row" }}
+                justifyContent="space-between"
+                alignItems="center"
+                spacing={2}
+              >
+                <Box>
+                  <Stack direction="row" alignItems="center" spacing={1}>
+                    <CheckCircleIcon color="success" />
+                    <Typography variant="subtitle1" fontWeight="bold">
+                      Validation Successful!
+                    </Typography>
+                  </Stack>
+                  <Typography variant="body2">
+                    {previewRows.length} rows valid. Ready for submission.
+                  </Typography>
+                </Box>
+                <Stack direction="row" spacing={2}>
+                  {/* HIDE DOWNLOAD IF CSV */}
+                  {!isCsvInput && successFile && (
+                    <Button
+                      variant="outlined"
+                      color="success"
+                      startIcon={<DownloadIcon />}
+                      disabled={isSubmitting}
+                      onClick={() =>
+                        downloadBase64File(
+                          successFile,
+                          `Processed_Journal_${selectedDate}.csv`,
+                          "text/csv"
+                        )
+                      }
+                      sx={{ bgcolor: "background.paper" }}
+                    >
+                      Download CSV
+                    </Button>
+                  )}
+
+                  <Button
+                    variant="contained"
+                    color="success"
+                    startIcon={
+                      isSubmitting ? (
+                        <CircularProgress size={20} color="inherit" />
+                      ) : (
+                        <SendIcon />
+                      )
+                    }
+                    onClick={handleSubmitBatch}
+                    disabled={isSubmitting}
+                  >
+                    {isSubmitting ? "Creating Batch..." : "Create Batch"}
+                  </Button>
+                </Stack>
+              </Stack>
+            </Paper>
+          )}
+        </Box>
+      </Paper>
+
+      {/* DATA GRID PREVIEW */}
+      {previewRows.length > 0 && !uiError && (
+        <Paper
+          elevation={1}
+          sx={{
+            p: 0,
+            mt: 3,
+            height: 600,
+            width: "100%",
+            borderRadius: 2,
+            overflow: "hidden",
+          }}
+        >
+          <Box sx={{ p: 2, borderBottom: 1, borderColor: "divider" }}>
+            <Typography variant="h6" sx={{ fontWeight: 600 }}>
+              Data Preview
+            </Typography>
+          </Box>
+          <DataGrid
+            rows={previewRows}
+            columns={columns}
+            pageSize={10}
+            rowsPerPageOptions={[10, 25, 50, 100]}
+            disableSelectionOnClick
+            density="comfortable"
+            sx={{ border: "none" }}
+          />
+        </Paper>
+      )}
+    </Box>
+  );
+};
+
+export default JournalBulkUpload;
+
+
+import React, { useState, useEffect, useCallback } from "react";
+import {
+  Box,
+  Typography,
+  Grid,
+  TextField,
+  Button,
+  Paper,
+  IconButton,
+  MenuItem,
+  CircularProgress,
+  Autocomplete,
+  Tooltip,
+  Checkbox,
+  FormControlLabel,
+} from "@mui/material";
+import AddIcon from "@mui/icons-material/Add";
+import DeleteIcon from "@mui/icons-material/Delete";
+import { debounce } from "lodash";
+
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
+
+const initialRowState = {
+  id: Date.now(),
+  branch: null,
+  currency: "",
+  cgl: null,
+  amount: "",
+  txnType: "",
+  remarks: "",
+  productCode: "",
+};
+
+const formatBigIntForDisplay = (val) => {
+  if (typeof val !== "bigint") {
+    val = BigInt(val || 0);
+  }
+  const str = val.toString().padStart(5, "0");
+  const integer = str.slice(0, -4);
+  const fractional = str.slice(-4);
+  return `${integer || "0"}.${fractional}`;
+};
+
+export default function JournalPosting() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+
+  const [rows, setRows] = useState([initialRowState]);
+  const [currencyOptions, setCurrencyOptions] = useState([]);
+
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const [commonBatchRemarks, setCommonBatchRemarks] = useState("");
+  const [postingDate, setPostingDate] = useState("");
+
+  // Checkbox
+  const [checked, setChecked] = useState(false);
+
+  const [branchSearch, setBranchSearch] = useState({
+    loading: false,
+    options: [],
+  });
+  const [cglSearch, setCglSearch] = useState({ loading: false, options: [] });
+
+  useEffect(() => {
+    const fetchInitialData = async () => {
+      try {
+        const dateResponse = await callApi(
+          "JS/journals/current-posting-date",
+          null,
+          "GET"
+        );
+
+        if (dateResponse) {
+          try {
+            const [year, month, day] = dateResponse.split("-");
+            const formattedDate = `${day}-${month}-${year}`;
+            setPostingDate(formattedDate);
+          } catch (e) {
+            console.error("Could not parse date:", dateResponse, e);
+            setPostingDate(dateResponse);
+          }
+        } else {
+          showSnackBar("Failed to load official posting date.", "error");
+          setPostingDate("Error");
+        }
+
+        const currencyResponse = await callApi("CM/currency", null, "GET");
+        if (currencyResponse?.success && Array.isArray(currencyResponse.data)) {
+          const uniqueCurrencies = [...new Set(currencyResponse.data)];
+          setCurrencyOptions(uniqueCurrencies);
+        } else {
+          showSnackBar("Failed to load currencies.", "error");
+        }
+      } catch (error) {
+        console.error("Error fetching initial data:", error);
+        showSnackBar("An error occurred while loading page data.", "error");
+      }
+    };
+
+    fetchInitialData();
+  }, [callApi, showSnackBar]);
+
+  const handleAddRow = () => {
+    const lastRow = rows[rows.length - 1];
+
+    if (
+      !lastRow.branch ||
+      !lastRow.currency ||
+      !lastRow.cgl ||
+      !lastRow.amount ||
+      !lastRow.txnType
+    ) {
+      showSnackBar(
+        "Please fill all required fields (*) in the current row before adding a new one.",
+        "warning"
+      );
+      return;
+    }
+
+    const newRow = {
+      ...initialRowState,
+      id: Date.now(),
+      remarks: checked ? commonBatchRemarks : "",
+    };
+    setRows([...rows, newRow]);
+  };
+
+  const handleChange = (event) => {
+    const isChecked = event.target.checked;
+    setChecked(isChecked);
+
+    if (isChecked) {
+      const newRows = rows.map((row) => ({
+        ...row,
+        remarks: commonBatchRemarks,
+      }));
+      setRows(newRows);
+    } else {
+      const newRows = rows.map((row) => ({
+        ...row,
+        remarks: "",
+      }));
+      setRows(newRows);
+    }
+  };
+
+  const handleDeleteRow = (id) => {
+    if (rows.length > 1) {
+      setRows(rows.filter((row) => row.id !== id));
+    } else {
+      showSnackBar("Cannot delete the last row.", "warning");
+    }
+  };
+
+  const handleRowChange = (id, field, value) => {
+    const newRows = rows.map((row) => {
+      if (row.id === id) {
+        return { ...row, [field]: value };
+      }
+      return row;
+    });
+    setRows(newRows);
+  };
+
+  const searchBranches = useCallback(
+    debounce(async (query) => {
+      if (!query) {
+        setBranchSearch({ loading: false, options: [] });
+        return;
+      }
+      setBranchSearch((prev) => ({ ...prev, loading: true }));
+      try {
+        const response = await callApi(
+          `JS/branches/search?query=${encodeURIComponent(query)}`,
+          null,
+          "GET"
+        );
+
+        setBranchSearch({ loading: false, options: response || [] });
+      } catch (error) {
+        showSnackBar("Branch search failed.", "error");
+        setBranchSearch({ loading: false, options: [] });
+      }
+    }, 300),
+    [callApi, showSnackBar]
+  );
+
+  const searchCgls = useCallback(
+    debounce(async (query) => {
+      if (!query) {
+        setCglSearch({ loading: false, options: [] });
+        return;
+      }
+      setCglSearch((prev) => ({ ...prev, loading: true }));
+      try {
+        const response = await callApi(
+          `JS/api/cgls/search?query=${encodeURIComponent(query)}`,
+          null,
+          "GET"
+        );
+        setCglSearch({ loading: false, options: response || [] });
+      } catch (error) {
+        showSnackBar("CGL search failed.", "error");
+        setCglSearch({ loading: false, options: [] });
+      }
+    }, 300),
+    [callApi, showSnackBar]
+  );
+
+  const handleSubmit = async () => {
+    setIsSubmitting(true);
+
+    if (!commonBatchRemarks.trim()) {
+      showSnackBar(
+        "Please enter Common Batch Remarks before submitting.",
+        "error"
+      );
+      setIsSubmitting(false);
+      return;
+    }
+
+    const cglCheck = new Map();
+    for (const row of rows) {
+      if (!row.branch || !row.currency || !row.cgl) {
+        continue;
+      }
+      const key = `${row.branch.code}-${row.currency}`;
+      const cgl = row.cgl.cglNumber;
+
+      if (!cglCheck.has(key)) {
+        cglCheck.set(key, new Set());
+      }
+
+      const cglSet = cglCheck.get(key);
+      if (cglSet.has(cgl)) {
+        showSnackBar(
+          `Duplicate CGL entry: "${cgl}" is used more than once for branch "${row.branch.name}" and currency "${row.currency}".`,
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
+      }
+      cglSet.add(cgl);
+    }
+
+    const branchCurrencyTotals = new Map();
+    const branchEntryCheck = new Map();
+    const rowPayloads = [];
+
+    for (const [index, row] of rows.entries()) {
+      if (
+        !row.branch ||
+        !row.currency ||
+        !row.cgl ||
+        !row.amount ||
+        !row.txnType
+      ) {
+        showSnackBar(
+          `Row ${index + 1} is incomplete. Please fill all required fields.`,
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
+      }
+
+      const branchCode = row.branch.code;
+      const branchName = row.branch.name;
+      const currency = row.currency;
+
+      const [integerPart = "0", fractionalPart = "0"] = (
+        row.amount || "0"
+      ).split(".");
+      const fractionalPadded = fractionalPart.substring(0, 4).padEnd(4, "0");
+      const amountAsBigInt = BigInt(integerPart + fractionalPadded);
+
+      const compositeKey = `${branchCode}-${currency}`;
+
+      if (!branchCurrencyTotals.has(compositeKey)) {
+        branchCurrencyTotals.set(compositeKey, {
+          totalDebit: 0n,
+          totalCredit: 0n,
+          branchName: branchName,
+          branchCode: branchCode,
+          currency: currency,
+        });
+      }
+      const currencyTotals = branchCurrencyTotals.get(compositeKey);
+
+      if (row.txnType === "Debit") {
+        currencyTotals.totalDebit += amountAsBigInt;
+      } else if (row.txnType === "Credit") {
+        currencyTotals.totalCredit += amountAsBigInt;
+      }
+
+      if (!branchEntryCheck.has(branchCode)) {
+        branchEntryCheck.set(branchCode, {
+          hasDebit: false,
+          hasCredit: false,
+          branchName: branchName,
+        });
+      }
+      const branchCheck = branchEntryCheck.get(branchCode);
+
+      if (row.txnType === "Debit" && amountAsBigInt > 0n) {
+        branchCheck.hasDebit = true;
+      } else if (row.txnType === "Credit" && amountAsBigInt > 0n) {
+        branchCheck.hasCredit = true;
+      }
+
+      const finalAmount =
+        row.txnType === "Credit" ? "-" + row.amount : row.amount;
+
+      rowPayloads.push({
+        changeType: "ADD",
+        branch: row.branch.code,
+        currency: row.currency,
+        cgl: row.cgl.cglNumber,
+        amount: finalAmount,
+        productType: row.productCode,
+        remarks: row.remarks,
+        arFlag: "A",
+      });
+    }
+
+    for (const [branchCode, totals] of branchEntryCheck.entries()) {
+      const { hasDebit, hasCredit, branchName } = totals;
+      if (!hasDebit || !hasCredit) {
+        showSnackBar(
+          `Submission failed. Branch "${branchName}" (${branchCode}) must have at least one Debit and one Credit entry.`,
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
+      }
+    }
+
+    for (const [compositeKey, totals] of branchCurrencyTotals.entries()) {
+      const { totalDebit, totalCredit, branchName, branchCode, currency } =
+        totals;
+
+      if (totalDebit !== totalCredit) {
+        showSnackBar(
+          `Submission failed. Totals for branch "${branchName}" (${branchCode}) and currency "${currency}" do not match. Debit: ${formatBigIntForDisplay(
+            totalDebit
+          )}, Credit: ${formatBigIntForDisplay(totalCredit)}`,
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
+      }
+    }
+
+    const finalPayload = {
+      commonBatchRemarks: commonBatchRemarks.trim(),
+      rows: rowPayloads,
+    };
+
+    try {
+      const response = await callApi(
+        "JS/journals/create-batch",
+        finalPayload,
+        "POST"
+      );
+
+      const newBatchId = response?.[0]?.batchId || "N/A";
+
+      showSnackBar(
+        `All ${response.length} Journal entries submitted successfully! Batch ID: ${newBatchId}`,
+        "success"
+      );
+      setRows([{ ...initialRowState, id: Date.now() }]);
+      setCommonBatchRemarks("");
+      setChecked(false);
+    } catch (error) {
+      showSnackBar("Journal Batch submission failed", "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <Box sx={{ p: 3, maxWidth: "98%" }}>
+      <Paper elevation={3} sx={{ p: 3 }}>
+        <Box>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+            <Typography variant="body1" fontWeight="bold" component="span">
+              Posting Date:
+            </Typography>
+            <Typography variant="body1" fontWeight="bold" component="span">
+              {postingDate}
+            </Typography>
+          </Box>
+          <Box sx={{ marginTop: 0.5 }}>
+            <Typography
+              variant="body2"
+              component="span"
+              sx={{ color: "#ec0101ff" }}
+            >
+              Note: All Journals will be Posted on this Date
+            </Typography>
+          </Box>
+        </Box>
+
+        <Grid item xs={12} md={12} sx={{ margin: "1% 0%", width: "92%" }}>
+          <TextField
+            label="Common Batch Remarks"
+            value={commonBatchRemarks}
+            onChange={(e) => {
+              const newValue = e.target.value;
+              if (newValue.length <= 50) {
+                setCommonBatchRemarks(newValue);
+
+                if (checked && newValue.trim()) {
+                  setRows(
+                    rows.map((row) => ({
+                      ...row,
+                      remarks: newValue,
+                    }))
+                  );
+                }
+
+                if (!newValue.trim()) {
+                  setChecked(false);
+                  setRows(
+                    rows.map((row) => ({
+                      ...row,
+                      remarks: "",
+                    }))
+                  );
+                }
+              }
+            }}
+            fullWidth
+            required
+            multiline
+            rows={1}
+            InputProps={{
+              inputProps: {
+                maxLength: 50,
+              },
+            }}
+          />
+          <Box sx={{ display: "flex", alignItems: "center" }}>
+            <FormControlLabel
+              control={
+                <Checkbox
+                  checked={checked}
+                  onChange={handleChange}
+                  color="primary"
+                  disabled={!commonBatchRemarks.trim()}
+                />
+              }
+              label="Apply This Remark To All Below Transaction"
+            />
+          </Box>
+        </Grid>
+
+        <Box>
+          {rows.map((row, index) => (
+            <React.Fragment key={row.id}>
+              <Grid container spacing={2} alignItems="center">
+                {/* Branch */}
+                <Grid item xs={12} md={3}>
+                  <Autocomplete
+                    popupIcon={null}
+                    autoHighlight
+                    options={branchSearch.options}
+                    getOptionLabel={(option) =>
+                      `${option.code} - ${option.name}`
+                    }
+                    value={row.branch}
+                    onChange={(event, newValue) =>
+                      handleRowChange(row.id, "branch", newValue)
+                    }
+                    onInputChange={(event, newInputValue) =>
+                      searchBranches(newInputValue)
+                    }
+                    loading={branchSearch.loading}
+                    filterOptions={(x) => x}
+                    isOptionEqualToValue={(option, value) =>
+                      option.code === value.code
+                    }
+                    noOptionsText=""
+                    renderInput={(params) => (
+                      <Tooltip
+                        title="Search by Branch name or Branch code"
+                        placement="top-start"
+                      >
+                        <TextField
+                          {...params}
+                          label="Branch *"
+                          placeholder="Search by name or code"
+                          InputLabelProps={{ shrink: true }}
+                          InputProps={{
+                            ...params.InputProps,
+                            endAdornment: (
+                              <Box>
+                                {branchSearch.loading ? (
+                                  <CircularProgress color="inherit" size={20} />
+                                ) : null}
+                                {params.InputProps.endAdornment}
+                              </Box>
+                            ),
+                          }}
+                        />
+                      </Tooltip>
+                    )}
+                  />
+                </Grid>
+
+                {/* Currency */}
+                <Grid item xs={12} md={1.5}>
+                  <TextField
+                    popupIcon={null}
+                    select
+                    label="Currency *"
+                    value={row.currency}
+                    onChange={(e) =>
+                      handleRowChange(row.id, "currency", e.target.value)
+                    }
+                    fullWidth
+                  >
+                    <MenuItem value="" disabled>
+                      <em>Select Currency</em>
+                    </MenuItem>
+                    {currencyOptions.map((c) => (
+                      <MenuItem key={c} value={c}>
+                        {c}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                </Grid>
+
+                {/* CGL */}
+                <Grid item xs={12} md={2}>
+                  <Autocomplete
+                    popupIcon={null}
+                    autoHighlight
+                    options={cglSearch.options}
+                    getOptionLabel={(option) =>
+                      `${option.cglNumber} - ${option.description}`
+                    }
+                    value={row.cgl}
+                    onChange={(event, newValue) =>
+                      handleRowChange(row.id, "cgl", newValue)
+                    }
+                    onInputChange={(event, newInputValue) =>
+                      searchCgls(newInputValue)
+                    }
+                    loading={cglSearch.loading}
+                    filterOptions={(x) => x}
+                    isOptionEqualToValue={(option, value) =>
+                      option.cglNumber === value.cglNumber
+                    }
+                    noOptionsText=""
+                    renderInput={(params) => (
+                      <TextField
+                        {...params}
+                        label="CGL *"
+                        placeholder="Search CGL by number or name"
+                        InputLabelProps={{ shrink: true }}
+                        InputProps={{
+                          ...params.InputProps,
+                          endAdornment: (
+                            <Box sx={{ marginLeft: "2%" }}>
+                              {cglSearch.loading ? (
+                                <CircularProgress color="inherit" size={20} />
+                              ) : null}
+                              {params.InputProps.endAdornment}
+                            </Box>
+                          ),
+                        }}
+                      />
+                    )}
+                  />
+                </Grid>
+
+                {/* Amount */}
+                <Grid item xs={12} md={1.5}>
+                  <TextField
+                    label="Amount *"
+                    type="text"
+                    value={row.amount}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      if (/^\d{0,21}(\.\d{0,4})?$/.test(val)) {
+                        handleRowChange(row.id, "amount", val);
+                      }
+                    }}
+                    fullWidth
+                    placeholder="0.0000"
+                  />
+                </Grid>
+
+                {/* Txn Type */}
+                <Grid item xs={12} md={1}>
+                  <TextField
+                    select
+                    label="Txn Type *"
+                    value={row.txnType}
+                    onChange={(e) =>
+                      handleRowChange(row.id, "txnType", e.target.value)
+                    }
+                    fullWidth
+                  >
+                    <MenuItem value="" disabled>
+                      <em>Select Type</em>
+                    </MenuItem>
+                    <MenuItem value="Debit">Debit</MenuItem>
+                    <MenuItem value="Credit">Credit</MenuItem>
+                  </TextField>
+                </Grid>
+
+                {/* Product Code */}
+                <Grid item xs={12} md={1.5}>
+                  <TextField
+                    label="Product Code"
+                    value={row.productCode}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      if (/^\d{0,8}$/.test(val)) {
+                        handleRowChange(row.id, "productCode", val);
+                      }
+                    }}
+                    fullWidth
+                    InputProps={{
+                      inputProps: {
+                        maxLength: 8,
+                      },
+                    }}
+                  />
+                </Grid>
+
+                {/* Remarks (Individual) */}
+                <Grid item xs={12} md={1.5}>
+                  <TextField
+                    label="Remarks"
+                    value={row.remarks}
+                    onChange={(e) => {
+                      const val = e.target.value;
+
+                      if (val.length <= 50) {
+                        handleRowChange(row.id, "remarks", val);
+                      }
+                    }}
+                    fullWidth
+                    InputProps={{
+                      inputProps: {
+                        maxLength: 50,
+                      },
+                      readOnly: checked,
+                    }}
+                  />
+                </Grid>
+
+                {/* Actions */}
+                <Grid item xs={12} md={0.5} sx={{ textAlign: "center" }}>
+                  <IconButton
+                    onClick={() => handleDeleteRow(row.id)}
+                    aria-label="delete row"
+                  >
+                    <DeleteIcon />
+                  </IconButton>
+                </Grid>
+              </Grid>
+
+              {index < rows.length - 1 && (
+                <Box
+                  sx={{
+                    borderBottom: 1,
+                    borderColor: "divider",
+                    my: 2,
+                  }}
+                />
+              )}
+            </React.Fragment>
+          ))}
+
+          <Box
+            sx={{ mt: 3, display: "flex", gap: 2, justifyContent: "right" }}
+          >
+            <Button
+              variant="contained"
+              startIcon={<AddIcon />}
+              onClick={handleAddRow}
+            >
+              Add Row
+            </Button>
+
+            <Button
+              variant="contained"
+              color="success"
+              onClick={handleSubmit}
+              disabled={isSubmitting}
+            >
+              {isSubmitting ? <CircularProgress size={24} /> : "Submit"}
+            </Button>
+          </Box>
+        </Box>
+      </Paper>
+    </Box>
+  );
+}
+
+
+import React, { useState, useEffect, useCallback } from "react";
+import {
+  Box,
+  Typography,
+  Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  Button,
+  CircularProgress,
+  Tooltip,
+  IconButton,
+  Stack,
+  Grid,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Paper,
+  Checkbox,
+} from "@mui/material";
+import { DataGrid } from "@mui/x-data-grid";
+import {
+  DeleteSweep as DeleteSweepIcon,
+  Visibility as VisibilityIcon,
+  Close as CloseIcon,
+} from "@mui/icons-material";
+import AccountCircleIcon from "@mui/icons-material/AccountCircle";
+import InfoIcon from "@mui/icons-material/Info";
+import DeleteIcon from "@mui/icons-material/Delete";
+
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
+
+// Assuming you save the styles file as JournalStyle.js
+import {
+  cellBorderStyle,
+  tableHeaderCellStyle,
+  stickyColumnCell,
+  stickyBoxStyle,
+  dialogTitleStyle,
+  loadingContainerStyle,
+  dialogActionsStyle,
+  dataGridContainerStyle,
+  mainContainerStyle,
+  tableContainerStyle,
+} from "./JournalStyle";
+
+const formatCurrency = (num) => {
+  return Number(num).toFixed(4);
+};
+
+const getTxnTypeColor = (txnType) => {
+  return txnType === "Credit" ? "error" : "success";
+};
+
+const getStatusChipColor = (status) => {
+  switch (status) {
+    case "ACCEPTED":
+      return "success";
+    case "REJECTED":
+      return "error";
+    case "PENDING":
+    default:
+      return "warning";
+  }
+};
+
+function CustomNoRowsOverlay() {
+  return (
+    <Stack height="100%" alignItems="center" justifyContent="center">
+      <InfoIcon sx={{ fontSize: 48, color: "text.secondary", mb: 2 }} />
+      <Typography variant="h6">No Journal Requests Found</Typography>
+      <Typography>You have not created any Journal requests.</Typography>
+    </Stack>
+  );
+}
+
+export default function JournalPostingStatus() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([]);
+
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [selectedBatch, setSelectedBatch] = useState(null);
+
+  const [isViewModalOpen, setIsViewModalOpen] = useState(false);
+  const [isViewLoading, setIsViewLoading] = useState(false);
+
+  const [batchDetails, setBatchDetails] = useState([]);
+  const [viewingBatchId, setViewingBatchId] = useState(null);
+  const [viewingBatchStatus, setViewingBatchStatus] = useState(null);
+
+  const [selectedJournalPrefixes, setSelectedJournalPrefixes] = useState([]);
+  const [isPartialSubmitting, setIsPartialSubmitting] = useState(false);
+
+  const fetchMyBatches = useCallback(async () => {
+    setLoading(true);
+    try {
+      const myRequests = await callApi("/JS/journals/my-requests", null, "GET");
+
+      if (!Array.isArray(myRequests) || myRequests.length === 0) {
+        setRows([]);
+        setLoading(false);
+        return;
+      }
+
+      const groupedBatches = new Map();
+      for (const request of myRequests) {
+        const batchId = request.batchId;
+
+        if (!groupedBatches.has(batchId)) {
+          groupedBatches.set(batchId, {
+            id: batchId,
+            batchId: batchId,
+            creatorId: request.creatorId,
+            requestStatus: request.requestStatus,
+            requestDate: request.requestDate,
+            commonBatchRemarks: request.commonBatchRemarks,
+            executorId: request.executorId,
+            executionDate: request.executionDate,
+            executorRemarks: request.executorRemarks,
+            totalDebit: 0,
+            totalCredit: 0,
+            requestCount: 0,
+          });
+        }
+
+        const batchDetails = groupedBatches.get(batchId);
+        batchDetails.requestCount++;
+
+        try {
+          const payload = JSON.parse(request.payload);
+          const amount = parseFloat(payload.amount) || 0;
+          if (amount < 0) {
+            batchDetails.totalCredit += Math.abs(amount);
+          } else {
+            batchDetails.totalDebit += amount;
+          }
+        } catch (e) {
+          console.error(`Failed to parse payload for request ${request.id}`, e);
+        }
+      }
+      setRows(Array.from(groupedBatches.values()));
+    } catch (err) {
+      console.error("Failed to fetch user's requests:", err);
+      const errorMsg =
+        err.response?.data?.message || "Failed to load your requests.";
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setLoading(false);
+    }
+  }, [callApi, showSnackBar]);
+
+  useEffect(() => {
+    fetchMyBatches();
+  }, [fetchMyBatches]);
+
+  const handleOpenModal = (batch) => {
+    setSelectedBatch(batch);
+    setIsModalOpen(true);
+  };
+
+  const handleCloseModal = () => {
+    if (isSubmitting) return;
+    setIsModalOpen(false);
+    setSelectedBatch(null);
+  };
+
+  const handleOpenViewModal = async (batchId, status) => {
+    setIsViewModalOpen(true);
+    setIsViewLoading(true);
+    setBatchDetails([]);
+    setViewingBatchId(batchId);
+    setViewingBatchStatus(status);
+
+    try {
+      const data = await callApi(
+        `/JS/journals/by-batch/${batchId}`,
+        null,
+        "GET"
+      );
+
+      setTimeout(() => {
+        if (Array.isArray(data)) {
+          const journalGroups = new Map();
+
+          const processedData = data
+            .map((req) => {
+              try {
+                const payload = JSON.parse(req.payload);
+                const prefix = req.journalId.split("-")[0];
+                const amount = parseFloat(payload.amount) || 0;
+                return {
+                  ...req,
+                  payload,
+                  journalPrefix: prefix,
+                  amount: Math.abs(amount),
+                  transactionType: amount < 0 ? "Credit" : "Debit",
+                };
+              } catch (e) {
+                console.error("Failed to parse payload for req:", req.id, e);
+                return null;
+              }
+            })
+            .filter(Boolean);
+
+          processedData.sort((a, b) => a.journalId.localeCompare(b.journalId));
+
+          for (const row of processedData) {
+            const prefix = row.journalPrefix;
+            if (!journalGroups.has(prefix)) {
+              journalGroups.set(prefix, []);
+            }
+            journalGroups.get(prefix).push(row);
+          }
+
+          setBatchDetails(Array.from(journalGroups.values()));
+        } else {
+          setBatchDetails([]);
+          showSnackBar("No details found for this batch.", "info");
+        }
+        setIsViewLoading(false);
+      }, 100);
+    } catch (error) {
+      console.error("Failed to fetch batch details:", error);
+      const errorMsg =
+        error.response?.data?.message || "Failed to load batch details.";
+      showSnackBar(errorMsg, "error");
+      setBatchDetails([]);
+      setIsViewLoading(false);
+    }
+  };
+
+  const handleCloseViewModal = () => {
+    setIsViewModalOpen(false);
+    setBatchDetails([]);
+    setViewingBatchId(null);
+    setSelectedJournalPrefixes([]);
+    setIsPartialSubmitting(false);
+    setViewingBatchStatus(null);
+  };
+
+  const handleSubmitBatchCancel = async () => {
+    setIsSubmitting(true);
+    try {
+      await callApi(
+        `/JS/journals/my-requests/by-batch/${selectedBatch.batchId}`,
+        null,
+        "DELETE"
+      );
+      showSnackBar(
+        `Batch ${selectedBatch.batchId} successfully canceled.`,
+        "success"
+      );
+      handleCloseModal();
+      fetchMyBatches();
+    } catch (error) {
+      console.error("Failed to cancel batch:", error);
+      const errorMsg =
+        error.response?.data?.message || "Failed to cancel batch.";
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleCancelSelectedJournals = async () => {
+    if (selectedJournalPrefixes.length === 0) {
+      showSnackBar(
+        "Please select at least one journal group to cancel.",
+        "warning"
+      );
+      return;
+    }
+
+    setIsPartialSubmitting(true);
+
+    try {
+      await callApi(
+        "/JS/journals/my-requests/by-journal-list",
+        selectedJournalPrefixes,
+        "DELETE"
+      );
+      showSnackBar(
+        "Selected journal entries successfully canceled.",
+        "success"
+      );
+      handleCloseViewModal();
+      fetchMyBatches();
+    } catch (error) {
+      console.error("Failed to process partial batch:", error);
+      const errorMsg =
+        error.response?.data?.message || "Failed to cancel selected entries.";
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setIsPartialSubmitting(false);
+    }
+  };
+
+  const handleSelectAllClick = (event) => {
+    if (event.target.checked) {
+      const newSelecteds = batchDetails.map((group) => group[0].journalPrefix);
+      setSelectedJournalPrefixes(newSelecteds);
+      return;
+    }
+    setSelectedJournalPrefixes([]);
+  };
+
+  const handleRowCheckboxClick = (event, prefix) => {
+    if (event) {
+      event.stopPropagation();
+    }
+
+    const selectedIndex = selectedJournalPrefixes.indexOf(prefix);
+    let newSelected = [];
+
+    if (selectedIndex === -1) {
+      newSelected = newSelected.concat(selectedJournalPrefixes, prefix);
+    } else if (selectedIndex === 0) {
+      newSelected = newSelected.concat(selectedJournalPrefixes.slice(1));
+    } else if (selectedIndex === selectedJournalPrefixes.length - 1) {
+      newSelected = newSelected.concat(selectedJournalPrefixes.slice(0, -1));
+    } else if (selectedIndex > 0) {
+      newSelected = newSelected.concat(
+        selectedJournalPrefixes.slice(0, selectedIndex),
+        selectedJournalPrefixes.slice(selectedIndex + 1)
+      );
+    }
+    setSelectedJournalPrefixes(newSelected);
+  };
+
+  const columns = [
+    {
+      field: "batchId",
+      headerName: "Batch ID",
+      width: 125,
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "requestStatus",
+      headerName: "Status",
+      width: 125,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Chip
+          label={params.value}
+          color={getStatusChipColor(params.value)}
+          size="small"
+        />
+      ),
+    },
+    {
+      field: "creatorId",
+      headerName: "Creator",
+      width: 150,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Chip icon={<AccountCircleIcon />} label={params.value} size="small" />
+      ),
+    },
+    {
+      field: "requestDate",
+      headerName: "Submitted On",
+      width: 200,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Box>
+          {new Date(params.value).toLocaleString("en-IN", {
+            dateStyle: "medium",
+            timeStyle: "short",
+          })}
+        </Box>
+      ),
+    },
+    {
+      field: "commonBatchRemarks",
+      headerName: "Creator Remarks",
+      width: 200,
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "requestCount",
+      headerName: "Entries",
+      width: 100,
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "totalCredit",
+      headerName: "Total Credit",
+      width: 250,
+      align: "right",
+      headerAlign: "center",
+
+      renderCell: (params) => (
+        <Typography marginTop={"5%"}>{formatCurrency(params.value)}</Typography>
+      ),
+    },
+    {
+      field: "totalDebit",
+      headerName: "Total Debit",
+      width: 250,
+      align: "right",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Typography marginTop={"5%"}>{formatCurrency(params.value)}</Typography>
+      ),
+    },
+    {
+      field: "actions",
+      headerName: "Actions",
+      flex: 0.8,
+      minWidth: 130,
+      align: "center",
+      headerAlign: "center",
+      sortable: false,
+      renderCell: (params) => {
+        const isPending = params.row.requestStatus === "PENDING";
+        return (
+          <Stack direction="row" spacing={0.5} marginTop={"5%"}>
+            <Tooltip title="View Details">
+              <IconButton
+                onClick={() =>
+                  handleOpenViewModal(
+                    params.row.batchId,
+                    params.row.requestStatus
+                  )
+                }
+                color="primary"
+              >
+                <VisibilityIcon />
+              </IconButton>
+            </Tooltip>
+            <Tooltip
+              title={
+                isPending ? "Cancel Entire Batch" : "Batch already processed"
+              }
+            >
+              <span>
+                <IconButton
+                  onClick={() => handleOpenModal(params.row)}
+                  disabled={!isPending}
+                >
+                  <DeleteIcon />
+                </IconButton>
+              </span>
+            </Tooltip>
+          </Stack>
+        );
+      },
+    },
+  ];
+
+  return (
+    <Box sx={mainContainerStyle}>
+      <DataGrid
+        rows={rows}
+        columns={columns}
+        loading={loading}
+        getRowId={(row) => row.batchId}
+        disableRowSelectionOnClick
+        pageSizeOptions={[5, 10, 25]}
+        disableColumnResize={true}
+        rowHeight={52}
+        initialState={{
+          pagination: {
+            paginationModel: { page: 0, pageSize: 10 },
+          },
+          sorting: { sortModel: [{ field: "requestDate", sort: "desc" }] },
+        }}
+        slots={{
+          noRowsOverlay: CustomNoRowsOverlay,
+        }}
+        sx={dataGridContainerStyle}
+      />
+
+      <Dialog
+        open={isModalOpen}
+        onClose={handleCloseModal}
+        fullWidth
+        maxWidth="sm"
+      >
+        <DialogTitle sx={{ display: "flex", alignItems: "center" }}>
+          <DeleteSweepIcon sx={{ mr: 1, color: "error.main" }} />
+          Confirm Batch Cancellation
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            Are you sure you want to cancel all your pending requests in batch{" "}
+            <strong>{selectedBatch?.batchId}</strong>?
+            <br />
+            <br />
+            This will permanently delete {selectedBatch?.requestCount}{" "}
+            entry/entries created by you and cannot be undone.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions sx={dialogActionsStyle}>
+          <Stack direction="row" spacing={1} justifyContent="flex-end">
+            <Button onClick={handleCloseModal} disabled={isSubmitting}>
+              Back
+            </Button>
+            <Button
+              onClick={handleSubmitBatchCancel}
+              variant="contained"
+              color="error"
+              disabled={isSubmitting}
+            >
+              {isSubmitting ? (
+                <CircularProgress size={24} color="inherit" />
+              ) : (
+                "Confirm Cancel"
+              )}
+            </Button>
+          </Stack>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog
+        open={isViewModalOpen}
+        onClose={handleCloseViewModal}
+        fullWidth
+        maxWidth="lg"
+      >
+        <DialogTitle sx={dialogTitleStyle}>
+          Batch Details: {viewingBatchId}
+          <IconButton
+            aria-label="close"
+            onClick={handleCloseViewModal}
+            sx={{
+              color: (theme) => theme.palette.grey[500],
+            }}
+          >
+            <CloseIcon />
+          </IconButton>
+        </DialogTitle>
+
+        <DialogContent dividers sx={{ p: 0 }}>
+          {isViewLoading ? (
+            <Box sx={loadingContainerStyle}>
+              <CircularProgress />
+            </Box>
+          ) : (
+            <>
+              {batchDetails.length > 0 ? (
+                <TableContainer component={Paper} sx={tableContainerStyle}>
+                  <Table sx={{ minWidth: 650 }} size="small" stickyHeader>
+                    <TableHead>
+                      <TableRow>
+                        {viewingBatchStatus === "PENDING" && (
+                          <TableCell
+                            padding="checkbox"
+                            sx={tableHeaderCellStyle}
+                          >
+                            <Checkbox
+                              color="primary"
+                              indeterminate={
+                                selectedJournalPrefixes.length > 0 &&
+                                selectedJournalPrefixes.length <
+                                  batchDetails.length
+                              }
+                              checked={
+                                batchDetails.length > 0 &&
+                                selectedJournalPrefixes.length ===
+                                  batchDetails.length
+                              }
+                              onChange={handleSelectAllClick}
+                            />
+                          </TableCell>
+                        )}
+                        <TableCell align="center" sx={tableHeaderCellStyle}>
+                          Journal ID
+                        </TableCell>
+                        <TableCell align="center" sx={tableHeaderCellStyle}>
+                          Status
+                        </TableCell>
+                        <TableCell align="center" sx={tableHeaderCellStyle}>
+                          Branch
+                        </TableCell>
+                        <TableCell align="center" sx={tableHeaderCellStyle}>
+                          Currency
+                        </TableCell>
+                        <TableCell align="center" sx={tableHeaderCellStyle}>
+                          CGL
+                        </TableCell>
+                        <TableCell align="center" sx={tableHeaderCellStyle}>
+                          Amount
+                        </TableCell>
+                        <TableCell align="center" sx={tableHeaderCellStyle}>
+                          Txn Type
+                        </TableCell>
+                      </TableRow>
+                    </TableHead>
+
+                    <TableBody>
+                      {batchDetails.map((group, groupIndex) => {
+                        const isSelected = selectedJournalPrefixes.includes(
+                          group[0].journalPrefix
+                        );
+                        const groupRowCount = group.length;
+
+                        return group.map((row, rowIndex) => (
+                          <TableRow
+                            key={row.id}
+                            hover={viewingBatchStatus === "PENDING"}
+                            onClick={() =>
+                              viewingBatchStatus === "PENDING" &&
+                              handleRowCheckboxClick(null, row.journalPrefix)
+                            }
+                            role="checkbox"
+                            aria-checked={isSelected}
+                            selected={
+                              viewingBatchStatus === "PENDING" && isSelected
+                            }
+                            sx={{
+                              cursor:
+                                viewingBatchStatus === "PENDING"
+                                  ? "pointer"
+                                  : "default",
+                              ...(rowIndex === 0 &&
+                                groupIndex > 0 && {
+                                  borderTop: (theme) =>
+                                    `2px solid ${theme.palette.divider}`,
+                                }),
+                            }}
+                          >
+                            {viewingBatchStatus === "PENDING" &&
+                              rowIndex === 0 && (
+                                <TableCell
+                                  padding="checkbox"
+                                  rowSpan={groupRowCount}
+                                  sx={stickyColumnCell}
+                                >
+                                  <Box sx={stickyBoxStyle}>
+                                    <Checkbox
+                                      color="primary"
+                                      checked={isSelected}
+                                      onClick={(e) =>
+                                        handleRowCheckboxClick(
+                                          e,
+                                          row.journalPrefix
+                                        )
+                                      }
+                                    />
+                                  </Box>
+                                </TableCell>
+                              )}
+                            {rowIndex === 0 && (
+                              <TableCell
+                                align="center"
+                                rowSpan={groupRowCount}
+                                sx={stickyColumnCell}
+                              >
+                                <Box sx={stickyBoxStyle}>
+                                  {row.journalPrefix}
+                                </Box>
+                              </TableCell>
+                            )}
+                            {rowIndex === 0 && (
+                              <TableCell
+                                align="center"
+                                rowSpan={groupRowCount}
+                                sx={stickyColumnCell}
+                              >
+                                <Box sx={stickyBoxStyle}>
+                                  <Chip
+                                    label={row.requestStatus}
+                                    color={getStatusChipColor(
+                                      row.requestStatus
+                                    )}
+                                    size="small"
+                                  />
+                                </Box>
+                              </TableCell>
+                            )}
+                            <TableCell align="center" sx={cellBorderStyle}>
+                              {row.payload.branch}
+                            </TableCell>
+                            <TableCell align="center" sx={cellBorderStyle}>
+                              {row.payload.currency}
+                            </TableCell>
+                            <TableCell align="center" sx={cellBorderStyle}>
+                              {row.payload.cgl}
+                            </TableCell>
+                            <TableCell align="center" sx={cellBorderStyle}>
+                              {formatCurrency(row.amount)}
+                            </TableCell>
+                            <TableCell align="center" sx={cellBorderStyle}>
+                              <Chip
+                                label={row.transactionType}
+                                color={getTxnTypeColor(row.transactionType)}
+                                size="small"
+                              />
+                            </TableCell>
+                          </TableRow>
+                        ));
+                      })}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              ) : (
+                <Typography sx={{ p: 3 }}>
+                  No details found for this batch.
+                </Typography>
+              )}
+            </>
+          )}
+        </DialogContent>
+
+        <DialogActions sx={dialogActionsStyle}>
+          <Grid
+            container
+            spacing={2}
+            alignItems="center"
+            justifyContent="flex-end"
+          >
+            <Grid item xs={12} md={6}></Grid>
+            <Grid item xs={12} md={6}>
+              <Stack direction="row" spacing={1} justifyContent="flex-end">
+                {viewingBatchStatus === "PENDING" && (
+                  <Button
+                    variant="contained"
+                    color="error"
+                    onClick={handleCancelSelectedJournals}
+                    disabled={
+                      isPartialSubmitting ||
+                      selectedJournalPrefixes.length === 0
+                    }
+                  >
+                    {isPartialSubmitting ? (
+                      <CircularProgress size={24} color="inherit" />
+                    ) : (
+                      "Cancel Selected"
+                    )}
+                  </Button>
+                )}
+              </Stack>
+            </Grid>
+          </Grid>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
+}
+
+
+export const cellBorderStyle = {
+  border: (theme) => `1px solid ${theme.palette.divider}`,
+};
+
+export const tableHeaderCellStyle = {
+  ...cellBorderStyle,
+  bgcolor: "#bcabebff",
+  fontWeight: "bold",
+  textAlign: "center",
+};
+
+export const stickyColumnCell = {
+  verticalAlign: "top",
+  ...cellBorderStyle,
+};
+
+export const stickyBoxStyle = {
+  position: "sticky",
+  top: "56px",
+  zIndex: 1,
+  backgroundColor: "transparent",
+  display: "flex",
+  justifyContent: "center",
+  alignItems: "center",
+  paddingTop: "8px",
+  paddingBottom: "8px",
+  width: "100%",
+};
+
+export const dialogTitleStyle = {
+  fontWeight: "bold",
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  pb: 2,
+};
+
+export const loadingContainerStyle = {
+  display: "flex",
+  justifyContent: "center",
+  alignItems: "center",
+  minHeight: "500px",
+};
+
+export const dialogActionsStyle = {
+  p: 2,
+  display: "block",
+};
+
+export const dataGridContainerStyle = {
+  height: 600,
+  width: "100%",
+  "& .MuiDataGrid-cell:focus": { outline: "none" },
+};
+
+export const mainContainerStyle = {
+  p: 3,
+  width: "100%",
+};
+
+export const tableContainerStyle = {
+  borderRadius: 0,
+  maxHeight: "60vh",
+};
+
+
+✓ 13972 modules transformed.
+✗ Build failed in 24.43s
+error during build:
+src/features/journal/JournalAuthrization.jsx (43:2): "tableHeaderCellStyle" is not exported by "src/features/journal/JournalBulkStyle.js", imported by "src/features/journal/JournalAuthrization.jsx".
+file: D:/Adesh/Projects/Frontend/src/features/journal/JournalAuthrization.jsx:43:2
+
+41: import {
+42:   cellBorderStyle,
+43:   tableHeaderCellStyle,
+      ^
+44:   stickyColumnCell,
+45:   stickyBoxStyle,
+
+    at getRollupError (file:///D:/Adesh/Projects/Frontend/node_modules/rollup/dist/es/shared/parseAst.js:401:41)
+    at error (file:///D:/Adesh/Projects/Frontend/node_modules/rollup/dist/es/shared/parseAst.js:397:42)
+    at Module.error (file:///D:/Adesh/Projects/Frontend/node_modules/rollup/dist/es/shared/node-entry.js:16939:16)
+    at Module.traceVariable (file:///D:/Adesh/Projects/Frontend/node_modules/rollup/dist/es/shared/node-entry.js:17391:29)
+    at ModuleScope.findVariable (file:///D:/Adesh/Projects/Frontend/node_modules/rollup/dist/es/shared/node-entry.js:15061:39)
+    at FunctionScope.findVariable (file:///D:/Adesh/Projects/Frontend/node_modules/rollup/dist/es/shared/node-entry.js:5642:38)
+    at FunctionBodyScope.findVariable (file:///D:/Adesh/Projects/Frontend/node_modules/rollup/dist/es/shared/node-entry.js:5642:38)
+    at Identifier.bind (file:///D:/Adesh/Projects/Frontend/node_modules/rollup/dist/es/shared/node-entry.js:5413:40)
+    at Property.bind (file:///D:/Adesh/Projects/Frontend/node_modules/rollup/dist/es/shared/node-entry.js:2804:23)
+    at ObjectExpression.bind (file:///D:/Adesh/Projects/Frontend/node_modules/rollup/dist/es/shared/node-entry.js:2800:28)
+
+please cheak carefully this is issue come contuineily what is the problem cheak again all files and give mi all corrected updated file i should not get error while build this project
