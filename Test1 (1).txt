@@ -1,124 +1,217 @@
-LOG_ID	NUMBER(19,0)	No		1	
-ACTION_TIME	TIMESTAMP(6)	Yes		2	
-ACTION_TYPE	VARCHAR2(255 CHAR)	Yes		3	
-CHANGE_TYPE	VARCHAR2(255 CHAR)	Yes		4	
-IP_ADDRESS	VARCHAR2(255 CHAR)	Yes		5	
-NEW_VALUE	VARCHAR2(255 CHAR)	Yes		6	
-OLD_VALUE	VARCHAR2(255 CHAR)	Yes		7	
-REQUEST_ID	NUMBER(19,0)	Yes		8	
-USER_ID	VARCHAR2(255 CHAR)	Yes		9	
+Here are the updated files to implement the Audit Logging (AOP) for your Journal Service using the new table schema.
+1. JournalLog.java (New Entity)
+This maps to your provided table structure.
+package com.fincore.JournalService.Models;
 
+import jakarta.persistence.*;
+import lombok.Data;
+import java.time.LocalDateTime;
 
-	this is new table in which this is for aop implementation i want to watch whenever the entry come and go i want to take care for that so that this new table is created i want to make entry in this table for creation deletion and all
+@Entity
+@Table(name = "JOURNAL_ACTIVITY_LOGS") // Assumed table name based on context
+@Data
+public class JournalLog {
 
-for everthing i need to watch here i will give u the code for that refernace purpose make it accordingly and give mi all files updated and also all updated code 
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY) // Or SEQUENCE if using Oracle specific sequence
+    @Column(name = "LOG_ID")
+    private Long logId;
 
+    @Column(name = "ACTION_TIME")
+    private LocalDateTime actionTime;
 
-there is aspect folder there in which UserActivityLogger file 
-package com.tcs.userservice.aspect;
+    @Column(name = "ACTION_TYPE", length = 255)
+    private String actionType; // e.g., CREATE, APPROVE, REJECT
+
+    @Column(name = "CHANGE_TYPE", length = 255)
+    private String changeType; // e.g., BATCH_UPLOAD, STATUS_CHANGE
+
+    @Column(name = "IP_ADDRESS", length = 255)
+    private String ipAddress;
+
+    @Column(name = "NEW_VALUE", length = 4000) // Adjusted length for safety
+    private String newValue;
+
+    @Column(name = "OLD_VALUE", length = 4000)
+    private String oldValue;
+
+    @Column(name = "REQUEST_ID")
+    private Long requestId; // Links to specific Journal Request ID (PK)
+
+    @Column(name = "USER_ID", length = 255)
+    private String userId;
+}
+
+2. JournalLogRepository.java (New Repository)
+package com.fincore.JournalService.Repository;
+
+import com.fincore.JournalService.Models.JournalLog;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface JournalLogRepository extends JpaRepository<JournalLog, Long> {
+}
+
+3. JournalActivityLogger.java (The Aspect)
+I have adapted your reference code to work with the JournalService methods. It automatically captures the IP address, User ID, and Request details for Creation, Bulk Uploads, Updates, and Cancellations.
+package com.fincore.JournalService.aspect;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.tcs.userservice.model.UserLogs;
-import com.tcs.userservice.repository.UserLogsRepository;
+import com.fincore.JournalService.Dto.BatchRequestDto;
+import com.fincore.JournalService.Dto.BulkProcessJournalRequestDto;
+import com.fincore.JournalService.Dto.ProcessJournalRequestDto;
+import com.fincore.JournalService.Models.JournalLog;
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Repository.JournalLogRepository;
+import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.aspectj.lang.JoinPoint;
 import org.aspectj.lang.annotation.AfterReturning;
 import org.aspectj.lang.annotation.Aspect;
 import org.springframework.stereotype.Component;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 
-import java.sql.Timestamp;
-import java.time.Instant;
-import java.util.Map;
-import org.springframework.http.ResponseEntity;
-import com.tcs.userservice.ResponseVO;
-
+import java.time.LocalDateTime;
+import java.util.List;
 
 @Aspect
 @Component
 @Slf4j
 @RequiredArgsConstructor
-public class UserActivityLogger {
+public class JournalActivityLogger {
 
-    private final UserLogsRepository userLogsRepository;
+    private final JournalLogRepository journalLogRepository;
     private final ObjectMapper objectMapper;
 
-    // 1. Log User Creation/Modification Requests
+    // --- 1. Log Batch Creation (Standard) ---
     @AfterReturning(
-            pointcut = "execution(* com.tcs.userservice.service.UserRequestService.createNewRequest(..)) && args(request, userId)",
+            pointcut = "execution(* com.fincore.JournalService.Service.JournalRequestService.createBatchRequest(..)) && args(batchDto, creatorId, creatorRole)",
             returning = "result"
     )
-    public void logUserRequest(JoinPoint joinPoint, Map<String, Object> request, String userId, Object result) {
-        if (isSuccess(result)) {
-            saveLog(userId, "USER_REQUEST", "CREATE/MODIFY Request Raised", request.toString());
-        } else {
-            log.debug("Skipping audit log for failed/conflicted user request.");
+    public void logCreateBatch(JoinPoint joinPoint, BatchRequestDto batchDto, String creatorId, Integer creatorRole, Object result) {
+        String summary = "Created Batch with " + (batchDto.getRows() != null ? batchDto.getRows().size() : 0) + " rows.";
+        saveLog(creatorId, "CREATE", "BATCH_CREATION", summary, null, null);
+    }
+
+    // --- 2. Log Bulk Batch Creation (Optimized Upload) ---
+    @AfterReturning(
+            pointcut = "execution(* com.fincore.JournalService.Service.JournalRequestService.createBulkBatchRequest(..)) && args(batchDto, creatorId, creatorRole)",
+            returning = "batchId"
+    )
+    public void logBulkCreate(JoinPoint joinPoint, BatchRequestDto batchDto, String creatorId, Integer creatorRole, Object batchId) {
+        String summary = "Bulk Upload Created. Batch ID: " + batchId + ". Rows: " + (batchDto.getRows() != null ? batchDto.getRows().size() : 0);
+        saveLog(creatorId, "CREATE", "BULK_UPLOAD", summary, null, null);
+    }
+
+    // --- 3. Log Single Status Update (Approve/Reject) ---
+    @AfterReturning(
+            pointcut = "execution(* com.fincore.JournalService.Service.JournalRequestService.updateRequestStatus(..)) && args(dto, executorId, executorRole)",
+            returning = "result"
+    )
+    public void logStatusUpdate(JoinPoint joinPoint, ProcessJournalRequestDto dto, String executorId, Integer executorRole, Object result) {
+        if (result instanceof JournalRequest) {
+            JournalRequest req = (JournalRequest) result; // The updated entity
+            String newValue = "Status: " + dto.getStatus() + ", Remarks: " + dto.getRemarks();
+            // We can treat 'changeType' as the Status (ACCEPTED/REJECTED)
+            saveLog(executorId, dto.getStatus().toString(), "STATUS_UPDATE", newValue, null, req.getId());
         }
     }
 
-    // 2. Log User Approval/Rejection
-    @AfterReturning(pointcut = "execution(* com.tcs.userservice.service.UserRequestService.acceptOrRejectUserRequest(..)) && args(dto, ip)", returning = "result")
-    public void logUserApproval(JoinPoint joinPoint, Object dto, String ip, Object result) {
-        // We can extract Approver ID from DTO if needed, or assume ContextHolder has it
-        // For simplicity, just logging the event content
-        saveLog("SYSTEM", "USER_APPROVAL", "User Request Processed", dto.toString());
-    }
-
-    // 2. Log Role Requests
+    // --- 4. Log Bulk Status Update (Bulk Approve/Reject) ---
     @AfterReturning(
-            pointcut = "execution(* com.tcs.userservice.service.RoleRequestService.createNewRoleRequest(..)) && args(request, userId)",
+            pointcut = "execution(* com.fincore.JournalService.Service.JournalRequestService.processBulkRequests(..)) && args(dto, executorId, executorRole)",
             returning = "result"
     )
-    public void logRoleRequest(JoinPoint joinPoint, Map<String, Object> request, String userId, Object result) {
-        if (isSuccess(result)) {
-            saveLog(userId, "ROLE_REQUEST", "Role Request Raised", request.toString());
-        }
+    public void logBulkStatusUpdate(JoinPoint joinPoint, BulkProcessJournalRequestDto dto, String executorId, Integer executorRole, Object result) {
+        String target = dto.getBatchId() != null ? "Batch ID: " + dto.getBatchId() : "Journals: " + dto.getJournalIdPrefixes();
+        String newValue = "Bulk " + dto.getStatus() + " for " + target + ". Remarks: " + dto.getRemarks();
+        
+        saveLog(executorId, "BULK_" + dto.getStatus(), "BULK_PROCESS", newValue, null, null);
     }
 
-    // 4. Log Role Approval
-    @AfterReturning(pointcut = "execution(* com.tcs.userservice.service.RoleRequestService.acceptOrRejectRoleRequest(..)) && args(request, userId)", returning = "result")
-    public void logRoleApproval(JoinPoint joinPoint, Map<String, Object> request, String userId, Object result) {
-        saveLog(userId, "ROLE_APPROVAL", "Role Request Processed", request.toString());
+    // --- 5. Log Single Cancellation ---
+    @AfterReturning(
+            pointcut = "execution(* com.fincore.JournalService.Service.JournalRequestService.cancelMyRequest(..)) && args(requestId, userId)"
+    )
+    public void logCancelRequest(JoinPoint joinPoint, Long requestId, String userId) {
+        saveLog(userId, "DELETE", "CANCEL_REQUEST", "User canceled request ID: " + requestId, null, requestId);
+    }
+
+    // --- 6. Log Bulk Cancellation (By Batch) ---
+    @AfterReturning(
+            pointcut = "execution(* com.fincore.JournalService.Service.JournalRequestService.cancelMyRequestsByBatchId(..)) && args(batchId, userId)"
+    )
+    public void logCancelBatch(JoinPoint joinPoint, String batchId, String userId) {
+        saveLog(userId, "DELETE", "CANCEL_BATCH", "User canceled all requests in Batch: " + batchId, null, null);
     }
 
     // --- Helper to Save to DB ---
-    private void saveLog(String userId, String actionType, String changeType, String newValue) {
+    private void saveLog(String userId, String actionType, String changeType, String newValue, String oldValue, Long requestId) {
         try {
-            UserLogs logEntry = new UserLogs();
+            JournalLog logEntry = new JournalLog();
             logEntry.setUserId(userId);
-            logEntry.setActionType(actionType);
-            logEntry.setChangeType(changeType);
-            logEntry.setActionTime(Timestamp.from(Instant.now()));
-            // Truncate if too long to prevent DB errors
-            if (newValue != null && newValue.length() > 3900) {
-                newValue = newValue.substring(0, 3900) + "...";
+            logEntry.setActionType(actionType); // e.g., CREATE, DELETE
+            logEntry.setChangeType(changeType); // e.g., BATCH_CREATION
+            logEntry.setActionTime(LocalDateTime.now());
+            logEntry.setRequestId(requestId);
+            
+            // Capture IP Address
+            logEntry.setIpAddress(getClientIp());
+
+            // Convert Objects to JSON String if they aren't already strings
+            if (newValue != null && !newValue.getClass().equals(String.class)) {
+                newValue = objectMapper.writeValueAsString(newValue);
             }
-            logEntry.setNewValue(newValue);
-            userLogsRepository.save(logEntry);
-            log.info("✅ Auto-Logged User Activity: {} -> {}", userId, actionType);
+            
+            // Truncate to avoid DB overflow (VARCHAR 255 or 4000)
+            // Assuming your DB col might be larger based on 'newValue' content, usually Text/Clob.
+            // If strictly 255 chars as per your schema, we must truncate heavily.
+            // I will assume 255 based on your table schema, but usually payloads need more.
+            // I'll truncate to 250 for safety if it's just a summary.
+            logEntry.setNewValue(truncate(newValue, 250));
+            logEntry.setOldValue(truncate(oldValue, 250));
+
+            journalLogRepository.save(logEntry);
+            log.info("✅ Audit Log Saved: {} performed {} on {}", userId, actionType, (requestId != null ? requestId : "Batch"));
+
         } catch (Exception e) {
             log.error("Failed to save audit log: {}", e.getMessage());
         }
     }
 
-    // --- Helper Method to Determine Success ---
-    private boolean isSuccess(Object result) {
-        if (result instanceof ResponseEntity) {
-            ResponseEntity<?> response = (ResponseEntity<?>) result;
-            // Check HTTP Status (200 OK or 201 CREATED)
-            if (!response.getStatusCode().is2xxSuccessful()) {
-                return false;
+    private String getClientIp() {
+        try {
+            HttpServletRequest request = ((ServletRequestAttributes) RequestContextHolder.currentRequestAttributes()).getRequest();
+            String xForwardedFor = request.getHeader("X-Forwarded-For");
+            if (xForwardedFor != null && !xForwardedFor.isEmpty()) {
+                return xForwardedFor.split(",")[0].trim();
             }
-            // Optional: Dig deeper into your ResponseVO "status" boolean if needed
-            if (response.getBody() instanceof ResponseVO) {
-                ResponseVO<?> vo = (ResponseVO<?>) response.getBody();
-                // if ResponseVO holds a Map with a "status" key,
-                // but checking HTTP code is usually sufficient for these flow.
-                return true;
-            }
+            return request.getRemoteAddr();
+        } catch (Exception e) {
+            return "UNKNOWN";
         }
-        return false;
     }
 
+    private String truncate(String value, int length) {
+        if (value != null && value.length() > length) {
+            return value.substring(0, length - 3) + "...";
+        }
+        return value;
+    }
 }
 
+4. pom.xml (Verify Dependencies)
+Ensure you have the AOP starter dependency. If not, add this:
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-aop</artifactId>
+</dependency>
+
+Summary of what this does:
+ * Creation: When you create a Batch (Normal or Bulk), it logs the Action Type as "CREATE" and Change Type as "BATCH_CREATION" or "BULK_UPLOAD". It stores the number of rows in NEW_VALUE.
+ * Update/Approval: When you Approve/Reject, it logs "ACCEPTED" or "REJECTED", captures the remarks in NEW_VALUE, and links the specific REQUEST_ID if it's a single operation.
+ * Deletion: When you cancel, it logs "DELETE" with the Batch ID or Request ID.
+ * IP Address: Automatically grabs the IP of the user making the request.
