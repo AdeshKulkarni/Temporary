@@ -1,3 +1,143 @@
+The reason the search data is coming "very late" is likely because the backend is trying to fetch every single matching record from the database. If you search for "1" or "A", the database might be finding thousands of Branches or CGLs, and converting/sending that huge list takes time.
+The Fix: We will limit the search results to the top 20-50 matches. This makes the query instant and the data transfer tiny.
+Here are the optimized backend files and the frontend file.
+1. Backend: BranchMasterRepository.java (Update)
+Change the method signature to accept Pageable. This allows us to tell the database "Stop after 50 results".
+package com.fincore.JournalService.Repository;
+
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.JournalService.Models.BranchMaster;
+
+import java.util.List;
+
+@Repository
+public interface BranchMasterRepository extends JpaRepository<BranchMaster, String> {
+
+    // Optimized: Accepts Pageable to limit results
+    List<BranchMaster> findByNameContainingIgnoreCaseOrCodeContainingIgnoreCase(String name, String code, Pageable pageable);
+}
+
+2. Backend: CglMasterRepository.java (Update)
+Same optimization here.
+package com.fincore.JournalService.Repository;
+
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.JournalService.Models.CglMaster;
+
+import java.util.List;
+
+@Repository
+public interface CglMasterRepository extends JpaRepository<CglMaster, String> {
+
+    // Optimized: Accepts Pageable to limit results
+    List<CglMaster> findByCglNumberContainingOrDescriptionContainingIgnoreCase(String cglNumber, String description, Pageable pageable);
+}
+
+3. Backend: BranchService.java (Update)
+Apply the limit (e.g., Top 50 results) when calling the repository.
+package com.fincore.JournalService.Service;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.stereotype.Service;
+
+import com.fincore.JournalService.Dto.BranchDto;
+import com.fincore.JournalService.Models.BranchMaster;
+import com.fincore.JournalService.Repository.BranchMasterRepository;
+
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class BranchService {
+
+    private final BranchMasterRepository branchMasterRepository;
+
+    public Map<String, String> getBranchCodeAndNameMap() {
+        // This method is likely cached or used rarely, leaving as is
+        List<BranchMaster> branches = branchMasterRepository.findAll();
+        return branches.stream()
+                .collect(Collectors.toMap(BranchMaster::getCode, BranchMaster::getName));
+    }
+
+    public List<BranchDto> searchBranches(String query) {
+        log.info("Searching branches for: '{}'", query);
+
+        // OPTIMIZATION: Limit to top 50 results. 
+        // This prevents fetching thousands of rows for generic queries like "1" or "A".
+        Pageable limit = PageRequest.of(0, 50);
+
+        List<BranchMaster> results = branchMasterRepository
+                .findByNameContainingIgnoreCaseOrCodeContainingIgnoreCase(query, query, limit);
+
+        return results.stream()
+                .map(branch -> new BranchDto(branch.getCode(), branch.getName()))
+                .collect(Collectors.toList());
+    }
+}
+
+4. Backend: CglService.java (Update)
+Apply the limit here as well.
+package com.fincore.JournalService.Service;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+
+import com.fincore.JournalService.Dto.CglDto;
+import com.fincore.JournalService.Models.CglMaster;
+import com.fincore.JournalService.Repository.CglMasterRepository;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class CglService {
+
+    private final CglMasterRepository cglMasterRepository;
+
+    private CglDto convertToDto(CglMaster cgl) {
+        return new CglDto(cgl.getCglNumber(), cgl.getDescription());
+    }
+
+    public List<CglDto> searchCgls(String query) {
+        
+        if (!StringUtils.hasText(query)) {
+            return List.of(); 
+        }
+
+        log.info("Searching CGLs for: '{}'", query);
+        
+        // OPTIMIZATION: Limit to top 50 results.
+        Pageable limit = PageRequest.of(0, 50);
+
+        List<CglMaster> results = cglMasterRepository
+                .findByCglNumberContainingOrDescriptionContainingIgnoreCase(query, query, limit);
+        
+        return results.stream()
+                .map(this::convertToDto)
+                .collect(Collectors.toList());
+    }
+}
+
+5. Frontend: JournalPosting.js (Check)
+The frontend logic was already good (using debounce), but ensures you are using the version below which correctly handles the loading state per row.
 import React, { useState, useEffect, useCallback } from "react";
 import {
   Box,
@@ -54,7 +194,6 @@ export default function JournalPosting() {
   const [commonBatchRemarks, setCommonBatchRemarks] = useState("");
   const [postingDate, setPostingDate] = useState("");
 
-  // Checkbox
   const [checked, setChecked] = useState(false);
 
   const [branchSearch, setBranchSearch] = useState({
@@ -63,7 +202,6 @@ export default function JournalPosting() {
   });
   const [cglSearch, setCglSearch] = useState({ loading: false, options: [] });
 
-  // Track active row for independent loaders
   const [activeBranchRowId, setActiveBranchRowId] = useState(null);
   const [activeCglRowId, setActiveCglRowId] = useState(null);
 
@@ -168,7 +306,6 @@ export default function JournalPosting() {
     setRows(newRows);
   };
 
-  // --- SEARCH LOGIC ---
   const searchBranches = useCallback(
     debounce(async (query, rowId) => {
       if (!query) {
@@ -192,7 +329,7 @@ export default function JournalPosting() {
         showSnackBar("Branch search failed.", "error");
         setBranchSearch({ loading: false, options: [] });
       }
-    }, 300),
+    }, 300), // 300ms debounce
     [callApi, showSnackBar]
   );
 
@@ -222,7 +359,6 @@ export default function JournalPosting() {
     [callApi, showSnackBar]
   );
 
-  // --- SUBMIT LOGIC (Updated with Memo Validation) ---
   const handleSubmit = async () => {
     setIsSubmitting(true);
 
@@ -236,7 +372,6 @@ export default function JournalPosting() {
     }
 
     const cglCheck = new Map();
-    // Two buckets for balancing
     const normalTotals = new Map();
     const memoTotals = new Map();
     const rowPayloads = [];
@@ -262,11 +397,14 @@ export default function JournalPosting() {
       const currency = row.currency;
       const cglNumber = row.cgl.cglNumber;
 
-      // 1. Duplicate Check
       const key = `${branchCode}-${currency}`;
-      if (!cglCheck.has(key)) cglCheck.set(key, new Set());
       
-      if (cglCheck.get(key).has(cglNumber)) {
+      if (!cglCheck.has(key)) {
+        cglCheck.set(key, new Set());
+      }
+
+      const cglSet = cglCheck.get(key);
+      if (cglSet.has(cglNumber)) {
         showSnackBar(
           `Duplicate CGL entry: "${cglNumber}" is used more than once for branch "${branchName}" and currency "${currency}".`,
           "error"
@@ -274,14 +412,14 @@ export default function JournalPosting() {
         setIsSubmitting(false);
         return;
       }
-      cglCheck.get(key).add(cglNumber);
+      cglSet.add(cglNumber);
 
-      // 2. Parse Amount
-      const [integerPart = "0", fractionalPart = "0"] = (row.amount || "0").split(".");
+      const [integerPart = "0", fractionalPart = "0"] = (
+        row.amount || "0"
+      ).split(".");
       const fractionalPadded = fractionalPart.substring(0, 4).padEnd(4, "0");
       const amountAsBigInt = BigInt(integerPart + fractionalPadded);
 
-      // 3. Separate Memo vs Normal
       const isMemo = cglNumber.startsWith("5");
       const targetMap = isMemo ? memoTotals : normalTotals;
 
@@ -302,7 +440,8 @@ export default function JournalPosting() {
         currentTotals.totalCredit += amountAsBigInt;
       }
 
-      const finalAmount = row.txnType === "Credit" ? "-" + row.amount : row.amount;
+      const finalAmount =
+        row.txnType === "Credit" ? "-" + row.amount : row.amount;
 
       rowPayloads.push({
         changeType: "ADD",
@@ -316,12 +455,15 @@ export default function JournalPosting() {
       });
     }
 
-    // 4. Validate Normal GLs
     for (const [key, totals] of normalTotals.entries()) {
-      const { totalDebit, totalCredit, branchName, branchCode, currency } = totals;
+      const { totalDebit, totalCredit, branchName, branchCode, currency } =
+        totals;
+
       if (totalDebit !== totalCredit) {
         showSnackBar(
-          `Submission failed. Normal GLs mismatch for branch "${branchName}" (${branchCode}) - ${currency}. Debit: ${formatBigIntForDisplay(totalDebit)}, Credit: ${formatBigIntForDisplay(totalCredit)}`,
+          `Submission failed. Normal GLs mismatch for branch "${branchName}" (${branchCode}) - ${currency}. Debit: ${formatBigIntForDisplay(
+            totalDebit
+          )}, Credit: ${formatBigIntForDisplay(totalCredit)}`,
           "error"
         );
         setIsSubmitting(false);
@@ -329,12 +471,15 @@ export default function JournalPosting() {
       }
     }
 
-    // 5. Validate Memo GLs (Starts with 5)
     for (const [key, totals] of memoTotals.entries()) {
-        const { totalDebit, totalCredit, branchName, branchCode, currency } = totals;
+        const { totalDebit, totalCredit, branchName, branchCode, currency } =
+          totals;
+  
         if (totalDebit !== totalCredit) {
           showSnackBar(
-            `Submission failed. Memo GLs (starting with 5) mismatch for branch "${branchName}" (${branchCode}) - ${currency}. Debit: ${formatBigIntForDisplay(totalDebit)}, Credit: ${formatBigIntForDisplay(totalCredit)}`,
+            `Submission failed. Memo GLs mismatch for branch "${branchName}" (${branchCode}) - ${currency}. Debit: ${formatBigIntForDisplay(
+              totalDebit
+            )}, Credit: ${formatBigIntForDisplay(totalCredit)}`,
             "error"
           );
           setIsSubmitting(false);
@@ -467,7 +612,7 @@ export default function JournalPosting() {
                     onInputChange={(event, newInputValue) =>
                       searchBranches(newInputValue, row.id)
                     }
-                    // LOADING FIX:
+                    // Optimized: Only loading for this row
                     loading={branchSearch.loading && activeBranchRowId === row.id}
                     filterOptions={(x) => x}
                     isOptionEqualToValue={(option, value) =>
@@ -541,7 +686,7 @@ export default function JournalPosting() {
                     onInputChange={(event, newInputValue) =>
                       searchCgls(newInputValue, row.id)
                     }
-                    // LOADING FIX:
+                    // Optimized: Only loading for this row
                     loading={cglSearch.loading && activeCglRowId === row.id}
                     filterOptions={(x) => x}
                     isOptionEqualToValue={(option, value) =>
@@ -695,3 +840,4 @@ export default function JournalPosting() {
     </Box>
   );
 }
+
