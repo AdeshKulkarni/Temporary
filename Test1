@@ -10,7 +10,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
 import org.apache.poi.ss.usermodel.*;
-import org.apache.poi.xssf.streaming.SXSSFWorkbook; // FAST STREAMING
+import org.apache.poi.xssf.streaming.SXSSFWorkbook; 
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
@@ -42,6 +42,7 @@ public class JournalBulkValidationService {
     private static final Pattern CLEAN_AMOUNT_REGEX = Pattern.compile("[^0-9.-]");
     private static final Pattern PRODUCT_CODE_REGEX = Pattern.compile("^\\d{8}$");
 
+    // Internal Data Structure
     private static class ExcelRowData {
         int rowIndex;
         String branch = "";
@@ -51,7 +52,7 @@ public class JournalBulkValidationService {
         String txnType = "";
         String remarks = "";
         String productCode = "";
-        // Thread-safe list for parallel collection
+        // Thread-safe list to hold MULTIPLE errors
         List<String> errors = Collections.synchronizedList(new ArrayList<>());
     }
 
@@ -60,7 +61,7 @@ public class JournalBulkValidationService {
         String filename = file.getOriginalFilename();
         List<ExcelRowData> parsedRows;
 
-        // 1. Parsing (Sequential - IO Bound)
+        // 1. Parsing (Sequential)
         if (filename != null && (filename.toLowerCase().endsWith(".csv") || filename.toLowerCase().endsWith(".txt"))) {
             parsedRows = parseCsvFile(file);
         } else {
@@ -69,38 +70,43 @@ public class JournalBulkValidationService {
         
         log.info("Parsed {} rows in {} ms", parsedRows.size(), (System.currentTimeMillis() - startTime));
 
-        // 2. Validation (Parallel - CPU Bound)
+        // 2. Validation (Parallel)
         Map<String, Object> result = validateRowsParallel(parsedRows, postingDate, filename != null && filename.toLowerCase().endsWith(".csv"));
         
-        log.info("Total processing time for {} rows: {} ms", parsedRows.size(), (System.currentTimeMillis() - startTime));
+        log.info("Total processing time: {} ms", (System.currentTimeMillis() - startTime));
         return result;
     }
 
     private Map<String, Object> validateRowsParallel(List<ExcelRowData> parsedRows, LocalDate postingDate, boolean isInputCsv) throws IOException {
         
-        // A. EXTRACT UNIQUE CODES (Parallel)
+        // A. Extract Codes (Parallel Stream for speed)
         Set<String> branchesInFile = parsedRows.parallelStream().map(r -> r.branch).filter(s -> !s.isEmpty()).collect(Collectors.toSet());
         Set<String> cglsInFile = parsedRows.parallelStream().map(r -> r.cgl).filter(s -> !s.isEmpty()).collect(Collectors.toSet());
         Set<String> currenciesInFile = parsedRows.parallelStream().map(r -> r.currency).filter(s -> !s.isEmpty()).collect(Collectors.toSet());
 
-        // B. DB FETCH (Batch)
+        // B. Fetch Valid Data from DB (Single Batch Call)
         Set<String> validBranches = branchRepo.findAllById(branchesInFile).stream().map(BranchMaster::getCode).map(String::trim).collect(Collectors.toSet());
         Set<String> validCgls = cglRepo.findAllById(cglsInFile).stream().map(CglMaster::getCglNumber).map(String::trim).collect(Collectors.toSet());
         Set<String> validCurrencies = currencyRepo.findAllById(currenciesInFile).stream().map(CurrencyMaster::getCurrencyCode).map(String::trim).collect(Collectors.toSet());
 
         // Concurrent Accumulator for Balancing
-        // Key: "BRANCH_CURRENCY_TYPE"
         ConcurrentHashMap<String, LongAdder> balanceMap = new ConcurrentHashMap<>();
 
         // C. VALIDATION LOOP (Parallel)
         parsedRows.parallelStream().forEach(data -> {
             
-            // 1. Master Data Checks
-            if (!validBranches.contains(data.branch)) data.errors.add("Invalid Branch Code");
-            if (!validCurrencies.contains(data.currency)) data.errors.add("Invalid Currency");
-            if (!validCgls.contains(data.cgl)) data.errors.add("Invalid CGL");
+            // --- 1. MASTER CHECKS (All Independent IFs) ---
+            if (!validBranches.contains(data.branch)) {
+                data.errors.add("Invalid Branch: " + data.branch);
+            }
+            if (!validCurrencies.contains(data.currency)) {
+                data.errors.add("Invalid Currency: " + data.currency);
+            }
+            if (!validCgls.contains(data.cgl)) {
+                data.errors.add("Invalid CGL: " + data.cgl);
+            }
 
-            // 2. Format Checks
+            // --- 2. FORMAT CHECKS ---
             if (data.productCode != null && !data.productCode.isEmpty() && !PRODUCT_CODE_REGEX.matcher(data.productCode).matches()) {
                 data.errors.add("Product Code must be 8 digits");
             }
@@ -111,12 +117,13 @@ public class JournalBulkValidationService {
                 data.errors.add("Remarks > 30 chars");
             }
 
-            // 3. Accumulate Balance (Only if valid)
+            // --- 3. ACCUMULATE BALANCE (Only if valid) ---
+            // We only add to balance if the Branch/CGL/Ccy are valid, otherwise balance check will be meaningless
             if (data.amount != null && validBranches.contains(data.branch) && validCurrencies.contains(data.currency)) {
                 String cglType = (data.cgl != null && data.cgl.startsWith("5")) ? "MEMO" : "NORMAL";
                 String key = data.branch + "_" + data.currency + "_" + cglType;
                 
-                // Scale to long for atomic addition (Speed optimization)
+                // Scale to long for atomic addition (High Speed)
                 long val = data.amount.multiply(new BigDecimal("10000")).longValue();
                 balanceMap.computeIfAbsent(key, k -> new LongAdder()).add(val);
             }
@@ -124,6 +131,7 @@ public class JournalBulkValidationService {
 
         // D. BALANCE CHECK (Parallel)
         parsedRows.parallelStream().forEach(data -> {
+            // Only check balance for rows that have valid master data
             if (!validBranches.contains(data.branch) || !validCurrencies.contains(data.currency)) return;
 
             String cglType = (data.cgl != null && data.cgl.startsWith("5")) ? "MEMO" : "NORMAL";
@@ -134,7 +142,7 @@ public class JournalBulkValidationService {
                 BigDecimal diff = BigDecimal.valueOf(adder.sum()).divide(new BigDecimal("10000"));
                 String msg = cglType + " Total Mismatch (" + diff.toPlainString() + ")";
                 
-                // Avoid adding duplicate mismatch errors if user re-uploads
+                // Avoid adding the same message multiple times if the row is processed concurrently (rare but safe)
                 synchronized(data.errors) {
                     if (data.errors.stream().noneMatch(e -> e.contains(cglType + " Total Mismatch"))) {
                         data.errors.add(msg);
@@ -147,14 +155,13 @@ public class JournalBulkValidationService {
         Map<String, Object> result = new HashMap<>();
 
         if (errorCount > 0) {
-            // Use SXSSF for super-fast Excel generation
             byte[] errorFile = generateErrorExcelFast(parsedRows);
             result.put("status", "ERROR");
             result.put("errorCount", errorCount);
             result.put("file", errorFile);
             result.put("message", "Validation failed. Found " + errorCount + " errors.");
         } else {
-            // Limit preview to 100 rows to keep JSON response light
+            // Success: Limit Preview to 100 rows
             List<Map<String, Object>> previewList = parsedRows.stream().limit(100).map(row -> {
                 Map<String, Object> map = new HashMap<>();
                 map.put("id", row.rowIndex);
@@ -173,7 +180,6 @@ public class JournalBulkValidationService {
             result.put("totalRows", parsedRows.size());
             result.put("message", "Validation Successful!");
             
-            // Only generate CSV download if input was Excel
             if (!isInputCsv) {
                 result.put("file", generateSuccessCsv(parsedRows, postingDate));
             }
@@ -181,19 +187,20 @@ public class JournalBulkValidationService {
         return result;
     }
 
-    // --- OPTIMIZED ERROR EXCEL (COLORS + SPEED) ---
+    // --- OPTIMIZED ERROR EXCEL (SXSSFWorkbook + Colors) ---
     private byte[] generateErrorExcelFast(List<ExcelRowData> rows) throws IOException {
-        // Window size 100 = keeps 100 rows in RAM, flushes rest to disk. 
-        // Prevents OOM on 100k rows.
+        // SXSSFWorkbook keeps limited rows in memory, writes rest to disk. 
+        // This makes it extremely fast and memory efficient for 100k+ rows.
         try (SXSSFWorkbook workbook = new SXSSFWorkbook(100)) { 
             workbook.setCompressTempFiles(true);
             Sheet sheet = workbook.createSheet("Error Report");
 
             // Styles
-            CellStyle normalStyle = workbook.createCellStyle();
+            CellStyle normalHeaderStyle = workbook.createCellStyle();
             Font normalFont = workbook.createFont();
             normalFont.setBold(true);
-            normalStyle.setFont(normalFont);
+            normalFont.setColor(IndexedColors.BLACK.getIndex());
+            normalHeaderStyle.setFont(normalFont);
 
             CellStyle errorHeaderStyle = workbook.createCellStyle();
             Font errorFont = workbook.createFont();
@@ -206,12 +213,13 @@ public class JournalBulkValidationService {
             errorDataFont.setColor(IndexedColors.RED.getIndex());
             errorDataStyle.setFont(errorDataFont);
 
+            // Header
             Row header = sheet.createRow(0);
             String[] headers = {"Branch", "Currency", "CGL", "Amount", "TxnType", "Remarks", "Product Code", "ERRORS"};
             for (int i = 0; i < headers.length; i++) {
                 Cell cell = header.createCell(i);
                 cell.setCellValue(headers[i]);
-                cell.setCellStyle("ERRORS".equalsIgnoreCase(headers[i]) ? errorHeaderStyle : normalStyle);
+                cell.setCellStyle("ERRORS".equalsIgnoreCase(headers[i]) ? errorHeaderStyle : normalHeaderStyle);
             }
 
             int rowIdx = 1;
@@ -227,19 +235,21 @@ public class JournalBulkValidationService {
 
                 if (!data.errors.isEmpty()) {
                     Cell errorCell = row.createCell(7);
-                    errorCell.setCellValue(String.join("; ", data.errors)); // Combines ALL errors
+                    // Join errors with a separator
+                    errorCell.setCellValue(String.join("; ", data.errors)); 
                     errorCell.setCellStyle(errorDataStyle);
                 }
             }
             
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             workbook.write(out);
-            workbook.dispose();
+            workbook.dispose(); // Cleanup temp files
             return out.toByteArray();
         }
     }
 
-    // --- HELPERS (Standard) ---
+    // --- Helpers (Copy exactly as provided before) ---
+    
     private List<ExcelRowData> parseExcelFile(MultipartFile file) throws IOException {
         List<ExcelRowData> rows = new ArrayList<>(5000); 
         try (Workbook workbook = new XSSFWorkbook(file.getInputStream())) {
