@@ -1,479 +1,765 @@
-Yes, I can certainly add that validation.
-Here is the logic I will add:
- * Check if the currency is "INR".
- * If it is, check if the amount has more than 2 decimal places (ignoring trailing zeros, so 100.5000 is fine, but 100.5555 is invalid).
- * If invalid, add a specific error message.
-Here is the updated JournalBulkValidationService.java.
-Backend: JournalBulkValidationService.java
-package com.fincore.JournalService.Service;
+import React, { useState, useEffect, useCallback } from "react";
+import {
+  Box,
+  Typography,
+  Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  Button,
+  CircularProgress,
+  Tooltip,
+  IconButton,
+  Stack,
+  Grid,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Paper,
+  Checkbox,
+} from "@mui/material";
+import { DataGrid } from "@mui/x-data-grid";
+import {
+  DeleteSweep as DeleteSweepIcon,
+  Visibility as VisibilityIcon,
+  Close as CloseIcon,
+} from "@mui/icons-material";
+import AccountCircleIcon from "@mui/icons-material/AccountCircle";
+import InfoIcon from "@mui/icons-material/Info";
+import DeleteIcon from "@mui/icons-material/Delete";
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.JournalService.Dto.BulkUploadStateDto;
-import com.fincore.JournalService.Models.*;
-import com.fincore.JournalService.Repository.*;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.poi.ss.usermodel.*;
-import org.apache.poi.xssf.streaming.SXSSFWorkbook;
-import org.apache.poi.xssf.usermodel.XSSFWorkbook;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.context.annotation.Lazy;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.scheduling.annotation.Async;
-import org.springframework.stereotype.Service;
-import org.springframework.web.multipart.MultipartFile;
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
 
-import java.io.*;
-import java.math.BigDecimal;
-import java.math.RoundingMode;
-import java.nio.charset.StandardCharsets;
-import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.LongAdder;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
+import {
+  cellBorderStyle,
+  tableHeaderCellStyle,
+  stickyColumnCell,
+  stickyBoxStyle,
+  dialogTitleStyle,
+  loadingContainerStyle,
+  dialogActionsStyle,
+  dataGridContainerStyle,
+  mainContainerStyle,
+  tableContainerStyle,
+} from "./JournalBulkStyle";
 
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class JournalBulkValidationService {
+const formatCurrency = (num) => {
+  return Number(num).toFixed(4);
+};
 
-    private final BranchMasterRepository branchRepo;
-    private final CglMasterRepository cglRepo;
-    private final CurrencyMasterRepository currencyRepo;
-    private final StringRedisTemplate redisTemplate;
-    private final ObjectMapper objectMapper;
+const getTxnTypeColor = (txnType) => {
+  return txnType === "Credit" ? "error" : "success";
+};
 
-    @Autowired
-    @Lazy
-    private JournalBulkValidationService self;
+const getStatusChipColor = (status) => {
+  switch (status) {
+    case "ACCEPTED":
+      return "success";
+    case "REJECTED":
+      return "error";
+    case "PENDING":
+    default:
+      return "warning";
+  }
+};
 
-    private static final Pattern CLEAN_AMOUNT_REGEX = Pattern.compile("[^0-9.]");
-    private static final Pattern PRODUCT_CODE_REGEX = Pattern.compile("^\\d{8}$");
-    private static final Pattern CGL_FORMAT_REGEX = Pattern.compile("^\\d{10}$");
-
-    private static final String KEY_META = "journal:upload:meta:";
-    private static final String KEY_FILE_ERR = "journal:upload:file:err:";
-    private static final String KEY_FILE_SUC = "journal:upload:file:suc:";
-    private static final long TTL_MINUTES = 60;
-
-    private static class ExcelRowData {
-        int rowIndex;
-        String branch = "", currency = "", cgl = "", txnType = "", remarks = "", productCode = "";
-        BigDecimal amount;
-
-        List<String> formatErrors = Collections.synchronizedList(new ArrayList<>());
-        List<String> dbErrors = Collections.synchronizedList(new ArrayList<>());
-        List<String> balErrors = Collections.synchronizedList(new ArrayList<>());
-
-        boolean hasErrors() {
-            return !formatErrors.isEmpty() || !dbErrors.isEmpty() || !balErrors.isEmpty();
-        }
-
-        String getAllErrors() {
-            List<String> all = new ArrayList<>();
-            all.addAll(formatErrors);
-            all.addAll(dbErrors);
-            all.addAll(balErrors);
-            return String.join("; ", all);
-        }
-    }
-
-    public String initiateValidation(MultipartFile file, LocalDate postingDate) throws IOException {
-        String requestId = UUID.randomUUID().toString();
-        
-        BulkUploadStateDto state = new BulkUploadStateDto();
-        state.setRequestId(requestId);
-        state.setStatus("PROCESSING");
-        state.setCurrentStage(1);
-        state.setMessage("Initializing Upload...");
-        state.setTotalRows(0);
-        saveStateToRedis(state);
-
-        byte[] fileBytes = file.getBytes();
-        String filename = file.getOriginalFilename();
-
-        self.processAsync(requestId, fileBytes, filename, postingDate);
-        
-        return requestId;
-    }
-
-    @Async("bulkExecutor")
-    public void processAsync(String requestId, byte[] fileBytes, String filename, LocalDate postingDate) {
-        log.info("Starting Async Validation for ReqID: {}", requestId);
-        try {
-            updateState(requestId, s -> s.setMessage("Parsing File..."));
-
-            List<ExcelRowData> parsedRows;
-            if (filename != null && (filename.toLowerCase().endsWith(".csv") || filename.toLowerCase().endsWith(".txt"))) {
-                parsedRows = parseCsvBytes(fileBytes);
-            } else {
-                parsedRows = parseExcelBytes(fileBytes);
-            }
-            boolean isInputCsv = filename != null && filename.toLowerCase().endsWith(".csv");
-
-            updateState(requestId, s -> { 
-                s.setTotalRows(parsedRows.size());
-                s.setMessage("Validating Formats...");
-            });
-
-            if (runFormatCheck(parsedRows)) {
-                failRequest(requestId, parsedRows, "Format Validation Failed", 1);
-                return;
-            }
-            
-            updateState(requestId, s -> { s.setCurrentStage(2); s.setMessage("Checking Database..."); });
-
-            if (runDbCheck(parsedRows)) {
-                failRequest(requestId, parsedRows, "Database Validation Failed", 2);
-                return;
-            }
-            
-            updateState(requestId, s -> { s.setCurrentStage(3); s.setMessage("Checking Balances..."); });
-
-            if (runBalanceCheck(parsedRows)) {
-                failRequest(requestId, parsedRows, "Debit/Credit Balance Mismatch", 3);
-                return;
-            }
-
-            completeRequest(requestId, parsedRows, postingDate, isInputCsv);
-
-        } catch (Exception e) {
-            log.error("Async Validation Error for {}", requestId, e);
-            updateState(requestId, s -> { 
-                s.setStatus("ERROR"); 
-                s.setMessage("System Error: " + e.getMessage()); 
-                s.setHasErrorFile(false);
-            });
-        }
-    }
-
-    // --- PARSING ---
-    private void parseAmount(ExcelRowData d, String amountRaw, String typeRaw) {
-        try {
-            if (amountRaw == null) amountRaw = "";
-            if (typeRaw == null) typeRaw = "";
-
-            String clean = CLEAN_AMOUNT_REGEX.matcher(amountRaw).replaceAll("");
-            if (clean.isEmpty()) {
-                d.amount = BigDecimal.ZERO;
-                return;
-            }
-
-            BigDecimal v = new BigDecimal(clean); 
-            
-            boolean isCredit = false;
-            String tUpper = typeRaw.toUpperCase();
-            String aUpper = amountRaw.toUpperCase();
-
-            if (tUpper.contains("C") || tUpper.contains("CR") || tUpper.contains("CREDIT")) {
-                isCredit = true;
-            } else if (aUpper.contains("CR")) {
-                isCredit = true;
-            }
-            
-            d.amount = isCredit ? v.abs().negate() : v.abs();
-            d.txnType = isCredit ? "Credit" : "Debit";
-
-        } catch(Exception e) {
-            d.amount = BigDecimal.ZERO;
-        }
-    }
-
-    private List<ExcelRowData> parseExcelBytes(byte[] bytes) throws IOException {
-        try(Workbook wb = new XSSFWorkbook(new ByteArrayInputStream(bytes))) { return parseSheet(wb.getSheetAt(0)); }
-    }
-
-    private List<ExcelRowData> parseCsvBytes(byte[] bytes) throws IOException {
-        List<ExcelRowData> list = new ArrayList<>();
-        try(BufferedReader br = new BufferedReader(new InputStreamReader(new ByteArrayInputStream(bytes), StandardCharsets.UTF_8))) {
-            String line; int i=0;
-            while((line=br.readLine())!=null) {
-                if(line.trim().isEmpty()) continue;
-                String[] c = line.split(",");
-                if(c.length < 5) continue; 
-                
-                if (i == 0) {
-                     String amtCheck = c.length > 3 ? c[3].trim() : "";
-                     if (amtCheck.matches(".*[a-zA-Z]+.*")) {
-                         continue; 
-                     }
-                }
-
-                ExcelRowData d = new ExcelRowData();
-                d.rowIndex = i++;
-                d.branch = c[0].trim(); 
-                d.currency = c[1].trim(); 
-                d.cgl = c[2].trim();
-                String amtRaw = c[3].trim();
-                String typeRaw = c[4].trim();
-                parseAmount(d, amtRaw, typeRaw);
-                d.remarks = c.length > 5 ? c[5].trim() : ""; 
-                d.productCode = c.length > 6 ? c[6].trim() : "";
-                list.add(d);
-            }
-        }
-        return list;
-    }
-
-    private List<ExcelRowData> parseSheet(Sheet sheet) {
-        List<ExcelRowData> list = new ArrayList<>();
-        DataFormatter fmt = new DataFormatter();
-        for(Row r : sheet) {
-            if(isRowEmpty(r)) continue;
-            
-            if (r.getRowNum() == 0) {
-                 String amtCheck = fmt.formatCellValue(r.getCell(3));
-                 if (amtCheck.matches(".*[a-zA-Z]+.*")) {
-                     continue;
-                 }
-            }
-
-            ExcelRowData d = new ExcelRowData();
-            d.rowIndex = r.getRowNum();
-            d.branch = parseCode(r.getCell(0), fmt);
-            d.currency = fmt.formatCellValue(r.getCell(1)).trim().toUpperCase();
-            d.cgl = parseCode(r.getCell(2), fmt);
-            String amountRaw = fmt.formatCellValue(r.getCell(3)).trim();
-            String typeRaw = fmt.formatCellValue(r.getCell(4)).trim().toUpperCase();
-            d.remarks = fmt.formatCellValue(r.getCell(5));
-            d.productCode = parseCode(r.getCell(6), fmt);
-            parseAmount(d, amountRaw, typeRaw);
-            list.add(d);
-        }
-        return list;
-    }
-
-    // --- VALIDATION & HELPERS ---
-    private boolean runFormatCheck(List<ExcelRowData> rows) {
-        rows.parallelStream().forEach(d -> {
-            // Basic Format Checks
-            if (d.branch == null || d.branch.isEmpty()) d.formatErrors.add("Branch is Empty");
-            if (d.currency == null || d.currency.length() != 3) d.formatErrors.add("Invalid Currency");
-            if (d.cgl == null || d.cgl.isEmpty()) {
-                d.formatErrors.add("CGL is Empty");
-            } else if (!CGL_FORMAT_REGEX.matcher(d.cgl).matches()) {
-                d.formatErrors.add("Invalid CGL Format");
-            }
-            if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) == 0) d.formatErrors.add("Amount cannot be Zero");
-            
-            if (d.productCode != null && !d.productCode.isEmpty()) {
-                if (!PRODUCT_CODE_REGEX.matcher(d.productCode).matches()) d.formatErrors.add("Invalid Product Code");
-            }
-
-            // --- ADDED INR DECIMAL CHECK ---
-            if (d.amount != null && "INR".equalsIgnoreCase(d.currency)) {
-                // stripTrailingZeros() converts 100.5000 -> 100.5 (scale 1).
-                // if scale > 2, it implies more than 2 significant decimal places.
-                if (d.amount.stripTrailingZeros().scale() > 2) {
-                    d.formatErrors.add("INR Amount allows max 2 decimal places");
-                }
-            }
-        });
-        return rows.stream().anyMatch(ExcelRowData::hasErrors);
-    }
-
-    private boolean runDbCheck(List<ExcelRowData> rows) {
-        Set<String> branches = rows.parallelStream().map(r -> r.branch).collect(Collectors.toSet());
-        Set<String> cgls = rows.parallelStream().map(r -> r.cgl).collect(Collectors.toSet());
-        Set<String> currs = rows.parallelStream().map(r -> r.currency).collect(Collectors.toSet());
-
-        Set<String> validBranches = branchRepo.findAllById(branches).stream().map(BranchMaster::getCode).collect(Collectors.toSet());
-        Set<String> validCgls = cglRepo.findAllById(cgls).stream().map(CglMaster::getCglNumber).collect(Collectors.toSet());
-        Set<String> validCurrs = currencyRepo.findAllById(currs).stream().map(CurrencyMaster::getCurrencyCode).collect(Collectors.toSet());
-
-        rows.parallelStream().forEach(d -> {
-            if (!validBranches.contains(d.branch)) d.dbErrors.add("Branch Not Found: " + d.branch);
-            if (!validCurrs.contains(d.currency)) d.dbErrors.add("Currency Not Found: " + d.currency);
-            if (!validCgls.contains(d.cgl)) d.dbErrors.add("CGL Not Found: " + d.cgl);
-        });
-        return rows.stream().anyMatch(ExcelRowData::hasErrors);
-    }
-
-    private boolean runBalanceCheck(List<ExcelRowData> rows) {
-        ConcurrentHashMap<String, LongAdder> balanceMap = new ConcurrentHashMap<>();
-        rows.parallelStream().forEach(d -> {
-            if (d.amount != null) {
-                String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
-                String key = d.branch + "_" + d.currency + "_" + type;
-                long val = d.amount.multiply(new BigDecimal("10000")).longValue();
-                balanceMap.computeIfAbsent(key, k -> new LongAdder()).add(val);
-            }
-        });
-
-        rows.parallelStream().forEach(d -> {
-            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
-            String key = d.branch + "_" + d.currency + "_" + type;
-            LongAdder adder = balanceMap.get(key);
-            if (adder != null && adder.sum() != 0) {
-                BigDecimal diff = BigDecimal.valueOf(adder.sum()).divide(new BigDecimal("10000"));
-                synchronized(d.balErrors) {
-                    if (d.balErrors.isEmpty()) d.balErrors.add(type + " Balance Mismatch: " + diff.toPlainString());
-                }
-            }
-        });
-        return rows.stream().anyMatch(ExcelRowData::hasErrors);
-    }
-
-    private String parseCode(Cell c, DataFormatter f) {
-        if(c == null) return "";
-        if(c.getCellType() == CellType.NUMERIC) return BigDecimal.valueOf(c.getNumericCellValue()).toPlainString().split("\\.")[0];
-        return f.formatCellValue(c).trim();
-    }
-
-    private boolean isRowEmpty(Row r) {
-        if(r==null) return true;
-        for(int c=r.getFirstCellNum(); c<r.getLastCellNum(); c++)
-            if(r.getCell(c)!=null && r.getCell(c).getCellType()!=CellType.BLANK && !r.getCell(c).toString().trim().isEmpty()) return false;
-        return true;
-    }
-
-    private void failRequest(String reqId, List<ExcelRowData> rows, String msg, int stage) throws IOException {
-        byte[] excel = generateErrorExcelFast(rows);
-        saveFileToRedis(reqId, "ERROR", excel);
-        updateState(reqId, s -> {
-            s.setStatus("ERROR");
-            s.setMessage(msg);
-            s.setCurrentStage(stage);
-            s.setErrorCount(rows.stream().filter(ExcelRowData::hasErrors).count());
-            s.setHasErrorFile(true);
-        });
-    }
-
-    private void completeRequest(String reqId, List<ExcelRowData> rows, LocalDate pDate, boolean isCsv) throws IOException {
-        if (!isCsv) {
-            byte[] csv = generateSuccessCsv(rows, pDate); 
-            saveFileToRedis(reqId, "SUCCESS", csv);
-        }
-        
-        List<Map<String, Object>> preview = rows.stream().limit(100).map(this::mapToPreview).collect(Collectors.toList());
-        String previewJson = objectMapper.writeValueAsString(preview);
-
-        updateState(reqId, s -> {
-            s.setCurrentStage(4);
-            s.setStatus("SUCCESS");
-            s.setMessage("Validation Successful");
-            s.setHasSuccessFile(!isCsv);
-            s.setPreviewDataJson(previewJson);
-        });
-    }
-
-    private byte[] generateErrorExcelFast(List<ExcelRowData> rows) throws IOException {
-        try (SXSSFWorkbook workbook = new SXSSFWorkbook(100)) {
-            workbook.setCompressTempFiles(true);
-            Sheet sheet = workbook.createSheet("Error Report");
-            CellStyle errStyle = workbook.createCellStyle();
-            Font f = workbook.createFont(); f.setColor(IndexedColors.RED.getIndex()); errStyle.setFont(f);
-
-            Row h = sheet.createRow(0);
-            String[] hd = {"Branch", "Currency", "CGL", "Amount", "TxnType", "Remarks", "Product", "ERRORS"};
-            for(int i=0; i<hd.length; i++) h.createCell(i).setCellValue(hd[i]);
-
-            int idx = 1;
-            for(ExcelRowData d : rows) {
-                if (d.hasErrors()) {
-                    Row r = sheet.createRow(idx++);
-                    r.createCell(0).setCellValue(d.branch);
-                    r.createCell(1).setCellValue(d.currency);
-                    r.createCell(2).setCellValue(d.cgl);
-                    r.createCell(3).setCellValue(d.amount != null ? d.amount.abs().toString() : "");
-                    r.createCell(4).setCellValue(d.txnType);
-                    r.createCell(5).setCellValue(d.remarks);
-                    r.createCell(6).setCellValue(d.productCode);
-                    Cell c = r.createCell(7); c.setCellValue(d.getAllErrors()); c.setCellStyle(errStyle);
-                }
-            }
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            workbook.write(out); return out.toByteArray();
-        }
-    }
-    
-    // --- UPDATED CSV GENERATION ---
-    private byte[] generateSuccessCsv(List<ExcelRowData> rows, LocalDate postingDate) {
-        StringBuilder csv = new StringBuilder(rows.size() * 100);
-        DateTimeFormatter ddMMyyyy = DateTimeFormatter.ofPattern("ddMMyyyy");
-        String col2 = postingDate.format(ddMMyyyy);
-
-        int month = postingDate.getMonthValue();
-        int year = postingDate.getYear();
-        String col3 = (month >= 4) ? String.valueOf(year) : String.valueOf(year - 1);
-        String col4 = (month >= 4) ? String.format("%02d", month - 3) : String.format("%02d", month + 9);
-
-        csv.append("Batch_ID,Date,Year,Month,Branch,Currency,CGL,Amount,Dr/Cr,Remarks,Product,Code_B,Code_C,Code_D\n");
-
-        for (ExcelRowData row : rows) {
-            String col1 = "01";
-            String col5 = String.format("%5s", row.branch).replace(' ', '0');
-            String col6 = (row.currency == null || row.currency.isEmpty()) ? "INR" : row.currency;
-            
-            BigDecimal absAmt = row.amount.abs();
-            String plainAmt = absAmt.setScale(4, RoundingMode.HALF_UP).toPlainString();
-            int dotIndex = plainAmt.indexOf('.');
-            String intPart = (dotIndex == -1) ? plainAmt : plainAmt.substring(0, dotIndex);
-            String decPart = (dotIndex == -1) ? "0000" : plainAmt.substring(dotIndex + 1);
-            String col8 = String.format("%16s", intPart).replace(' ', '0') + "." + decPart;
-
-            String col9 = (row.amount.compareTo(BigDecimal.ZERO) < 0) ? "Cr" : "Dr";
-            String col10 = (row.remarks != null) ? row.remarks.replace(",", " ") : "";
-            String col11 = (row.productCode != null && !row.productCode.isEmpty()) ? row.productCode : "A";
-            String col12 = "B";
-            String col13 = "C";
-            String col14 = "D";
-
-            csv.append(col1).append(",")
-               .append(col2).append(",")
-               .append(col3).append(",")
-               .append(col4).append(",")
-               .append(col5).append(",")
-               .append(col6).append(",")
-               .append(row.cgl).append(",")
-               .append(col8).append(",")
-               .append(col9).append(",")
-               .append(col10).append(",")
-               .append(col11).append(",")
-               .append(col12).append(",")
-               .append(col13).append(",")
-               .append(col14).append("\n");
-        }
-        return csv.toString().getBytes(StandardCharsets.UTF_8);
-    }
-
-    private Map<String, Object> mapToPreview(ExcelRowData r) {
-        Map<String, Object> m = new HashMap<>();
-        m.put("id", r.rowIndex); m.put("branch", r.branch); m.put("currency", r.currency);
-        m.put("cgl", r.cgl); m.put("amount", r.amount!=null?r.amount.abs().toString():"");
-        m.put("txnType", r.txnType); m.put("remarks", r.remarks); m.put("productCode", r.productCode);
-        return m;
-    }
-
-    private void saveStateToRedis(BulkUploadStateDto state) {
-        try { redisTemplate.opsForValue().set(KEY_META + state.getRequestId(), objectMapper.writeValueAsString(state), TTL_MINUTES, TimeUnit.MINUTES); } catch (Exception e) {}
-    }
-    private void updateState(String requestId, java.util.function.Consumer<BulkUploadStateDto> updater) {
-        try {
-            String json = redisTemplate.opsForValue().get(KEY_META + requestId);
-            if (json != null) {
-                BulkUploadStateDto state = objectMapper.readValue(json, BulkUploadStateDto.class);
-                updater.accept(state);
-                saveStateToRedis(state);
-            }
-        } catch (Exception e) {}
-    }
-    private void saveFileToRedis(String requestId, String type, byte[] data) {
-        String key = (type.equals("ERROR") ? KEY_FILE_ERR : KEY_FILE_SUC) + requestId;
-        String base64 = Base64.getEncoder().encodeToString(data);
-        redisTemplate.opsForValue().set(key, base64, TTL_MINUTES, TimeUnit.MINUTES);
-    }
-    public BulkUploadStateDto getState(String reqId) {
-        try { String json = redisTemplate.opsForValue().get(KEY_META + reqId); return json != null ? objectMapper.readValue(json, BulkUploadStateDto.class) : null; } catch (Exception e) { return null; }
-    }
-    public byte[] getFileBytes(String reqId, String type) {
-        String key = (type.equals("ERROR") ? KEY_FILE_ERR : KEY_FILE_SUC) + reqId;
-        String base64 = redisTemplate.opsForValue().get(key);
-        return base64 != null ? Base64.getDecoder().decode(base64) : null;
-    }
+function CustomNoRowsOverlay() {
+  return (
+    <Stack height="100%" alignItems="center" justifyContent="center">
+      <InfoIcon sx={{ fontSize: 48, color: "text.secondary", mb: 2 }} />
+      <Typography variant="h6">No Journal Requests Found</Typography>
+      <Typography>You have not created any Journal requests.</Typography>
+    </Stack>
+  );
 }
 
+export default function JournalPostingStatus() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([]);
+
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [selectedBatch, setSelectedBatch] = useState(null);
+
+  const [isViewModalOpen, setIsViewModalOpen] = useState(false);
+  const [isViewLoading, setIsViewLoading] = useState(false);
+
+  const [batchDetails, setBatchDetails] = useState([]);
+  const [viewingBatchId, setViewingBatchId] = useState(null);
+  const [viewingBatchStatus, setViewingBatchStatus] = useState(null);
+
+  const [selectedJournalPrefixes, setSelectedJournalPrefixes] = useState([]);
+  const [isPartialSubmitting, setIsPartialSubmitting] = useState(false);
+
+  const fetchMyBatches = useCallback(async () => {
+    setLoading(true);
+    try {
+      const myRequests = await callApi("/JS/journals/my-requests", null, "GET");
+
+      if (!Array.isArray(myRequests) || myRequests.length === 0) {
+        setRows([]);
+        setLoading(false);
+        return;
+      }
+
+      const groupedBatches = new Map();
+      for (const request of myRequests) {
+        const batchId = request.batchId;
+
+        if (!groupedBatches.has(batchId)) {
+          groupedBatches.set(batchId, {
+            id: batchId,
+            batchId: batchId,
+            creatorId: request.creatorId,
+            requestStatus: request.requestStatus,
+            requestDate: request.requestDate,
+            commonBatchRemarks: request.commonBatchRemarks,
+            executorId: request.executorId,
+            executionDate: request.executionDate,
+            executorRemarks: request.executorRemarks,
+            totalDebit: 0,
+            totalCredit: 0,
+            requestCount: 0,
+          });
+        }
+
+        const batchDetails = groupedBatches.get(batchId);
+        batchDetails.requestCount++;
+
+        try {
+          const payload = JSON.parse(request.payload);
+          const amount = parseFloat(payload.amount) || 0;
+          if (amount < 0) {
+            batchDetails.totalCredit += Math.abs(amount);
+          } else {
+            batchDetails.totalDebit += amount;
+          }
+        } catch (e) {
+          console.error(`Failed to parse payload for request ${request.id}`, e);
+        }
+      }
+      setRows(Array.from(groupedBatches.values()));
+    } catch (err) {
+      console.error("Failed to fetch user's requests:", err);
+      const errorMsg =
+        err.response?.data?.message || "Failed to load your requests.";
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setLoading(false);
+    }
+  }, [callApi, showSnackBar]);
+
+  useEffect(() => {
+    fetchMyBatches();
+  }, [fetchMyBatches]);
+
+  const handleOpenModal = (batch) => {
+    setSelectedBatch(batch);
+    setIsModalOpen(true);
+  };
+
+  const handleCloseModal = () => {
+    if (isSubmitting) return;
+    setIsModalOpen(false);
+    setSelectedBatch(null);
+  };
+
+  const handleOpenViewModal = async (batchId, status) => {
+    setIsViewModalOpen(true);
+    setIsViewLoading(true);
+    setBatchDetails([]);
+    setViewingBatchId(batchId);
+    setViewingBatchStatus(status);
+
+    try {
+      const data = await callApi(
+        `/JS/journals/by-batch/${batchId}`,
+        null,
+        "GET"
+      );
+
+      setTimeout(() => {
+        if (Array.isArray(data)) {
+          const journalGroups = new Map();
+
+          const processedData = data
+            .map((req) => {
+              try {
+                const payload = JSON.parse(req.payload);
+                const prefix = req.journalId.split("-")[0];
+                const amount = parseFloat(payload.amount) || 0;
+                return {
+                  ...req,
+                  payload,
+                  journalPrefix: prefix,
+                  amount: Math.abs(amount),
+                  transactionType: amount < 0 ? "Credit" : "Debit",
+                };
+              } catch (e) {
+                console.error("Failed to parse payload for req:", req.id, e);
+                return null;
+              }
+            })
+            .filter(Boolean);
+
+          processedData.sort((a, b) => a.journalId.localeCompare(b.journalId));
+
+          for (const row of processedData) {
+            const prefix = row.journalPrefix;
+            if (!journalGroups.has(prefix)) {
+              journalGroups.set(prefix, []);
+            }
+            journalGroups.get(prefix).push(row);
+          }
+
+          setBatchDetails(Array.from(journalGroups.values()));
+        } else {
+          setBatchDetails([]);
+          showSnackBar("No details found for this batch.", "info");
+        }
+        setIsViewLoading(false);
+      }, 100);
+    } catch (error) {
+      console.error("Failed to fetch batch details:", error);
+      const errorMsg =
+        error.response?.data?.message || "Failed to load batch details.";
+      showSnackBar(errorMsg, "error");
+      setBatchDetails([]);
+      setIsViewLoading(false);
+    }
+  };
+
+  const handleCloseViewModal = () => {
+    setIsViewModalOpen(false);
+    setBatchDetails([]);
+    setViewingBatchId(null);
+    setSelectedJournalPrefixes([]);
+    setIsPartialSubmitting(false);
+    setViewingBatchStatus(null);
+  };
+
+  const handleSubmitBatchCancel = async () => {
+    setIsSubmitting(true);
+    try {
+      await callApi(
+        `/JS/journals/my-requests/by-batch/${selectedBatch.batchId}`,
+        null,
+        "DELETE"
+      );
+      showSnackBar(
+        `Batch ${selectedBatch.batchId} successfully canceled.`,
+        "success"
+      );
+      handleCloseModal();
+      fetchMyBatches();
+    } catch (error) {
+      console.error("Failed to cancel batch:", error);
+      const errorMsg =
+        error.response?.data?.message || "Failed to cancel batch.";
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleCancelSelectedJournals = async () => {
+    if (selectedJournalPrefixes.length === 0) {
+      showSnackBar(
+        "Please select at least one journal group to cancel.",
+        "warning"
+      );
+      return;
+    }
+
+    setIsPartialSubmitting(true);
+
+    try {
+      await callApi(
+        "/JS/journals/my-requests/by-journal-list",
+        selectedJournalPrefixes,
+        "DELETE"
+      );
+      showSnackBar(
+        "Selected journal entries successfully canceled.",
+        "success"
+      );
+      handleCloseViewModal();
+      fetchMyBatches();
+    } catch (error) {
+      console.error("Failed to process partial batch:", error);
+      const errorMsg =
+        error.response?.data?.message || "Failed to cancel selected entries.";
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setIsPartialSubmitting(false);
+    }
+  };
+
+  const handleSelectAllClick = (event) => {
+    if (event.target.checked) {
+      const newSelecteds = batchDetails.map((group) => group[0].journalPrefix);
+      setSelectedJournalPrefixes(newSelecteds);
+      return;
+    }
+    setSelectedJournalPrefixes([]);
+  };
+
+  const handleRowCheckboxClick = (event, prefix) => {
+    if (event) {
+      event.stopPropagation();
+    }
+
+    const selectedIndex = selectedJournalPrefixes.indexOf(prefix);
+    let newSelected = [];
+
+    if (selectedIndex === -1) {
+      newSelected = newSelected.concat(selectedJournalPrefixes, prefix);
+    } else if (selectedIndex === 0) {
+      newSelected = newSelected.concat(selectedJournalPrefixes.slice(1));
+    } else if (selectedIndex === selectedJournalPrefixes.length - 1) {
+      newSelected = newSelected.concat(selectedJournalPrefixes.slice(0, -1));
+    } else if (selectedIndex > 0) {
+      newSelected = newSelected.concat(
+        selectedJournalPrefixes.slice(0, selectedIndex),
+        selectedJournalPrefixes.slice(selectedIndex + 1)
+      );
+    }
+    setSelectedJournalPrefixes(newSelected);
+  };
+
+  const columns = [
+    {
+      field: "batchId",
+      headerName: "Batch ID",
+      width: 125,
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "requestStatus",
+      headerName: "Status",
+      width: 125,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Chip
+          label={params.value}
+          color={getStatusChipColor(params.value)}
+          size="small"
+        />
+      ),
+    },
+    {
+      field: "creatorId",
+      headerName: "Creator",
+      width: 150,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Chip icon={<AccountCircleIcon />} label={params.value} size="small" />
+      ),
+    },
+    {
+      field: "requestDate",
+      headerName: "Submitted On",
+      width: 200,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Box>
+          {new Date(params.value).toLocaleString("en-IN", {
+            dateStyle: "medium",
+            timeStyle: "short",
+          })}
+        </Box>
+      ),
+    },
+    {
+      field: "commonBatchRemarks",
+      headerName: "Creator Remarks",
+      width: 200,
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "requestCount",
+      headerName: "Entries",
+      width: 100,
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "totalCredit",
+      headerName: "Total Credit",
+      width: 250,
+      align: "right",
+      headerAlign: "center",
+
+      renderCell: (params) => (
+        <Typography marginTop={"5%"}>{formatCurrency(params.value)}</Typography>
+      ),
+    },
+    {
+      field: "totalDebit",
+      headerName: "Total Debit",
+      width: 250,
+      align: "right",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Typography marginTop={"5%"}>{formatCurrency(params.value)}</Typography>
+      ),
+    },
+    {
+      field: "actions",
+      headerName: "Actions",
+      flex: 0.8,
+      minWidth: 130,
+      align: "center",
+      headerAlign: "center",
+      sortable: false,
+      renderCell: (params) => {
+        const isPending = params.row.requestStatus === "PENDING";
+        return (
+          <Stack direction="row" spacing={0.5} marginTop={"5%"}>
+            <Tooltip title="View Details">
+              <IconButton
+                onClick={() =>
+                  handleOpenViewModal(
+                    params.row.batchId,
+                    params.row.requestStatus
+                  )
+                }
+                color="primary"
+              >
+                <VisibilityIcon />
+              </IconButton>
+            </Tooltip>
+            <Tooltip
+              title={
+                isPending ? "Cancel Entire Batch" : "Batch already processed"
+              }
+            >
+              <span>
+                <IconButton
+                  onClick={() => handleOpenModal(params.row)}
+                  disabled={!isPending}
+                >
+                  <DeleteIcon />
+                </IconButton>
+              </span>
+            </Tooltip>
+          </Stack>
+        );
+      },
+    },
+  ];
+
+  return (
+    <Box sx={mainContainerStyle}>
+      <DataGrid
+        rows={rows}
+        columns={columns}
+        loading={loading}
+        getRowId={(row) => row.batchId}
+        disableRowSelectionOnClick
+        pageSizeOptions={[5, 10, 25]}
+        disableColumnResize={true}
+        rowHeight={52}
+        initialState={{
+          pagination: {
+            paginationModel: { page: 0, pageSize: 10 },
+          },
+          sorting: { sortModel: [{ field: "requestDate", sort: "desc" }] },
+        }}
+        slots={{
+          noRowsOverlay: CustomNoRowsOverlay,
+        }}
+        sx={dataGridContainerStyle}
+      />
+
+      <Dialog
+        open={isModalOpen}
+        onClose={handleCloseModal}
+        fullWidth
+        maxWidth="sm"
+      >
+        <DialogTitle sx={{ display: "flex", alignItems: "center" }}>
+          <DeleteSweepIcon sx={{ mr: 1, color: "error.main" }} />
+          Confirm Batch Cancellation
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            Are you sure you want to cancel all your pending requests in batch{" "}
+            <strong>{selectedBatch?.batchId}</strong>?
+            <br />
+            <br />
+            This will permanently delete {selectedBatch?.requestCount}{" "}
+            entry/entries created by you and cannot be undone.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions sx={dialogActionsStyle}>
+          <Stack direction="row" spacing={1} justifyContent="flex-end">
+            <Button onClick={handleCloseModal} disabled={isSubmitting}>
+              Back
+            </Button>
+            <Button
+              onClick={handleSubmitBatchCancel}
+              variant="contained"
+              color="error"
+              disabled={isSubmitting}
+            >
+              {isSubmitting ? (
+                <CircularProgress size={24} color="inherit" />
+              ) : (
+                "Confirm Cancel"
+              )}
+            </Button>
+          </Stack>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog
+        open={isViewModalOpen}
+        onClose={handleCloseViewModal}
+        fullWidth
+        maxWidth="lg"
+      >
+        <DialogTitle sx={dialogTitleStyle}>
+          Batch Details: {viewingBatchId}
+          <IconButton
+            aria-label="close"
+            onClick={handleCloseViewModal}
+            sx={{
+              color: (theme) => theme.palette.grey[500],
+            }}
+          >
+            <CloseIcon />
+          </IconButton>
+        </DialogTitle>
+
+        <DialogContent dividers sx={{ p: 0 }}>
+          {isViewLoading ? (
+            <Box sx={loadingContainerStyle}>
+              <CircularProgress />
+            </Box>
+          ) : (
+            <>
+              {batchDetails.length > 0 ? (
+                <TableContainer component={Paper} sx={tableContainerStyle}>
+                  <Table sx={{ minWidth: 650 }} size="small" stickyHeader>
+                    <TableHead>
+                      <TableRow>
+                        {viewingBatchStatus === "PENDING" && (
+                          <TableCell
+                            padding="checkbox"
+                            sx={tableHeaderCellStyle}
+                          >
+                            <Checkbox
+                              color="primary"
+                              indeterminate={
+                                selectedJournalPrefixes.length > 0 &&
+                                selectedJournalPrefixes.length <
+                                  batchDetails.length
+                              }
+                              checked={
+                                batchDetails.length > 0 &&
+                                selectedJournalPrefixes.length ===
+                                  batchDetails.length
+                              }
+                              onChange={handleSelectAllClick}
+                            />
+                          </TableCell>
+                        )}
+                        <TableCell align="center" sx={tableHeaderCellStyle}>
+                          Journal ID
+                        </TableCell>
+                        <TableCell align="center" sx={tableHeaderCellStyle}>
+                          Status
+                        </TableCell>
+                        <TableCell align="center" sx={tableHeaderCellStyle}>
+                          Branch
+                        </TableCell>
+                        <TableCell align="center" sx={tableHeaderCellStyle}>
+                          Currency
+                        </TableCell>
+                        <TableCell align="center" sx={tableHeaderCellStyle}>
+                          CGL
+                        </TableCell>
+                        <TableCell align="center" sx={tableHeaderCellStyle}>
+                          Amount
+                        </TableCell>
+                        <TableCell align="center" sx={tableHeaderCellStyle}>
+                          Txn Type
+                        </TableCell>
+                      </TableRow>
+                    </TableHead>
+
+                    <TableBody>
+                      {batchDetails.map((group, groupIndex) => {
+                        const isSelected = selectedJournalPrefixes.includes(
+                          group[0].journalPrefix
+                        );
+                        const groupRowCount = group.length;
+
+                        return group.map((row, rowIndex) => (
+                          <TableRow
+                            key={row.id}
+                            hover={viewingBatchStatus === "PENDING"}
+                            onClick={() =>
+                              viewingBatchStatus === "PENDING" &&
+                              handleRowCheckboxClick(null, row.journalPrefix)
+                            }
+                            role="checkbox"
+                            aria-checked={isSelected}
+                            selected={
+                              viewingBatchStatus === "PENDING" && isSelected
+                            }
+                            sx={{
+                              cursor:
+                                viewingBatchStatus === "PENDING"
+                                  ? "pointer"
+                                  : "default",
+                              ...(rowIndex === 0 &&
+                                groupIndex > 0 && {
+                                  borderTop: (theme) =>
+                                    `2px solid ${theme.palette.divider}`,
+                                }),
+                            }}
+                          >
+                            {viewingBatchStatus === "PENDING" &&
+                              rowIndex === 0 && (
+                                <TableCell
+                                  padding="checkbox"
+                                  rowSpan={groupRowCount}
+                                  sx={stickyColumnCell}
+                                >
+                                  <Box sx={stickyBoxStyle}>
+                                    <Checkbox
+                                      color="primary"
+                                      checked={isSelected}
+                                      onClick={(e) =>
+                                        handleRowCheckboxClick(
+                                          e,
+                                          row.journalPrefix
+                                        )
+                                      }
+                                    />
+                                  </Box>
+                                </TableCell>
+                              )}
+                            {rowIndex === 0 && (
+                              <TableCell
+                                align="center"
+                                rowSpan={groupRowCount}
+                                sx={stickyColumnCell}
+                              >
+                                <Box sx={stickyBoxStyle}>
+                                  {row.journalPrefix}
+                                </Box>
+                              </TableCell>
+                            )}
+                            {rowIndex === 0 && (
+                              <TableCell
+                                align="center"
+                                rowSpan={groupRowCount}
+                                sx={stickyColumnCell}
+                              >
+                                <Box sx={stickyBoxStyle}>
+                                  <Chip
+                                    label={row.requestStatus}
+                                    color={getStatusChipColor(
+                                      row.requestStatus
+                                    )}
+                                    size="small"
+                                  />
+                                </Box>
+                              </TableCell>
+                            )}
+                            <TableCell align="center" sx={cellBorderStyle}>
+                              {row.payload.branch}
+                            </TableCell>
+                            <TableCell align="center" sx={cellBorderStyle}>
+                              {row.payload.currency}
+                            </TableCell>
+                            <TableCell align="center" sx={cellBorderStyle}>
+                              {row.payload.cgl}
+                            </TableCell>
+                            <TableCell align="center" sx={cellBorderStyle}>
+                              {formatCurrency(row.amount)}
+                            </TableCell>
+                            <TableCell align="center" sx={cellBorderStyle}>
+                              <Chip
+                                label={row.transactionType}
+                                color={getTxnTypeColor(row.transactionType)}
+                                size="small"
+                              />
+                            </TableCell>
+                          </TableRow>
+                        ));
+                      })}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              ) : (
+                <Typography sx={{ p: 3 }}>
+                  No details found for this batch.
+                </Typography>
+              )}
+            </>
+          )}
+        </DialogContent>
+
+        <DialogActions sx={dialogActionsStyle}>
+          <Grid
+            container
+            spacing={2}
+            alignItems="center"
+            justifyContent="flex-end"
+          >
+            <Grid item xs={12} md={6}></Grid>
+            <Grid item xs={12} md={6}>
+              <Stack direction="row" spacing={1} justifyContent="flex-end">
+                {viewingBatchStatus === "PENDING" && (
+                  <Button
+                    variant="contained"
+                    color="error"
+                    onClick={handleCancelSelectedJournals}
+                    disabled={
+                      isPartialSubmitting ||
+                      selectedJournalPrefixes.length === 0
+                    }
+                  >
+                    {isPartialSubmitting ? (
+                      <CircularProgress size={24} color="inherit" />
+                    ) : (
+                      "Cancel Selected"
+                    )}
+                  </Button>
+                )}
+              </Stack>
+            </Grid>
+          </Grid>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
+}
+
+
+
+in this screen there is issue like as soon as i open the screen 
+it shows No Journal Requests Found
+You have not created any Journal requests and giving the snak bar error 
+Failed to load your requests.
+but after 1 2 sec data is coming handle this do proper state managment 
+and give mi the correct updated code if u want to add loader or some thing like that do that and handle
+and if u are doing any styling change then add that in the saprate file exporting and importing then use that 
