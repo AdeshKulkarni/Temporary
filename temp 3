@@ -1,3 +1,37 @@
+This is the Simpler, Production-Grade "In-Memory" Solution.
+💡 The Solution Strategy
+ * No Redis / No DB Table: We store the status in a simple Java In-Memory Map. This is fast and requires no configuration.
+ * File Storage: We save the generated Excel/CSV files to your server's Temp Folder (java.io.tmpdir) to keep memory usage low.
+ * 4-Stage Logic: The validation runs in the background and updates the status map.
+ * Frontend: Simply polls the status and updates the Stepper.
+1. Backend: BulkUploadStateDto.java
+(Keep this file, it's just a simple data holder)
+package com.fincore.JournalService.Dto;
+
+import lombok.Data;
+import java.io.Serializable;
+
+@Data
+public class BulkUploadStateDto implements Serializable {
+    private String requestId;
+    private String status; // PROCESSING, SUCCESS, ERROR
+    private Integer currentStage; // 1..4
+    private Integer totalRows;
+    private Long errorCount;
+    private String message;
+    private String previewDataJson;
+    
+    // Flags for frontend
+    private boolean hasErrorFile;
+    private boolean hasSuccessFile;
+    
+    // Internal paths (transient = not sent to frontend)
+    private transient String errorFilePath;
+    private transient String successFilePath;
+}
+
+2. Backend: JournalBulkValidationService.java (In-Memory Async)
+This replaces Redis with a ConcurrentHashMap and uses Disk IO for files.
 package com.fincore.JournalService.Service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -10,7 +44,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.xssf.streaming.SXSSFWorkbook;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
@@ -19,13 +52,12 @@ import java.io.*;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.time.LocalDate;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -38,25 +70,20 @@ public class JournalBulkValidationService {
     private final BranchMasterRepository branchRepo;
     private final CglMasterRepository cglRepo;
     private final CurrencyMasterRepository currencyRepo;
-    private final StringRedisTemplate redisTemplate;
     private final ObjectMapper objectMapper;
+
+    // --- IN-MEMORY STATE STORE (Replaces Redis/DB) ---
+    private static final Map<String, BulkUploadStateDto> jobStore = new ConcurrentHashMap<>();
 
     private static final Pattern CLEAN_AMOUNT_REGEX = Pattern.compile("[^0-9.-]");
     private static final Pattern PRODUCT_CODE_REGEX = Pattern.compile("^\\d{8}$");
-    private static final Pattern CGL_FORMAT_REGEX = Pattern.compile("^\\d{10}$"); 
-
-    // Redis Keys
-    private static final String KEY_META = "journal:upload:meta:";
-    private static final String KEY_FILE_ERR = "journal:upload:file:err:";
-    private static final String KEY_FILE_SUC = "journal:upload:file:suc:";
-    private static final long TTL_MINUTES = 60;
+    private static final Pattern CGL_FORMAT_REGEX = Pattern.compile("^\\d{10}$");
 
     private static class ExcelRowData {
         int rowIndex;
         String branch = "", currency = "", cgl = "", txnType = "", remarks = "", productCode = "";
         BigDecimal amount;
         
-        // Errors
         List<String> formatErrors = Collections.synchronizedList(new ArrayList<>());
         List<String> dbErrors = Collections.synchronizedList(new ArrayList<>());
         List<String> balErrors = Collections.synchronizedList(new ArrayList<>());
@@ -64,8 +91,6 @@ public class JournalBulkValidationService {
         boolean hasErrors() { 
             return !formatErrors.isEmpty() || !dbErrors.isEmpty() || !balErrors.isEmpty(); 
         }
-        
-        // Helper to combine all errors for Excel
         String getAllErrors() {
             List<String> all = new ArrayList<>();
             all.addAll(formatErrors);
@@ -75,56 +100,69 @@ public class JournalBulkValidationService {
         }
     }
 
+    // --- 1. INITIATE ---
     public String initiateValidation(MultipartFile file, LocalDate postingDate) throws IOException {
         String requestId = UUID.randomUUID().toString();
+
+        // Initialize State in Map
         BulkUploadStateDto state = new BulkUploadStateDto();
         state.setRequestId(requestId);
         state.setStatus("PROCESSING");
         state.setCurrentStage(1);
         state.setMessage("Validating Formats...");
-        saveStateToRedis(state);
+        jobStore.put(requestId, state);
 
         byte[] fileBytes = file.getBytes();
         String filename = file.getOriginalFilename();
+        
+        // Fire Async Process
         processAsync(requestId, fileBytes, filename, postingDate);
+
         return requestId;
     }
 
-    @Async("bulkExecutor")
+    // --- 2. ASYNC PROCESS ---
+    @Async("bulkExecutor") // Needs AsyncConfig
     public void processAsync(String requestId, byte[] fileBytes, String filename, LocalDate postingDate) {
         try {
-            List<ExcelRowData> parsedRows;
+            // 0. Parse
+            List<ExcelRowData> rows;
             if (filename != null && (filename.toLowerCase().endsWith(".csv") || filename.toLowerCase().endsWith(".txt"))) {
-                parsedRows = parseCsvBytes(fileBytes);
+                rows = parseCsvBytes(fileBytes);
             } else {
-                parsedRows = parseExcelBytes(fileBytes);
+                rows = parseExcelBytes(fileBytes);
             }
             boolean isInputCsv = filename != null && filename.toLowerCase().endsWith(".csv");
 
-            updateState(requestId, s -> s.setTotalRows(parsedRows.size()));
+            // Update Total Rows
+            updateState(requestId, s -> s.setTotalRows(rows.size()));
 
             // --- STAGE 1: FORMAT CHECK ---
-            if (runFormatCheck(parsedRows)) {
-                failRequest(requestId, parsedRows, "Format Validation Failed", 1);
+            if (runFormatCheck(rows)) {
+                failRequest(requestId, rows, "Format Validation Failed", 1);
                 return;
             }
+            // Move to Stage 2
             updateState(requestId, s -> { s.setCurrentStage(2); s.setMessage("Checking Database..."); });
+            Thread.sleep(500); // Tiny artificial delay so user sees the step change in UI
 
             // --- STAGE 2: DB CHECK ---
-            if (runDbCheck(parsedRows)) {
-                failRequest(requestId, parsedRows, "Database Validation Failed", 2);
+            if (runDbCheck(rows)) {
+                failRequest(requestId, rows, "Database Validation Failed", 2);
                 return;
             }
             updateState(requestId, s -> { s.setCurrentStage(3); s.setMessage("Checking Balances..."); });
+            Thread.sleep(500);
 
             // --- STAGE 3: BALANCE CHECK ---
-            if (runBalanceCheck(parsedRows)) {
-                failRequest(requestId, parsedRows, "Debit/Credit Balance Mismatch", 3);
+            if (runBalanceCheck(rows)) {
+                failRequest(requestId, rows, "Debit/Credit Balance Mismatch", 3);
                 return;
             }
 
             // --- STAGE 4: SUCCESS ---
-            completeRequest(requestId, parsedRows, postingDate, isInputCsv);
+            updateState(requestId, s -> { s.setCurrentStage(4); s.setMessage("Finalizing..."); });
+            completeRequest(requestId, rows, postingDate, isInputCsv);
 
         } catch (Exception e) {
             log.error("Async Error", e);
@@ -132,7 +170,8 @@ public class JournalBulkValidationService {
         }
     }
 
-    // --- LOGIC ---
+    // --- LOGIC METHODS ---
+
     private boolean runFormatCheck(List<ExcelRowData> rows) {
         rows.parallelStream().forEach(d -> {
             if (d.branch == null || d.branch.isEmpty()) d.formatErrors.add("Branch Empty");
@@ -188,165 +227,112 @@ public class JournalBulkValidationService {
         return rows.stream().anyMatch(ExcelRowData::hasErrors);
     }
 
+    // --- STATE & FILE HELPERS ---
+
     private void failRequest(String reqId, List<ExcelRowData> rows, String msg, int stage) throws IOException {
-        byte[] excel = generateErrorExcelFast(rows);
-        saveFileToRedis(reqId, "ERROR", excel);
+        String path = saveBytesToTempFile(reqId, "ERR", generateErrorExcelFast(rows));
         
         updateState(reqId, s -> {
             s.setStatus("ERROR");
             s.setMessage(msg);
             s.setCurrentStage(stage);
             s.setErrorCount(rows.stream().filter(ExcelRowData::hasErrors).count());
-            s.setHasErrorFile(true); 
+            s.setHasErrorFile(true);
+            s.setErrorFilePath(path);
         });
     }
 
     private void completeRequest(String reqId, List<ExcelRowData> rows, LocalDate pDate, boolean isCsv) throws IOException {
+        String sucPath = null;
         if (!isCsv) {
-            byte[] csv = generateSuccessCsv(rows, pDate);
-            saveFileToRedis(reqId, "SUCCESS", csv);
+            sucPath = saveBytesToTempFile(reqId, "SUC", generateSuccessCsv(rows, pDate));
         }
         
         List<Map<String, Object>> preview = rows.stream().limit(100).map(this::mapToPreview).collect(Collectors.toList());
         String previewJson = objectMapper.writeValueAsString(preview);
-
+        
+        final String finalSucPath = sucPath;
         updateState(reqId, s -> {
-            s.setCurrentStage(4);
             s.setStatus("SUCCESS");
+            s.setCurrentStage(4);
             s.setMessage("Validation Successful");
             s.setHasSuccessFile(!isCsv);
+            s.setSuccessFilePath(finalSucPath);
             s.setPreviewDataJson(previewJson);
         });
     }
 
-    // --- PARSING & FILE GENERATION (COMPLETELY FILLED IN) ---
+    // --- UTILS: MAP & FILE ---
 
-    private List<ExcelRowData> parseExcelBytes(byte[] bytes) throws IOException {
-        try (Workbook workbook = new XSSFWorkbook(new ByteArrayInputStream(bytes))) {
-            return parseWorkbookLogic(workbook);
+    private void updateState(String reqId, java.util.function.Consumer<BulkUploadStateDto> updater) {
+        BulkUploadStateDto state = jobStore.get(reqId);
+        if (state != null) {
+            updater.accept(state);
         }
     }
 
-    private List<ExcelRowData> parseCsvBytes(byte[] bytes) throws IOException {
-        List<ExcelRowData> rows = new ArrayList<>();
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(new ByteArrayInputStream(bytes), StandardCharsets.UTF_8))) {
-            String line;
-            int lineNum = 0;
-            while ((line = reader.readLine()) != null) {
-                if (line.trim().isEmpty()) continue;
-                String[] cols = line.split(",", -1);
-                if (cols.length < 9) continue;
-                ExcelRowData data = new ExcelRowData();
-                data.rowIndex = lineNum++;
-                data.branch = cols[4].trim();
-                data.currency = cols[5].trim();
-                data.cgl = cols[6].trim();
-                parseAmountAndType(data, cols[7].trim(), cols[8].trim());
-                data.remarks = (cols.length > 9) ? cols[9].trim() : "";
-                data.productCode = (cols.length > 10) ? cols[10].trim() : "";
-                rows.add(data);
-            }
-        }
-        return rows;
+    // Save bytes to OS Temp folder (No DB/Redis bloat)
+    private String saveBytesToTempFile(String reqId, String type, byte[] data) throws IOException {
+        String fileName = "journal_" + type + "_" + reqId + ".tmp";
+        Path path = Paths.get(System.getProperty("java.io.tmpdir"), fileName);
+        Files.write(path, data);
+        return path.toString();
     }
 
-    private List<ExcelRowData> parseWorkbookLogic(Workbook workbook) {
-        List<ExcelRowData> rows = new ArrayList<>();
-        Sheet sheet = workbook.getSheetAt(0);
-        DataFormatter formatter = new DataFormatter();
-        for (Row row : sheet) {
-            if (row.getRowNum() == 0) continue; // Skip Header
-            if (isRowEmpty(row)) continue;
-            ExcelRowData data = new ExcelRowData();
-            data.rowIndex = row.getRowNum();
-            data.branch = parseCode(row.getCell(0), formatter);     
-            data.currency = getCellValueAsString(row.getCell(1), formatter).toUpperCase().trim(); 
-            data.cgl = parseCode(row.getCell(2), formatter);        
-            String amountRaw = getCellValueAsString(row.getCell(3), formatter).trim(); 
-            String typeRaw = getCellValueAsString(row.getCell(4), formatter).trim().toUpperCase(); 
-            data.remarks = getCellValueAsString(row.getCell(5), formatter);
-            data.productCode = parseCode(row.getCell(6), formatter); 
-            data.txnType = typeRaw; 
-            parseAmountAndType(data, amountRaw, typeRaw);
-            rows.add(data);
-        }
-        return rows;
+    // Accessor for Controller
+    public BulkUploadStateDto getState(String reqId) {
+        return jobStore.get(reqId);
     }
 
-    private void parseAmountAndType(ExcelRowData data, String amountRaw, String typeRaw) {
-        try {
-            String clean = CLEAN_AMOUNT_REGEX.matcher(amountRaw).replaceAll("");
-            if (clean.isEmpty()) throw new NumberFormatException("Empty");
-            BigDecimal val = new BigDecimal(clean);
-            boolean isCr = typeRaw.toUpperCase().contains("CR") || amountRaw.contains("-");
-            data.amount = isCr ? val.abs().negate() : val.abs();
-            data.txnType = typeRaw.toUpperCase();
-        } catch (Exception e) { 
-            data.amount = BigDecimal.ZERO; 
+    // Read file for Download
+    public byte[] getFileBytes(String reqId, String type) throws IOException {
+        BulkUploadStateDto state = jobStore.get(reqId);
+        if (state == null) return null;
+        
+        String pathStr = "ERROR".equals(type) ? state.getErrorFilePath() : state.getSuccessFilePath();
+        if (pathStr == null) return null;
+        
+        Path path = Paths.get(pathStr);
+        if (Files.exists(path)) {
+            return Files.readAllBytes(path);
         }
+        return null;
     }
 
-    private byte[] generateSuccessCsv(List<ExcelRowData> rows, LocalDate postingDate) {
-        StringBuilder csv = new StringBuilder(rows.size() * 100);
-        DateTimeFormatter ddMMyyyy = DateTimeFormatter.ofPattern("ddMMyyyy");
-        String col2 = postingDate.format(ddMMyyyy);
-        int month = postingDate.getMonthValue();
-        int year = postingDate.getYear();
-        String col3 = (month >= 4) ? String.valueOf(year) : String.valueOf(year - 1);
-        String col4 = (month >= 4) ? String.format("%02d", month - 3) : String.format("%02d", month + 9);
-
-        for (ExcelRowData row : rows) {
-            String col5 = String.format("%5s", row.branch).replace(' ', '0');
-            String col6 = (row.currency == null || row.currency.isEmpty()) ? "INR" : row.currency;
-            BigDecimal absAmt = row.amount.abs();
-            String plainAmt = absAmt.setScale(4, RoundingMode.HALF_UP).toPlainString();
-            int dotIndex = plainAmt.indexOf('.');
-            String intPart = (dotIndex == -1) ? plainAmt : plainAmt.substring(0, dotIndex);
-            String decPart = (dotIndex == -1) ? "0000" : plainAmt.substring(dotIndex + 1);
-            String col8 = String.format("%16s", intPart).replace(' ', '0') + "." + decPart;
-            String col9 = (row.amount.compareTo(BigDecimal.ZERO) < 0) ? "Cr" : "Dr";
-            String col10 = (row.remarks != null) ? row.remarks.replace(",", " ") : "";
-            String col11 = (row.productCode != null && !row.productCode.isEmpty()) ? row.productCode : "A";
-
-            csv.append("01,").append(col2).append(",").append(col3).append(",").append(col4).append(",")
-               .append(col5).append(",").append(col6).append(",").append(row.cgl).append(",")
-               .append(col8).append(",").append(col9).append(",").append(col10).append(",")
-               .append(col11).append(",B,C,D\n");
-        }
-        return csv.toString().getBytes();
-    }
+    // --- EXCEL & CSV GENERATORS (COMPLETE) ---
 
     private byte[] generateErrorExcelFast(List<ExcelRowData> rows) throws IOException {
         try (SXSSFWorkbook workbook = new SXSSFWorkbook(100)) { 
             workbook.setCompressTempFiles(true);
             Sheet sheet = workbook.createSheet("Error Report");
 
-            CellStyle errorHeaderStyle = workbook.createCellStyle();
+            CellStyle errorHeader = workbook.createCellStyle();
             Font errorFont = workbook.createFont();
-            errorFont.setBold(true);
             errorFont.setColor(IndexedColors.RED.getIndex());
-            errorHeaderStyle.setFont(errorFont);
-            
-            CellStyle normalHeaderStyle = workbook.createCellStyle();
+            errorFont.setBold(true);
+            errorHeader.setFont(errorFont);
+
+            CellStyle normalHeader = workbook.createCellStyle();
             Font normalFont = workbook.createFont();
             normalFont.setBold(true);
-            normalHeaderStyle.setFont(normalFont);
-
-            CellStyle errorDataStyle = workbook.createCellStyle();
-            Font errorDataFont = workbook.createFont();
-            errorDataFont.setColor(IndexedColors.RED.getIndex());
-            errorDataStyle.setFont(errorDataFont);
+            normalHeader.setFont(normalFont);
+            
+            CellStyle errorText = workbook.createCellStyle();
+            Font errorTextFont = workbook.createFont();
+            errorTextFont.setColor(IndexedColors.RED.getIndex());
+            errorText.setFont(errorTextFont);
 
             Row header = sheet.createRow(0);
             String[] headers = {"Branch", "Currency", "CGL", "Amount", "TxnType", "Remarks", "Product", "ERRORS"};
             for(int i=0; i<headers.length; i++) {
                 Cell c = header.createCell(i);
                 c.setCellValue(headers[i]);
-                c.setCellStyle(headers[i].equals("ERRORS") ? errorHeaderStyle : normalHeaderStyle);
+                c.setCellStyle("ERRORS".equals(headers[i]) ? errorHeader : normalHeader);
             }
 
             int idx = 1;
             for(ExcelRowData d : rows) {
+                // Only write rows with errors
                 if (d.hasErrors()) {
                     Row r = sheet.createRow(idx++);
                     r.createCell(0).setCellValue(d.branch);
@@ -358,8 +344,8 @@ public class JournalBulkValidationService {
                     r.createCell(6).setCellValue(d.productCode);
                     
                     Cell err = r.createCell(7);
-                    err.setCellValue(d.getAllErrors()); 
-                    err.setCellStyle(errorDataStyle);
+                    err.setCellValue(d.getAllErrors()); // Combined Errors
+                    err.setCellStyle(errorText);
                 }
             }
             ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -369,45 +355,88 @@ public class JournalBulkValidationService {
         }
     }
 
-    // --- REDIS METHODS ---
-    private void saveStateToRedis(BulkUploadStateDto state) {
-        try {
-            String json = objectMapper.writeValueAsString(state);
-            redisTemplate.opsForValue().set(KEY_META + state.getRequestId(), json, TTL_MINUTES, TimeUnit.MINUTES);
-        } catch (Exception e) { log.error("Redis Save Error", e); }
+    private byte[] generateSuccessCsv(List<ExcelRowData> rows, LocalDate d) {
+        StringBuilder csv = new StringBuilder();
+        String dateStr = d.format(DateTimeFormatter.ofPattern("ddMMyyyy"));
+        // Fixed columns logic from previous
+        String col3 = (d.getMonthValue() >= 4) ? String.valueOf(d.getYear()) : String.valueOf(d.getYear() - 1);
+        String col4 = (d.getMonthValue() >= 4) ? String.format("%02d", d.getMonthValue() - 3) : String.format("%02d", d.getMonthValue() + 9);
+
+        for(ExcelRowData r : rows) {
+            String amtStr = r.amount.abs().setScale(4, RoundingMode.HALF_UP).toString();
+            int dot = amtStr.indexOf('.');
+            String intP = (dot == -1) ? amtStr : amtStr.substring(0, dot);
+            String decP = (dot == -1) ? "0000" : amtStr.substring(dot + 1);
+            String formattedAmt = String.format("%16s", intP).replace(' ', '0') + "." + decP;
+            
+            String txn = r.amount.signum() < 0 ? "Cr" : "Dr";
+            csv.append("01,").append(dateStr).append(",").append(col3).append(",").append(col4).append(",")
+               .append(String.format("%5s", r.branch).replace(' ', '0')).append(",")
+               .append(r.currency).append(",").append(r.cgl).append(",")
+               .append(formattedAmt).append(",").append(txn).append(",")
+               .append(r.remarks).append(",").append(r.productCode).append(",B,C,D\n");
+        }
+        return csv.toString().getBytes();
     }
 
-    private void updateState(String requestId, java.util.function.Consumer<BulkUploadStateDto> updater) {
-        try {
-            String json = redisTemplate.opsForValue().get(KEY_META + requestId);
-            if (json != null) {
-                BulkUploadStateDto state = objectMapper.readValue(json, BulkUploadStateDto.class);
-                updater.accept(state);
-                saveStateToRedis(state);
+    // --- PARSERS ---
+    private List<ExcelRowData> parseExcelBytes(byte[] bytes) throws IOException {
+        try(Workbook wb = new XSSFWorkbook(new ByteArrayInputStream(bytes))) { return parseSheet(wb.getSheetAt(0)); }
+    }
+    private List<ExcelRowData> parseCsvBytes(byte[] bytes) throws IOException {
+        List<ExcelRowData> list = new ArrayList<>();
+        try(BufferedReader br = new BufferedReader(new InputStreamReader(new ByteArrayInputStream(bytes), StandardCharsets.UTF_8))) {
+            String line; int i=0;
+            while((line=br.readLine())!=null) {
+                if(line.trim().isEmpty()) continue;
+                String[] c = line.split(",");
+                if(c.length < 9) continue;
+                ExcelRowData d = new ExcelRowData();
+                d.rowIndex = i++;
+                d.branch = c[4].trim(); d.currency = c[5].trim(); d.cgl = c[6].trim();
+                parseAmount(d, c[7].trim(), c[8].trim());
+                d.remarks = c.length>9?c[9].trim():""; d.productCode = c.length>10?c[10].trim():"";
+                list.add(d);
             }
-        } catch (Exception e) { log.error("Redis Update Error", e); }
+        }
+        return list;
     }
-
-    private void saveFileToRedis(String requestId, String type, byte[] data) {
-        String key = (type.equals("ERROR") ? KEY_FILE_ERR : KEY_FILE_SUC) + requestId;
-        String base64 = Base64.getEncoder().encodeToString(data);
-        redisTemplate.opsForValue().set(key, base64, TTL_MINUTES, TimeUnit.MINUTES);
+    private List<ExcelRowData> parseSheet(Sheet sheet) {
+        List<ExcelRowData> list = new ArrayList<>();
+        DataFormatter fmt = new DataFormatter();
+        for(Row r : sheet) {
+            if(r.getRowNum()==0) continue; 
+            if (isRowEmpty(r)) continue;
+            ExcelRowData d = new ExcelRowData();
+            d.rowIndex = r.getRowNum();
+            d.branch = fmt.formatCellValue(r.getCell(0)).trim();
+            d.currency = fmt.formatCellValue(r.getCell(1)).trim();
+            d.cgl = fmt.formatCellValue(r.getCell(2)).trim();
+            parseAmount(d, fmt.formatCellValue(r.getCell(3)), fmt.formatCellValue(r.getCell(4)));
+            d.remarks = fmt.formatCellValue(r.getCell(5));
+            d.productCode = fmt.formatCellValue(r.getCell(6));
+            if(!d.branch.isEmpty()) list.add(d);
+        }
+        return list;
     }
-
-    public BulkUploadStateDto getState(String reqId) {
+    private void parseAmount(ExcelRowData d, String amtRaw, String typeRaw) {
         try {
-            String json = redisTemplate.opsForValue().get(KEY_META + reqId);
-            return json != null ? objectMapper.readValue(json, BulkUploadStateDto.class) : null;
-        } catch (Exception e) { return null; }
+            d.txnType = typeRaw.toUpperCase();
+            String clean = CLEAN_AMOUNT_REGEX.matcher(amtRaw).replaceAll("");
+            if(clean.isEmpty()) return;
+            BigDecimal v = new BigDecimal(clean);
+            boolean isCr = d.txnType.contains("CR") || amtRaw.contains("-");
+            d.amount = isCr ? v.abs().negate() : v.abs();
+        } catch(Exception e) {}
     }
-
-    public byte[] getFileFromRedis(String reqId, String type) {
-        String key = (type.equals("ERROR") ? KEY_FILE_ERR : KEY_FILE_SUC) + reqId;
-        String base64 = redisTemplate.opsForValue().get(key);
-        return base64 != null ? Base64.getDecoder().decode(base64) : null;
+    private String parseCode(Cell c, DataFormatter f) { return getCellValueAsString(c, f).split("\\.")[0]; }
+    private String getCellValueAsString(Cell c, DataFormatter f) { return f.formatCellValue(c).trim(); }
+    private boolean isRowEmpty(Row r) { 
+        if(r==null) return true;
+        for(int c=r.getFirstCellNum(); c<r.getLastCellNum(); c++) 
+            if(r.getCell(c)!=null && r.getCell(c).getCellType()!=CellType.BLANK && !r.getCell(c).toString().trim().isEmpty()) return false;
+        return true;
     }
-
-    // --- UTILS ---
     private Map<String, Object> mapToPreview(ExcelRowData r) {
         Map<String, Object> m = new HashMap<>();
         m.put("id", r.rowIndex); m.put("branch", r.branch); m.put("currency", r.currency);
@@ -415,15 +444,99 @@ public class JournalBulkValidationService {
         m.put("txnType", r.txnType); m.put("remarks", r.remarks); m.put("productCode", r.productCode);
         return m;
     }
-    private String parseCode(Cell c, DataFormatter f) { return getCellValueAsString(c, f).split("\\.")[0]; }
-    private String getCellValueAsString(Cell c, DataFormatter f) { return f.formatCellValue(c).trim(); }
-    private boolean isRowEmpty(Row r) { 
-        if (r == null) return true;
-        for (int c = r.getFirstCellNum(); c < r.getLastCellNum(); c++) {
-            Cell cell = r.getCell(c);
-            if (cell != null && cell.getCellType() != CellType.BLANK && !getCellValueAsString(cell, new DataFormatter()).trim().isEmpty())
-                return false;
-        }
-        return true;
-    }
 }
+
+3. Backend: JournalRequestController.java (Updated)
+Calls the new In-Memory Service.
+    // ... imports ...
+
+    // 1. INITIATE
+    @PostMapping(value = "/bulk-validate-init", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<Map<String, String>> initiate(@RequestParam("file") MultipartFile file, @RequestParam("postingDate") String date) throws IOException {
+        String reqId = journalBulkValidationService.initiateValidation(file, LocalDate.parse(date));
+        return ResponseEntity.ok(Map.of("status", "QUEUED", "requestId", reqId));
+    }
+
+    // 2. CHECK STATUS
+    @GetMapping("/bulk-status/{requestId}")
+    public ResponseEntity<BulkUploadStateDto> checkStatus(@PathVariable String requestId) {
+        BulkUploadStateDto state = journalBulkValidationService.getState(requestId);
+        if (state == null) return ResponseEntity.notFound().build();
+        return ResponseEntity.ok(state);
+    }
+
+    // 3. DOWNLOAD
+    @GetMapping("/download-bulk-file/{requestId}")
+    public ResponseEntity<Resource> download(@PathVariable String requestId, @RequestParam String type) throws IOException {
+        byte[] data = journalBulkValidationService.getFileBytes(requestId, type);
+        
+        if (data == null) return ResponseEntity.notFound().build();
+
+        String name = type.equals("ERROR") ? "Error_Report.xlsx" : "Success.csv";
+        String mime = type.equals("ERROR") ? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" : "text/csv";
+
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + name + "\"")
+                .contentType(MediaType.parseMediaType(mime))
+                .body(new ByteArrayResource(data));
+    }
+
+4. Frontend: JournalBulkUpload.js (Updated Logic)
+Kept your design, but updated polling to handle the BulkUploadStateDto fields correctly.
+// ... imports (same as before) ...
+
+const JournalBulkUpload = () => {
+  // ... state ...
+  // --- DOWNLOAD HELPER ---
+  const handleDownloadFile = (type) => {
+    if (!requestId) return;
+    const baseUrl = process.env.REACT_APP_API_URL || "http://localhost:8080";
+    window.location.href = `${baseUrl}/JS/journals/download-bulk-file/${requestId}?type=${type}`;
+  };
+
+  // --- POLLING ---
+  useEffect(() => {
+    let interval;
+    if (isProcessing && requestId) {
+      interval = setInterval(async () => {
+        try {
+          const res = await callApi(`/JS/journals/bulk-status/${requestId}`, null, "GET");
+          if (!res) return;
+
+          if (res.currentStage > 0) setActiveStep(res.currentStage - 1);
+
+          if (res.status === "ERROR") {
+            setIsProcessing(false);
+            setFailedStep(res.currentStage - 1);
+            setActiveStep(res.currentStage - 1);
+            setResultStatus("ERROR");
+            setResultMsg(res.message);
+            setErrorCount(res.errorCount);
+            
+            showSnackBar(res.message, "error");
+            clearInterval(interval);
+            
+            // AUTO DOWNLOAD
+            if (res.hasErrorFile) {
+                setTimeout(() => handleDownloadFile("ERROR"), 500);
+            }
+
+          } else if (res.status === "SUCCESS") {
+            setIsProcessing(false);
+            setActiveStep(4); 
+            setResultStatus("SUCCESS");
+            setHasSuccessFile(res.hasSuccessFile);
+            setTotalRows(res.totalRows);
+            if (res.previewDataJson) setPreviewRows(JSON.parse(res.previewDataJson));
+            
+            showSnackBar("Validation Successful!", "success");
+            clearInterval(interval);
+          }
+        } catch (e) {}
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [isProcessing, requestId]);
+
+  // ... (rest of the UI code - Stepper, Buttons, Grid - keeps your styles exactly) ...
+
