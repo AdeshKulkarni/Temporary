@@ -1,542 +1,657 @@
-This is the Simpler, Production-Grade "In-Memory" Solution.
-💡 The Solution Strategy
- * No Redis / No DB Table: We store the status in a simple Java In-Memory Map. This is fast and requires no configuration.
- * File Storage: We save the generated Excel/CSV files to your server's Temp Folder (java.io.tmpdir) to keep memory usage low.
- * 4-Stage Logic: The validation runs in the background and updates the status map.
- * Frontend: Simply polls the status and updates the Stepper.
-1. Backend: BulkUploadStateDto.java
-(Keep this file, it's just a simple data holder)
-package com.fincore.JournalService.Dto;
+import React, { useState, useRef, useEffect } from "react";
+import {
+  Box,
+  Typography,
+  Paper,
+  TextField,
+  Button,
+  CircularProgress,
+  Chip,
+  Alert,
+  Stack,
+  Stepper,
+  Step,
+  StepLabel,
+  LinearProgress,
+} from "@mui/material";
+import {
+  CloudUpload as CloudUploadIcon,
+  RestartAlt as RestartAltIcon,
+  Description as DescriptionIcon,
+  CheckCircle as CheckCircleIcon,
+  Error as ErrorIcon,
+  Download as DownloadIcon,
+  Send as SendIcon,
+  FormatListBulleted as FormatIcon,
+  Storage as DbIcon,
+  Balance as BalanceIcon,
+  DoneAll as DoneIcon,
+} from "@mui/icons-material";
 
-import lombok.Data;
-import java.io.Serializable;
+import { DataGrid } from "@mui/x-data-grid";
 
-@Data
-public class BulkUploadStateDto implements Serializable {
-    private String requestId;
-    private String status; // PROCESSING, SUCCESS, ERROR
-    private Integer currentStage; // 1..4
-    private Integer totalRows;
-    private Long errorCount;
-    private String message;
-    private String previewDataJson;
-    
-    // Flags for frontend
-    private boolean hasErrorFile;
-    private boolean hasSuccessFile;
-    
-    // Internal paths (transient = not sent to frontend)
-    private transient String errorFilePath;
-    private transient String successFilePath;
-}
+import {
+  mainContainerStyle,
+  uploadBoxStyle,
+  controlPanelStyle,
+  iconStyle,
+  headerTextStyle,
+  subTextStyle,
+  dateinputfield,
+  stepperContainerStyle,
+  stepLabelStyle,
+  progressContainerStyle,
+} from "./JournalBulkStyle";
 
-2. Backend: JournalBulkValidationService.java (In-Memory Async)
-This replaces Redis with a ConcurrentHashMap and uses Disk IO for files.
-package com.fincore.JournalService.Service;
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.JournalService.Dto.BulkUploadStateDto;
-import com.fincore.JournalService.Models.*;
-import com.fincore.JournalService.Repository.*;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-
-import org.apache.poi.ss.usermodel.*;
-import org.apache.poi.xssf.streaming.SXSSFWorkbook;
-import org.apache.poi.xssf.usermodel.XSSFWorkbook;
-import org.springframework.scheduling.annotation.Async;
-import org.springframework.stereotype.Service;
-import org.springframework.web.multipart.MultipartFile;
-
-import java.io.*;
-import java.math.BigDecimal;
-import java.math.RoundingMode;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.time.LocalDate;
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.LongAdder;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class JournalBulkValidationService {
-
-    private final BranchMasterRepository branchRepo;
-    private final CglMasterRepository cglRepo;
-    private final CurrencyMasterRepository currencyRepo;
-    private final ObjectMapper objectMapper;
-
-    // --- IN-MEMORY STATE STORE (Replaces Redis/DB) ---
-    private static final Map<String, BulkUploadStateDto> jobStore = new ConcurrentHashMap<>();
-
-    private static final Pattern CLEAN_AMOUNT_REGEX = Pattern.compile("[^0-9.-]");
-    private static final Pattern PRODUCT_CODE_REGEX = Pattern.compile("^\\d{8}$");
-    private static final Pattern CGL_FORMAT_REGEX = Pattern.compile("^\\d{10}$");
-
-    private static class ExcelRowData {
-        int rowIndex;
-        String branch = "", currency = "", cgl = "", txnType = "", remarks = "", productCode = "";
-        BigDecimal amount;
-        
-        List<String> formatErrors = Collections.synchronizedList(new ArrayList<>());
-        List<String> dbErrors = Collections.synchronizedList(new ArrayList<>());
-        List<String> balErrors = Collections.synchronizedList(new ArrayList<>());
-        
-        boolean hasErrors() { 
-            return !formatErrors.isEmpty() || !dbErrors.isEmpty() || !balErrors.isEmpty(); 
-        }
-        String getAllErrors() {
-            List<String> all = new ArrayList<>();
-            all.addAll(formatErrors);
-            all.addAll(dbErrors);
-            all.addAll(balErrors);
-            return String.join("; ", all);
-        }
-    }
-
-    // --- 1. INITIATE ---
-    public String initiateValidation(MultipartFile file, LocalDate postingDate) throws IOException {
-        String requestId = UUID.randomUUID().toString();
-
-        // Initialize State in Map
-        BulkUploadStateDto state = new BulkUploadStateDto();
-        state.setRequestId(requestId);
-        state.setStatus("PROCESSING");
-        state.setCurrentStage(1);
-        state.setMessage("Validating Formats...");
-        jobStore.put(requestId, state);
-
-        byte[] fileBytes = file.getBytes();
-        String filename = file.getOriginalFilename();
-        
-        // Fire Async Process
-        processAsync(requestId, fileBytes, filename, postingDate);
-
-        return requestId;
-    }
-
-    // --- 2. ASYNC PROCESS ---
-    @Async("bulkExecutor") // Needs AsyncConfig
-    public void processAsync(String requestId, byte[] fileBytes, String filename, LocalDate postingDate) {
-        try {
-            // 0. Parse
-            List<ExcelRowData> rows;
-            if (filename != null && (filename.toLowerCase().endsWith(".csv") || filename.toLowerCase().endsWith(".txt"))) {
-                rows = parseCsvBytes(fileBytes);
-            } else {
-                rows = parseExcelBytes(fileBytes);
-            }
-            boolean isInputCsv = filename != null && filename.toLowerCase().endsWith(".csv");
-
-            // Update Total Rows
-            updateState(requestId, s -> s.setTotalRows(rows.size()));
-
-            // --- STAGE 1: FORMAT CHECK ---
-            if (runFormatCheck(rows)) {
-                failRequest(requestId, rows, "Format Validation Failed", 1);
-                return;
-            }
-            // Move to Stage 2
-            updateState(requestId, s -> { s.setCurrentStage(2); s.setMessage("Checking Database..."); });
-            Thread.sleep(500); // Tiny artificial delay so user sees the step change in UI
-
-            // --- STAGE 2: DB CHECK ---
-            if (runDbCheck(rows)) {
-                failRequest(requestId, rows, "Database Validation Failed", 2);
-                return;
-            }
-            updateState(requestId, s -> { s.setCurrentStage(3); s.setMessage("Checking Balances..."); });
-            Thread.sleep(500);
-
-            // --- STAGE 3: BALANCE CHECK ---
-            if (runBalanceCheck(rows)) {
-                failRequest(requestId, rows, "Debit/Credit Balance Mismatch", 3);
-                return;
-            }
-
-            // --- STAGE 4: SUCCESS ---
-            updateState(requestId, s -> { s.setCurrentStage(4); s.setMessage("Finalizing..."); });
-            completeRequest(requestId, rows, postingDate, isInputCsv);
-
-        } catch (Exception e) {
-            log.error("Async Error", e);
-            updateState(requestId, s -> { s.setStatus("ERROR"); s.setMessage("System Error: " + e.getMessage()); });
-        }
-    }
-
-    // --- LOGIC METHODS ---
-
-    private boolean runFormatCheck(List<ExcelRowData> rows) {
-        rows.parallelStream().forEach(d -> {
-            if (d.branch == null || d.branch.isEmpty()) d.formatErrors.add("Branch Empty");
-            if (d.currency == null || d.currency.length() != 3) d.formatErrors.add("Invalid Currency");
-            if (d.cgl == null || !CGL_FORMAT_REGEX.matcher(d.cgl).matches()) d.formatErrors.add("Invalid CGL");
-            if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) == 0) d.formatErrors.add("Invalid Amount");
-            if (d.productCode != null && !d.productCode.isEmpty() && !PRODUCT_CODE_REGEX.matcher(d.productCode).matches()) {
-                d.formatErrors.add("Invalid Product Code");
-            }
-        });
-        return rows.stream().anyMatch(ExcelRowData::hasErrors);
-    }
-
-    private boolean runDbCheck(List<ExcelRowData> rows) {
-        Set<String> branches = rows.parallelStream().map(r -> r.branch).collect(Collectors.toSet());
-        Set<String> cgls = rows.parallelStream().map(r -> r.cgl).collect(Collectors.toSet());
-        Set<String> currs = rows.parallelStream().map(r -> r.currency).collect(Collectors.toSet());
-
-        Set<String> validBranches = branchRepo.findAllById(branches).stream().map(BranchMaster::getCode).collect(Collectors.toSet());
-        Set<String> validCgls = cglRepo.findAllById(cgls).stream().map(CglMaster::getCglNumber).collect(Collectors.toSet());
-        Set<String> validCurrs = currencyRepo.findAllById(currs).stream().map(CurrencyMaster::getCurrencyCode).collect(Collectors.toSet());
-
-        rows.parallelStream().forEach(d -> {
-            if (!validBranches.contains(d.branch)) d.dbErrors.add("Branch Not Found: " + d.branch);
-            if (!validCurrs.contains(d.currency)) d.dbErrors.add("Currency Not Found: " + d.currency);
-            if (!validCgls.contains(d.cgl)) d.dbErrors.add("CGL Not Found: " + d.cgl);
-        });
-        return rows.stream().anyMatch(ExcelRowData::hasErrors);
-    }
-
-    private boolean runBalanceCheck(List<ExcelRowData> rows) {
-        ConcurrentHashMap<String, LongAdder> balanceMap = new ConcurrentHashMap<>();
-        rows.parallelStream().forEach(d -> {
-            if (d.amount != null) {
-                String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
-                String key = d.branch + "_" + d.currency + "_" + type;
-                long val = d.amount.multiply(new BigDecimal("10000")).longValue();
-                balanceMap.computeIfAbsent(key, k -> new LongAdder()).add(val);
-            }
-        });
-
-        rows.parallelStream().forEach(d -> {
-            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
-            String key = d.branch + "_" + d.currency + "_" + type;
-            LongAdder adder = balanceMap.get(key);
-            if (adder != null && adder.sum() != 0) {
-                BigDecimal diff = BigDecimal.valueOf(adder.sum()).divide(new BigDecimal("10000"));
-                synchronized(d.balErrors) {
-                    if (d.balErrors.isEmpty()) d.balErrors.add(type + " Mismatch: " + diff.toPlainString());
-                }
-            }
-        });
-        return rows.stream().anyMatch(ExcelRowData::hasErrors);
-    }
-
-    // --- STATE & FILE HELPERS ---
-
-    private void failRequest(String reqId, List<ExcelRowData> rows, String msg, int stage) throws IOException {
-        String path = saveBytesToTempFile(reqId, "ERR", generateErrorExcelFast(rows));
-        
-        updateState(reqId, s -> {
-            s.setStatus("ERROR");
-            s.setMessage(msg);
-            s.setCurrentStage(stage);
-            s.setErrorCount(rows.stream().filter(ExcelRowData::hasErrors).count());
-            s.setHasErrorFile(true);
-            s.setErrorFilePath(path);
-        });
-    }
-
-    private void completeRequest(String reqId, List<ExcelRowData> rows, LocalDate pDate, boolean isCsv) throws IOException {
-        String sucPath = null;
-        if (!isCsv) {
-            sucPath = saveBytesToTempFile(reqId, "SUC", generateSuccessCsv(rows, pDate));
-        }
-        
-        List<Map<String, Object>> preview = rows.stream().limit(100).map(this::mapToPreview).collect(Collectors.toList());
-        String previewJson = objectMapper.writeValueAsString(preview);
-        
-        final String finalSucPath = sucPath;
-        updateState(reqId, s -> {
-            s.setStatus("SUCCESS");
-            s.setCurrentStage(4);
-            s.setMessage("Validation Successful");
-            s.setHasSuccessFile(!isCsv);
-            s.setSuccessFilePath(finalSucPath);
-            s.setPreviewDataJson(previewJson);
-        });
-    }
-
-    // --- UTILS: MAP & FILE ---
-
-    private void updateState(String reqId, java.util.function.Consumer<BulkUploadStateDto> updater) {
-        BulkUploadStateDto state = jobStore.get(reqId);
-        if (state != null) {
-            updater.accept(state);
-        }
-    }
-
-    // Save bytes to OS Temp folder (No DB/Redis bloat)
-    private String saveBytesToTempFile(String reqId, String type, byte[] data) throws IOException {
-        String fileName = "journal_" + type + "_" + reqId + ".tmp";
-        Path path = Paths.get(System.getProperty("java.io.tmpdir"), fileName);
-        Files.write(path, data);
-        return path.toString();
-    }
-
-    // Accessor for Controller
-    public BulkUploadStateDto getState(String reqId) {
-        return jobStore.get(reqId);
-    }
-
-    // Read file for Download
-    public byte[] getFileBytes(String reqId, String type) throws IOException {
-        BulkUploadStateDto state = jobStore.get(reqId);
-        if (state == null) return null;
-        
-        String pathStr = "ERROR".equals(type) ? state.getErrorFilePath() : state.getSuccessFilePath();
-        if (pathStr == null) return null;
-        
-        Path path = Paths.get(pathStr);
-        if (Files.exists(path)) {
-            return Files.readAllBytes(path);
-        }
-        return null;
-    }
-
-    // --- EXCEL & CSV GENERATORS (COMPLETE) ---
-
-    private byte[] generateErrorExcelFast(List<ExcelRowData> rows) throws IOException {
-        try (SXSSFWorkbook workbook = new SXSSFWorkbook(100)) { 
-            workbook.setCompressTempFiles(true);
-            Sheet sheet = workbook.createSheet("Error Report");
-
-            CellStyle errorHeader = workbook.createCellStyle();
-            Font errorFont = workbook.createFont();
-            errorFont.setColor(IndexedColors.RED.getIndex());
-            errorFont.setBold(true);
-            errorHeader.setFont(errorFont);
-
-            CellStyle normalHeader = workbook.createCellStyle();
-            Font normalFont = workbook.createFont();
-            normalFont.setBold(true);
-            normalHeader.setFont(normalFont);
-            
-            CellStyle errorText = workbook.createCellStyle();
-            Font errorTextFont = workbook.createFont();
-            errorTextFont.setColor(IndexedColors.RED.getIndex());
-            errorText.setFont(errorTextFont);
-
-            Row header = sheet.createRow(0);
-            String[] headers = {"Branch", "Currency", "CGL", "Amount", "TxnType", "Remarks", "Product", "ERRORS"};
-            for(int i=0; i<headers.length; i++) {
-                Cell c = header.createCell(i);
-                c.setCellValue(headers[i]);
-                c.setCellStyle("ERRORS".equals(headers[i]) ? errorHeader : normalHeader);
-            }
-
-            int idx = 1;
-            for(ExcelRowData d : rows) {
-                // Only write rows with errors
-                if (d.hasErrors()) {
-                    Row r = sheet.createRow(idx++);
-                    r.createCell(0).setCellValue(d.branch);
-                    r.createCell(1).setCellValue(d.currency);
-                    r.createCell(2).setCellValue(d.cgl);
-                    r.createCell(3).setCellValue(d.amount != null ? d.amount.toString() : "");
-                    r.createCell(4).setCellValue(d.txnType);
-                    r.createCell(5).setCellValue(d.remarks);
-                    r.createCell(6).setCellValue(d.productCode);
-                    
-                    Cell err = r.createCell(7);
-                    err.setCellValue(d.getAllErrors()); // Combined Errors
-                    err.setCellStyle(errorText);
-                }
-            }
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            workbook.write(out);
-            workbook.dispose();
-            return out.toByteArray();
-        }
-    }
-
-    private byte[] generateSuccessCsv(List<ExcelRowData> rows, LocalDate d) {
-        StringBuilder csv = new StringBuilder();
-        String dateStr = d.format(DateTimeFormatter.ofPattern("ddMMyyyy"));
-        // Fixed columns logic from previous
-        String col3 = (d.getMonthValue() >= 4) ? String.valueOf(d.getYear()) : String.valueOf(d.getYear() - 1);
-        String col4 = (d.getMonthValue() >= 4) ? String.format("%02d", d.getMonthValue() - 3) : String.format("%02d", d.getMonthValue() + 9);
-
-        for(ExcelRowData r : rows) {
-            String amtStr = r.amount.abs().setScale(4, RoundingMode.HALF_UP).toString();
-            int dot = amtStr.indexOf('.');
-            String intP = (dot == -1) ? amtStr : amtStr.substring(0, dot);
-            String decP = (dot == -1) ? "0000" : amtStr.substring(dot + 1);
-            String formattedAmt = String.format("%16s", intP).replace(' ', '0') + "." + decP;
-            
-            String txn = r.amount.signum() < 0 ? "Cr" : "Dr";
-            csv.append("01,").append(dateStr).append(",").append(col3).append(",").append(col4).append(",")
-               .append(String.format("%5s", r.branch).replace(' ', '0')).append(",")
-               .append(r.currency).append(",").append(r.cgl).append(",")
-               .append(formattedAmt).append(",").append(txn).append(",")
-               .append(r.remarks).append(",").append(r.productCode).append(",B,C,D\n");
-        }
-        return csv.toString().getBytes();
-    }
-
-    // --- PARSERS ---
-    private List<ExcelRowData> parseExcelBytes(byte[] bytes) throws IOException {
-        try(Workbook wb = new XSSFWorkbook(new ByteArrayInputStream(bytes))) { return parseSheet(wb.getSheetAt(0)); }
-    }
-    private List<ExcelRowData> parseCsvBytes(byte[] bytes) throws IOException {
-        List<ExcelRowData> list = new ArrayList<>();
-        try(BufferedReader br = new BufferedReader(new InputStreamReader(new ByteArrayInputStream(bytes), StandardCharsets.UTF_8))) {
-            String line; int i=0;
-            while((line=br.readLine())!=null) {
-                if(line.trim().isEmpty()) continue;
-                String[] c = line.split(",");
-                if(c.length < 9) continue;
-                ExcelRowData d = new ExcelRowData();
-                d.rowIndex = i++;
-                d.branch = c[4].trim(); d.currency = c[5].trim(); d.cgl = c[6].trim();
-                parseAmount(d, c[7].trim(), c[8].trim());
-                d.remarks = c.length>9?c[9].trim():""; d.productCode = c.length>10?c[10].trim():"";
-                list.add(d);
-            }
-        }
-        return list;
-    }
-    private List<ExcelRowData> parseSheet(Sheet sheet) {
-        List<ExcelRowData> list = new ArrayList<>();
-        DataFormatter fmt = new DataFormatter();
-        for(Row r : sheet) {
-            if(r.getRowNum()==0) continue; 
-            if (isRowEmpty(r)) continue;
-            ExcelRowData d = new ExcelRowData();
-            d.rowIndex = r.getRowNum();
-            d.branch = fmt.formatCellValue(r.getCell(0)).trim();
-            d.currency = fmt.formatCellValue(r.getCell(1)).trim();
-            d.cgl = fmt.formatCellValue(r.getCell(2)).trim();
-            parseAmount(d, fmt.formatCellValue(r.getCell(3)), fmt.formatCellValue(r.getCell(4)));
-            d.remarks = fmt.formatCellValue(r.getCell(5));
-            d.productCode = fmt.formatCellValue(r.getCell(6));
-            if(!d.branch.isEmpty()) list.add(d);
-        }
-        return list;
-    }
-    private void parseAmount(ExcelRowData d, String amtRaw, String typeRaw) {
-        try {
-            d.txnType = typeRaw.toUpperCase();
-            String clean = CLEAN_AMOUNT_REGEX.matcher(amtRaw).replaceAll("");
-            if(clean.isEmpty()) return;
-            BigDecimal v = new BigDecimal(clean);
-            boolean isCr = d.txnType.contains("CR") || amtRaw.contains("-");
-            d.amount = isCr ? v.abs().negate() : v.abs();
-        } catch(Exception e) {}
-    }
-    private String parseCode(Cell c, DataFormatter f) { return getCellValueAsString(c, f).split("\\.")[0]; }
-    private String getCellValueAsString(Cell c, DataFormatter f) { return f.formatCellValue(c).trim(); }
-    private boolean isRowEmpty(Row r) { 
-        if(r==null) return true;
-        for(int c=r.getFirstCellNum(); c<r.getLastCellNum(); c++) 
-            if(r.getCell(c)!=null && r.getCell(c).getCellType()!=CellType.BLANK && !r.getCell(c).toString().trim().isEmpty()) return false;
-        return true;
-    }
-    private Map<String, Object> mapToPreview(ExcelRowData r) {
-        Map<String, Object> m = new HashMap<>();
-        m.put("id", r.rowIndex); m.put("branch", r.branch); m.put("currency", r.currency);
-        m.put("cgl", r.cgl); m.put("amount", r.amount!=null?r.amount.abs().toString():"");
-        m.put("txnType", r.txnType); m.put("remarks", r.remarks); m.put("productCode", r.productCode);
-        return m;
-    }
-}
-
-3. Backend: JournalRequestController.java (Updated)
-Calls the new In-Memory Service.
-    // ... imports ...
-
-    // 1. INITIATE
-    @PostMapping(value = "/bulk-validate-init", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public ResponseEntity<Map<String, String>> initiate(@RequestParam("file") MultipartFile file, @RequestParam("postingDate") String date) throws IOException {
-        String reqId = journalBulkValidationService.initiateValidation(file, LocalDate.parse(date));
-        return ResponseEntity.ok(Map.of("status", "QUEUED", "requestId", reqId));
-    }
-
-    // 2. CHECK STATUS
-    @GetMapping("/bulk-status/{requestId}")
-    public ResponseEntity<BulkUploadStateDto> checkStatus(@PathVariable String requestId) {
-        BulkUploadStateDto state = journalBulkValidationService.getState(requestId);
-        if (state == null) return ResponseEntity.notFound().build();
-        return ResponseEntity.ok(state);
-    }
-
-    // 3. DOWNLOAD
-    @GetMapping("/download-bulk-file/{requestId}")
-    public ResponseEntity<Resource> download(@PathVariable String requestId, @RequestParam String type) throws IOException {
-        byte[] data = journalBulkValidationService.getFileBytes(requestId, type);
-        
-        if (data == null) return ResponseEntity.notFound().build();
-
-        String name = type.equals("ERROR") ? "Error_Report.xlsx" : "Success.csv";
-        String mime = type.equals("ERROR") ? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" : "text/csv";
-
-        return ResponseEntity.ok()
-                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + name + "\"")
-                .contentType(MediaType.parseMediaType(mime))
-                .body(new ByteArrayResource(data));
-    }
-
-4. Frontend: JournalBulkUpload.js (Updated Logic)
-Kept your design, but updated polling to handle the BulkUploadStateDto fields correctly.
-// ... imports (same as before) ...
+const steps = [
+  "Format Validation",
+  "Database Check",
+  "Balance Check",
+  "Finalizing",
+];
 
 const JournalBulkUpload = () => {
-  // ... state ...
-  // --- DOWNLOAD HELPER ---
-  const handleDownloadFile = (type) => {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+
+  const [selectedDate, setSelectedDate] = useState("");
+  const [file, setFile] = useState(null);
+  const [isCsvInput, setIsCsvInput] = useState(false);
+
+  // Status State
+  const [requestId, setRequestId] = useState(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [activeStep, setActiveStep] = useState(0);
+  const [failedStep, setFailedStep] = useState(-1);
+
+  // Result State
+  const [resultStatus, setResultStatus] = useState(null); // SUCCESS or ERROR
+  const [resultMsg, setResultMsg] = useState("");
+  const [previewRows, setPreviewRows] = useState([]);
+  const [totalRows, setTotalRows] = useState(0);
+  const [processedRows, setProcessedRows] = useState(0);
+  const [hasSuccessFile, setHasSuccessFile] = useState(false);
+  const [errorCount, setErrorCount] = useState(0);
+
+  // Download State
+  const [isDownloading, setIsDownloading] = useState(false);
+  const [downloadText, setDownloadText] = useState("");
+
+  const [isCreatingBatch, setIsCreatingBatch] = useState(false);
+  const fileInputRef = useRef(null);
+
+  // --- 1. SECURE DOWNLOAD FUNCTION ---
+  const handleDownloadFile = async (type) => {
     if (!requestId) return;
-    const baseUrl = process.env.REACT_APP_API_URL || "http://localhost:8080";
-    window.location.href = `${baseUrl}/JS/journals/download-bulk-file/${requestId}?type=${type}`;
+    setIsDownloading(true);
+
+    try {
+      // Get Token from Storage (Redux Persist pattern)
+      let token = "";
+      const storage =
+        sessionStorage.getItem("persist:auth") ||
+        localStorage.getItem("persist:auth");
+
+      if (storage) {
+        const parsed = JSON.parse(storage);
+        if (parsed && parsed.token) {
+          // Remove quotes if present
+          token = parsed.token.replace(/^"|"$/g, "");
+        }
+      }
+
+      // If useApi handles token automatically, you might need to extract that logic.
+      // Assuming standard Bearer token here:
+      const response = await fetch(
+        `/JS/journals/download-bulk-file/${requestId}?type=${type}`,
+        {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error("Download failed");
+      }
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.setAttribute(
+        "download",
+        type === "ERROR"
+          ? `Error_Report_${requestId}.xlsx`
+          : `Success_Journal_${requestId}.csv`
+      );
+      document.body.appendChild(link);
+      link.click();
+      link.parentNode.removeChild(link);
+      window.URL.revokeObjectURL(url);
+
+      if (type === "ERROR") setDownloadText("Report Downloaded");
+      showSnackBar("File downloaded successfully.", "success");
+    } catch (error) {
+      console.error("Download Error", error);
+      showSnackBar("Failed to download file.", "error");
+    } finally {
+      setIsDownloading(false);
+    }
   };
 
-  // --- POLLING ---
+  // --- 2. POLLING LOGIC ---
   useEffect(() => {
     let interval;
     if (isProcessing && requestId) {
       interval = setInterval(async () => {
         try {
-          const res = await callApi(`/JS/journals/bulk-status/${requestId}`, null, "GET");
+          const res = await callApi(
+            `/JS/journals/bulk-status/${requestId}`,
+            null,
+            "GET"
+          );
           if (!res) return;
 
+          // Update Progress
+          if (res.totalRows) setTotalRows(res.totalRows);
+          if (res.processedCount) setProcessedRows(res.processedCount);
           if (res.currentStage > 0) setActiveStep(res.currentStage - 1);
 
+          // Handle ERROR
           if (res.status === "ERROR") {
             setIsProcessing(false);
-            setFailedStep(res.currentStage - 1);
-            setActiveStep(res.currentStage - 1);
             setResultStatus("ERROR");
             setResultMsg(res.message);
             setErrorCount(res.errorCount);
-            
-            showSnackBar(res.message, "error");
+            setFailedStep(res.currentStage ? res.currentStage - 1 : 0);
+            setActiveStep(res.currentStage ? res.currentStage - 1 : 0);
             clearInterval(interval);
-            
-            // AUTO DOWNLOAD
-            if (res.hasErrorFile) {
-                setTimeout(() => handleDownloadFile("ERROR"), 500);
-            }
 
-          } else if (res.status === "SUCCESS") {
+            showSnackBar(res.message, "error");
+
+            // AUTO DOWNLOAD TRIGGER
+            if (res.hasErrorFile) {
+              setTimeout(() => {
+                handleDownloadFile("ERROR");
+              }, 1000);
+            }
+          }
+          // Handle SUCCESS
+          else if (res.status === "SUCCESS") {
             setIsProcessing(false);
-            setActiveStep(4); 
             setResultStatus("SUCCESS");
+            setActiveStep(4);
             setHasSuccessFile(res.hasSuccessFile);
             setTotalRows(res.totalRows);
-            if (res.previewDataJson) setPreviewRows(JSON.parse(res.previewDataJson));
-            
-            showSnackBar("Validation Successful!", "success");
+            // Parse Preview JSON
+            if (res.previewDataJson) {
+              try {
+                setPreviewRows(JSON.parse(res.previewDataJson));
+              } catch (e) {
+                console.error("JSON Parse Error", e);
+              }
+            } else if (res.previewData) {
+              // Backward compatibility if backend sends object
+              setPreviewRows(res.previewData);
+            }
+
             clearInterval(interval);
+            showSnackBar("Validation Successful!", "success");
           }
-        } catch (e) {}
+        } catch (e) {
+          console.error("Poll Error", e);
+        }
       }, 1000);
     }
     return () => clearInterval(interval);
-  }, [isProcessing, requestId]);
+  }, [isProcessing, requestId]); // Removed unnecessary deps to prevent loops
 
-  // ... (rest of the UI code - Stepper, Buttons, Grid - keeps your styles exactly) ...
+  // --- 3. STANDARD HANDLERS ---
 
+  const handleDateChange = (e) => {
+    setSelectedDate(e.target.value);
+    resetState();
+  };
+
+  const handleFileChange = (e) => {
+    const selectedFile = e.target.files[0];
+    if (selectedFile) {
+      const name = selectedFile.name.toLowerCase();
+      if (
+        !name.endsWith(".xlsx") &&
+        !name.endsWith(".xls") &&
+        !name.endsWith(".csv")
+      ) {
+        showSnackBar("Invalid file type.", "error");
+        setFile(null);
+        return;
+      }
+      setFile(selectedFile);
+      setIsCsvInput(name.endsWith(".csv"));
+      resetState();
+    }
+  };
+
+  const resetState = () => {
+    setUiError("");
+    setErrorCount(0);
+    setHasSuccessFile(false);
+    setPreviewRows([]);
+    setTotalRows(0);
+    setProcessedRows(0);
+    setRequestId(null);
+    setActiveStep(0);
+    setFailedStep(-1);
+    setResultStatus(null);
+    setDownloadText("");
+  };
+
+  const resetForm = () => {
+    setFile(null);
+    setSelectedDate("");
+    resetState();
+    setIsProcessing(false);
+    setIsCreatingBatch(false);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const startValidation = async () => {
+    if (!file || !selectedDate) {
+      showSnackBar("Please select Date and File.", "warning");
+      return;
+    }
+    resetState();
+    setIsProcessing(true);
+
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("postingDate", selectedDate);
+
+    try {
+      const res = await callApi(
+        "/JS/journals/bulk-validate-init",
+        formData,
+        "POST",
+        "json",
+        "multipart/form-data"
+      );
+      if (res && res.requestId) {
+        setRequestId(res.requestId);
+      } else {
+        setIsProcessing(false);
+        showSnackBar("Failed to start validation.", "error");
+      }
+    } catch (err) {
+      setIsProcessing(false);
+      showSnackBar("System Error", "error");
+    }
+  };
+
+  const handleSubmitBatch = async () => {
+    if (previewRows.length === 0) return;
+    setIsCreatingBatch(true);
+    try {
+      const payloadRows = previewRows.map((row) => ({
+        changeType: "ADD",
+        branch: row.branch,
+        currency: row.currency,
+        cgl: row.cgl,
+        amount: row.txnType === "Credit" ? "-" + row.amount : row.amount,
+        productType: row.productCode,
+        remarks: row.remarks,
+        arFlag: "A",
+        acClassification: "A",
+      }));
+
+      const finalPayload = {
+        commonBatchRemarks: `Bulk Upload - ${selectedDate}`,
+        rows: payloadRows,
+      };
+      const response = await callApi(
+        "/JS/journals/create-bulk-batch",
+        finalPayload,
+        "POST"
+      );
+
+      if (response && response.status === "SUCCESS") {
+        showSnackBar(`Batch Created! ID: ${response.batchId}`, "success");
+        resetForm();
+      }
+    } catch (e) {
+      showSnackBar("Failed to create batch", "error");
+    } finally {
+      setIsCreatingBatch(false);
+    }
+  };
+
+  const columns = [
+    {
+      field: "branch",
+      headerName: "Branch",
+      flex: 1,
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "currency",
+      headerName: "Currency",
+      width: 100,
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "cgl",
+      headerName: "CGL",
+      flex: 1.5,
+      align: "center",
+      headerAlign: "center",
+    },
+    {
+      field: "productCode",
+      headerName: "Product",
+      width: 120,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (p) => p.value || "-",
+    },
+    {
+      field: "amount",
+      headerName: "Amount",
+      flex: 1.5,
+      minWidth: 150,
+      align: "right",
+      headerAlign: "center",
+    },
+    {
+      field: "txnType",
+      headerName: "Type",
+      width: 100,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => (
+        <Chip
+          label={params.value}
+          color={params.value === "Credit" ? "error" : "success"}
+          size="small"
+          variant="filled"
+          sx={{ fontWeight: "bold", width: "80px" }}
+        />
+      ),
+    },
+    {
+      field: "remarks",
+      headerName: "Remarks",
+      flex: 2,
+      align: "center",
+      headerAlign: "center",
+    },
+  ];
+
+  // Percentage Calc
+  const progressPercent =
+    totalRows > 0
+      ? Math.min(100, Math.round((processedRows / totalRows) * 100))
+      : 0;
+
+  return (
+    <Box sx={mainContainerStyle}>
+      <Paper elevation={1} sx={controlPanelStyle}>
+        {/* Date Input */}
+        <Box sx={dateinputfield}>
+          <TextField
+            type="date"
+            label="Posting Date"
+            size="small"
+            value={selectedDate}
+            onChange={handleDateChange}
+            InputLabelProps={{ shrink: true }}
+            inputProps={{ max: new Date().toISOString().split("T")[0] }}
+          />
+        </Box>
+
+        {/* Upload Box */}
+        <Box sx={uploadBoxStyle} onClick={() => fileInputRef.current.click()}>
+          <input
+            type="file"
+            hidden
+            accept=".xlsx,.xls,.csv"
+            onChange={handleFileChange}
+            ref={fileInputRef}
+          />
+          {file ? (
+            <>
+              <DescriptionIcon color="success" sx={{ fontSize: 60, mb: 1 }} />
+              <Typography variant="h6" sx={headerTextStyle}>
+                {file.name}
+              </Typography>
+              <Chip
+                label="Ready"
+                color="success"
+                size="small"
+                variant="outlined"
+              />
+            </>
+          ) : (
+            <>
+              <CloudUploadIcon sx={iconStyle} />
+              <Typography variant="h6" sx={headerTextStyle}>
+                Click to Upload
+              </Typography>
+              <Typography sx={subTextStyle}>
+                Supported: .xlsx, .xls, .csv
+              </Typography>
+            </>
+          )}
+        </Box>
+
+        {/* STEPPER */}
+        {(isProcessing || resultStatus === "SUCCESS" || resultStatus === "ERROR") && (
+          <Box sx={stepperContainerStyle}>
+            <Stepper activeStep={activeStep} alternativeLabel>
+              {steps.map((label, index) => {
+                const isFailed = index === failedStep;
+                const isCompleted = index < activeStep || resultStatus === "SUCCESS";
+
+                return (
+                  <Step key={label}>
+                    <StepLabel
+                      error={isFailed}
+                      sx={stepLabelStyle}
+                      StepIconComponent={() => {
+                        if (isFailed) return <ErrorIcon color="error" />;
+                        if (isCompleted) return <CheckCircleIcon color="success" />;
+                        if (index === activeStep && isProcessing)
+                          return <CircularProgress size={20} />;
+                        return (
+                          <Typography
+                            color="text.disabled"
+                            fontWeight="bold"
+                          >
+                            {index + 1}
+                          </Typography>
+                        );
+                      }}
+                    >
+                      {label}
+                    </StepLabel>
+                  </Step>
+                );
+              })}
+            </Stepper>
+
+            {/* LIVE PROGRESS */}
+            {isProcessing && totalRows > 0 && (
+              <Box sx={progressContainerStyle}>
+                <LinearProgress
+                  variant="determinate"
+                  value={progressPercent}
+                  sx={{ height: 8, borderRadius: 4 }}
+                />
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  sx={{ display: "block", mt: 1 }}
+                >
+                  Processed: {processedRows.toLocaleString()} /{" "}
+                  {totalRows.toLocaleString()} ({progressPercent}%)
+                </Typography>
+              </Box>
+            )}
+          </Box>
+        )}
+
+        <Stack
+          direction="row"
+          justifyContent="center"
+          spacing={2}
+          sx={{ mt: 2 }}
+        >
+          <Button
+            variant="contained"
+            onClick={startValidation}
+            disabled={isProcessing || !file || !selectedDate}
+            size="large"
+          >
+            {isProcessing ? "Validating..." : "Validate"}
+          </Button>
+          <Button
+            variant="outlined"
+            color="error"
+            onClick={resetForm}
+            disabled={isProcessing}
+            size="large"
+          >
+            Reset
+          </Button>
+        </Stack>
+
+        {/* RESULTS AREA */}
+        <Box sx={{ mt: 3 }}>
+          {/* ERROR PANEL */}
+          {resultStatus === "ERROR" && (
+            <Alert
+              severity="error"
+              sx={{ mb: 2, border: "1px solid #ee0404ff" }}
+            >
+              <Typography variant="subtitle2" fontWeight="bold">
+                Validation Failed
+              </Typography>
+              <Typography variant="body2">{resultMsg}</Typography>
+
+              <Button
+                variant="outlined"
+                color="error"
+                size="small"
+                startIcon={
+                  isDownloading ? (
+                    <CircularProgress size={16} />
+                  ) : (
+                    <DownloadIcon />
+                  )
+                }
+                sx={{ mt: 1, bgcolor: "background.paper" }}
+                onClick={() => handleDownloadFile("ERROR")}
+                disabled={isDownloading}
+              >
+                {downloadText || "Download Error Report"}
+              </Button>
+            </Alert>
+          )}
+
+          {/* SUCCESS PANEL */}
+          {resultStatus === "SUCCESS" && (
+            <Paper
+              variant="outlined"
+              sx={{ p: 2, borderColor: "success.main" }}
+            >
+              <Stack
+                direction={{ xs: "column", sm: "row" }}
+                justifyContent="space-between"
+                alignItems="center"
+                spacing={2}
+              >
+                <Box>
+                  <Stack direction="row" alignItems="center" spacing={1}>
+                    <CheckCircleIcon color="success" />
+                    <Typography variant="subtitle1" fontWeight="bold">
+                      Validation Successful!
+                    </Typography>
+                  </Stack>
+                  <Typography variant="body2">
+                    {totalRows.toLocaleString()} rows verified.
+                  </Typography>
+                </Box>
+                <Stack direction="row" spacing={2}>
+                  {!isCsvInput && hasSuccessFile && (
+                    <Button
+                      variant="outlined"
+                      color="success"
+                      startIcon={<DownloadIcon />}
+                      onClick={() => handleDownloadFile("SUCCESS")}
+                      sx={{ bgcolor: "background.paper" }}
+                      disabled={isDownloading}
+                    >
+                      Download CSV
+                    </Button>
+                  )}
+                  <Button
+                    variant="contained"
+                    color="success"
+                    startIcon={
+                      isCreatingBatch ? (
+                        <CircularProgress size={20} color="inherit" />
+                      ) : (
+                        <SendIcon />
+                      )
+                    }
+                    onClick={handleSubmitBatch}
+                    disabled={isCreatingBatch}
+                  >
+                    {isCreatingBatch ? "Creating..." : "Create Batch"}
+                  </Button>
+                </Stack>
+              </Stack>
+            </Paper>
+          )}
+        </Box>
+      </Paper>
+
+      {/* DATA GRID */}
+      {resultStatus === "SUCCESS" && previewRows.length > 0 && (
+        <Paper
+          elevation={1}
+          sx={{
+            p: 0,
+            mt: 3,
+            height: 600,
+            width: "100%",
+            borderRadius: 2,
+            overflow: "hidden",
+          }}
+        >
+          <Box sx={{ p: 2, borderBottom: 1, borderColor: "divider" }}>
+            <Typography variant="h6" sx={{ fontWeight: 600 }}>
+              Data Preview (Top 100)
+            </Typography>
+          </Box>
+          <DataGrid
+            rows={previewRows}
+            columns={columns}
+            pageSize={10}
+            rowsPerPageOptions={[10, 25, 50, 100]}
+            disableSelectionOnClick
+            density="comfortable"
+            sx={{ border: "none" }}
+          />
+        </Paper>
+      )}
+    </Box>
+  );
+};
+
+export default JournalBulkUpload;
