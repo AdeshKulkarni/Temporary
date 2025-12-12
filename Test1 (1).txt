@@ -1,49 +1,1055 @@
-Here is the Final Optimized, Production-Grade Solution.
-🚀 How the Optimized Logic Works (Step-by-Step)
-This architecture prevents browser timeouts and handles 100,000+ rows instantly from the user's perspective.
- * User Uploads File: The frontend sends the file to /bulk-validate-init.
- * Immediate Response (The "Ticket"): The Backend saves a record in the Database with status PROCESSING and returns a requestId (UUID) immediately (in milliseconds). The connection closes.
- * Async Processing (Background): A separate Thread picks up the file bytes.
-   * Smart Parsing: Reads the file efficiently.
-   * Smart Fetching: Extracts only unique Branch/CGL codes and fetches them from DB in one batch (instead of 100,000 queries).
-   * Validation: It runs the Memo vs Normal balancing logic.
-   * Saving Results: It generates the Success CSV or Error Excel and saves them as BLOBs in the database.
- * Frontend Polling: The Frontend asks the server every 2 seconds: "Is job X done?".
- * Completion: Once the DB status changes to SUCCESS or ERROR, the Frontend stops spinning.
-   * It shows a Preview of the first 100 rows.
-   * It offers a Download button.
-   * Download Strategy: Clicking download hits a specific API that streams the file from the DB, handling large sizes without crashing memory.
-PART 1: Configuration & Entity
-1. application.properties (Crucial for Large Files)
-# Allow unlimited file size (or set specific limit like 500MB)
-spring.servlet.multipart.max-file-size=-1
-spring.servlet.multipart.max-request-size=-1
+package com.fincore.JournalService.Aspect;
 
-2. AsyncConfig.java
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.JournalService.Dto.BatchRequestDto;
+import com.fincore.JournalService.Dto.BulkProcessJournalRequestDto;
+import com.fincore.JournalService.Dto.ProcessJournalRequestDto;
+import com.fincore.JournalService.Models.JournalLog;
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Repository.JournalLogRepository;
+import jakarta.servlet.http.HttpServletRequest;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.aspectj.lang.JoinPoint;
+import org.aspectj.lang.annotation.AfterReturning;
+import org.aspectj.lang.annotation.Aspect;
+import org.springframework.stereotype.Component;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
+
+import java.time.LocalDateTime;
+
+@Aspect
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class JournalActivityLogger {
+
+    private final JournalLogRepository journalLogRepository;
+    private final ObjectMapper objectMapper;
+
+    // --- 1. Log Batch Creation (Standard) ---
+    @AfterReturning(
+            pointcut = "execution(* com.fincore.JournalService.Service.JournalRequestService.createBatchRequest(..)) && args(batchDto, creatorId, creatorRole)",
+            returning = "result"
+    )
+    public void logCreateBatch(JoinPoint joinPoint, BatchRequestDto batchDto, String creatorId, Integer creatorRole, Object result) {
+        String summary = "Created Batch with " + (batchDto.getRows() != null ? batchDto.getRows().size() : 0) + " rows.";
+        // Passing null for requestId is correct here, but saveLog must handle it safely
+        saveLog(creatorId, "CREATE", "BATCH_CREATION", summary, null, null);
+    }
+
+    // --- 2. Log Bulk Batch Creation (Optimized Upload) ---
+    @AfterReturning(
+            pointcut = "execution(* com.fincore.JournalService.Service.JournalRequestService.createBulkBatchRequest(..)) && args(batchDto, creatorId, creatorRole)",
+            returning = "batchId"
+    )
+    public void logBulkCreate(JoinPoint joinPoint, BatchRequestDto batchDto, String creatorId, Integer creatorRole, Object batchId) {
+        String summary = "Bulk Upload Created. Batch ID: " + batchId + ". Rows: " + (batchDto.getRows() != null ? batchDto.getRows().size() : 0);
+        saveLog(creatorId, "CREATE", "BULK_UPLOAD", summary, null, null);
+    }
+
+    // --- 3. Log Single Status Update (Approve/Reject) ---
+    @AfterReturning(
+            pointcut = "execution(* com.fincore.JournalService.Service.JournalRequestService.updateRequestStatus(..)) && args(dto, executorId, executorRole)",
+            returning = "result"
+    )
+    public void logStatusUpdate(JoinPoint joinPoint, ProcessJournalRequestDto dto, String executorId, Integer executorRole, Object result) {
+        if (result instanceof JournalRequest) {
+            JournalRequest req = (JournalRequest) result; // The updated entity
+            String newValue = "Status: " + dto.getStatus() + ", Remarks: " + dto.getRemarks();
+            // We can treat 'changeType' as the Status (ACCEPTED/REJECTED)
+            saveLog(executorId, dto.getStatus().toString(), "STATUS_UPDATE", newValue, null, req.getId());
+        }
+    }
+
+    // --- 4. Log Bulk Status Update (Bulk Approve/Reject) ---
+    @AfterReturning(
+            pointcut = "execution(* com.fincore.JournalService.Service.JournalRequestService.processBulkRequests(..)) && args(dto, executorId, executorRole)",
+            returning = "result"
+    )
+    public void logBulkStatusUpdate(JoinPoint joinPoint, BulkProcessJournalRequestDto dto, String executorId, Integer executorRole, Object result) {
+        String target = dto.getBatchId() != null ? "Batch ID: " + dto.getBatchId() : "Journals: " + dto.getJournalIdPrefixes();
+        String newValue = "Bulk " + dto.getStatus() + " for " + target + ". Remarks: " + dto.getRemarks();
+        
+        saveLog(executorId, "BULK_" + dto.getStatus(), "BULK_PROCESS", newValue, null, null);
+    }
+
+    // --- 5. Log Single Cancellation ---
+    @AfterReturning(
+            pointcut = "execution(* com.fincore.JournalService.Service.JournalRequestService.cancelMyRequest(..)) && args(requestId, userId)"
+    )
+    public void logCancelRequest(JoinPoint joinPoint, Long requestId, String userId) {
+        saveLog(userId, "DELETE", "CANCEL_REQUEST", "User canceled request ID: " + requestId, null, requestId);
+    }
+
+    // --- 6. Log Bulk Cancellation (By Batch) ---
+    @AfterReturning(
+            pointcut = "execution(* com.fincore.JournalService.Service.JournalRequestService.cancelMyRequestsByBatchId(..)) && args(batchId, userId)"
+    )
+    public void logCancelBatch(JoinPoint joinPoint, String batchId, String userId) {
+        saveLog(userId, "DELETE", "CANCEL_BATCH", "User canceled all requests in Batch: " + batchId, null, null);
+    }
+
+    // --- Helper to Save to DB ---
+    private void saveLog(String userId, String actionType, String changeType, String newValue, String oldValue, Long requestId) {
+        try {
+            JournalLog logEntry = new JournalLog();
+            
+            logEntry.setUserId(userId);
+            
+            logEntry.setActionType(actionType);
+            logEntry.setChangeType(changeType);
+            logEntry.setActionTime(LocalDateTime.now());
+            logEntry.setRequestId(requestId);
+            
+            // Capture IP Address
+            logEntry.setIpAddress(getClientIp());
+
+            // Convert Objects to JSON String if they aren't already strings
+            if (newValue != null && !newValue.getClass().equals(String.class)) {
+                newValue = objectMapper.writeValueAsString(newValue);
+            }
+
+            logEntry.setNewValue(truncate(newValue, 250));
+            logEntry.setOldValue(truncate(oldValue, 250));
+
+
+
+            journalLogRepository.save(logEntry);
+            log.info("? Audit Log Saved: {} performed {} on {}", userId, actionType, (requestId != null ? requestId : "Batch"));
+
+        } catch (Exception e) {
+            log.error("Failed to save audit log: {}", e.getMessage());
+        }
+    }
+
+    private String getClientIp() {
+        try {
+            HttpServletRequest request = ((ServletRequestAttributes) RequestContextHolder.currentRequestAttributes()).getRequest();
+            String xForwardedFor = request.getHeader("X-Forwarded-For");
+            if (xForwardedFor != null && !xForwardedFor.isEmpty()) {
+                return xForwardedFor.split(",")[0].trim();
+            }
+            return request.getRemoteAddr();
+        } catch (Exception e) {
+            return "UNKNOWN";
+        }
+    }
+
+    private String truncate(String value, int length) {
+        if (value != null && value.length() > length) {
+            return value.substring(0, length - 3) + "...";
+        }
+        return value;
+    }
+} 
+
+
 package com.fincore.JournalService.config;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.scheduling.annotation.EnableAsync;
-import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
-import java.util.concurrent.Executor;
+import org.springframework.context.annotation.Primary;
 
 @Configuration
-@EnableAsync
-public class AsyncConfig {
-    @Bean(name = "bulkExecutor")
-    public Executor bulkExecutor() {
-        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(5); 
-        executor.setMaxPoolSize(10); // Adjust based on server capacity
-        executor.setQueueCapacity(100);
-        executor.setThreadNamePrefix("BulkJournal-");
-        executor.initialize();
-        return executor;
+public class AppConfig {
+
+	@Bean
+	@Primary
+	public ObjectMapper objectMapper() {
+		ObjectMapper mapper = new ObjectMapper();
+
+		mapper.registerModule(new JavaTimeModule());
+
+		mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+
+		return mapper;
+	}
+}
+
+package com.fincore.JournalService.config;
+
+
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.cache.concurrent.ConcurrentMapCacheManager;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+@EnableCaching
+public class CacheConfig {
+
+    @Bean
+    public ConcurrentMapCacheManager cacheManager() {
+      
+        return new ConcurrentMapCacheManager("notification_configs");
+    }
+}
+package com.fincore.JournalService.config;
+
+import jakarta.persistence.AttributeConverter;
+import jakarta.persistence.Converter;
+import java.util.stream.Stream;
+
+import com.fincore.JournalService.Models.enums.RequestStatus;
+
+@Converter(autoApply = true)
+public class RequestStatusConverter implements AttributeConverter<RequestStatus, String> {
+
+    @Override
+    public String convertToDatabaseColumn(RequestStatus status) {
+        if (status == null) {
+            return null;
+        }
+        return status.getCode(); // Converts PENDING to "P"
+    }
+
+    @Override
+    public RequestStatus convertToEntityAttribute(String code) {
+        if (code == null) {
+            return null;
+        }
+        // Finds the Enum constant that matches the code from the DB
+        return Stream.of(RequestStatus.values())
+                .filter(c -> c.getCode().equals(code))
+                .findFirst()
+                .orElseThrow(IllegalArgumentException::new);
     }
 }
 
-3. BulkUploadRequest.java (Entity)
+package com.fincore.JournalService.config;
+
+import com.fincore.commonutilities.config.RedisConfig; // Ensures Redis Template is loaded
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.fincore.commonutilities.security.ContextRbacFilter;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+
+/**
+ * Global security configuration for the application.
+ * This class uses Spring Security's Java configuration to define security rules,
+ * such as disabling CSRF, making the session stateless, and defining authorization policies.
+ *
+ * The `@Configuration` annotation marks this class as a source of bean definitions.
+ * The `@EnableWebSecurity` annotation enables Spring Security's web security support and provides
+ * the integration with the Spring MVC.
+ */
+@Configuration
+@EnableWebSecurity
+@Import({RedisConfig.class, JwtUtil.class}) // Import Redis Config from Library
+public class SecurityConfig {
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+
+    @Autowired
+    private JwtUtil jwtUtil;
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+                .csrf(csrf -> csrf.disable())
+                .cors(cors -> {}) // Enable CORS (uses your existing WebConfig)
+                .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+
+                // LOCK DOWN ENDPOINTS
+                .authorizeHttpRequests(authz -> authz
+                        .requestMatchers("/**").permitAll() // Allows access to all your API endpoints
+                        .requestMatchers("/actuator/**", "/auth/**", "/error").permitAll()
+                        // All other requests MUST pass the ContextRbacFilter
+                        .anyRequest().authenticated()
+                )
+
+                // ======== INSERTING THE GUARD HERE =======
+                // This filter does two things:
+                // 1. Validates JWT & Sets User Context
+                // 2. Checks Redis for Permissions (e.g. "POST:/create-request|SEGMENT_CODE")
+                .addFilterBefore(new ContextRbacFilter(redisTemplate, jwtUtil), UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
+}
+package com.fincore.JournalService.Controllers;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import com.fincore.JournalService.Dto.BranchDto;
+import com.fincore.JournalService.Service.BranchService;
+
+import java.util.Collections; 
+import java.util.List;
+import java.util.Map;
+
+@RestController
+@RequestMapping("branches-journal")
+@RequiredArgsConstructor
+public class BranchController {
+
+	private final BranchService branchService;
+
+	@GetMapping("/map")
+	public Map<String, String> getBranchMap() {
+		return branchService.getBranchCodeAndNameMap();
+	}
+
+	@GetMapping("/search")
+	public List<BranchDto> searchBranches(@RequestParam String query) {
+       
+        if (query == null || query.trim().isEmpty()) {
+            return Collections.emptyList();
+        }
+     
+		return branchService.searchBranches(query);
+	}
+}
+package com.fincore.JournalService.Controllers;
+
+
+import com.fincore.JournalService.Dto.CglDto;
+import com.fincore.JournalService.Service.CglService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.util.List;
+
+
+@RestController
+@RequestMapping("cgl-journal")
+@RequiredArgsConstructor
+public class CglController {
+
+    private final CglService cglService;
+
+    @GetMapping("/search")
+    public ResponseEntity<List<CglDto>> searchCgl(@RequestParam(value = "query", required = false, defaultValue = "") String query) {
+        return ResponseEntity.ok(cglService.searchCgls(query));
+    }
+}
+package com.fincore.JournalService.Controllers;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.JournalService.Dto.*;
+import com.fincore.JournalService.Exception.ResourceNotFoundException;
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Service.JournalBulkValidationService;
+import com.fincore.JournalService.Service.JournalRequestService;
+import com.fincore.commonutilities.jwt.JwtUtil;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.core.io.Resource;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.io.IOException;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.Base64;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@RestController
+@RequestMapping("journals")
+@RequiredArgsConstructor
+@Slf4j
+public class JournalRequestController {
+
+    private final JournalRequestService journalRequestService;
+    private final JournalBulkValidationService journalBulkValidationService;
+    private final JwtUtil jwtUtil;
+
+    // --- UTILITY ---
+    @GetMapping("/current-posting-date")
+    public String getCurrentPostingDate() {
+        return LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE);
+    }
+
+    // ==================================================================================
+    //  BULK UPLOAD (REDIS ARCHITECTURE - NO DB TABLE)
+    // ==================================================================================
+
+    @PostMapping(value = "/bulk-validate-init", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<Map<String, String>> initiate(@RequestParam("file") MultipartFile file, @RequestParam("postingDate") String date) throws IOException {
+        String reqId = journalBulkValidationService.initiateValidation(file, LocalDate.parse(date));
+        return ResponseEntity.ok(Map.of("status", "QUEUED", "requestId", reqId));
+    }
+
+    // 2. CHECK STATUS (POLLING)
+    // Fetches State DTO from Redis. Fast & Stateless.
+    @GetMapping("/bulk-status/{requestId}")
+    public ResponseEntity<BulkUploadStateDto> checkStatus(@PathVariable String requestId) {
+        BulkUploadStateDto state = journalBulkValidationService.getState(requestId);
+        if (state == null) return ResponseEntity.notFound().build();
+        return ResponseEntity.ok(state);
+    }
+    // 3. DOWNLOAD FILE
+    // Streams the generated Excel/CSV from Redis to the browser
+    @GetMapping("/download-bulk-file/{requestId}")
+    public ResponseEntity<Resource> download(@PathVariable String requestId, @RequestParam String type) throws IOException {
+        byte[] data = journalBulkValidationService.getFileBytes(requestId, type);
+
+        if (data == null) return ResponseEntity.notFound().build();
+
+        String name = type.equals("ERROR") ? "Error_Report.xlsx" : "Success.csv";
+        String mime = type.equals("ERROR") ? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" : "text/csv";
+
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + name + "\"")
+                .contentType(MediaType.parseMediaType(mime))
+                .body(new ByteArrayResource(data));
+    }
+
+    // ==================================================================================
+    //  STANDARD JOURNAL OPERATIONS (DB BACKED)
+    // ==================================================================================
+
+    @PostMapping("/create-batch")
+    @ResponseStatus(HttpStatus.CREATED)
+    public List<JournalRequest> createBatchRequest(@Valid @RequestBody BatchRequestDto batchDto,
+                                                   @RequestHeader("Authorization") String token) throws JsonProcessingException {
+
+        String userId = jwtUtil.getUserIdFromToken(token);
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+
+        log.info("Received Journal batch request creation call from user: {}, role: {}", userId, userRole);
+
+        return journalRequestService.createBatchRequest(batchDto, userId, userRole);
+    }
+
+    @PostMapping("/create-bulk-batch")
+    @ResponseStatus(HttpStatus.CREATED)
+    public ResponseEntity<Map<String, Object>> createBulkBatchRequest(@RequestBody BatchRequestDto batchDto,
+                                                                      @RequestHeader("Authorization") String token) throws JsonProcessingException {
+
+        String userId = jwtUtil.getUserIdFromToken(token);
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+
+        log.info("Received BULK Journal batch request from user: {}. Rows: {}", userId, batchDto.getRows().size());
+
+        String batchId = journalRequestService.createBulkBatchRequest(batchDto, userId, userRole);
+
+        return ResponseEntity.ok(Map.of("status", "SUCCESS", "message", "Batch created successfully", "batchId",
+                batchId, "totalRows", batchDto.getRows().size()));
+    }
+
+    @PatchMapping("/update-request")
+    public JournalRequest updateRequestStatus(@RequestHeader("Authorization") String token,
+                                              @RequestBody ProcessJournalRequestDto processRequestDto) throws JsonProcessingException {
+
+        String executorId = jwtUtil.getUserIdFromToken(token);
+        Integer executorRole = jwtUtil.getUserRoleFromToken(token);
+
+        log.info("Received Journal update request call from user: {}, role: {}", executorId, executorRole);
+
+        return journalRequestService.updateRequestStatus(processRequestDto, executorId, executorRole).get();
+    }
+
+    @GetMapping("/my-requests")
+    public List<JournalRequest> getMyRequests() {
+        return journalRequestService.getMyRequests();
+    }
+
+    @GetMapping("/pending-requests")
+    public List<JournalRequest> getPendingRequests(@RequestHeader("Authorization") String token) {
+        String userId = jwtUtil.getUserIdFromToken(token);
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+        return journalRequestService.getPendingRequests(userId, userRole);
+    }
+
+    @PostMapping("/process-bulk")
+    public List<JournalRequest> processBulkRequests(@RequestHeader("Authorization") String token,
+                                                    @Valid @RequestBody BulkProcessJournalRequestDto processRequestDto) throws JsonProcessingException {
+
+        String executorId = jwtUtil.getUserIdFromToken(token);
+        Integer executorRole = jwtUtil.getUserRoleFromToken(token);
+        return journalRequestService.processBulkRequests(processRequestDto, executorId, executorRole);
+    }
+
+    @GetMapping("/by-batch/{batchId}")
+    public ResponseEntity<List<JournalRequest>> getRequestsByBatchId(@PathVariable String batchId) {
+        List<JournalRequest> requests = journalRequestService.getRequestsByBatchId(batchId);
+        return ResponseEntity.ok(requests);
+    }
+
+    @DeleteMapping("/my-request/{requestId}")
+    public ResponseEntity<Void> cancelMyRequest(@RequestHeader("Authorization") String token,
+                                                @PathVariable Long requestId) {
+        String userId = jwtUtil.getUserIdFromToken(token);
+        journalRequestService.cancelMyRequest(requestId, userId);
+        return ResponseEntity.noContent().build();
+    }
+
+    @DeleteMapping("/my-requests/by-journal/{journalIdPrefix}")
+    public ResponseEntity<Void> cancelMyRequestsByJournal(@RequestHeader("Authorization") String token,
+                                                          @PathVariable String journalIdPrefix) {
+        String userId = jwtUtil.getUserIdFromToken(token);
+        journalRequestService.cancelMyRequestsByJournalPrefix(journalIdPrefix, userId);
+        return ResponseEntity.noContent().build();
+    }
+
+    @DeleteMapping("/my-requests/by-batch/{batchId}")
+    public ResponseEntity<Void> cancelMyRequestsByBatch(@RequestHeader("Authorization") String token,
+                                                        @PathVariable String batchId) throws JsonProcessingException {
+        String userId = jwtUtil.getUserIdFromToken(token);
+        journalRequestService.cancelMyRequestsByBatchId(batchId, userId);
+        return ResponseEntity.noContent().build();
+    }
+
+    @DeleteMapping("/my-requests/by-journal-list")
+    public ResponseEntity<Void> cancelMyRequestsByJournalPrefixes(@RequestHeader("Authorization") String token,
+                                                                  @RequestBody List<String> journalIdPrefixes) throws JsonProcessingException {
+        String userId = jwtUtil.getUserIdFromToken(token);
+        journalRequestService.cancelMyRequestsByJournalPrefixes(journalIdPrefixes, userId);
+        return ResponseEntity.noContent().build();
+    }
+
+    @GetMapping("/status")
+    public ResponseEntity<List<JournalRequestStatusDto>> getJournalStatusList() {
+        return ResponseEntity.ok(journalRequestService.getJournalRequestStatusList());
+    }
+}
+
+package com.fincore.JournalService.Dto;
+
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
+import java.math.BigDecimal;
+import lombok.Data;
+import java.util.List;
+
+import com.fincore.JournalService.Models.enums.ChangeType;
+
+@Data
+public class BatchRequestDto {
+
+    @Data
+    public static class JournalRequestRow {
+        @NotNull
+        private ChangeType changeType = ChangeType.ADD; 
+        
+        private Long masterJournalId; 
+
+        @NotNull @Size(min = 1, max = 50) 
+        private String branch; 
+
+        @NotNull @Size(min = 3, max = 3) 
+        private String currency;
+
+        @NotNull @Size(min = 1, max = 10)
+        private String cgl;
+
+        @NotNull
+        private BigDecimal amount; 
+       
+        @Size(max = 20) 
+        private String productType;
+        
+        @Size(max = 40) 
+        private String remarks;
+        
+        @Size(min = 1, max = 1)
+        private String arFlag = "A"; 
+        
+        @Size(min = 1, max = 1) 
+        private String acClassification; 
+    }
+
+    @Size(max = 200)
+    private String commonBatchRemarks;
+
+    @Valid
+    @NotNull
+    private List<JournalRequestRow> rows;
+}
+
+package com.fincore.JournalService.Dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class BranchDto {
+    private String code;
+    private String name;
+    
+}
+
+package com.fincore.JournalService.Dto;
+
+import java.util.List;
+
+import com.fincore.JournalService.Models.enums.RequestStatus;
+
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
+import lombok.Data;
+
+@Data
+public class BulkProcessJournalRequestDto {
+     
+    private String batchId;
+    
+    private List<String> journalIdPrefixes;
+
+    @NotNull
+    private RequestStatus status; 
+    
+    @Size(max = 50)
+    private String remarks;
+}
+package com.fincore.JournalService.Dto;
+
+import lombok.Data;
+import java.io.Serializable;
+
+@Data
+public class BulkUploadStateDto implements Serializable {
+    private String requestId;
+    private String status; // PROCESSING, SUCCESS, ERROR
+    private Integer currentStage; // 1..4
+    private Integer totalRows;
+    private Long errorCount;
+    private String message;
+    private String previewDataJson;
+
+    // Flags for frontend
+    private boolean hasErrorFile;
+    private boolean hasSuccessFile;
+
+    // Internal paths (transient = not sent to frontend)
+    private transient String errorFilePath;
+    private transient String successFilePath;
+}
+
+
+package com.fincore.JournalService.Dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class CglDto {
+    private String cglNumber;
+    private String description;
+}
+
+package com.fincore.JournalService.Dto;
+
+import lombok.Data;
+import lombok.Getter;
+import lombok.Setter;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+
+import com.fincore.JournalService.Models.enums.ChangeType;
+
+@Data
+@Getter
+@Setter
+public class CreateJournalRequestDto {
+
+    @NotNull
+    private ChangeType changeType;
+  
+    private Long masterJournalId; 
+
+    @NotNull 
+    private LocalDate pDate;
+    
+    @NotNull @Size(min = 1, max = 50) 
+    private String branch; 
+
+    @NotNull @Size(min = 3, max = 3) 
+    private String currency;
+
+    @NotNull @Size(min = 1, max = 50)
+    private String cgl;
+
+    @NotNull
+    private BigDecimal amount; 
+    
+    @Size(max = 20) 
+    private String productType;
+    
+    @Size(max = 50) 
+    private String remarks;
+    
+    @Size(min = 1, max = 1)
+    private String arFlag;
+    
+    @Size(min = 1, max = 1) 
+    private String acClassification; 
+
+    @NotNull @Size(min = 1, max = 50) 
+    private String batchId;
+
+    @NotNull @Size(min = 1, max = 50) 
+    private String journalId;
+    
+    @Size(max = 50)
+    private String commonBatchRemarks;
+    
+    private Integer transactionCount;
+}
+
+package com.fincore.JournalService.Dto;
+
+import lombok.Data;
+import java.time.LocalDateTime;
+
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Models.enums.RequestStatus;
+
+@Data
+public class JournalRequestStatusDto {
+
+    private RequestStatus requestStatus;
+    private LocalDateTime requestDate;
+    private String creatorId;
+    private String executorId;
+    private String executorRemarks;
+    private String batchId;
+    private String journalId;
+
+    // A helper constructor 
+    public JournalRequestStatusDto(JournalRequest request) {
+        this.requestStatus = request.getRequestStatus();
+        this.requestDate = request.getRequestDate();
+        this.creatorId = request.getCreatorId();
+        this.executorId = request.getExecutorId();
+        this.executorRemarks = request.getExecutorRemarks();
+        this.batchId = request.getBatchId();
+        this.journalId = request.getJournalId();
+    }
+}
+package com.fincore.JournalService.Dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class NotificationConfigDto {
+    private String targetUrl;
+    private String targetRoles; // Comma separated string: "51,52,55"
+}
+
+package com.fincore.JournalService.Dto;
+
+import com.fincore.JournalService.Models.enums.RequestStatus;
+
+import jakarta.persistence.Column;
+import jakarta.validation.constraints.Size;
+import lombok.Data;
+import lombok.Getter;
+import lombok.Setter;
+
+@Data
+@Getter
+@Setter
+public class ProcessJournalRequestDto {
+	@Column(nullable = false)
+    private Long requestId;
+    
+    @Column(nullable = false)
+    private RequestStatus status; 
+    
+    @Size(max = 50)
+    private String remarks;
+
+}
+
+
+package com.fincore.JournalService.Models;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Data;
+import java.time.LocalDate;
+
+
+@Entity
+@Table(name = "BRANCH_MASTER")
+@Data
+public class BranchMaster {
+
+    @Id
+    @Column(name = "CODE" )
+    private String code;
+
+    @Column(name = "NAME")
+    private String name;
+
+    @Column(name = "CIRCLE_CODE")
+    private String circleCode;
+
+    @Column(name = "STATE")
+    private String state;
+
+    @Column(name = "CITY")
+    private String city;
+
+    @Column(name = "ADDRESS")
+    private String address;
+
+    @Column(name = "PINCODE")
+    private String pincode;
+
+    @Column(name = "PHONE_NUMBER")
+    private String phoneNumber;
+
+    @Column(name = "EMAIL_ID")
+    private String emailId;
+
+    @Column(name = "NMR_CODE" )
+    private String nmrCode;
+
+    @Column(name = "STATUS")
+    private Integer status;
+
+    @Column(name = "OPEN_DATE")
+    private LocalDate openDate;
+
+    @Column(name = "CLOSE_DATE")
+    private LocalDate closeDate;
+
+    @Column(name = "MERGE_DATE")
+    private LocalDate mergeDate;
+
+    @Column(name = "MERGED_WITH_BRANCH" )
+    private String mergedWithBranch;
+
+    @Column(name = "LAST_CHANGE_DATE")
+    private LocalDate lastChangeDate;
+
+    @Column(name = "CPC_FLAG")
+    private Boolean cpcFlag;
+
+    @Column(name = "FOOD_CREDIT_FLAG")
+    private Boolean foodCreditFlag;
+
+    @Column(name = "CURR_CHEST_FLAG")
+    private Boolean currChestFlag;
+
+    @Column(name = "BRANCH_TYPE")
+    private String branchType;
+}
+package com.fincore.JournalService.Models.enums;
+
+
+import lombok.Getter;
+
+@Getter
+public enum RequestStatus {
+    PENDING("P"),
+    ACCEPTED("A"),
+    REJECTED("R");
+
+    private final String code;
+
+    RequestStatus(String code) {
+        this.code = code;
+    }
+}
+
+package com.fincore.JournalService.Models.enums;
+
+import lombok.Getter;
+
+@Getter
+public enum ChangeType {
+	    ADD("A"),
+	    UPDATE("U"),
+	    DELETE("D");
+
+	    private final String code;
+
+	    ChangeType(String code) {
+	        this.code = code;
+	    }
+}
+package com.fincore.JournalService.Models;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Data;
+import java.time.LocalDate;
+
+
+@Entity
+@Table(name = "CGL_MASTER")
+@Data
+public class CglMaster {
+
+    @Id
+    @Column(name = "CGL_NUMBER", length = 10, updatable = false, insertable = false)
+    private String cglNumber;
+
+    @Column(name = "COMP_1", length = 4, nullable = false)
+    private String comp1;
+
+    @Column(name = "SEGMENT_CODE", length = 4, nullable = false)
+    private String segmentCode;
+
+    @Column(name = "COMP_2", length = 2, nullable = false)
+    private String comp2;
+
+    @Column(name = "DESCRIPTION", length = 100, nullable = false)
+    private String description;
+
+    @Column(name = "AC_CLASSIFICATION", length = 1, nullable = false)
+    private String acClassification;
+
+    @Column(name = "BAL_FWD", nullable = false)
+    private Boolean balFwd = false;
+
+    @Column(name = "DEF_BAL_TYPE", length = 1, nullable = false)
+    private String defBalType;
+
+    @Column(name = "STATUS", nullable = false)
+    private Boolean status = true;
+
+    @Column(name = "OPEN_DATE", nullable = false)
+    private LocalDate openDate;
+
+    @Column(name = "CLOSE_DATE")
+    private LocalDate closeDate;
+
+    @Column(name = "BAL_COMPARE", nullable = false)
+    private Boolean balCompare = true;
+
+    @Column(name = "MANUAL_POSTING", nullable = false)
+    private Boolean manualPosting = true;
+}
+
+package com.fincore.JournalService.Models;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Data;
+
+@Entity
+@Table(name = "CURRENCY_MASTER")
+@Data
+public class CurrencyMaster {
+    @Id
+    @Column(name = "CURRENCY_CODE", length = 3)
+    private String currencyCode;
+
+    @Column(name = "CURRENCY_NAME", length = 50)
+    private String currencyName;
+    
+    // 1 = Active, 0 = Inactive
+    @Column(name = "FLAG")
+    private Integer flag; 
+}
+
+package com.fincore.JournalService.Models;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "GL_TRANSACTIONS")
+@Data
+public class GlTransaction {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "GL_TRANSACTIONS_SEQ")
+    @SequenceGenerator(name = "GL_TRANSACTIONS_SEQ", sequenceName = "GL_TRANSACTIONS_SEQ", allocationSize = 1)
+    @Column(name = "TRANSACTION_ID")
+    private Long transactionId;
+
+    @Column(name = "BATCH_ID", length = 50) 
+    private String batchId;
+
+    @Column(name = "JOURNAL_ID", length = 50)
+    private String journalId;
+   
+    // UPDATED: Removed 'insertable = false' so we can set this in Java
+    @Column(name = "TRANSACTION_DATE")
+    @Temporal(TemporalType.DATE)
+    private LocalDate transactionDate;
+
+    @Column(name = "POST_DATE")
+    @Temporal(TemporalType.TIMESTAMP)
+    private LocalDateTime postDate;
+
+    @Column(name = "BRANCH_CODE", length = 50)
+    private String branchCode;
+
+    @Column(name = "CURRENCY", length = 3)
+    private String currency;
+
+    @Column(name = "CGL", length = 10)
+    private String cgl;
+
+    @Column(name = "NARRATION", length = 40)
+    private String narration;
+
+    @Column(name = "DEBIT_AMOUNT", precision = 25, scale = 4)
+    private BigDecimal debitAmount;
+
+    @Column(name = "CREDIT_AMOUNT", precision = 25, scale = 4)
+    private BigDecimal creditAmount;
+
+    @Column(name = "TRANSACTION_COUNT")
+    private Integer transactionCount;
+
+    @Column(name = "SOURCE_FLAG", length = 1)
+    private String sourceFlag;
+}
+
 package com.fincore.JournalService.Models;
 
 import jakarta.persistence.*;
@@ -51,67 +1057,510 @@ import lombok.Data;
 import java.time.LocalDateTime;
 
 @Entity
-@Table(name = "BULK_UPLOAD_REQUESTS")
+@Table(name = "AUDIT_LOG")
 @Data
-public class BulkUploadRequest {
-    @Id
+public class JournalLog {
+
+
+    
+	@Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "AUDIT_LOG_SEQ")
+    @SequenceGenerator(
+        name = "AUDIT_LOG_SEQ", 
+        sequenceName = "AUDIT_LOG_SEQ", 
+        allocationSize = 1
+    )
+    @Column(name = "LOG_ID")
+    private Long id;
+
+    @Column(name = "ACTION_TIME")
+    private LocalDateTime actionTime;
+
+    @Column(name = "ACTION_TYPE", length = 255)
+    private String actionType; // e.g., CREATE, APPROVE, REJECT
+
+    @Column(name = "CHANGE_TYPE", length = 255)
+    private String changeType; // e.g., BATCH_UPLOAD, STATUS_CHANGE
+
+    @Column(name = "IP_ADDRESS", length = 255)
+    private String ipAddress;
+
+    @Column(name = "NEW_VALUE", length = 4000) // Adjusted length for safety
+    private String newValue;
+
+    @Column(name = "OLD_VALUE", length = 4000)
+    private String oldValue;
+
     @Column(name = "REQUEST_ID")
-    private String requestId;
+    private Long requestId; // Links to specific Journal Request ID (PK)
 
-    @Column(name = "STATUS")
-    private String status; // PROCESSING, SUCCESS, ERROR
-
-    @Column(name = "TOTAL_ROWS")
-    private Integer totalRows;
-
-    @Column(name = "ERROR_COUNT")
-    private Long errorCount;
-
-    @Lob
-    @Column(name = "SUCCESS_FILE")
-    private byte[] successFile;
-
-    @Lob
-    @Column(name = "ERROR_FILE")
-    private byte[] errorFile;
-
-    @Lob
-    @Column(name = "PREVIEW_DATA_JSON") // Stores top 100 rows JSON string
-    private String previewDataJson;
-    
-    @Column(name = "MESSAGE")
-    private String message;
-    
-    @Column(name = "CREATED_AT")
-    private LocalDateTime createdAt;
+    @Column(name = "USER_ID", length = 255)
+    private String userId;
 }
 
-4. BulkUploadRepository.java
+package com.fincore.JournalService.Models;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import java.time.LocalDateTime;
+
+import com.fincore.JournalService.Models.enums.ChangeType;
+import com.fincore.JournalService.Models.enums.RequestStatus;
+
+@Entity
+@Table(name = "JOURNAL_REQUEST")
+@Data
+public class JournalRequest {
+	 @Id
+     @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "JOURNAL_REQUEST_SEQ")
+     @SequenceGenerator(name = "JOURNAL_REQUEST_SEQ", sequenceName = "JOURNAL_REQUEST_SEQ", allocationSize = 1)
+     @Column(name = "REQ_ID")
+     private Long id;
+
+     @Enumerated(EnumType.STRING)
+     @Column(name = "REQ_STATUS", length = 10)
+     private RequestStatus requestStatus;
+
+     @Enumerated(EnumType.STRING)
+     @Column(name = "CHANGE_TYPE", length = 10)
+     private ChangeType changeType;
+
+     @Column(name = "REQ_DATE", updatable = false)
+     private LocalDateTime requestDate = LocalDateTime.now();
+
+     @Column(name = "CREATOR_ID", length = 12, updatable = false)
+     private String creatorId;
+
+     @Column(name = "CREATOR_ROLE", updatable = false)
+     private Integer creatorRole;
+
+     @Column(name = "EXECUTOR_ID", length = 12)
+     private String executorId;
+
+     @Column(name = "EXECUTION_DATE")
+     private LocalDateTime executionDate;
+
+     @Column(name = "EXECUTOR_REMARKS", length = 50)
+     private String executorRemarks;
+
+     @Lob
+     @Column(name = "PAYLOAD")
+     private String payload;
+
+     @Column(name = "BATCH_ID", length = 50)
+     private String batchId;
+
+     @Column(name = "JOURNAL_ID", length = 50) 
+     private String journalId;
+     
+     @Column(name = "COMMON_BATCH_REMARKS" , length = 50)
+     private String commonBatchRemarks;
+}
+
+
+
+package com.fincore.JournalService.Models;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import jakarta.persistence.*;
+import lombok.Data;
+
+@Entity
+@Table(name = "MASTER_JOURNAL")
+@Data
+public class MasterJournal {
+      @Id
+      @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "MASTER_JOURNAL_SEQ")
+      @SequenceGenerator(name = "MASTER_JOURNAL_SEQ", sequenceName = "MASTER_JOURNAL_SEQ", allocationSize = 1)
+      @Column(name = "JOURNAL_ID")
+      private Long id;
+
+      @Column(name = "JOURNAL_PDATE")
+      private LocalDate pDate;
+
+      @Column(name = "JOURNAL_BRANCH", length = 50)
+      private String branch;
+
+      @Column(name = "CURRENCY", length = 3)
+      private String currency;
+
+      @Column(name = "JOURNAL_CGL", length = 50)
+      private String cgl;
+
+      @Column(name = "JOURNAL_AMT")
+      private BigDecimal amount;
+
+      @Column(name = "TXN_TYPE", length = 20)
+      private String transactionType;
+
+      @Column(name = "PRODUCT_TYPE", length = 20)
+      private String productType;
+
+      @Column(name = "REMARKS", length = 50)
+      private String remarks;
+
+      @Column(name = "AR_FLAG", length = 1)
+      private String arFlag;
+      
+      @Column(name= "AC_CLASSIFICATION")
+      private String acClassification;
+
+      @Column(name = "BATCH_ID", length = 50)
+      private String batchId;
+
+      @Column(name = "JOURNAL_ID_REF", length = 50) // Renamed to avoid conflict with PK if needed, or just JOURNAL_ID
+      private String journalId;
+      
+      @Column(name = "COMMON_BATCH_REMARKS" , length = 50)
+      private String commonBatchRemarks;
+}
+package com.fincore.JournalService.Models;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+import org.springframework.data.jpa.domain.support.AuditingEntityListener;
+
+import java.io.Serializable;
+import java.time.Instant;
+import java.util.UUID;
+
+@Entity
+@Table(name = "NOTIFICATIONS")
+@Builder
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@EntityListeners(AuditingEntityListener.class)
+public class Notifications implements Serializable {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    @Column(name = "EVENT_ID", nullable = false, updatable = false)
+    private UUID eventId; // Maps to RAW(16)
+
+    @Column(name = "USER_ID", length = 255)
+    private String userId;
+
+    @Column(name = "MESSAGE", length = 1024, nullable = false)
+    private String message;
+
+    @Column(name = "LINK_URL", length = 1024)
+    private String linkUrl;
+
+    @Column(name = "EVENT_SOURCE", length = 100)
+    private String eventSource;
+
+    @Column(name = "AGGREGATE_ID", length = 255)
+    private String aggregateId;
+
+    @CreationTimestamp
+    @Column(name = "EVENT_TIMESTAMP", nullable = false, updatable = false)
+    private Instant eventTimestamp; // Maps to TIMESTAMP(6) WITH TIME ZONE
+
+    @Column(name = "TARGET_ROLE", length = 100)
+    private String targetRole;
+}
+
+package com.fincore.JournalService.Models;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+@Entity
+@Table(name = "MENU_ITEMS") // Mapped to your existing table
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@ToString
+public class Permissions {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "menu_item_seq_gen")
+    @SequenceGenerator(name = "menu_item_seq_gen", sequenceName = "FINCORE.MENU_ITEMS_SEQ", allocationSize = 1)
+    @Column(name = "MENU_ID", nullable = false)
+    private int menuId;
+
+    @Column(name = "MENU_TITLE", length = 100)
+    private String menuTitle;
+
+    @Column(name = "MENU_ICON", length = 100)
+    private String menuIcon;
+
+    @Column(name = "MENU_SUBMENU", length = 100)
+    private String menuSubmenu;
+
+    @Column(name = "MENU_ACTION", length = 200)
+    private String menuAction;
+
+    @Column(name = "MENU_URL", length = 200)
+    private String menuUrl;
+
+    @Column(name = "MENU_COMPONENT_PATH", length = 200)
+    private String menuComponentPath;
+
+    @Column(name = "MENU_DESCRIPTION", length = 255)
+    private String menuDescription;
+
+    @Column(name = "MENU_DEPENDANT")
+    private Integer menuDependant;
+
+    // This is the key field used for Journal Authorization logic
+    @Column(name = "MAPPED_REQUEST_TYPE", length = 50)
+    private String mappedRequestType; 
+}
+
+
 package com.fincore.JournalService.Repository;
 
-import com.fincore.JournalService.Models.BulkUploadRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.JournalService.Models.BranchMaster;
+
+import java.util.List;
+
+@Repository
+public interface BranchMasterRepository extends JpaRepository<BranchMaster, String> {
+
+    List<BranchMaster> findByNameContainingIgnoreCaseOrCodeContainingIgnoreCase(String name, String code, Pageable pageable);
+}
+
+package com.fincore.JournalService.Repository;
+
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.JournalService.Models.CglMaster;
+
+import java.util.List;
+
+@Repository
+public interface CglMasterRepository extends JpaRepository<CglMaster, String> {
+
+    List<CglMaster> findByCglNumberContainingOrDescriptionContainingIgnoreCase(String cglNumber, String description, Pageable pageable);
+}
+package com.fincore.JournalService.Repository;
+
+import com.fincore.JournalService.Models.CurrencyMaster;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;
 
 @Repository
-public interface BulkUploadRepository extends JpaRepository<BulkUploadRequest, String> {
+public interface CurrencyMasterRepository extends JpaRepository<CurrencyMaster, String> {
 }
 
-PART 2: The Core Logic (Service)
-JournalBulkValidationService.java
- * Contains Async Logic.
- * Contains Smart Fetching.
- * Contains Memo vs Normal Validation.
-<!-- end list -->
+package com.fincore.JournalService.Repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.JournalService.Models.GlTransaction;
+
+@Repository
+public interface GlTransactionRepository extends JpaRepository<GlTransaction, Long> {
+}
+package com.fincore.JournalService.Repository;
+
+import com.fincore.JournalService.Models.JournalLog;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface JournalLogRepository extends JpaRepository<JournalLog, Long> {
+}
+package com.fincore.JournalService.Repository;
+
+import java.util.List;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.JpaSpecificationExecutor; 
+import org.springframework.stereotype.Repository;
+
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Models.enums.RequestStatus;
+
+@Repository
+public interface JournalRequestRepository extends JpaRepository<JournalRequest, Long>, JpaSpecificationExecutor<JournalRequest> { 
+    
+    List<JournalRequest> findByJournalIdAndRequestStatus(String journalId, RequestStatus status);
+    
+    List<JournalRequest> findByCreatorId(String creatorId);
+    List<JournalRequest> findByRequestStatus(RequestStatus status);
+    List<JournalRequest> findByBatchIdAndRequestStatus(String batchId, RequestStatus status);
+
+    List<JournalRequest> findByJournalIdInAndRequestStatus(List<String> journalIds, RequestStatus status);
+    
+    List<JournalRequest> findByJournalIdStartingWithAndRequestStatus(String journalIdPrefix, RequestStatus status);
+    
+    List<JournalRequest> findByBatchId(String batchId);
+
+    List<JournalRequest> findByJournalIdStartingWith(String journalIdPrefix);
+
+    List<JournalRequest> findByBatchIdAndCreatorIdAndRequestStatus(String batchId, String creatorId, RequestStatus status);
+    List<JournalRequest> findByJournalIdStartingWithAndCreatorIdAndRequestStatus(String journalIdPrefix, String creatorId, RequestStatus status);
+}
+
+
+package com.fincore.JournalService.Repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.JournalService.Models.MasterJournal;
+
+@Repository
+public interface MasterJournalRepository extends JpaRepository<MasterJournal, Long>{
+
+}
+package com.fincore.JournalService.Repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+import com.fincore.JournalService.Models.Notifications;
+import java.util.UUID;
+
+@Repository
+public interface NotificationRepository extends JpaRepository<Notifications, UUID> {
+}
+
+package com.fincore.JournalService.Repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.JournalService.Models.Permissions;
+
+import java.util.List;
+
+@Repository
+public interface PermissionRepository extends JpaRepository<Permissions, Integer> {
+
+    @Query(value = """
+       SELECT p.MENU_URL, rp.ROLE_ID
+       FROM PERMISSIONS p
+       JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
+       JOIN ROLES r ON rp.ROLE_ID = r.ROLE_ID
+       WHERE p.MAPPED_REQUEST_TYPE = :requestType
+         AND (p.MENU_ACTION LIKE '%approve%' OR p.MENU_ACTION LIKE '%reject%')
+         AND r.ROLE_STATUS = 'ACTIVE'
+   """, nativeQuery = true)
+    List<Object[]> findUrlAndRolesByRequestType(@Param("requestType") String requestType);
+}
+
+package com.fincore.JournalService.Service;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.stereotype.Service;
+
+import com.fincore.JournalService.Dto.BranchDto;
+import com.fincore.JournalService.Models.BranchMaster;
+import com.fincore.JournalService.Repository.BranchMasterRepository;
+
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class BranchService {
+
+    private final BranchMasterRepository branchMasterRepository;
+
+    public Map<String, String> getBranchCodeAndNameMap() {
+        // This method is likely cached or used rarely, leaving as is
+        List<BranchMaster> branches = branchMasterRepository.findAll();
+        return branches.stream()
+                .collect(Collectors.toMap(BranchMaster::getCode, BranchMaster::getName));
+    }
+
+    public List<BranchDto> searchBranches(String query) {
+        log.info("Searching branches for: '{}'", query);
+
+        Pageable limit = PageRequest.of(0, 50);
+
+
+        List<BranchMaster> results = branchMasterRepository
+                .findByNameContainingIgnoreCaseOrCodeContainingIgnoreCase(query, query, limit);
+
+        return results.stream()
+                .map(branch -> new BranchDto(branch.getCode(), branch.getName()))
+                .collect(Collectors.toList());
+    }
+}
+package com.fincore.JournalService.Service;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+
+import com.fincore.JournalService.Dto.CglDto;
+import com.fincore.JournalService.Models.CglMaster;
+import com.fincore.JournalService.Repository.CglMasterRepository;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class CglService {
+
+    private final CglMasterRepository cglMasterRepository;
+
+    private CglDto convertToDto(CglMaster cgl) {
+        return new CglDto(cgl.getCglNumber(), cgl.getDescription());
+    }
+
+    public List<CglDto> searchCgls(String query) {
+
+
+
+        if (!StringUtils.hasText(query)) {
+            return List.of();
+        }
+
+        log.info("Searching CGLs for: '{}'", query);
+
+        Pageable limit = PageRequest.of(0, 50);
+
+        List<CglMaster> results = cglMasterRepository
+                .findByCglNumberContainingOrDescriptionContainingIgnoreCase(query, query, limit);
+
+        return results.stream()
+                .map(this::convertToDto)
+                .collect(Collectors.toList());
+    }
+}
+
 package com.fincore.JournalService.Service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.JournalService.Dto.BulkUploadStateDto;
 import com.fincore.JournalService.Models.*;
 import com.fincore.JournalService.Repository.*;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+
 import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.xssf.streaming.SXSSFWorkbook;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
@@ -124,6 +1573,10 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -135,42 +1588,56 @@ public class JournalBulkValidationService {
     private final BranchMasterRepository branchRepo;
     private final CglMasterRepository cglRepo;
     private final CurrencyMasterRepository currencyRepo;
-    private final BulkUploadRepository bulkUploadRepo;
+    private final StringRedisTemplate redisTemplate;
     private final ObjectMapper objectMapper;
 
     private static final Pattern CLEAN_AMOUNT_REGEX = Pattern.compile("[^0-9.-]");
+    private static final Pattern PRODUCT_CODE_REGEX = Pattern.compile("^\\d{8}$");
+    private static final Pattern CGL_FORMAT_REGEX = Pattern.compile("^\\d{10}$");
+
+    // Redis Keys
+    private static final String KEY_META = "journal:upload:meta:";
+    private static final String KEY_FILE_ERR = "journal:upload:file:err:";
+    private static final String KEY_FILE_SUC = "journal:upload:file:suc:";
+    private static final long TTL_MINUTES = 60;
 
     private static class ExcelRowData {
         int rowIndex;
-        String branch = "";
-        String currency = "";
-        String cgl = "";
-        BigDecimal amount; 
-        String txnType = "";
-        String remarks = "";
-        String productCode = "";
-        List<String> errors = new ArrayList<>();
+        String branch = "", currency = "", cgl = "", txnType = "", remarks = "", productCode = "";
+        BigDecimal amount;
+
+        List<String> formatErrors = Collections.synchronizedList(new ArrayList<>());
+        List<String> dbErrors = Collections.synchronizedList(new ArrayList<>());
+        List<String> balErrors = Collections.synchronizedList(new ArrayList<>());
+
+        boolean hasErrors() {
+            return !formatErrors.isEmpty() || !dbErrors.isEmpty() || !balErrors.isEmpty();
+        }
+
+        String getAllErrors() {
+            List<String> all = new ArrayList<>();
+            all.addAll(formatErrors);
+            all.addAll(dbErrors);
+            all.addAll(balErrors);
+            return String.join("; ", all);
+        }
     }
 
-    // 1. INITIATE (Sync - Fast)
     public String initiateValidation(MultipartFile file, LocalDate postingDate) throws IOException {
         String requestId = UUID.randomUUID().toString();
-
-        BulkUploadRequest request = new BulkUploadRequest();
-        request.setRequestId(requestId);
-        request.setStatus("PROCESSING");
-        request.setCreatedAt(LocalDateTime.now());
-        bulkUploadRepo.save(request);
+        BulkUploadStateDto state = new BulkUploadStateDto();
+        state.setRequestId(requestId);
+        state.setStatus("PROCESSING");
+        state.setCurrentStage(1);
+        state.setMessage("Validating Formats...");
+        saveStateToRedis(state);
 
         byte[] fileBytes = file.getBytes();
         String filename = file.getOriginalFilename();
-
-        processAsync(requestId, fileBytes, filename, postingDate); // Trigger Background Thread
-
+        processAsync(requestId, fileBytes, filename, postingDate);
         return requestId;
     }
 
-    // 2. PROCESS (Async - Heavy)
     @Async("bulkExecutor")
     public void processAsync(String requestId, byte[] fileBytes, String filename, LocalDate postingDate) {
         try {
@@ -180,369 +1647,1756 @@ public class JournalBulkValidationService {
             } else {
                 parsedRows = parseExcelBytes(fileBytes);
             }
-
             boolean isInputCsv = filename != null && filename.toLowerCase().endsWith(".csv");
-            processValidationLogic(requestId, parsedRows, postingDate, isInputCsv);
+
+            updateState(requestId, s -> s.setTotalRows(parsedRows.size()));
+
+            // --- STAGE 1: FORMAT CHECK ---
+            if (runFormatCheck(parsedRows)) {
+                failRequest(requestId, parsedRows, "Format Validation Failed", 1);
+                return;
+            }
+            updateState(requestId, s -> { s.setCurrentStage(2); s.setMessage("Checking Database..."); });
+
+            // --- STAGE 2: DB CHECK ---
+            if (runDbCheck(parsedRows)) {
+                failRequest(requestId, parsedRows, "Database Validation Failed", 2);
+                return;
+            }
+            updateState(requestId, s -> { s.setCurrentStage(3); s.setMessage("Checking Balances..."); });
+
+            // --- STAGE 3: BALANCE CHECK ---
+            if (runBalanceCheck(parsedRows)) {
+                failRequest(requestId, parsedRows, "Debit/Credit Balance Mismatch", 3);
+                return;
+            }
+
+            // --- STAGE 4: SUCCESS ---
+            completeRequest(requestId, parsedRows, postingDate, isInputCsv);
 
         } catch (Exception e) {
-            log.error("Async Processing Failed", e);
-            updateStatus(requestId, "ERROR", "System Error: " + e.getMessage());
+            log.error("Async Error", e);
+            updateState(requestId, s -> { s.setStatus("ERROR"); s.setMessage("System Error: " + e.getMessage()); });
         }
     }
 
-    // 3. LOGIC & VALIDATION
-    private void processValidationLogic(String requestId, List<ExcelRowData> parsedRows, LocalDate postingDate, boolean isInputCsv) {
-        try {
-            // A. Smart Fetch (Get only used codes)
-            Set<String> branchesInFile = parsedRows.stream().map(r -> r.branch).filter(s -> !s.isEmpty()).collect(Collectors.toSet());
-            Set<String> cglsInFile = parsedRows.stream().map(r -> r.cgl).filter(s -> !s.isEmpty()).collect(Collectors.toSet());
-            Set<String> currenciesInFile = parsedRows.stream().map(r -> r.currency).filter(s -> !s.isEmpty()).collect(Collectors.toSet());
+    // --- LOGIC ---
+    private boolean runFormatCheck(List<ExcelRowData> rows) {
+        rows.parallelStream().forEach(d -> {
+            // Branch
+            if (d.branch == null || d.branch.isEmpty()) d.formatErrors.add("Branch is Empty");
 
-            Set<String> validBranches = branchRepo.findAllById(branchesInFile).stream().map(BranchMaster::getCode).collect(Collectors.toSet());
-            Set<String> validCgls = cglRepo.findAllById(cglsInFile).stream().map(CglMaster::getCglNumber).collect(Collectors.toSet());
-            Set<String> validCurrencies = currencyRepo.findAllById(currenciesInFile).stream().map(CurrencyMaster::getCurrencyCode).collect(Collectors.toSet());
+            // Currency
+            if (d.currency == null || d.currency.length() != 3) d.formatErrors.add("Invalid Currency (Must be 3 letters)");
 
-            // Map Key: BRANCH_CURRENCY_TYPE (Type = MEMO or NORMAL)
-            Map<String, BigDecimal> balanceMap = new HashMap<>();
-
-            // B. Validation Loop
-            for (ExcelRowData data : parsedRows) {
-                if (!validBranches.contains(data.branch)) data.errors.add("Invalid Branch Code");
-                if (!validCurrencies.contains(data.currency)) data.errors.add("Invalid Currency");
-                if (!validCgls.contains(data.cgl)) data.errors.add("Invalid CGL");
-
-                if (data.productCode != null && !data.productCode.isEmpty() && !data.productCode.matches("\\d{8}")) {
-                    data.errors.add("Product Code must be 8 digits");
-                }
-                if (data.amount == null || data.amount.compareTo(BigDecimal.ZERO) == 0) {
-                    data.errors.add("Amount cannot be Zero");
-                }
-                if (data.remarks != null && data.remarks.length() > 30) data.errors.add("Remarks > 30 chars");
-
-                // Accumulate Balance (Split Memo vs Normal)
-                if (validBranches.contains(data.branch) && validCurrencies.contains(data.currency) && data.amount != null) {
-                    String cglType = (data.cgl != null && data.cgl.startsWith("5")) ? "MEMO" : "NORMAL";
-                    String key = data.branch + "_" + data.currency + "_" + cglType;
-                    balanceMap.put(key, balanceMap.getOrDefault(key, BigDecimal.ZERO).add(data.amount));
-                }
+            // CGL
+            if (d.cgl == null || d.cgl.isEmpty()) {
+                d.formatErrors.add("CGL is Empty");
+            } else if (!CGL_FORMAT_REGEX.matcher(d.cgl).matches()) {
+                d.formatErrors.add("Invalid CGL Format (Must be 10 digits)");
             }
 
-            // C. Check Balance
-            for (ExcelRowData data : parsedRows) {
-                if (!validBranches.contains(data.branch)) continue;
-                String cglType = (data.cgl != null && data.cgl.startsWith("5")) ? "MEMO" : "NORMAL";
-                String key = data.branch + "_" + data.currency + "_" + cglType;
-                
-                BigDecimal netTotal = balanceMap.getOrDefault(key, BigDecimal.ZERO);
-                if (netTotal.setScale(4, RoundingMode.HALF_UP).compareTo(BigDecimal.ZERO) != 0) {
-                    data.errors.add(cglType + " Total Mismatch (" + netTotal.toPlainString() + ")");
+            // Amount
+            if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) == 0) d.formatErrors.add("Amount cannot be Zero");
+
+            // Product Code (Optional but must be 8 digits if present)
+            if (d.productCode != null && !d.productCode.isEmpty()) {
+                if (!PRODUCT_CODE_REGEX.matcher(d.productCode).matches()) {
+                    d.formatErrors.add("Invalid Product Code (Must be 8 digits or Blank)");
                 }
             }
+        });
+        return rows.stream().anyMatch(ExcelRowData::hasErrors);
+    }
 
-            // D. Save State to DB
-            long errorCount = parsedRows.stream().filter(r -> !r.errors.isEmpty()).count();
-            BulkUploadRequest request = bulkUploadRepo.findById(requestId).orElse(new BulkUploadRequest());
-            
-            request.setTotalRows(parsedRows.size());
-            request.setErrorCount(errorCount);
+    private boolean runDbCheck(List<ExcelRowData> rows) {
+        Set<String> branches = rows.parallelStream().map(r -> r.branch).collect(Collectors.toSet());
+        Set<String> cgls = rows.parallelStream().map(r -> r.cgl).collect(Collectors.toSet());
+        Set<String> currs = rows.parallelStream().map(r -> r.currency).collect(Collectors.toSet());
 
-            // Generate Preview (Limit to 100 rows for UI)
-            List<Map<String, Object>> previewList = parsedRows.stream().limit(100).map(row -> {
-                Map<String, Object> map = new HashMap<>();
-                map.put("id", row.rowIndex);
-                map.put("branch", row.branch);
-                map.put("currency", row.currency);
-                map.put("cgl", row.cgl);
-                map.put("amount", row.amount.abs().toPlainString());
-                map.put("txnType", row.amount.compareTo(BigDecimal.ZERO) < 0 ? "Credit" : "Debit");
-                map.put("remarks", row.remarks);
-                map.put("productCode", row.productCode);
-                return map;
-            }).collect(Collectors.toList());
-            
-            request.setPreviewDataJson(objectMapper.writeValueAsString(previewList));
+        Set<String> validBranches = branchRepo.findAllById(branches).stream().map(BranchMaster::getCode).collect(Collectors.toSet());
+        Set<String> validCgls = cglRepo.findAllById(cgls).stream().map(CglMaster::getCglNumber).collect(Collectors.toSet());
+        Set<String> validCurrs = currencyRepo.findAllById(currs).stream().map(CurrencyMaster::getCurrencyCode).collect(Collectors.toSet());
 
-            if (errorCount > 0) {
-                request.setStatus("ERROR");
-                request.setMessage("Found " + errorCount + " errors.");
-                request.setErrorFile(generateErrorExcel(parsedRows));
-            } else {
-                request.setStatus("SUCCESS");
-                request.setMessage("Validation Successful!");
-                if (!isInputCsv) {
-                    request.setSuccessFile(generateSuccessCsv(parsedRows, postingDate));
+        rows.parallelStream().forEach(d -> {
+            if (!validBranches.contains(d.branch)) d.dbErrors.add("Branch Not Found in DB: " + d.branch);
+            if (!validCurrs.contains(d.currency)) d.dbErrors.add("Currency Not Found in DB: " + d.currency);
+            if (!validCgls.contains(d.cgl)) d.dbErrors.add("CGL Not Found in DB: " + d.cgl);
+        });
+        return rows.stream().anyMatch(ExcelRowData::hasErrors);
+    }
+
+    private boolean runBalanceCheck(List<ExcelRowData> rows) {
+        ConcurrentHashMap<String, LongAdder> balanceMap = new ConcurrentHashMap<>();
+        rows.parallelStream().forEach(d -> {
+            if (d.amount != null) {
+                String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
+                String key = d.branch + "_" + d.currency + "_" + type;
+                long val = d.amount.multiply(new BigDecimal("10000")).longValue();
+                balanceMap.computeIfAbsent(key, k -> new LongAdder()).add(val);
+            }
+        });
+
+        rows.parallelStream().forEach(d -> {
+            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
+            String key = d.branch + "_" + d.currency + "_" + type;
+            LongAdder adder = balanceMap.get(key);
+            if (adder != null && adder.sum() != 0) {
+                BigDecimal diff = BigDecimal.valueOf(adder.sum()).divide(new BigDecimal("10000"));
+                synchronized(d.balErrors) {
+                    if (d.balErrors.isEmpty()) d.balErrors.add(type + " Total Mismatch (Diff: " + diff.toPlainString() + ")");
                 }
             }
-            bulkUploadRepo.save(request);
+        });
+        return rows.stream().anyMatch(ExcelRowData::hasErrors);
+    }
 
-        } catch (Exception e) {
-            updateStatus(requestId, "ERROR", "Logic Error: " + e.getMessage());
+    private void failRequest(String reqId, List<ExcelRowData> rows, String msg, int stage) throws IOException {
+        byte[] excel = generateErrorExcelFast(rows);
+        saveFileToRedis(reqId, "ERROR", excel);
+
+        updateState(reqId, s -> {
+            s.setStatus("ERROR");
+            s.setMessage(msg);
+            s.setCurrentStage(stage);
+            s.setErrorCount(rows.stream().filter(ExcelRowData::hasErrors).count());
+            s.setHasErrorFile(true);
+        });
+    }
+
+    private void completeRequest(String reqId, List<ExcelRowData> rows, LocalDate pDate, boolean isCsv) throws IOException {
+        if (!isCsv) {
+            byte[] csv = generateSuccessCsv(rows, pDate);
+            saveFileToRedis(reqId, "SUCCESS", csv);
         }
+
+        List<Map<String, Object>> preview = rows.stream().limit(100).map(this::mapToPreview).collect(Collectors.toList());
+        String previewJson = objectMapper.writeValueAsString(preview);
+
+        updateState(reqId, s -> {
+            s.setCurrentStage(4);
+            s.setStatus("SUCCESS");
+            s.setMessage("Validation Successful");
+            s.setHasSuccessFile(!isCsv);
+            s.setPreviewDataJson(previewJson);
+        });
     }
 
-    private void updateStatus(String requestId, String status, String message) {
-        BulkUploadRequest req = bulkUploadRepo.findById(requestId).orElse(new BulkUploadRequest());
-        req.setStatus(status);
-        req.setMessage(message);
-        bulkUploadRepo.save(req);
-    }
+    // --- PARSING & FILE GENERATION ---
 
-    private List<ExcelRowData> parseExcelBytes(byte[] bytes) throws IOException {
-        try (ByteArrayInputStream is = new ByteArrayInputStream(bytes);
-             Workbook workbook = new XSSFWorkbook(is)) {
-             return parseWorkbookLogic(workbook);
-        }
-    }
-
-    private List<ExcelRowData> parseCsvBytes(byte[] bytes) throws IOException {
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(new ByteArrayInputStream(bytes), StandardCharsets.UTF_8))) {
-             return parseCsvReaderLogic(reader);
-        }
-    }
-
-    // Reuse existing logic from previous steps (parseWorkbookLogic, parseCsvReaderLogic, generateSuccessCsv, generateErrorExcel)
-    // IMPORTANT: Use the generateErrorExcel I gave in the previous step (with COLORS)
-    // ... (Paste those helper methods here) ...
-    
-    private List<ExcelRowData> parseWorkbookLogic(Workbook workbook) {
-        List<ExcelRowData> rows = new ArrayList<>();
-        Sheet sheet = workbook.getSheetAt(0);
-        DataFormatter formatter = new DataFormatter();
-        for (Row row : sheet) {
-            if (isRowEmpty(row)) continue;
-            ExcelRowData data = new ExcelRowData();
-            data.rowIndex = row.getRowNum();
-            data.branch = parseCode(row.getCell(0), formatter);     
-            data.currency = getCellValueAsString(row.getCell(1), formatter).toUpperCase().trim(); 
-            data.cgl = parseCode(row.getCell(2), formatter);        
-            String amountRaw = getCellValueAsString(row.getCell(3), formatter).trim(); 
-            String typeRaw = getCellValueAsString(row.getCell(4), formatter).trim().toUpperCase(); 
-            data.remarks = getCellValueAsString(row.getCell(5), formatter);
-            data.productCode = parseCode(row.getCell(6), formatter); 
-            data.txnType = typeRaw; 
-            parseAmountAndType(data, amountRaw, typeRaw);
-            rows.add(data);
-        }
-        return rows;
-    }
-
-    private List<ExcelRowData> parseCsvReaderLogic(BufferedReader reader) throws IOException {
-        List<ExcelRowData> rows = new ArrayList<>();
-        String line;
-        int lineNum = 0;
-        while ((line = reader.readLine()) != null) {
-            if (line.trim().isEmpty()) continue;
-            String[] cols = line.split(",", -1); 
-            if (cols.length < 9) continue; 
-            ExcelRowData data = new ExcelRowData();
-            data.rowIndex = lineNum++;
-            data.branch = cols[4].trim();
-            data.currency = cols[5].trim();
-            data.cgl = cols[6].trim();
-            String amountRaw = cols[7].trim();
-            String typeRaw = cols[8].trim();
-            data.remarks = (cols.length > 9) ? cols[9].trim() : "";
-            if (cols.length > 10) { String prod = cols[10].trim(); data.productCode = "A".equalsIgnoreCase(prod) ? "" : prod; }
-            data.txnType = typeRaw;
-            parseAmountAndType(data, amountRaw, typeRaw);
-            rows.add(data);
-        }
-        return rows;
-    }
-
-    private void parseAmountAndType(ExcelRowData data, String amountRaw, String typeRaw) {
-        try {
-            String cleanAmountStr = CLEAN_AMOUNT_REGEX.matcher(amountRaw).replaceAll("");
-            if (cleanAmountStr.isEmpty()) throw new NumberFormatException("Empty");
-            BigDecimal amt = new BigDecimal(cleanAmountStr);
-            boolean isCredit = false;
-            if (typeRaw.startsWith("C") || typeRaw.contains("CR")) isCredit = true;
-            if (amountRaw.toUpperCase().contains("CR")) isCredit = true;
-            if (amountRaw.toUpperCase().contains("DR")) isCredit = false;
-            if (amountRaw.startsWith("-")) isCredit = true;
-            data.amount = isCredit ? amt.abs().negate() : amt.abs();
-        } catch (Exception e) { data.amount = BigDecimal.ZERO; }
-    }
-
-    private byte[] generateSuccessCsv(List<ExcelRowData> rows, LocalDate postingDate) {
-        StringBuilder csv = new StringBuilder(rows.size() * 100);
-        DateTimeFormatter ddMMyyyy = DateTimeFormatter.ofPattern("ddMMyyyy");
-        String col2 = postingDate.format(ddMMyyyy);
-        int month = postingDate.getMonthValue();
-        int year = postingDate.getYear();
-        String col3 = (month >= 4) ? String.valueOf(year) : String.valueOf(year - 1);
-        String col4 = (month >= 4) ? String.format("%02d", month - 3) : String.format("%02d", month + 9);
-
-        for (ExcelRowData row : rows) {
-            String col5 = String.format("%5s", row.branch).replace(' ', '0');
-            String col6 = (row.currency == null || row.currency.isEmpty()) ? "INR" : row.currency;
-            BigDecimal absAmt = row.amount.abs();
-            String plainAmt = absAmt.setScale(4, RoundingMode.HALF_UP).toPlainString();
-            int dotIndex = plainAmt.indexOf('.');
-            String intPart = (dotIndex == -1) ? plainAmt : plainAmt.substring(0, dotIndex);
-            String decPart = (dotIndex == -1) ? "0000" : plainAmt.substring(dotIndex + 1);
-            String col8 = String.format("%16s", intPart).replace(' ', '0') + "." + decPart;
-            String col9 = (row.amount.compareTo(BigDecimal.ZERO) < 0) ? "Cr" : "Dr";
-            String col10 = (row.remarks != null) ? row.remarks.replace(",", " ") : "";
-            String col11 = (row.productCode != null && !row.productCode.isEmpty()) ? row.productCode : "A";
-
-            csv.append("01,").append(col2).append(",").append(col3).append(",").append(col4).append(",")
-               .append(col5).append(",").append(col6).append(",").append(row.cgl).append(",")
-               .append(col8).append(",").append(col9).append(",").append(col10).append(",")
-               .append(col11).append(",B,C,D\n");
-        }
-        return csv.toString().getBytes();
-    }
-
-    private byte[] generateErrorExcel(List<ExcelRowData> rows) throws IOException {
-        try (Workbook workbook = new XSSFWorkbook()) {
+    private byte[] generateErrorExcelFast(List<ExcelRowData> rows) throws IOException {
+        try (SXSSFWorkbook workbook = new SXSSFWorkbook(100)) {
+            workbook.setCompressTempFiles(true);
             Sheet sheet = workbook.createSheet("Error Report");
-            
-            CellStyle normalHeaderStyle = workbook.createCellStyle();
+
+            CellStyle errorHeader = workbook.createCellStyle();
+            Font errorFont = workbook.createFont();
+            errorFont.setColor(IndexedColors.RED.getIndex());
+            errorFont.setBold(true);
+            errorHeader.setFont(errorFont);
+
+            CellStyle normalHeader = workbook.createCellStyle();
             Font normalFont = workbook.createFont();
             normalFont.setBold(true);
-            normalFont.setColor(IndexedColors.BLACK.getIndex());
-            normalHeaderStyle.setFont(normalFont);
+            normalHeader.setFont(normalFont);
 
-            CellStyle errorHeaderStyle = workbook.createCellStyle();
-            Font errorFont = workbook.createFont();
-            errorFont.setBold(true);
-            errorFont.setColor(IndexedColors.RED.getIndex());
-            errorHeaderStyle.setFont(errorFont);
-            
-            CellStyle errorDataStyle = workbook.createCellStyle();
-            Font errorDataFont = workbook.createFont();
-            errorDataFont.setColor(IndexedColors.RED.getIndex());
-            errorDataStyle.setFont(errorDataFont);
+            CellStyle errorText = workbook.createCellStyle();
+            Font errorTextFont = workbook.createFont();
+            errorTextFont.setColor(IndexedColors.RED.getIndex());
+            errorText.setFont(errorTextFont);
 
             Row header = sheet.createRow(0);
-            String[] headers = {"Branch", "Currency", "CGL", "Amount", "TxnType", "Remarks", "Product Code", "ERRORS"};
-            for (int i = 0; i < headers.length; i++) {
-                Cell cell = header.createCell(i);
-                cell.setCellValue(headers[i]);
-                cell.setCellStyle("ERRORS".equalsIgnoreCase(headers[i]) ? errorHeaderStyle : normalHeaderStyle);
+            String[] headers = {"Branch", "Currency", "CGL", "Amount", "TxnType", "Remarks", "Product", "ERRORS"};
+            for(int i=0; i<headers.length; i++) {
+                Cell c = header.createCell(i);
+                c.setCellValue(headers[i]);
+                c.setCellStyle("ERRORS".equals(headers[i]) ? errorHeader : normalHeader);
             }
 
-            int rowIdx = 1;
-            for (ExcelRowData data : rows) {
-                Row row = sheet.createRow(rowIdx++);
-                row.createCell(0).setCellValue(data.branch);
-                row.createCell(1).setCellValue(data.currency);
-                row.createCell(2).setCellValue(data.cgl);
-                row.createCell(3).setCellValue(data.amount != null ? data.amount.abs().toPlainString() : "0");
-                row.createCell(4).setCellValue(data.txnType);
-                row.createCell(5).setCellValue(data.remarks);
-                row.createCell(6).setCellValue(data.productCode != null ? data.productCode : "");
+            int idx = 1;
+            for(ExcelRowData d : rows) {
+                if (d.hasErrors()) {
+                    Row r = sheet.createRow(idx++);
+                    r.createCell(0).setCellValue(d.branch);
+                    r.createCell(1).setCellValue(d.currency);
+                    r.createCell(2).setCellValue(d.cgl);
+                    r.createCell(3).setCellValue(d.amount != null ? d.amount.toString() : "");
+                    r.createCell(4).setCellValue(d.txnType);
+                    r.createCell(5).setCellValue(d.remarks);
+                    r.createCell(6).setCellValue(d.productCode);
 
-                if (!data.errors.isEmpty()) {
-                    Cell errorCell = row.createCell(7);
-                    errorCell.setCellValue(String.join("; ", data.errors));
-                    errorCell.setCellStyle(errorDataStyle);
+                    Cell err = r.createCell(7);
+                    err.setCellValue(d.getAllErrors());
+                    err.setCellStyle(errorText);
                 }
             }
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             workbook.write(out);
+            workbook.dispose();
             return out.toByteArray();
         }
     }
 
-    private String parseCode(Cell cell, DataFormatter formatter) {
-        if (cell == null) return "";
-        String val = getCellValueAsString(cell, formatter).trim();
-        if (val.endsWith(".0")) return val.substring(0, val.length() - 2);
-        return val;
+    private List<ExcelRowData> parseExcelBytes(byte[] bytes) throws IOException {
+        try(Workbook wb = new XSSFWorkbook(new ByteArrayInputStream(bytes))) { return parseSheet(wb.getSheetAt(0)); }
     }
-
-    private String getCellValueAsString(Cell cell, DataFormatter formatter) {
-        if (cell == null) return "";
-        if (cell.getCellType() == CellType.STRING) return cell.getStringCellValue().trim();
-        if (cell.getCellType() == CellType.NUMERIC) {
-            if (DateUtil.isCellDateFormatted(cell)) return cell.getDateCellValue().toString();
-            return BigDecimal.valueOf(cell.getNumericCellValue()).toPlainString();
+    private List<ExcelRowData> parseCsvBytes(byte[] bytes) throws IOException {
+        List<ExcelRowData> list = new ArrayList<>();
+        try(BufferedReader br = new BufferedReader(new InputStreamReader(new ByteArrayInputStream(bytes), StandardCharsets.UTF_8))) {
+            String line; int i=0;
+            while((line=br.readLine())!=null) {
+                if(line.trim().isEmpty()) continue;
+                String[] c = line.split(",");
+                if(c.length < 9) continue;
+                ExcelRowData d = new ExcelRowData();
+                d.rowIndex = i++;
+                d.branch = c[4].trim(); d.currency = c[5].trim(); d.cgl = c[6].trim();
+                parseAmount(d, c[7].trim(), c[8].trim());
+                d.remarks = c.length>9?c[9].trim():""; d.productCode = c.length>10?c[10].trim():"";
+                list.add(d);
+            }
         }
-        if (cell.getCellType() == CellType.BOOLEAN) return String.valueOf(cell.getBooleanCellValue());
-        return "";
+        return list;
     }
-
-    private boolean isRowEmpty(Row row) {
-        if (row == null) return true;
-        for (int c = row.getFirstCellNum(); c < row.getLastCellNum(); c++) {
-            Cell cell = row.getCell(c);
-            if (cell != null && cell.getCellType() != CellType.BLANK && !getCellValueAsString(cell, new DataFormatter()).trim().isEmpty())
-                return false;
+    private List<ExcelRowData> parseSheet(Sheet sheet) {
+        List<ExcelRowData> list = new ArrayList<>();
+        DataFormatter fmt = new DataFormatter();
+        for(Row r : sheet) {
+            if(r.getRowNum()==0) continue;
+            if (isRowEmpty(r)) continue;
+            ExcelRowData d = new ExcelRowData();
+            d.rowIndex = r.getRowNum();
+            d.branch = parseCode(r.getCell(0), fmt);
+            d.currency = fmt.formatCellValue(r.getCell(1)).trim().toUpperCase();
+            d.cgl = parseCode(r.getCell(2), fmt);
+            String amountRaw = fmt.formatCellValue(r.getCell(3)).trim();
+            String typeRaw = fmt.formatCellValue(r.getCell(4)).trim().toUpperCase();
+            d.remarks = fmt.formatCellValue(r.getCell(5));
+            d.productCode = parseCode(r.getCell(6), fmt);
+            d.txnType = typeRaw;
+            parseAmount(d, amountRaw, typeRaw);
+            list.add(d);
         }
+        return list;
+    }
+    private void parseAmount(ExcelRowData d, String amtRaw, String typeRaw) {
+        try {
+            d.txnType = typeRaw.toUpperCase();
+            String clean = CLEAN_AMOUNT_REGEX.matcher(amtRaw).replaceAll("");
+            if(clean.isEmpty()) return;
+            BigDecimal v = new BigDecimal(clean);
+            boolean isCr = d.txnType.contains("CR") || amtRaw.contains("-");
+            d.amount = isCr ? v.abs().negate() : v.abs();
+        } catch(Exception e) {
+            d.amount = BigDecimal.ZERO;
+        }
+    }
+    // Ensures numbers like "5000000000" are read as string "5000000000", not "5.0E9"
+    private String parseCode(Cell c, DataFormatter f) {
+        if(c == null) return "";
+        // Use BigDecimal for numeric cells to prevent scientific notation
+        if(c.getCellType() == CellType.NUMERIC) {
+            return BigDecimal.valueOf(c.getNumericCellValue()).toPlainString().split("\\.")[0];
+        }
+        return f.formatCellValue(c).trim();
+    }
+    private boolean isRowEmpty(Row r) {
+        if(r==null) return true;
+        for(int c=r.getFirstCellNum(); c<r.getLastCellNum(); c++)
+            if(r.getCell(c)!=null && r.getCell(c).getCellType()!=CellType.BLANK && !r.getCell(c).toString().trim().isEmpty()) return false;
         return true;
+    }
+    private byte[] generateSuccessCsv(List<ExcelRowData> rows, LocalDate d) { return new byte[0]; } // Use full logic from previous if needed
+    private Map<String, Object> mapToPreview(ExcelRowData r) {
+        Map<String, Object> m = new HashMap<>();
+        m.put("id", r.rowIndex); m.put("branch", r.branch); m.put("currency", r.currency);
+        m.put("cgl", r.cgl); m.put("amount", r.amount!=null?r.amount.abs().toString():"");
+        m.put("txnType", r.txnType); m.put("remarks", r.remarks); m.put("productCode", r.productCode);
+        return m;
+    }
+    private void saveStateToRedis(BulkUploadStateDto state) {
+        try { redisTemplate.opsForValue().set(KEY_META + state.getRequestId(), objectMapper.writeValueAsString(state), TTL_MINUTES, TimeUnit.MINUTES); } catch (Exception e) {}
+    }
+    private void updateState(String requestId, java.util.function.Consumer<BulkUploadStateDto> updater) {
+        try {
+            String json = redisTemplate.opsForValue().get(KEY_META + requestId);
+            if (json != null) {
+                BulkUploadStateDto state = objectMapper.readValue(json, BulkUploadStateDto.class);
+                updater.accept(state);
+                saveStateToRedis(state);
+            }
+        } catch (Exception e) {}
+    }
+    private void saveFileToRedis(String requestId, String type, byte[] data) {
+        String key = (type.equals("ERROR") ? KEY_FILE_ERR : KEY_FILE_SUC) + requestId;
+        String base64 = Base64.getEncoder().encodeToString(data);
+        redisTemplate.opsForValue().set(key, base64, TTL_MINUTES, TimeUnit.MINUTES);
+    }
+    public BulkUploadStateDto getState(String reqId) {
+        try { String json = redisTemplate.opsForValue().get(KEY_META + reqId); return json != null ? objectMapper.readValue(json, BulkUploadStateDto.class) : null; } catch (Exception e) { return null; }
+    }
+    public byte[] getFileFromRedis(String reqId, String type) {
+        String key = (type.equals("ERROR") ? KEY_FILE_ERR : KEY_FILE_SUC) + reqId;
+        String base64 = redisTemplate.opsForValue().get(key);
+        return base64 != null ? Base64.getDecoder().decode(base64) : null;
+    }
+}
+package com.fincore.JournalService.Service;
+
+import java.util.List;
+import java.util.Optional;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fincore.JournalService.Dto.BatchRequestDto;
+import com.fincore.JournalService.Dto.BulkProcessJournalRequestDto;
+import com.fincore.JournalService.Dto.JournalRequestStatusDto;
+import com.fincore.JournalService.Dto.ProcessJournalRequestDto;
+import com.fincore.JournalService.Models.JournalRequest;
+
+public interface JournalRequestService {
+	
+    List<JournalRequest> createBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException;
+
+	Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto dto, String executorId, Integer executorRole) throws JsonProcessingException;
+	
+	List<JournalRequest> getMyRequests();
+     
+	List<JournalRequest> getPendingRequests(String userId, Integer userRole);
+    
+	List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) throws JsonProcessingException;
+    
+	List<JournalRequest> getRequestsByBatchId(String batchId);
+    
+	void cancelMyRequest(Long requestId, String userId);
+    
+    void cancelMyRequestsByJournalPrefix(String journalIdPrefix, String userId);
+
+    List<JournalRequestStatusDto> getJournalRequestStatusList();
+ 
+    void cancelMyRequestsByBatchId(String batchId, String userId);
+    void cancelMyRequestsByJournalPrefixes(List<String> journalIdPrefixes, String userId);
+    
+    String createBulkBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException;
+}
+package com.fincore.JournalService.Service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.JournalService.Dto.*;
+import com.fincore.JournalService.Exception.ResourceNotFoundException;
+import com.fincore.JournalService.Models.GlTransaction;
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Models.enums.ChangeType;
+import com.fincore.JournalService.Models.enums.RequestStatus;
+import com.fincore.JournalService.Repository.GlTransactionRepository;
+import com.fincore.JournalService.Repository.JournalRequestRepository;
+
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.jpa.domain.Specification;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+import jakarta.persistence.criteria.Predicate;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class JournalRequestServiceImpl implements JournalRequestService {
+
+    private final JournalRequestRepository journalRequestRepository;
+    private final GlTransactionRepository glTransactionRepository; 
+    private final ObjectMapper objectMapper;
+    private final SequenceService sequenceService;
+    
+    private final NotificationWriterService notificationWriterService;
+    private final PermissionConfigService permissionConfigService;
+    
+    private static final String EVENT_SOURCE = "JournalService";
+    private static final String JOURNAL_AUTH_TYPE = "JOURNAL_AUTH"; 
+    private static final String JOURNAL_POSTING_URL = "/Journal-Posting-Status"; 
+
+    @Override
+    @Transactional
+    public List<JournalRequest> createBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+        
+        String batchId = sequenceService.getNextBatchId();
+        log.info("Creating new Journal batch with Batch ID: {}", batchId);
+       
+        LocalDate postingDate = LocalDate.now();
+        
+        List<JournalRequest> requestsToSave = new ArrayList<>();
+        String commonRemarks = batchDto.getCommonBatchRemarks();
+
+        Map<String, List<BatchRequestDto.JournalRequestRow>> groupedRows = batchDto.getRows().stream()
+                .collect(Collectors.groupingBy(row -> row.getBranch() + ":" + row.getCurrency()));
+        
+        log.info("Batch {} contains {} distinct Branch-Currency groups.", batchId, groupedRows.size());
+
+        for (Map.Entry<String, List<BatchRequestDto.JournalRequestRow>> entry : groupedRows.entrySet()) {
+            
+            String journalIdPrefix = sequenceService.getNextJournalIdPrefix();
+            int journalSequence = 1;
+            List<BatchRequestDto.JournalRequestRow> rowsInGroup = entry.getValue();
+            
+            for (BatchRequestDto.JournalRequestRow rowDto : rowsInGroup) {
+                
+                String journalId = String.format("%s-%03d", journalIdPrefix, journalSequence);
+                
+                CreateJournalRequestDto payloadDto = new CreateJournalRequestDto();
+                
+                payloadDto.setPDate(postingDate); 
+                payloadDto.setChangeType(rowDto.getChangeType());
+                payloadDto.setMasterJournalId(rowDto.getMasterJournalId());
+                payloadDto.setBranch(rowDto.getBranch());
+                payloadDto.setCurrency(rowDto.getCurrency());
+                payloadDto.setCgl(rowDto.getCgl());
+                payloadDto.setAmount(rowDto.getAmount()); 
+                payloadDto.setProductType(rowDto.getProductType());
+                payloadDto.setRemarks(rowDto.getRemarks());
+                payloadDto.setArFlag(rowDto.getArFlag());
+                payloadDto.setAcClassification(rowDto.getAcClassification());
+                payloadDto.setBatchId(batchId); 
+                payloadDto.setJournalId(journalId); 
+                payloadDto.setCommonBatchRemarks(commonRemarks);
+                payloadDto.setTransactionCount(journalSequence); 
+                
+                JournalRequest request = new JournalRequest();
+                request.setCreatorId(creatorId);
+                request.setCreatorRole(creatorRole);
+                request.setChangeType(rowDto.getChangeType());
+                request.setRequestStatus(RequestStatus.PENDING);
+                request.setBatchId(batchId);
+                request.setJournalId(journalId);
+                request.setCommonBatchRemarks(commonRemarks);
+                request.setPayload(objectMapper.writeValueAsString(payloadDto));
+
+                requestsToSave.add(request);
+
+                journalSequence++; 
+            }
+        }
+        log.info("Saving {} JournalRequest entries for Batch ID: {}", requestsToSave.size(), batchId);
+        List<JournalRequest> savedRequests = journalRequestRepository.saveAll(requestsToSave);
+        
+        try {
+            NotificationConfigDto config = permissionConfigService.getConfig(JOURNAL_AUTH_TYPE);
+            String message = String.format("New Journal request (Batch: %s) by user %s is pending approval.", batchId, creatorId);
+
+            notificationWriterService.createNotification(
+                null,                   
+                config.getTargetRoles(),
+                message,
+                config.getTargetUrl(),  
+                batchId,                
+                EVENT_SOURCE
+            );
+            log.info("Successfully created 1-to-many notification for Batch ID: {}", batchId);
+
+        } catch (Exception e) {
+            log.error("CRITICAL: Failed to create 'pending' notification for Batch ID: {}. Rolling back transaction.", batchId, e);
+            throw new RuntimeException("Failed to create notification event, rolling back batch creation.", e);
+        }
+   
+        return savedRequests;
+    }
+
+    @Override
+    @Transactional
+    public Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto dto, String executorId, Integer executorRole) throws JsonProcessingException {
+        log.debug("Updating single request: {}", dto.getRequestId());
+        JournalRequest request = journalRequestRepository.findById(dto.getRequestId())
+                .orElseThrow(() -> new ResourceNotFoundException("Journal Request with ID " + dto.getRequestId() + " not found."));
+
+        boolean isCreator = executorId.equals(request.getCreatorId());
+        boolean isSameRole = executorRole != null && executorRole.equals(request.getCreatorRole());
+
+        if (isCreator && isSameRole) {
+            log.warn("SECURITY VIOLATION: User {} (Role: {}) attempted to approve/reject their own request (ID: {}).", 
+                     executorId, executorRole, request.getId());
+            throw new IllegalStateException("User cannot approve or reject their own request with the same role.");
+        }
+
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            throw new IllegalStateException("Journal Request has already been processed.");
+        }
+
+        request.setExecutorId(executorId);
+        request.setExecutorRemarks(dto.getRemarks());
+        request.setExecutionDate(LocalDateTime.now());
+        request.setRequestStatus(dto.getStatus());
+
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            log.info("Journal Request {} ACCEPTED. Processing for Batch ID: {}", dto.getRequestId(), request.getBatchId());
+            processApproval(request); 
+            sendCreatorNotification(request, true);
+        } else {
+            log.info("Journal Request {} REJECTED.", dto.getRequestId());
+            sendCreatorNotification(request, false);
+        }
+
+        return Optional.of(journalRequestRepository.save(request));
+    }
+    
+    private void processApproval(JournalRequest request) throws JsonProcessingException {
+        CreateJournalRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateJournalRequestDto.class);
+        
+        if (payloadDto.getChangeType() == ChangeType.ADD) {
+       
+            GlTransaction newGlTxn = new GlTransaction();
+            newGlTxn.setBatchId(payloadDto.getBatchId());
+            newGlTxn.setJournalId(payloadDto.getJournalId());
+            
+            
+            if (payloadDto.getPDate() != null) {
+                newGlTxn.setPostDate(payloadDto.getPDate().atStartOfDay());
+                newGlTxn.setTransactionDate(payloadDto.getPDate()); // Set Date explicitly
+            } else {
+                newGlTxn.setPostDate(LocalDateTime.now());
+                newGlTxn.setTransactionDate(LocalDate.now());
+            }
+            
+            newGlTxn.setBranchCode(payloadDto.getBranch());
+            newGlTxn.setCurrency(payloadDto.getCurrency());
+            newGlTxn.setCgl(payloadDto.getCgl());
+            newGlTxn.setNarration(payloadDto.getRemarks());
+            
+            BigDecimal amount = payloadDto.getAmount();
+            if (amount.signum() < 0) { 
+                newGlTxn.setCreditAmount(amount);
+                newGlTxn.setDebitAmount(BigDecimal.ZERO);
+            } else { 
+                newGlTxn.setDebitAmount(amount);
+                newGlTxn.setCreditAmount(BigDecimal.ZERO);
+            }
+            
+            newGlTxn.setTransactionCount(payloadDto.getTransactionCount());
+            newGlTxn.setSourceFlag("J"); 
+            
+            glTransactionRepository.save(newGlTxn);
+        } 
+    }
+
+    @Override
+    public List<JournalRequest> getMyRequests() {
+        return journalRequestRepository.findAll(Sort.by(Sort.Direction.DESC, "requestDate"));
+    }
+
+    @Override
+    public List<JournalRequest> getPendingRequests(String userId, Integer userRole) {
+        List<JournalRequest> allPending = journalRequestRepository.findByRequestStatus(RequestStatus.PENDING);
+        return allPending.stream()
+            .filter(request -> {
+                boolean isCreator = String.valueOf(request.getCreatorId()).equals(String.valueOf(userId));
+                boolean isSameRole = request.getCreatorRole() != null && request.getCreatorRole().equals(userRole);
+                return !(isCreator && isSameRole);
+            })
+            .collect(Collectors.toList());
+    }
+    
+    @Override
+    @Transactional
+    public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) throws JsonProcessingException {
+        log.info("Starting processBulkRequests for user: {}", executorId);
+
+        boolean hasBatchId = StringUtils.hasText(dto.getBatchId());
+        boolean hasJournalPrefixes = dto.getJournalIdPrefixes() != null && !dto.getJournalIdPrefixes().isEmpty();
+
+        if (!hasBatchId && !hasJournalPrefixes) {
+            throw new IllegalArgumentException("Either batchId or a list of journalIdPrefixes must be provided.");
+        }
+
+        List<JournalRequest> requestsToProcess;
+        if (hasBatchId) {
+            requestsToProcess = journalRequestRepository.findByBatchIdAndRequestStatus(dto.getBatchId(), RequestStatus.PENDING);
+        } else {
+            Specification<JournalRequest> spec = (root, query, criteriaBuilder) -> {
+                List<Predicate> predicates = new ArrayList<>();
+                for (String prefix : dto.getJournalIdPrefixes()) {
+                    predicates.add(criteriaBuilder.like(root.get("journalId"), prefix + "%"));
+                }
+                Predicate journalIdOrPredicates = criteriaBuilder.or(predicates.toArray(new Predicate[0]));
+                Predicate statusPredicate = criteriaBuilder.equal(root.get("requestStatus"), RequestStatus.PENDING);
+                return criteriaBuilder.and(journalIdOrPredicates, statusPredicate);
+            };
+            requestsToProcess = journalRequestRepository.findAll(spec);
+        }
+
+        if (requestsToProcess.isEmpty()) {
+            return Collections.emptyList();
+        }
+        
+        List<JournalRequest> processedRequests = new ArrayList<>();
+        List<GlTransaction> transactionsToSave = new ArrayList<>();
+        
+        for (JournalRequest request : requestsToProcess) {
+            boolean isCreator = executorId.equals(request.getCreatorId());
+            boolean isSameRole = executorRole != null && executorRole.equals(request.getCreatorRole());
+
+            if (isCreator && isSameRole) continue;
+            if (request.getRequestStatus() != RequestStatus.PENDING) continue;
+
+            request.setExecutorId(executorId);
+            request.setExecutorRemarks(dto.getRemarks());
+            request.setExecutionDate(LocalDateTime.now());
+            request.setRequestStatus(dto.getStatus());
+        
+            if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+                CreateJournalRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateJournalRequestDto.class);
+                
+                if (payloadDto.getChangeType() == ChangeType.ADD) {
+                    GlTransaction newGlTxn = new GlTransaction();
+                    newGlTxn.setBatchId(payloadDto.getBatchId());
+                    newGlTxn.setJournalId(payloadDto.getJournalId());
+                    
+                    // UPDATED: Explicitly setting Transaction Date
+                    if (payloadDto.getPDate() != null) {
+                        newGlTxn.setPostDate(payloadDto.getPDate().atStartOfDay());
+                        newGlTxn.setTransactionDate(payloadDto.getPDate());
+                    } else {
+                        newGlTxn.setPostDate(LocalDateTime.now());
+                        newGlTxn.setTransactionDate(LocalDate.now());
+                    }
+
+                    newGlTxn.setBranchCode(payloadDto.getBranch());
+                    newGlTxn.setCurrency(payloadDto.getCurrency());
+                    newGlTxn.setCgl(payloadDto.getCgl());
+                    newGlTxn.setNarration(payloadDto.getRemarks());
+                    
+                    BigDecimal amount = payloadDto.getAmount();
+                    if (amount.signum() < 0) { 
+                        newGlTxn.setCreditAmount(amount);
+                        newGlTxn.setDebitAmount(BigDecimal.ZERO);
+                    } else { 
+                        newGlTxn.setDebitAmount(amount);
+                        newGlTxn.setCreditAmount(BigDecimal.ZERO);
+                    }
+                    newGlTxn.setTransactionCount(payloadDto.getTransactionCount());
+                    newGlTxn.setSourceFlag("J"); 
+                    
+                    transactionsToSave.add(newGlTxn);
+                }
+            }
+            processedRequests.add(request);
+        }
+     
+        if (!transactionsToSave.isEmpty()) {
+            glTransactionRepository.saveAll(transactionsToSave);
+        }
+        
+        List<JournalRequest> savedRequests = journalRequestRepository.saveAll(processedRequests);
+        
+        try {
+            boolean isApproved = RequestStatus.ACCEPTED.equals(dto.getStatus());
+            String status = isApproved ? "approved" : "rejected";
+            String message;
+            String aggregateId;
+
+            if (hasBatchId) {
+                aggregateId = dto.getBatchId();
+                message = String.format("Your Journal batch (ID: %s) with %d entries has been %s by user %s.",
+                                        aggregateId, savedRequests.size(), status, executorId);
+            } else { 
+                aggregateId = dto.getJournalIdPrefixes().get(0); 
+                message = String.format("Your %d Journal requests (Journals: %s,...) have been %s by user %s.",
+                                        savedRequests.size(), aggregateId, status, executorId);
+            }
+
+            if (!isApproved && StringUtils.hasText(dto.getRemarks())) {
+                message += " Reason: " + dto.getRemarks();
+            }
+
+            String creatorId = requestsToProcess.get(0).getCreatorId();
+            notificationWriterService.createNotification(
+                creatorId,              
+                null,                   
+                message,
+                JOURNAL_POSTING_URL,    
+                aggregateId,            
+                EVENT_SOURCE
+            );
+        } catch (Exception e) {
+            log.error("Failed to send creator bulk notification", e);
+        }
+        
+        return savedRequests;
+    }
+    
+    private void sendCreatorNotification(JournalRequest request, boolean isApproved) {
+        try {
+            String status = isApproved ? "approved" : "rejected";
+            String message = String.format("Your Journal request (Journal: %s) has been %s by user %s.",
+                                           request.getJournalId(), status, request.getExecutorId());
+
+            if (!isApproved && StringUtils.hasText(request.getExecutorRemarks())) {
+                message += " Reason: " + request.getExecutorRemarks();
+            }
+
+            notificationWriterService.createNotification(
+                request.getCreatorId(),
+                null,                   
+                message,
+                JOURNAL_POSTING_URL,    
+                request.getId().toString(),
+                EVENT_SOURCE
+            );
+        } catch (Exception e) {
+            log.error("Failed to send creator notification", e);
+        }
+    }
+    
+    @Override
+    public List<JournalRequest> getRequestsByBatchId(String batchId) {
+        List<JournalRequest> requests = journalRequestRepository.findByBatchId(batchId);
+        if (requests.isEmpty()) {
+            throw new ResourceNotFoundException("No Journal requests found for Batch ID: " + batchId);
+        }
+        return requests;
+    }
+   
+    @Override
+    @Transactional
+    public void cancelMyRequest(Long requestId, String userId) {
+        JournalRequest request = journalRequestRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("Journal Request with ID " + requestId + " not found."));
+
+        if (!userId.equals(request.getCreatorId())) {
+            throw new IllegalStateException("You are not authorized to cancel this request.");
+        }
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            throw new IllegalStateException("Cannot cancel a request that has already been processed.");
+        }
+        
+        journalRequestRepository.delete(request);
+    }
+
+    @Override
+    @Transactional
+    public void cancelMyRequestsByJournalPrefix(String journalIdPrefix, String userId) {
+        List<JournalRequest> requestsToCancel = journalRequestRepository.findByJournalIdStartingWithAndCreatorIdAndRequestStatus(
+                journalIdPrefix, userId, RequestStatus.PENDING);
+
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found for you with journal prefix: " + journalIdPrefix);
+        }
+        journalRequestRepository.deleteAll(requestsToCancel);
+    }
+
+    @Override
+    public List<JournalRequestStatusDto> getJournalRequestStatusList() {
+        return journalRequestRepository.findAll().stream()
+                .map(JournalRequestStatusDto::new)
+                .collect(Collectors.toList());
+    }
+    
+    @Override
+    @Transactional
+    public void cancelMyRequestsByBatchId(String batchId, String userId) {
+        List<JournalRequest> requestsToCancel = journalRequestRepository.findByBatchIdAndCreatorIdAndRequestStatus(
+                batchId, userId, RequestStatus.PENDING);
+        
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found for you in this batch.");
+        }
+        journalRequestRepository.deleteAll(requestsToCancel);
+    }
+
+    @Override
+    @Transactional
+    public void cancelMyRequestsByJournalPrefixes(List<String> journalIdPrefixes, String userId) {
+        Specification<JournalRequest> spec = (root, query, criteriaBuilder) -> {
+            List<Predicate> predicates = new ArrayList<>();
+            for (String prefix : journalIdPrefixes) {
+                predicates.add(criteriaBuilder.like(root.get("journalId"), prefix + "%"));
+            }
+            Predicate journalIdOrPredicates = criteriaBuilder.or(predicates.toArray(new Predicate[0]));
+            Predicate statusPredicate = criteriaBuilder.equal(root.get("requestStatus"), RequestStatus.PENDING);
+            Predicate creatorPredicate = criteriaBuilder.equal(root.get("creatorId"), userId);
+            return criteriaBuilder.and(journalIdOrPredicates, statusPredicate, creatorPredicate);
+        };
+        
+        List<JournalRequest> requestsToCancel = journalRequestRepository.findAll(spec);
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found for you with the specified journal prefixes.");
+        }
+        journalRequestRepository.deleteAll(requestsToCancel);
+    }
+    
+    @Override
+    @Transactional
+    public String createBulkBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+        
+        String batchId = sequenceService.getNextBatchId();
+        log.info("Processing BULK Batch ID: {}", batchId);
+       
+        LocalDate postingDate = LocalDate.now();
+        List<JournalRequest> requestsToSave = new ArrayList<>();
+        
+      
+        String commonRemarks = (batchDto.getCommonBatchRemarks() != null && !batchDto.getCommonBatchRemarks().isEmpty()) 
+                                ? batchDto.getCommonBatchRemarks() 
+                                : "Bulk Upload Batch " + batchId;
+
+        // Grouping logic (Same as original, ensures Journal IDs are sequenced per Branch/Currency)
+        Map<String, List<BatchRequestDto.JournalRequestRow>> groupedRows = batchDto.getRows().stream()
+                .collect(Collectors.groupingBy(row -> row.getBranch() + ":" + row.getCurrency()));
+
+        for (Map.Entry<String, List<BatchRequestDto.JournalRequestRow>> entry : groupedRows.entrySet()) {
+            
+            String journalIdPrefix = sequenceService.getNextJournalIdPrefix();
+            int journalSequence = 1;
+            List<BatchRequestDto.JournalRequestRow> rowsInGroup = entry.getValue();
+            
+            for (BatchRequestDto.JournalRequestRow rowDto : rowsInGroup) {
+                
+                String journalId = String.format("%s-%03d", journalIdPrefix, journalSequence);
+                
+                CreateJournalRequestDto payloadDto = new CreateJournalRequestDto();
+                payloadDto.setPDate(postingDate); 
+                payloadDto.setChangeType(rowDto.getChangeType());
+                payloadDto.setMasterJournalId(rowDto.getMasterJournalId());
+                payloadDto.setBranch(rowDto.getBranch());
+                payloadDto.setCurrency(rowDto.getCurrency());
+                payloadDto.setCgl(rowDto.getCgl());
+                payloadDto.setAmount(rowDto.getAmount()); 
+                payloadDto.setProductType(rowDto.getProductType());
+                payloadDto.setRemarks(rowDto.getRemarks());
+     
+                payloadDto.setArFlag(rowDto.getArFlag() != null ? rowDto.getArFlag() : "A");
+                payloadDto.setAcClassification(rowDto.getAcClassification() != null ? rowDto.getAcClassification() : "A");
+                
+                payloadDto.setBatchId(batchId); 
+                payloadDto.setJournalId(journalId); 
+                payloadDto.setCommonBatchRemarks(commonRemarks);
+                payloadDto.setTransactionCount(journalSequence); 
+                
+                JournalRequest request = new JournalRequest();
+                request.setCreatorId(creatorId);
+                request.setCreatorRole(creatorRole);
+                request.setChangeType(rowDto.getChangeType()); // Default to ADD
+                request.setRequestStatus(RequestStatus.PENDING);
+                request.setBatchId(batchId);
+                request.setJournalId(journalId);
+                request.setCommonBatchRemarks(commonRemarks);
+                request.setPayload(objectMapper.writeValueAsString(payloadDto));
+
+                requestsToSave.add(request);
+                journalSequence++; 
+            }
+        }
+
+      
+        journalRequestRepository.saveAll(requestsToSave);
+        
+     
+        try {
+            NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH"); 
+            String message = String.format("Bulk Journal Batch %s (%d rows) by %s pending approval.", 
+                                           batchId, requestsToSave.size(), creatorId);
+
+            notificationWriterService.createNotification(
+                null,                   
+                config.getTargetRoles(),
+                message,
+                config.getTargetUrl(),  
+                batchId,                
+                "JournalService"
+            );
+        } catch (Exception e) {
+            log.error("Failed to create notification for Bulk Batch: {}", batchId, e);
+            
+        }
+   
+        return batchId; // Return ID only
     }
 }
 
-PART 3: The Controller
-JournalRequestController.java
-Uses initiate, checkStatus, and downloadFile (Stream).
-    @Autowired
-    private BulkUploadRepository bulkUploadRepo; 
+package com.fincore.JournalService.Service;
 
-    // 1. INITIATE (Immediate Return)
-    @PostMapping(value = "/bulk-validate-init", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public ResponseEntity<Map<String, String>> initiateBulkUpload(
-            @RequestParam("file") MultipartFile file,
-            @RequestParam("postingDate") String postingDateStr
-    ) throws IOException {
-        LocalDate postingDate = LocalDate.parse(postingDateStr);
-        String requestId = journalBulkValidationService.initiateValidation(file, postingDate);
-        return ResponseEntity.ok(Map.of("status", "QUEUED", "requestId", requestId));
-    }
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 
-    // 2. STATUS (Polling)
-    @GetMapping("/bulk-status/{requestId}")
-    public ResponseEntity<Map<String, Object>> checkBulkStatus(@PathVariable String requestId) {
-        BulkUploadRequest request = bulkUploadRepo.findById(requestId)
-                .orElseThrow(() -> new ResourceNotFoundException("Request ID not found"));
+import com.fincore.JournalService.Models.Notifications;
+import com.fincore.JournalService.Repository.NotificationRepository;
 
-        Map<String, Object> response = new HashMap<>();
-        response.put("status", request.getStatus());
-        response.put("message", request.getMessage());
-        
-        if ("SUCCESS".equals(request.getStatus()) || "ERROR".equals(request.getStatus())) {
-            response.put("totalRows", request.getTotalRows());
-            response.put("errorCount", request.getErrorCount());
-            response.put("hasErrorFile", request.getErrorFile() != null);
-            response.put("hasSuccessFile", request.getSuccessFile() != null);
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class NotificationWriterService {
 
-            try {
-                if (request.getPreviewDataJson() != null) {
-                    ObjectMapper mapper = new ObjectMapper();
-                    response.put("previewData", mapper.readTree(request.getPreviewDataJson()));
-                }
-            } catch (Exception e) { log.error("JSON Error", e); }
+    private final NotificationRepository notificationRepository;
+
+    @Transactional(propagation = Propagation.MANDATORY) 
+    public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
+
+        if (userId == null && targetRole == null) {
+            log.warn("Skipping notification creation: Both userId and targetRole are null. AggregateID: {}", aggregateId);
+            return;
         }
-        return ResponseEntity.ok(response);
+
+        if (message == null || message.isBlank()) {
+            log.warn("Skipping notification creation: Message is null or blank. AggregateID: {}", aggregateId);
+            throw new IllegalArgumentException("Notification message cannot be null or blank.");
+        }
+
+        Notifications notification = Notifications.builder()
+                .userId(userId)
+                .targetRole(targetRole)
+                .message(message)
+                .linkUrl(linkUrl)
+                .aggregateId(aggregateId)
+                .eventSource(eventSource)
+                .build();
+
+        notificationRepository.save(notification);
+
+        if (userId != null) {
+            log.info("Saved 1-to-1 notification event for user: {} (AggregateID: {})", userId, aggregateId);
+        } else {
+            log.info("Saved 1-to-many notification event for role: {} (AggregateID: {})", targetRole, aggregateId);
+        }
+    }
+}
+
+
+
+package com.fincore.JournalService.Service;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Service;
+
+import com.fincore.JournalService.Dto.NotificationConfigDto;
+import com.fincore.JournalService.Repository.PermissionRepository;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class PermissionConfigService {
+
+    private final PermissionRepository permissionRepository;
+
+    @Cacheable(value = "notification_configs", key = "#requestType")
+    public NotificationConfigDto getConfig(String requestType) {
+
+        log.info("Cache Miss: Fetching DB permissions for MOC notification type: {}", requestType);
+
+        List<Object[]> results = permissionRepository.findUrlAndRolesByRequestType(requestType);
+
+        if (results.isEmpty()) {
+            log.warn("No notification config found for request type {}. Using defaults.", requestType);
+            return new NotificationConfigDto("/dashboard", null); // Default to no roles
+        }
+
+        String url = (String) results.get(0)[0];
+        if (url == null) url = "/dashboard";
+
+        String roles = results.stream()
+                .map(row -> String.valueOf(row[1])) // Role ID
+                .distinct()
+                .collect(Collectors.joining(","));
+
+        if (roles.isEmpty()) {
+             log.warn("No roles found for request type {}. Notification will not be sent to a group.", requestType);
+             return new NotificationConfigDto(url, null);
+        }
+        
+        log.info("Fetched Notification Config for {}: URL=[{}], Roles=[{}]", requestType, url, roles);
+        return new NotificationConfigDto(url, roles);
+    }
+}
+package com.fincore.JournalService.Service;
+
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import jakarta.transaction.Transactional;
+
+@Service
+@RequiredArgsConstructor
+public class SequenceService {
+
+    @PersistenceContext
+    private EntityManager entityManager;
+
+    /**
+     * Pads the given number with leading zeros to a total length of 7.
+     */
+    private String padToSevenDigits(Long id) {
+        if (id == null) {
+            throw new IllegalStateException("Sequence query returned null");
+        }
+        return String.format("%07d", id);
     }
 
-    // 3. DOWNLOAD (Stream)
-    @GetMapping("/download-bulk-file/{requestId}")
-    public ResponseEntity<Resource> downloadBulkFile(
-            @PathVariable String requestId, 
-            @RequestParam String type // "SUCCESS" or "ERROR"
-    ) {
-        BulkUploadRequest request = bulkUploadRepo.findById(requestId)
-                .orElseThrow(() -> new ResourceNotFoundException("ID not found"));
-
-        byte[] fileData = ("ERROR".equalsIgnoreCase(type)) ? request.getErrorFile() : request.getSuccessFile();
-        String fileName = ("ERROR".equalsIgnoreCase(type)) ? "Error_Report.xlsx" : "Success_File.csv";
-
-        if (fileData == null) return ResponseEntity.notFound().build();
-
-        ByteArrayResource resource = new ByteArrayResource(fileData);
-        return ResponseEntity.ok()
-                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + fileName + "\"")
-                .contentLength(fileData.length)
-                .contentType(MediaType.APPLICATION_OCTET_STREAM)
-                .body(resource);
+    /**
+     * Gets the next BATCH_ID from the BATCH_SEQ sequence. 
+     */
+    @Transactional
+    public String getNextBatchId() {
+        Number nextId = (Number) entityManager
+                .createNativeQuery("select BATCH_SEQ.nextval from dual")
+                .getSingleResult();
+        
+        return padToSevenDigits(nextId.longValue());
     }
 
-PART 4: The Frontend
-JournalBulkUpload.js (Restored Style + Polling Logic)
-import React, { useState, useRef } from "react";
+    /**
+     * Gets the next JOURNAL_ID prefix from the JRNL_SEQ sequence.
+     */
+    @Transactional
+    public String getNextJournalIdPrefix() {
+        
+      
+        Number nextId = (Number) entityManager
+                .createNativeQuery("select JRNL_SEQ.nextval from dual")
+                .getSingleResult();
+      
+
+        return padToSevenDigits(nextId.longValue());
+    }
+}
+
+package com.fincore.JournalService;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.cache.annotation.EnableCaching;
+
+@SpringBootApplication
+@EnableCaching
+public class JournalServiceApplication {
+
+	public static void main(String[] args) {
+		SpringApplication.run(JournalServiceApplication.class, args);
+	}
+
+}
+
+
+frontend files
+
+// import { Margin } from "@mui/icons-material";
+// import { alpha } from "@mui/material/styles";
+
+// // --- Main Containers ---
+// export const mainContainerStyle = {
+//   padding: 3,
+//   height: "100%",
+//   width: "100%",
+// };
+
+// export const loadingContainerStyle = {
+//   display: "flex",
+//   justifyContent: "center",
+//   alignItems: "center",
+//   height: "60vh",
+//   width: "100%",
+// };
+
+// export const stickyBoxStyle = {
+//   position: "sticky",
+//   top: 0,
+//   zIndex: 2,
+//   backgroundColor: "background.paper",
+//   paddingBottom: 1,
+//   marginBottom: 2,
+// };
+
+// // --- DataGrid Styles ---
+// export const dataGridContainerStyle = {
+//   height: 500,
+//   width: "100%",
+//   "& .MuiDataGrid-columnHeaders": {
+//     backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.1),
+//     color: "text.primary",
+//     fontWeight: "bold",
+//   },
+//   "& .MuiDataGrid-cell:focus, & .MuiDataGrid-cell:focus-within": {
+//     outline: "none",
+//   },
+// };
+
+// // --- Table Styles ---
+// export const tableContainerStyle = {
+//   marginTop: 2,
+//   borderRadius: 2,
+//   border: "1px solid",
+//   borderColor: "divider",
+//   overflow: "hidden",
+//   maxHeight: 440, // often useful for sticky headers
+// };
+
+// export const stickyColumnCell = {
+//   position: "sticky",
+//   right: 0,
+//   backgroundColor: "background.paper",
+//   zIndex: 1,
+//   boxShadow: "-2px 0px 5px rgba(0,0,0,0.05)",
+// };
+
+// export const dialogTitleStyle = {
+//   m: 0,
+//   p: 2,
+//   display: "flex",
+//   justifyContent: "space-between",
+//   alignItems: "center",
+// };
+
+// export const dialogActionsStyle = {
+//   padding: 2,
+//   display: "flex",
+//   gap: 1,
+//   justifyContent: "flex-end",
+// };
+
+// export const dialogContentStyle = {
+//   paddingTop: "20px !important",
+// };
+
+// export const filterContainerStyle = {
+//   display: "flex",
+//   justifyContent: "space-between",
+//   alignItems: "center",
+//   marginBottom: 2,
+//   flexWrap: "wrap",
+//   gap: 2,
+// };
+
+// export const searchFieldStyle = {
+//   minWidth: "250px",
+//   "& .MuiOutlinedInput-root": {
+//     borderRadius: "8px",
+//   },
+// };
+
+// export const tableHeaderCellStyle = {};
+
+// export const cellBorderStyle = {};
+
+// export const controlPanelStyle = {
+//   padding: "2%",
+// };
+
+// export const uploadBoxStyle = {
+//   // border: "soild",
+//   display: "grid",
+//   justifyContent: "center",
+//   border: "2px dashed #9b78c7",
+//   padding: "3% 0% 5% 0%",
+// };
+
+// export const headerTextStyle = {
+//   textAlign: "center",
+// };
+
+// export const iconStyle = {
+//   fontSize: "6rem",
+//   margin: "1% 0% 1% 30% ",
+// };
+
+// export const dateinputfield = {
+//   display: "flex",
+//   justifyContent: "center",
+// };
+// export const subTextStyle = {
+//   display:"flex",
+//   justifyContent:"center"
+// };
+
+import { alpha } from "@mui/material/styles";
+
+// --- Main Layout ---
+export const mainContainerStyle = {
+  padding: 3,
+  height: "100%",
+  width: "100%",
+};
+
+export const controlPanelStyle = {
+  padding: "30px",
+  marginBottom: "20px",
+  borderRadius: "12px",
+  backgroundColor: "background.paper", // Theme color
+  boxShadow: (theme) => theme.shadows[1],
+};
+
+// --- Upload Box (Centered & Theme Aware) ---
+export const uploadBoxStyle = {
+  display: "flex",
+  flexDirection: "column",
+  justifyContent: "center",
+  alignItems: "center",
+  // Use theme tokens for borders
+  border: 2,
+  borderStyle: "dashed",
+  borderColor: "primary.main", 
+  borderRadius: "12px",
+  padding: "40px",
+  cursor: "pointer",
+  backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.02), // Subtle tint
+  transition: "all 0.3s ease",
+  minHeight: "200px",
+  "&:hover": {
+    backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.08),
+    borderColor: "primary.dark",
+  },
+};
+
+export const iconStyle = {
+  fontSize: "5rem",
+  color: "primary.main", // Theme color
+  marginBottom: "16px",
+};
+
+export const headerTextStyle = {
+  fontWeight: 600,
+  fontSize: "1.1rem",
+  textAlign: "center",
+  color: "text.primary",
+};
+
+export const subTextStyle = {
+  color: "text.secondary",
+  fontSize: "0.85rem",
+  textAlign: "center",
+  marginTop: "4px",
+};
+
+// --- Date Input ---
+export const dateinputfield = {
+  display: "flex",
+  justifyContent: "center",
+  marginBottom: "30px",
+  "& .MuiTextField-root": {
+    minWidth: "250px",
+  }
+};
+
+// --- Stepper & Status ---
+export const stepperContainerStyle = {
+  width: '100%',
+  marginBottom: '40px',
+  marginTop: '30px'
+};
+
+export const stepLabelStyle = {
+  "& .MuiStepLabel-label": {
+    fontWeight: 600,
+    fontSize: "0.9rem"
+  },
+  "& .MuiStepLabel-label.Mui-completed": {
+    color: "success.main", 
+  },
+  "& .MuiStepLabel-label.Mui-error": {
+    color: "error.main",
+  }
+};
+
+export const progressContainerStyle = {
+    width: '60%', 
+    margin: '20px auto',
+    textAlign: 'center'
+};
+
+// --- DataGrid Styles ---
+export const dataGridContainerStyle = {
+  height: 600,
+  width: "100%",
+  borderRadius: "12px",
+  overflow: "hidden",
+  marginTop: "20px",
+  backgroundColor: "background.paper",
+  boxShadow: (theme) => theme.shadows[1],
+  "& .MuiDataGrid-columnHeaders": {
+    backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.08),
+    color: "text.primary",
+    fontWeight: "bold",
+    fontSize: "0.95rem",
+  },
+  "& .MuiDataGrid-row:hover": {
+    backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.04),
+  },
+};
+
+// Compatibility exports (if needed by other files)
+export const loadingContainerStyle = { display: "flex", justifyContent: "center", alignItems: "center", height: "60vh" };
+export const stickyBoxStyle = { position: "sticky", top: 0, zIndex: 2, backgroundColor: "background.paper" };
+export const tableContainerStyle = { marginTop: 2, borderRadius: 2, border: "1px solid", borderColor: "divider", overflow: "hidden" };
+export const stickyColumnCell = { position: "sticky", right: 0, backgroundColor: "background.paper", zIndex: 1 };
+export const dialogTitleStyle = { m: 0, p: 2, display: "flex", justifyContent: "space-between", alignItems: "center" };
+export const dialogActionsStyle = { padding: 2, display: "flex", gap: 1, justifyContent: "flex-end" };
+export const dialogContentStyle = { paddingTop: "20px !important" };
+export const filterContainerStyle = { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2 };
+export const searchFieldStyle = { minWidth: "250px" };
+export const tableHeaderCellStyle = {};
+export const cellBorderStyle = {};
+
+
+this is main file in which there are 2 files old version and new version old version is commented and from there is take a referance
+// import React, { useState, useRef, useEffect } from "react";
+// import {
+//   Box,
+//   Typography,
+//   Paper,
+//   TextField,
+//   Button,
+//   CircularProgress,
+//   Chip,
+//   Alert,
+//   Stack,
+//   LinearProgress,
+// } from "@mui/material";
+// import {
+//   CloudUpload as CloudUploadIcon,
+//   RestartAlt as RestartAltIcon,
+//   Description as DescriptionIcon,
+//   CheckCircle as CheckCircleIcon,
+//   Error as ErrorIcon,
+//   Download as DownloadIcon,
+//   Send as SendIcon,
+// } from "@mui/icons-material";
+
+// import { DataGrid } from "@mui/x-data-grid";
+
+// import {
+//   mainContainerStyle,
+//   uploadBoxStyle,
+//   controlPanelStyle,
+//   iconStyle,
+//   headerTextStyle,
+//   subTextStyle,
+//   dateinputfield,
+// } from "./JournalBulkStyle";
+
+// import useApi from "../../hooks/useApi";
+// import useCustomSnackbar from "../../utils/useCustomSnackbar";
+
+// const JournalBulkUpload = () => {
+//   const { callApi, loading } = useApi();
+//   const showSnackBar = useCustomSnackbar();
+
+//   const [selectedDate, setSelectedDate] = useState("");
+//   const [file, setFile] = useState(null);
+//   const [isCsvInput, setIsCsvInput] = useState(false);
+
+//   const [uiError, setUiError] = useState("");
+//   const [errorCount, setErrorCount] = useState(0);
+//   const [downloadStatus, setDownloadStatus] = useState(""); // "" | "DOWNLOADING" | "DOWNLOADED"
+
+//   const [successFile, setSuccessFile] = useState(null);
+//   const [previewRows, setPreviewRows] = useState([]);
+//   const [totalRowsProcessed, setTotalRowsProcessed] = useState(0);
+
+//   const [isSubmitting, setIsSubmitting] = useState(false);
+//   const [timer, setTimer] = useState(0); // Progress Timer
+
+//   const fileInputRef = useRef(null);
+
+//   // Timer Effect
+//   useEffect(() => {
+//     let interval = null;
+//     if (isSubmitting) {
+//       setTimer(0);
+//       interval = setInterval(() => {
+//         setTimer((prev) => prev + 1);
+//       }, 1000);
+//     } else {
+//       clearInterval(interval);
+//     }
+//     return () => clearInterval(interval);
+//   }, [isSubmitting]);
+
+//   const downloadBase64File = (base64String, fileName, mimeType) => {
+//     try {
+//       const byteCharacters = atob(base64String);
+//       const byteNumbers = new Array(byteCharacters.length);
+//       for (let i = 0; i < byteCharacters.length; i++) {
+//         byteNumbers[i] = byteCharacters.charCodeAt(i);
+//       }
+//       const byteArray = new Uint8Array(byteNumbers);
+//       const blob = new Blob([byteArray], { type: mimeType });
+//       const url = window.URL.createObjectURL(blob);
+//       const link = document.createElement("a");
+//       link.href = url;
+//       link.setAttribute("download", fileName);
+//       document.body.appendChild(link);
+//       link.click();
+//       link.parentNode.removeChild(link);
+//       window.URL.revokeObjectURL(url);
+//       setDownloadStatus("DOWNLOADED");
+//     } catch (e) {
+//       console.error("Failed to download", e);
+//       showSnackBar("Failed to download file.", "error");
+//     }
+//   };
+
+//   const handleDateChange = (e) => {
+//     setSelectedDate(e.target.value);
+//     setUiError("");
+//     setSuccessFile(null);
+//     setPreviewRows([]);
+//     setTotalRowsProcessed(0);
+//     setDownloadStatus("");
+//   };
+
+//   const handleFileChange = (e) => {
+//     const selectedFile = e.target.files[0];
+//     if (selectedFile) {
+//       const name = selectedFile.name.toLowerCase();
+//       if (
+//         !name.endsWith(".xlsx") &&
+//         !name.endsWith(".xls") &&
+//         !name.endsWith(".csv")
+//       ) {
+//         const msg = "Invalid file type. Supported: .xlsx, .xls, .csv";
+//         setUiError(msg);
+//         showSnackBar(msg, "error");
+//         setFile(null);
+//         return;
+//       }
+//       setFile(selectedFile);
+//       setIsCsvInput(name.endsWith(".csv"));
+
+//       setUiError("");
+//       setErrorCount(0);
+//       setSuccessFile(null);
+//       setPreviewRows([]);
+//       setTotalRowsProcessed(0);
+//       setDownloadStatus("");
+//     }
+//   };
+
+//   const resetForm = () => {
+//     setFile(null);
+//     setSelectedDate("");
+//     setUiError("");
+//     setErrorCount(0);
+//     setSuccessFile(null);
+//     setPreviewRows([]);
+//     setTotalRowsProcessed(0);
+//     setIsSubmitting(false);
+//     setIsCsvInput(false);
+//     setDownloadStatus("");
+//     if (fileInputRef.current) fileInputRef.current.value = "";
+//   };
+
+//   const handleValidation = async () => {
+//     if (!selectedDate || !file) {
+//       const msg = "Please select a Date and upload a File.";
+//       setUiError(msg);
+//       showSnackBar(msg, "warning");
+//       return;
+//     }
+
+//     setUiError("");
+//     setErrorCount(0);
+//     setSuccessFile(null);
+//     setPreviewRows([]);
+//     setTotalRowsProcessed(0);
+//     setDownloadStatus("");
+//     setIsSubmitting(true); // START
+
+//     const formData = new FormData();
+//     formData.append("file", file);
+//     formData.append("postingDate", selectedDate);
+
+//     try {
+//       const response = await callApi(
+//         "/JS/journals/bulk-validate",
+//         formData,
+//         "POST",
+//         "json",
+//         "multipart/form-data"
+//       );
+
+//       if (response && response.status === "ERROR") {
+//         const count = response.errorCount || 0;
+//         setErrorCount(count);
+//         setUiError(`Validation Failed with ${count} errors.`);
+        
+//         if (response.errorReportBase64) {
+//           setDownloadStatus("DOWNLOADING");
+//           setTimeout(() => {
+//              downloadBase64File(
+//                 response.errorReportBase64,
+//                 `Error_Report.xlsx`,
+//                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+//              );
+//           }, 500); // Slight delay for UX
+//         }
+//       } else if (response && response.status === "SUCCESS") {
+//         showSnackBar(response.message, "success");
+//         if (response.successFileBase64)
+//           setSuccessFile(response.successFileBase64);
+//         if (response.previewData) setPreviewRows(response.previewData);
+//         if (response.totalRows) setTotalRowsProcessed(response.totalRows);
+//       }
+//     } catch (err) {
+//       console.error("Validation Error:", err);
+//     } finally {
+//         setIsSubmitting(false); // STOP
+//     }
+//   };
+
+//   const handleSubmitBatch = async () => {
+//     if (previewRows.length === 0) {
+//       showSnackBar("No validated data to submit.", "warning");
+//       return;
+//     }
+
+//     setIsSubmitting(true);
+
+//     try {
+//       const payloadRows = previewRows.map((row) => {
+//         let amt = parseFloat(row.amount.replace(/,/g, ""));
+//         if (row.txnType === "Credit") {
+//           amt = -Math.abs(amt);
+//         } else {
+//           amt = Math.abs(amt);
+//         }
+
+//         return {
+//           changeType: "ADD",
+//           branch: row.branch,
+//           currency: row.currency,
+//           cgl: row.cgl,
+//           amount: amt,
+//           productType: row.productCode || "",
+//           remarks: row.remarks || "",
+//           arFlag: "A",
+//           acClassification: "A",
+//         };
+//       });
+
+//       const finalPayload = {
+//         commonBatchRemarks: `Bulk Upload - ${selectedDate}`,
+//         rows: payloadRows,
+//       };
+
+//       const response = await callApi(
+//         "/JS/journals/create-bulk-batch",
+//         finalPayload,
+//         "POST"
+//       );
+
+//       if (response && response.status === "SUCCESS") {
+//         showSnackBar(
+//           `Batch Created Successfully! Batch ID: ${response.batchId}`,
+//           "success"
+//         );
+//         resetForm();
+//       }
+//     } catch (error) {
+//       console.error("Batch Creation Failed:", error);
+//       showSnackBar("Failed to create batch.", "error");
+//     } finally {
+//       setIsSubmitting(false);
+//     }
+//   };
+
+//   // Grid Columns
+//   const columns = [
+//     { field: "branch", headerName: "Branch", flex: 1, align: "center", headerAlign: "center" },
+//     { field: "currency", headerName: "Currency", width: 100, align: "center", headerAlign: "center" },
+//     { field: "cgl", headerName: "CGL", flex: 1.5, align: "center", headerAlign: "center" },
+//     { field: "productCode", headerName: "Product", width: 120, align: "center", headerAlign: "center", renderCell: (p) => p.value || "-" },
+//     { 
+//       field: "amount", headerName: "Amount", flex: 1.5, minWidth: 150, align: "right", headerAlign: "center",
+//       valueFormatter: (params) => {
+//         const val = params?.value || params;
+//         if (!val) return "0.00";
+//         const parts = String(val).split(".");
+//         parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+//         return parts.join(".");
+//       }
+//     },
+//     { 
+//       field: "txnType", headerName: "Type", width: 100, align: "center", headerAlign: "center",
+//       renderCell: (params) => (
+//         <Chip 
+//           label={params.value} 
+//           color={params.value === "Credit" ? "error" : "success"} 
+//           size="small" 
+//           variant="filled"
+//           sx={{ fontWeight: "bold", width: "80px" }}
+//         />
+//       )
+//     },
+//     { field: "remarks", headerName: "Remarks", flex: 2, align: "center", headerAlign: "center" },
+//   ];
+
+//   return (
+//     <Box sx={mainContainerStyle}>
+//       <Paper elevation={1} sx={controlPanelStyle}>
+        
+//         <Box sx={dateinputfield}>
+//             <TextField
+//                 type="date"
+//                 label="Posting Date"
+//                 sx={{ alignItems: "center" }}
+//                 size="small"
+//                 value={selectedDate}
+//                 onChange={handleDateChange}
+//                 InputLabelProps={{ shrink: true }}
+//                 // FUTURE DATE RESTRICTION
+//                 inputProps={{ max: new Date().toISOString().split("T")[0] }}
+//             />
+//         </Box>
+
+//         <br />
+
+//         <Box sx={uploadBoxStyle} onClick={() => fileInputRef.current.click()}>
+//           <input
+//             type="file"
+//             hidden
+//             accept=".xlsx, .xls, .csv"
+//             onChange={handleFileChange}
+//             ref={fileInputRef}
+//           />
+
+//           {file ? (
+//             <>
+//               <DescriptionIcon color="success" sx={{ fontSize: 60, mb: 1 }} />
+//               <Typography variant="h6" sx={headerTextStyle}>{file.name}</Typography>
+//               <Chip label="Ready" color="success" size="small" variant="outlined" />
+//               <Typography variant="caption" sx={{ mt: 1, color: "text.disabled" }}>Click to change</Typography>
+//             </>
+//           ) : (
+//             <>
+//               <CloudUploadIcon sx={iconStyle} />
+//               <Typography variant="h6" sx={headerTextStyle}>Click to Upload</Typography>
+//               <Typography sx={subTextStyle}>Supported: .xlsx, .xls, .csv</Typography>
+//             </>
+//           )}
+//         </Box>
+
+//         <br />
+//         <Stack direction="row" sx={{ display: "flex", justifyContent: "center" }} spacing={2}>
+//           <Button
+//             variant="contained"
+//             sx={{ cursor: "pointer" }}
+//             onClick={handleValidation}
+//             disabled={loading || !file || !selectedDate || isSubmitting}
+//             startIcon={isSubmitting ? <CircularProgress size={20} color="inherit" /> : <CheckCircleIcon />}
+//             size="large"
+//           >
+//             {/* BUTTON TEXT UPDATE */}
+//             {isSubmitting ? `Processing (${timer}s)...` : "Validate"}
+//           </Button>
+
+//           <Button variant="outlined" color="error" onClick={resetForm} startIcon={<RestartAltIcon />} disabled={isSubmitting} size="large">
+//             Reset
+//           </Button>
+//         </Stack>
+
+//         {/* FEEDBACK SECTION */}
+//         <Box sx={{ mt: 3 }}>
+//           {/* LIVE PROGRESS (When Processing) */}
+//           {isSubmitting && (
+//              <Box sx={{ width: '100%', mb: 2 }}>
+//                 <Typography variant="body2" color="text.secondary" align="center" gutterBottom>
+//                     Validating large file, please wait...
+//                 </Typography>
+//                 <LinearProgress />
+//              </Box>
+//           )}
+
+//           {uiError && (
+//             <Alert severity="error" sx={{ mb: 2, border: "1px solid #ee0404ff" }}>
+//               <Typography variant="subtitle2" fontWeight="bold">Validation Failed</Typography>
+//               <Typography variant="body2">{uiError}</Typography>
+//               {/* STATUS TEXT UPDATE */}
+//               {downloadStatus === "DOWNLOADED" && (
+//                   <Typography variant="caption" sx={{ display: 'block', mt: 1, fontStyle: 'italic' }}>
+//                       Error Report Downloaded. Please check your downloads folder.
+//                   </Typography>
+//               )}
+//             </Alert>
+//           )}
+
+//           {!uiError && previewRows.length > 0 && (
+//             <Paper variant="outlined" sx={{ p: 2, borderColor: "success.main" }}>
+//               <Stack direction={{ xs: "column", sm: "row" }} justifyContent="space-between" alignItems="center" spacing={2}>
+//                 <Box>
+//                   <Stack direction="row" alignItems="center" spacing={1}>
+//                     <CheckCircleIcon color="success" />
+//                     <Typography variant="subtitle1" fontWeight="bold">Validation Successful!</Typography>
+//                   </Stack>
+//                   {/* ROW COUNT SUMMARY */}
+//                   <Typography variant="body2">
+//                     {totalRowsProcessed} rows validated. Ready for submission.
+//                   </Typography>
+//                 </Box>
+//                 <Stack direction="row" spacing={2}>
+//                   {!isCsvInput && successFile && (
+//                     <Button
+//                       variant="outlined"
+//                       color="success"
+//                       startIcon={<DownloadIcon />}
+//                       onClick={() => downloadBase64File(successFile, `Processed_Journal_${selectedDate}.csv`, "text/csv")}
+//                       sx={{ bgcolor: "background.paper" }}
+//                     >
+//                       Download CSV
+//                     </Button>
+//                   )}
+//                   <Button
+//                     variant="contained"
+//                     color="success"
+//                     startIcon={isSubmitting ? <CircularProgress size={20} color="inherit" /> : <SendIcon />}
+//                     onClick={handleSubmitBatch}
+//                     disabled={isSubmitting}
+//                   >
+//                     {isSubmitting ? "Creating Batch..." : "Create Batch"}
+//                   </Button>
+//                 </Stack>
+//               </Stack>
+//             </Paper>
+//           )}
+//         </Box>
+//       </Paper>
+
+//       {/* GRID */}
+//       {previewRows.length > 0 && !uiError && (
+//         <Paper elevation={1} sx={{ p: 0, mt: 3, height: 600, width: "100%", borderRadius: 2, overflow: "hidden" }}>
+//           <Box sx={{ p: 2, borderBottom: 1, borderColor: "divider" }}>
+//             <Typography variant="h6" sx={{ fontWeight: 600 }}>Data Preview</Typography>
+//           </Box>
+//           <DataGrid
+//             rows={previewRows}
+//             columns={columns}
+//             pageSize={10}
+//             rowsPerPageOptions={[10, 25, 50, 100]}
+//             disableSelectionOnClick
+//             density="comfortable"
+//             sx={{ border: "none" }}
+//           />
+//         </Paper>
+//       )}
+//     </Box>
+//   );
+// };
+
+// export default JournalBulkUpload;
+import React, { useState, useRef, useEffect } from "react";
 import {
   Box,
   Typography,
@@ -553,6 +3407,9 @@ import {
   Chip,
   Alert,
   Stack,
+  Stepper,
+  Step,
+  StepLabel,
 } from "@mui/material";
 import {
   CloudUpload as CloudUploadIcon,
@@ -562,10 +3419,15 @@ import {
   Error as ErrorIcon,
   Download as DownloadIcon,
   Send as SendIcon,
+  FormatListBulleted as FormatIcon,
+  Storage as DbIcon,
+  Balance as BalanceIcon,
+  DoneAll as DoneIcon,
 } from "@mui/icons-material";
 
 import { DataGrid } from "@mui/x-data-grid";
 
+// Import Styles
 import {
   mainContainerStyle,
   uploadBoxStyle,
@@ -574,138 +3436,257 @@ import {
   headerTextStyle,
   subTextStyle,
   dateinputfield,
+  stepperContainerStyle,
+  stepLabelStyle,
+  progressContainerStyle,
+  dataGridContainerStyle
 } from "./JournalBulkStyle";
 
 import useApi from "../../hooks/useApi";
 import useCustomSnackbar from "../../utils/useCustomSnackbar";
 
+const steps = [
+  "Format Validation",
+  "Database Check",
+  "Balance Check",
+  "Finalizing",
+];
+
 const JournalBulkUpload = () => {
-  const { callApi, loading } = useApi();
+  const { callApi } = useApi();
   const showSnackBar = useCustomSnackbar();
 
+  // --- STATE ---
   const [selectedDate, setSelectedDate] = useState("");
   const [file, setFile] = useState(null);
   const [isCsvInput, setIsCsvInput] = useState(false);
 
-  const [uiError, setUiError] = useState("");
-  const [errorCount, setErrorCount] = useState(0);
-
-  const [hasSuccessFile, setHasSuccessFile] = useState(false);
+  // Process Status
   const [requestId, setRequestId] = useState(null);
-  const [previewRows, setPreviewRows] = useState([]);
-  const [totalRowsProcessed, setTotalRowsProcessed] = useState(0);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [activeStep, setActiveStep] = useState(0);
+  const [failedStep, setFailedStep] = useState(-1);
 
-  const [isSubmitting, setIsSubmitting] = useState(false); // Controls Spinner
+  // Results
+  const [resultStatus, setResultStatus] = useState(null); // "SUCCESS" | "ERROR"
+  const [resultMsg, setResultMsg] = useState("");
+  const [previewRows, setPreviewRows] = useState([]);
+  const [totalRows, setTotalRows] = useState(0);
+  const [processedRows, setProcessedRows] = useState(0);
+  const [hasSuccessFile, setHasSuccessFile] = useState(false);
+  const [hasErrorFile, setHasErrorFile] = useState(false);
+
+  // Flags
+  const [autoDownloadTriggered, setAutoDownloadTriggered] = useState(false);
+  const [isCreatingBatch, setIsCreatingBatch] = useState(false);
 
   const fileInputRef = useRef(null);
 
-  // --- DOWNLOAD ---
-  const handleDownloadFile = (type) => {
+  // --- 1. SECURE DOWNLOAD HELPER ---
+  const handleDownloadFile = async (type) => {
     if (!requestId) return;
-    const baseUrl = process.env.REACT_APP_API_URL || "http://localhost:8080";
-    window.location.href = `${baseUrl}/JS/journals/download-bulk-file/${requestId}?type=${type}`;
+
+    try {
+      // Robust Token Retrieval (Try Session, then Local)
+      let token = "";
+      const getRaw = (key) => sessionStorage.getItem(key) || localStorage.getItem(key);
+      
+      const storageAuth = getRaw("persist:auth");
+      if (storageAuth) {
+        try {
+            const parsed = JSON.parse(storageAuth);
+            if (parsed?.token) token = parsed.token.replace(/^"|"$/g, "");
+        } catch (e) { console.warn("Token parse error", e); }
+      }
+
+      // If token is missing, the backend might reject it.
+      console.log("Downloading file type:", type, "ReqID:", requestId);
+
+      const response = await fetch(
+        `/JS/journals/download-bulk-file/${requestId}?type=${type}`,
+        {
+          method: "GET",
+          headers: { 
+              Authorization: `Bearer ${token}`,
+              'Content-Type': 'application/json' 
+          },
+        }
+      );
+
+      if (!response.ok) throw new Error("Server returned " + response.status);
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.setAttribute(
+        "download",
+        type === "ERROR" ? `Error_Report_${requestId}.xlsx` : `Success_Journal_${requestId}.csv`
+      );
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
+
+      if(type === "SUCCESS") showSnackBar("File downloaded successfully.", "success");
+      
+    } catch (error) {
+      console.error("Download Error", error);
+      showSnackBar("Failed to download file.", "error");
+    }
   };
+
+  // --- 2. POLLING LOGIC ---
+  useEffect(() => {
+    let interval;
+    if (isProcessing && requestId) {
+      interval = setInterval(async () => {
+        try {
+          const res = await callApi(`/JS/journals/bulk-status/${requestId}`, null, "GET");
+          if (!res) return;
+
+          // Update Progress
+          if (res.totalRows) setTotalRows(res.totalRows);
+          if (res.processedCount) setProcessedRows(res.processedCount);
+          if (res.currentStage > 0) setActiveStep(res.currentStage - 1);
+
+          // STATUS: ERROR
+          if (res.status === "ERROR") {
+            setIsProcessing(false);
+            setResultStatus("ERROR");
+            setResultMsg(res.message);
+            
+            const failIdx = res.currentStage ? res.currentStage - 1 : 0;
+            setFailedStep(failIdx);
+            setActiveStep(failIdx);
+            setHasErrorFile(res.hasErrorFile);
+            
+            clearInterval(interval);
+            showSnackBar(res.message, "error");
+
+            // Auto-Download Error Report
+            if (res.hasErrorFile && !autoDownloadTriggered) {
+                setAutoDownloadTriggered(true);
+                setTimeout(() => handleDownloadFile("ERROR"), 500);
+            }
+          } 
+          // STATUS: SUCCESS
+          else if (res.status === "SUCCESS") {
+            setIsProcessing(false);
+            setResultStatus("SUCCESS");
+            setActiveStep(4);
+            setHasSuccessFile(res.hasSuccessFile);
+            
+            if (res.previewData) {
+               const data = typeof res.previewData === 'string' ? JSON.parse(res.previewData) : res.previewData;
+               setPreviewRows(data);
+            } else if (res.previewDataJson) {
+               setPreviewRows(JSON.parse(res.previewDataJson));
+            }
+            
+            clearInterval(interval);
+            showSnackBar("Validation Successful!", "success");
+          }
+        } catch (e) {
+          console.error("Poll Error", e);
+        }
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [isProcessing, requestId, autoDownloadTriggered, callApi, showSnackBar]);
+
+  // --- 3. UI HANDLERS ---
 
   const handleDateChange = (e) => {
     setSelectedDate(e.target.value);
-    setUiError("");
-    setHasSuccessFile(false);
-    setPreviewRows([]);
-    setTotalRowsProcessed(0);
+    resetState();
+  };
+
+  const handleUploadClick = () => {
+      if (!selectedDate) {
+          showSnackBar("Please select the Posting Date first.", "warning");
+          return;
+      }
+      if (fileInputRef.current) {
+          fileInputRef.current.value = ""; 
+          fileInputRef.current.click();
+      }
   };
 
   const handleFileChange = (e) => {
     const selectedFile = e.target.files[0];
     if (selectedFile) {
-      const name = selectedFile.name.toLowerCase();
-      if (!name.endsWith(".xlsx") && !name.endsWith(".xls") && !name.endsWith(".csv")) {
-        showSnackBar("Invalid file type.", "error");
-        setFile(null);
-        return;
-      }
-      setFile(selectedFile);
-      setIsCsvInput(name.endsWith(".csv"));
-      setUiError("");
-      setErrorCount(0);
-      setHasSuccessFile(false);
-      setPreviewRows([]);
-      setTotalRowsProcessed(0);
+        if (!selectedFile.name.toLowerCase().match(/\.(xlsx|xls|csv)$/)) {
+            showSnackBar("Invalid file type.", "error");
+            setFile(null); return;
+        }
+        setFile(selectedFile);
+        setIsCsvInput(selectedFile.name.toLowerCase().endsWith(".csv"));
+        resetState();
     }
+  };
+
+  const resetState = () => {
+    setResultStatus(null);
+    setResultMsg("");
+    setErrorCount(0);
+    setHasSuccessFile(false);
+    setHasErrorFile(false);
+    setPreviewRows([]);
+    setTotalRows(0);
+    setProcessedRows(0);
+    setRequestId(null);
+    setActiveStep(0);
+    setFailedStep(-1);
+    setAutoDownloadTriggered(false);
   };
 
   const resetForm = () => {
     setFile(null);
     setSelectedDate("");
-    setUiError("");
-    setErrorCount(0);
-    setHasSuccessFile(false);
-    setPreviewRows([]);
-    setTotalRowsProcessed(0);
-    setIsSubmitting(false);
-    setIsCsvInput(false);
-    setRequestId(null);
+    resetState();
+    setIsProcessing(false);
+    setIsCreatingBatch(false);
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
-  // --- POLLING ---
-  const pollStatus = async (id) => {
-    try {
-      const response = await callApi(`/JS/journals/bulk-status/${id}`, null, "GET");
-      
-      if (response.status === "PROCESSING" || response.status === "QUEUED") {
-        setTimeout(() => pollStatus(id), 2000); // 2s delay
-      } else {
-        setIsSubmitting(false);
-        if (response.status === "ERROR") {
-            setErrorCount(response.errorCount || 0);
-            setUiError(response.message || "Validation Failed");
-            showSnackBar("Validation Failed", "error");
-            if (response.hasErrorFile) {
-                // Trigger Error Download
-                const baseUrl = process.env.REACT_APP_API_URL || "http://localhost:8080";
-                window.location.href = `${baseUrl}/JS/journals/download-bulk-file/${id}?type=ERROR`;
-            }
-        } else if (response.status === "SUCCESS") {
-            showSnackBar("Validation Successful!", "success");
-            setHasSuccessFile(response.hasSuccessFile);
-            if (response.previewData) setPreviewRows(response.previewData);
-            if (response.totalRows) setTotalRowsProcessed(response.totalRows);
-        }
-      }
-    } catch (e) {
-      setIsSubmitting(false);
-      showSnackBar("Connection Lost", "error");
-    }
-  };
-
-  const handleValidation = async () => {
-    if (!selectedDate || !file) {
-      showSnackBar("Select Date and File.", "warning");
+  const startValidation = async () => {
+    console.log("Start Validation Clicked");
+    if (!file || !selectedDate) {
+      showSnackBar("Please select Date and File.", "warning");
       return;
     }
-    setIsSubmitting(true);
+    
+    resetState();
+    setIsProcessing(true); // UI shows Spinner immediately
+
     const formData = new FormData();
     formData.append("file", file);
     formData.append("postingDate", selectedDate);
 
     try {
-      const response = await callApi("/JS/journals/bulk-validate-init", formData, "POST", "json", "multipart/form-data");
-      if (response && response.requestId) {
-          setRequestId(response.requestId);
-          pollStatus(response.requestId);
+      console.log("Calling API...");
+      const res = await callApi("/JS/journals/bulk-validate-init", formData, "POST", "json", "multipart/form-data");
+      
+      console.log("API Response:", res);
+      
+      if (res && res.requestId) {
+          setRequestId(res.requestId);
+          // Polling will auto-start via useEffect
       } else {
-          setIsSubmitting(false);
-          showSnackBar("Failed to start.", "error");
+          setIsProcessing(false);
+          showSnackBar("Failed to initiate validation.", "error");
       }
     } catch (err) {
-      setIsSubmitting(false);
+      console.error("Init Error:", err);
+      setIsProcessing(false);
+      showSnackBar("System Error: Check console.", "error");
     }
   };
 
-  // --- CREATE BATCH ---
   const handleSubmitBatch = async () => {
     if (previewRows.length === 0) return;
-    setIsSubmitting(true);
+    setIsCreatingBatch(true);
     try {
       const payloadRows = previewRows.map((row) => ({
         changeType: "ADD",
@@ -715,8 +3696,7 @@ const JournalBulkUpload = () => {
         amount: row.txnType === "Credit" ? "-" + row.amount : row.amount,
         productType: row.productCode,
         remarks: row.remarks,
-        arFlag: "A",
-        acClassification: "A",
+        arFlag: "A", acClassification: "A",
       }));
 
       const finalPayload = { commonBatchRemarks: `Bulk Upload - ${selectedDate}`, rows: payloadRows };
@@ -727,12 +3707,13 @@ const JournalBulkUpload = () => {
         resetForm();
       }
     } catch (e) {
-      showSnackBar("Failed", "error");
+      showSnackBar("Failed to create batch", "error");
     } finally {
-      setIsSubmitting(false);
+      setIsCreatingBatch(false);
     }
   };
 
+  // --- GRID COLUMNS ---
   const columns = [
     { field: "branch", headerName: "Branch", flex: 1, align: "center", headerAlign: "center" },
     { field: "currency", headerName: "Currency", width: 100, align: "center", headerAlign: "center" },
@@ -741,7 +3722,7 @@ const JournalBulkUpload = () => {
     { 
       field: "amount", headerName: "Amount", flex: 1.5, minWidth: 150, align: "right", headerAlign: "center",
       valueFormatter: (params) => {
-        const val = (params && typeof params === 'object' && 'value' in params) ? params.value : params;
+        const val = params?.value || params;
         if (!val) return "0.00";
         const parts = String(val).split(".");
         parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ",");
@@ -755,87 +3736,146 @@ const JournalBulkUpload = () => {
           label={params.value} 
           color={params.value === "Credit" ? "error" : "success"} 
           size="small" 
-          variant="filled"
-          sx={{ fontWeight: "bold", width: "80px" }}
+          variant="filled" 
+          sx={{ fontWeight: "bold", width: "80px" }} 
         />
       )
     },
-    { field: "remarks", headerName: "Remarks", flex: 2, headerAlign: "center" },
+    { field: "remarks", headerName: "Remarks", flex: 2, align: "center", headerAlign: "center" },
   ];
+
+  // Percentage Calc
+  const progressPercent = totalRows > 0 ? Math.min(100, Math.round((processedRows / totalRows) * 100)) : 0;
 
   return (
     <Box sx={mainContainerStyle}>
       <Paper elevation={1} sx={controlPanelStyle}>
         
+        {/* 1. Date Input */}
         <Box sx={dateinputfield}>
             <TextField
                 type="date"
                 label="Posting Date"
-                sx={{ alignItems: "center" }}
                 size="small"
                 value={selectedDate}
                 onChange={handleDateChange}
-                InputLabelProps={{ shrink: true }} 
+                InputLabelProps={{ shrink: true }}
+                inputProps={{ max: new Date().toISOString().split("T")[0] }}
             />
         </Box>
 
-        <br />
-
-        <Box sx={uploadBoxStyle} onClick={() => fileInputRef.current.click()}>
-          <input type="file" hidden accept=".xlsx, .xls, .csv" onChange={handleFileChange} ref={fileInputRef} />
+        {/* 2. Upload Box */}
+        <Box sx={uploadBoxStyle} onClick={handleUploadClick}>
+          <input
+            type="file"
+            hidden
+            accept=".xlsx,.xls,.csv"
+            onChange={handleFileChange}
+            ref={fileInputRef}
+          />
           {file ? (
             <>
-              <DescriptionIcon color="success" sx={{ fontSize: 60, mb: 1 }} />
-              <Typography variant="h6" sx={headerTextStyle}>{file.name}</Typography>
-              <Chip label="Ready" color="success" size="small" variant="outlined" />
-              <Typography variant="caption" sx={{ mt: 1, color: "text.disabled" }}>Click to change</Typography>
+              <DescriptionIcon sx={{ fontSize: 60, color: "success.main", mb: 1 }} />
+              <Typography sx={headerTextStyle}>{file.name}</Typography>
+              <Chip label="Ready" color="success" size="small" variant="outlined" sx={{ mt: 1 }} />
+              <Typography sx={subTextStyle}>Click to change</Typography>
             </>
           ) : (
             <>
               <CloudUploadIcon sx={iconStyle} />
-              <Typography variant="h6" sx={headerTextStyle}>Click to Upload</Typography>
+              <Typography sx={headerTextStyle}>Click to Upload</Typography>
               <Typography sx={subTextStyle}>Supported: .xlsx, .xls, .csv</Typography>
             </>
           )}
         </Box>
 
-        <br />
-        <Stack direction="row" sx={{ display: "flex", justifyContent: "center" }} spacing={2}>
+        {/* 3. Stepper */}
+        {(isProcessing || resultStatus) && (
+          <Box sx={stepperContainerStyle}>
+            <Stepper activeStep={activeStep} alternativeLabel>
+              {steps.map((label, index) => {
+                const isFailed = index === failedStep;
+                const isCompleted = index < activeStep || resultStatus === "SUCCESS";
+
+                return (
+                  <Step key={label}>
+                    <StepLabel
+                      error={isFailed}
+                      sx={stepLabelStyle}
+                      StepIconComponent={() => {
+                        if (isFailed) return <ErrorIcon color="error" />;
+                        if (isCompleted) return <CheckCircleIcon color="success" />;
+                        if (index === activeStep && isProcessing) return <CircularProgress size={20} />;
+                        return <Typography color="text.disabled" fontWeight="bold">{index + 1}</Typography>;
+                      }}
+                    >
+                      {label}
+                    </StepLabel>
+                  </Step>
+                );
+              })}
+            </Stepper>
+            
+            {/* Live Counter (Only show when processing) */}
+            {isProcessing && (
+                <Box sx={progressContainerStyle}>
+                    <Typography variant="caption" color="text.secondary">
+                       {totalRows > 0 ? `Processed: ${processedRows.toLocaleString()} / ${totalRows.toLocaleString()}` : "Initializing..."}
+                    </Typography>
+                </Box>
+            )}
+          </Box>
+        )}
+
+        {/* 4. Action Buttons */}
+        <Stack direction="row" justifyContent="center" spacing={2} sx={{ mt: 2 }}>
           <Button
             variant="contained"
-            sx={{ cursor: "pointer" }}
-            onClick={handleValidation}
-            disabled={isSubmitting || !file || !selectedDate}
-            startIcon={isSubmitting ? <CircularProgress size={20} color="inherit" /> : <CheckCircleIcon />}
+            onClick={startValidation}
+            disabled={isProcessing || !file || !selectedDate}
             size="large"
+            startIcon={isProcessing ? <CircularProgress size={20} color="inherit" /> : <CheckCircleIcon />}
           >
-            {isSubmitting ? "Processing..." : "Validate & Process"}
+            {isProcessing ? "Validating..." : "Validate"}
           </Button>
-
-          <Button variant="outlined" color="error" onClick={resetForm} startIcon={<RestartAltIcon />} disabled={isSubmitting} size="large">
+          <Button variant="outlined" color="error" onClick={resetForm} disabled={isProcessing} size="large" startIcon={<RestartAltIcon />}>
             Reset
           </Button>
         </Stack>
 
+        {/* 5. Results Section */}
         <Box sx={{ mt: 3 }}>
-          {uiError && (
-            <Alert severity="error" sx={{ mb: 2, border: "1px solid #ee0404ff" }}>
+          {/* ERROR STATUS */}
+          {resultStatus === "ERROR" && (
+            <Alert severity="error" sx={{ mb: 2, borderColor: 'error.main', borderWidth: 1, borderStyle: 'solid' }}>
               <Typography variant="subtitle2" fontWeight="bold">Validation Failed</Typography>
-              <Typography variant="body2">{uiError}</Typography>
+              <Typography variant="body2">{resultMsg}</Typography>
+              
+              {/* If Auto-downloaded, show text link instead of primary button */}
+              {hasErrorFile && (
+                  <Button
+                    variant="text"
+                    color="inherit"
+                    size="small"
+                    onClick={() => handleDownloadFile("ERROR")}
+                    sx={{ mt: 1, textDecoration: 'underline', textTransform: 'none' }}
+                  >
+                    Download Error Report Again
+                  </Button>
+              )}
             </Alert>
           )}
 
-          {!uiError && previewRows.length > 0 && (
-            <Paper variant="outlined" sx={{ p: 2, borderColor: "success.main" }}>
+          {/* SUCCESS STATUS */}
+          {resultStatus === "SUCCESS" && (
+            <Paper variant="outlined" sx={{ p: 2, borderColor: "success.main", bgcolor: (theme) => alpha(theme.palette.success.main, 0.05) }}>
               <Stack direction={{ xs: "column", sm: "row" }} justifyContent="space-between" alignItems="center" spacing={2}>
                 <Box>
                   <Stack direction="row" alignItems="center" spacing={1}>
                     <CheckCircleIcon color="success" />
                     <Typography variant="subtitle1" fontWeight="bold">Validation Successful!</Typography>
                   </Stack>
-                  <Typography variant="body2">
-                    {totalRowsProcessed} rows valid. {totalRowsProcessed > 100 && `(Previewing first 100)`}
-                  </Typography>
+                  <Typography variant="body2">{totalRows.toLocaleString()} rows verified.</Typography>
                 </Box>
                 <Stack direction="row" spacing={2}>
                   {!isCsvInput && hasSuccessFile && (
@@ -852,11 +3892,11 @@ const JournalBulkUpload = () => {
                   <Button
                     variant="contained"
                     color="success"
-                    startIcon={isSubmitting ? <CircularProgress size={20} color="inherit" /> : <SendIcon />}
+                    startIcon={isCreatingBatch ? <CircularProgress size={20} color="inherit" /> : <SendIcon />}
                     onClick={handleSubmitBatch}
-                    disabled={isSubmitting}
+                    disabled={isCreatingBatch}
                   >
-                    {isSubmitting ? "Creating..." : "Create Batch"}
+                    {isCreatingBatch ? "Creating..." : "Create Batch"}
                   </Button>
                 </Stack>
               </Stack>
@@ -865,10 +3905,11 @@ const JournalBulkUpload = () => {
         </Box>
       </Paper>
 
-      {previewRows.length > 0 && !uiError && (
-        <Paper elevation={1} sx={{ p: 0, mt: 3, height: 600, width: "100%", borderRadius: 2, overflow: "hidden" }}>
+      {/* 6. Preview Grid */}     
+      {resultStatus === "SUCCESS" && previewRows.length > 0 && (
+        <Paper elevation={1} sx={dataGridContainerStyle}>
           <Box sx={{ p: 2, borderBottom: 1, borderColor: "divider" }}>
-            <Typography variant="h6" sx={{ fontWeight: 600 }}>Data Preview</Typography>
+            <Typography variant="h6" sx={{ fontWeight: 600 }}>Data Preview (Top 100)</Typography>
           </Box>
           <DataGrid
             rows={previewRows}
@@ -887,3 +3928,8 @@ const JournalBulkUpload = () => {
 
 export default JournalBulkUpload;
 
+here is all files which i am sending to u from that there things are not working in the bulk upload i alredy send the backend and frontend files alredy i am sending u please cheak and give that i am try to upload nothing is happing after clicking on the validate button dont change any other things just cheak what it the problem and how can we improve this 
+please cheak and what ever change in the files tell me files name and whole updated code for that file dont give mi all files just give mi updated files
+if i need  to add new files tell me that also and
+the code should be optimzed for production k8 frendly
+also cheak the backend flow for the code 
