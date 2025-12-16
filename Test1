@@ -1,1065 +1,119 @@
-Here are the updated files.
-Changes Made:
- * Frontend Styling: Removed the external JournalStyles.js file. All styles are now internal using const styles = { ... } and passed via sx props.
- * Backend Controller: I have restored the original createBulkBatchRequest endpoint (so existing logic remains) AND kept the new createBulkBatchOptimized endpoint (which is required to fix the 5000+ row limit issue).
- * Frontend Logic: The Bulk Upload screen now uses the Optimized endpoint to ensure large files work, but the UI follows the Stepper/Table design you requested.
-1. Backend: JournalRequestController.java
-Status: Updated. Restored the original bulk endpoint and kept the new optimized one.
-package com.fincore.JournalService.Controllers;
+import * as React from 'react';
+import Box from '@mui/material/Box';
+import Stepper from '@mui/material/Stepper';
+import Step from '@mui/material/Step';
+import StepLabel from '@mui/material/StepLabel';
+import Button from '@mui/material/Button';
+import Typography from '@mui/material/Typography';
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fincore.JournalService.Dto.*;
-import com.fincore.JournalService.Models.JournalRequest;
-import com.fincore.JournalService.Service.JournalBulkValidationService;
-import com.fincore.JournalService.Service.JournalRequestService;
-import com.fincore.JournalService.Service.JournalRequestServiceImpl;
-import com.fincore.commonutilities.jwt.JwtUtil;
-import jakarta.validation.Valid;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.core.io.ByteArrayResource;
-import org.springframework.core.io.Resource;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-import org.springframework.web.multipart.MultipartFile;
+const steps = ['Select campaign settings', 'Create an ad group', 'Create an ad'];
 
-import java.io.IOException;
-import java.util.List;
-import java.util.Map;
+export default function HorizontalLinearStepper() {
+  const [activeStep, setActiveStep] = React.useState(0);
+  const [skipped, setSkipped] = React.useState(new Set());
 
-@RestController
-@RequestMapping("journals")
-@RequiredArgsConstructor
-@Slf4j
-public class JournalRequestController {
-
-    private final JournalRequestService journalRequestService;
-    private final JournalBulkValidationService journalBulkValidationService;
-    private final JwtUtil jwtUtil;
-
-    // --- 1. Validation Init ---
-    @PostMapping(value = "/bulk-validate-init", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public ResponseEntity<?> initiateValidation(@RequestParam("file") MultipartFile file,
-                                                @RequestParam("postingDate") String date) {
-        try {
-            if(file.isEmpty()) return ResponseEntity.badRequest().body(Map.of("error", "File is empty"));
-            // Parse date (Frontend sends YYYY-MM-DD)
-            java.time.LocalDate pDate = java.time.LocalDate.parse(date);
-            String reqId = journalBulkValidationService.initiateValidation(file.getBytes(), file.getOriginalFilename(), pDate);
-            return ResponseEntity.ok(Map.of("status", "QUEUED", "requestId", reqId));
-        } catch (Exception e) {
-            log.error("Validation init failed", e);
-            return ResponseEntity.badRequest().body(Map.of("error", "Invalid Request: " + e.getMessage()));
-        }
-    }
-
-    // --- 2. Validation Status Poll ---
-    @GetMapping("/bulk-status/{requestId}")
-    public ResponseEntity<BulkUploadStateDto> checkStatus(@PathVariable String requestId) {
-        BulkUploadStateDto state = journalBulkValidationService.getState(requestId);
-        if (state == null) return ResponseEntity.notFound().build();
-        return ResponseEntity.ok(state);
-    }
-
-    // --- 3. File Download (Success/Error) ---
-    @GetMapping("/download-bulk-file/{requestId}")
-    public ResponseEntity<Resource> downloadFile(@PathVariable String requestId, @RequestParam String type) {
-        byte[] data = journalBulkValidationService.getFileBytes(requestId, type);
-        if (data == null) return ResponseEntity.notFound().build();
-
-        String name = type.equals("ERROR") ? "Error_Report.xlsx" : "Success.csv";
-        String mime = type.equals("ERROR") ? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" : "text/csv";
-
-        return ResponseEntity.ok()
-                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + name + "\"")
-                .contentType(MediaType.parseMediaType(mime))
-                .body(new ByteArrayResource(data));
-    }
-
-    // --- 4. Template Download ---
-    @GetMapping("/download-template")
-    public ResponseEntity<Resource> downloadTemplate() throws IOException {
-        byte[] data = journalBulkValidationService.generateTemplateBytes();
-        return ResponseEntity.ok()
-                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Journal_Upload_Template.xlsx\"")
-                .contentType(MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
-                .body(new ByteArrayResource(data));
-    }
-
-    // --- 5. Create Batch (OPTIMIZED for 5000+ rows) ---
-    // Uses cached data from validation step via Request ID
-    @PostMapping("/create-bulk-batch-optimized")
-    public ResponseEntity<Map<String, Object>> createBulkBatchOptimized(@RequestBody Map<String, String> payload,
-                                                                        @RequestHeader("Authorization") String token) {
-        try {
-            String userId = jwtUtil.getUserIdFromToken(token);
-            Integer userRole = jwtUtil.getUserRoleFromToken(token);
-            String requestId = payload.get("requestId");
-            String remarks = payload.getOrDefault("commonBatchRemarks", "Bulk Upload");
-
-            String batchId = journalRequestService.createBatchFromCache(requestId, remarks, userId, userRole);
-            
-            return ResponseEntity.ok(Map.of("status", "SUCCESS", "message", "Batch created successfully", "batchId", batchId));
-        } catch (Exception e) {
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("status", "ERROR", "message", e.getMessage()));
-        }
-    }
-
-    // --- 6. Create Batch (Legacy/Standard JSON) ---
-    // RESTORED as requested: If you send raw JSON rows, this handles it.
-    @PostMapping("/create-bulk-batch")
-    public ResponseEntity<Map<String, Object>> createBulkBatchRequest(@RequestBody BatchRequestDto batchDto,
-                                                                      @RequestHeader("Authorization") String token) throws JsonProcessingException {
-        try {
-            String userId = jwtUtil.getUserIdFromToken(token);
-            Integer userRole = jwtUtil.getUserRoleFromToken(token);
-            // This method creates batch from the raw DTO rows sent from frontend
-            String batchId = journalRequestService.createBulkBatchRequest(batchDto, userId, userRole);
-            return ResponseEntity.ok(Map.of("status", "SUCCESS", "message", "Batch created successfully", "batchId", batchId));
-        } catch (Exception e) {
-             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("status", "ERROR", "message", e.getMessage()));
-        }
-    }
-
-    // --- 7. Standard Operations ---
-    @PostMapping("/process-bulk")
-    public List<JournalRequest> processBulkRequests(@RequestHeader("Authorization") String token,
-                                                    @Valid @RequestBody BulkProcessJournalRequestDto processRequestDto) throws JsonProcessingException {
-        String executorId = jwtUtil.getUserIdFromToken(token);
-        Integer executorRole = jwtUtil.getUserRoleFromToken(token);
-        return journalRequestService.processBulkRequests(processRequestDto, executorId, executorRole);
-    }
-    
-    @GetMapping("/pending-requests")
-    public List<JournalRequest> getPendingRequests(@RequestHeader("Authorization") String token) {
-        String userId = jwtUtil.getUserIdFromToken(token);
-        Integer userRole = jwtUtil.getUserRoleFromToken(token);
-        return journalRequestService.getPendingRequests(userId, userRole);
-    }
-    
-    @GetMapping("/by-batch/{batchId}")
-    public ResponseEntity<List<JournalRequest>> getRequestsByBatchId(@PathVariable String batchId) {
-        return ResponseEntity.ok(journalRequestService.getRequestsByBatchId(batchId));
-    }
-}
-
-2. Frontend: JournalBulkUpload.jsx
-Status: Updated.
- * Styling: All styling is now internal (no external import).
- * Logic: Uses Stepper, 3 steps.
- * 5000 Rows: Uses the create-bulk-batch-optimized endpoint logic to fix the truncation issue.
- * Validation: Checks empty files, auto-downloads error reports.
-<!-- end list -->
-import React, { useState, useRef, useEffect } from "react";
-import {
-  Box, Typography, Paper, TextField, Button, CircularProgress, Chip, Alert,
-  Stack, Stepper, Step, StepLabel, Table, TableBody, TableCell, TableContainer,
-  TableHead, TableRow
-} from "@mui/material";
-import {
-  CloudUpload, CheckCircle, Error as ErrorIcon, Send, RestartAlt,
-  FileDownload
-} from "@mui/icons-material";
-import { alpha } from "@mui/material/styles";
-
-import useApi from "../../hooks/useApi";
-import useCustomSnackbar from "../../utils/useCustomSnackbar";
-
-// --- INTERNAL STYLING ---
-const styles = {
-  mainContainer: {
-    padding: 3,
-    height: "100%",
-    width: "100%",
-    backgroundColor: "background.default",
-  },
-  controlPanel: {
-    padding: "30px",
-    borderRadius: "12px",
-    backgroundColor: "background.paper",
-    boxShadow: "0px 4px 12px rgba(0,0,0,0.05)",
-    marginBottom: 3,
-  },
-  dateInputContainer: {
-    display: "flex",
-    justifyContent: "center",
-    marginBottom: "20px",
-  },
-  uploadBox: {
-    display: "flex",
-    flexDirection: "column",
-    justifyContent: "center",
-    alignItems: "center",
-    border: "2px dashed",
-    borderColor: "primary.main",
-    borderRadius: "12px",
-    padding: "40px",
-    cursor: "pointer",
-    backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.03),
-    transition: "all 0.3s ease",
-    minHeight: "220px",
-    "&:hover": {
-      backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.08),
-      borderColor: "primary.dark",
-    },
-  },
-  uploadIcon: {
-    fontSize: "4rem",
-    color: "primary.main",
-    marginBottom: 1,
-  },
-  uploadText: {
-    fontWeight: 600,
-    fontSize: "1.1rem",
-    color: "text.primary",
-  },
-  uploadSubText: {
-    color: "text.secondary",
-    fontSize: "0.9rem",
-  },
-  stepperContainer: {
-    width: "100%",
-    marginTop: 4,
-    marginBottom: 4,
-  },
-  tableContainer: {
-    marginTop: 2,
-    borderRadius: "8px",
-    border: "1px solid",
-    borderColor: "divider",
-    overflow: "auto",
-    maxHeight: "600px",
-    boxShadow: "0px 2px 8px rgba(0,0,0,0.05)",
-  },
-  tableHeader: {
-    backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.1),
-    fontWeight: "bold",
-    position: "sticky",
-    top: 0,
-    zIndex: 10,
-    whiteSpace: "nowrap",
-  },
-  actionButtons: {
-    display: "flex",
-    justifyContent: "center",
-    marginTop: 3,
-    gap: 2,
-  },
-};
-
-const steps = ["Upload File", "Validation", "Preview & Submit"];
-
-const JournalBulkUpload = () => {
-  const { callApi } = useApi();
-  const showSnackBar = useCustomSnackbar();
-
-  // --- State ---
-  const [selectedDate, setSelectedDate] = useState("");
-  const [file, setFile] = useState(null);
-  const fileInputRef = useRef(null);
-
-  // Process Status
-  const [activeStep, setActiveStep] = useState(0);
-  const [requestId, setRequestId] = useState(null);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [resultStatus, setResultStatus] = useState(null); // 'SUCCESS' | 'ERROR'
-  const [errorMsg, setErrorMsg] = useState("");
-
-  // Data
-  const [previewRows, setPreviewRows] = useState([]);
-  const [totalRows, setTotalRows] = useState(0);
-  const [hasProductColumn, setHasProductColumn] = useState(false);
-  const [autoDlTriggered, setAutoDlTriggered] = useState(false);
-
-  // Batch Creation
-  const [isCreatingBatch, setIsCreatingBatch] = useState(false);
-
-  // --- Handlers ---
-  const handleDateChange = (e) => {
-    setSelectedDate(e.target.value);
-    // If user changes date after failure, reset the process
-    if (resultStatus) resetProcess();
+  const isStepOptional = (step) => {
+    return step === 1;
   };
 
-  const handleFileSelect = (e) => {
-    if (e.target.files[0]) {
-      setFile(e.target.files[0]);
-      resetProcess();
-    }
+  const isStepSkipped = (step) => {
+    return skipped.has(step);
   };
 
-  const resetProcess = () => {
+  const handleNext = () => {
+    let newSkipped = skipped;
+    if (isStepSkipped(activeStep)) {
+      newSkipped = new Set(newSkipped.values());
+      newSkipped.delete(activeStep);
+    }
+
+    setActiveStep((prevActiveStep) => prevActiveStep + 1);
+    setSkipped(newSkipped);
+  };
+
+  const handleBack = () => {
+    setActiveStep((prevActiveStep) => prevActiveStep - 1);
+  };
+
+  const handleSkip = () => {
+    if (!isStepOptional(activeStep)) {
+      // You probably want to guard against something like this,
+      // it should never occur unless someone's actively trying to break something.
+      throw new Error("You can't skip a step that isn't optional.");
+    }
+
+    setActiveStep((prevActiveStep) => prevActiveStep + 1);
+    setSkipped((prevSkipped) => {
+      const newSkipped = new Set(prevSkipped.values());
+      newSkipped.add(activeStep);
+      return newSkipped;
+    });
+  };
+
+  const handleReset = () => {
     setActiveStep(0);
-    setRequestId(null);
-    setResultStatus(null);
-    setErrorMsg("");
-    setPreviewRows([]);
-    setTotalRows(0);
-    setIsProcessing(false);
-    setAutoDlTriggered(false);
-    if (fileInputRef.current) fileInputRef.current.value = "";
-  };
-
-  const handleDownloadTemplate = async () => {
-    try {
-      let token = "";
-      const storageAuth = sessionStorage.getItem("persist:auth") || localStorage.getItem("persist:auth");
-      if (storageAuth) { try { token = JSON.parse(storageAuth).token.replace(/"/g, ""); } catch (e) { } }
-
-      const response = await fetch("/JS/journals/download-template", {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-
-      if (!response.ok) throw new Error("Template download failed");
-
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.setAttribute("download", "Journal_Upload_Template.xlsx");
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-    } catch (e) {
-      showSnackBar("Failed to download template", "error");
-    }
-  };
-
-  const handleStartValidation = async () => {
-    if (!selectedDate) {
-      showSnackBar("Please select a Posting Date first.", "warning");
-      return;
-    }
-    if (!file) {
-      showSnackBar("Please select a file.", "warning");
-      return;
-    }
-    if (file.size === 0) {
-      showSnackBar("The selected file is empty.", "error");
-      return;
-    }
-
-    setIsProcessing(true);
-    setActiveStep(1); // Move to Processing Step
-
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("postingDate", selectedDate);
-
-    try {
-      // Get Token
-      let token = "";
-      const storageAuth = sessionStorage.getItem("persist:auth") || localStorage.getItem("persist:auth");
-      if (storageAuth) { try { token = JSON.parse(storageAuth).token.replace(/"/g, ""); } catch (e) { } }
-
-      const res = await fetch("/JS/journals/bulk-validate-init", {
-        method: "POST",
-        headers: { "Authorization": `Bearer ${token}` },
-        body: formData
-      });
-
-      if (!res.ok) {
-        const txt = await res.text();
-        throw new Error(txt || "Upload initialization failed");
-      }
-
-      const data = await res.json();
-      setRequestId(data.requestId); // Triggers useEffect polling
-    } catch (err) {
-      setIsProcessing(false);
-      setResultStatus("ERROR");
-      setErrorMsg("Upload failed: " + err.message);
-      showSnackBar("Upload initialization failed.", "error");
-    }
-  };
-
-  // --- Polling for Status ---
-  useEffect(() => {
-    let interval;
-    if (isProcessing && requestId) {
-      interval = setInterval(async () => {
-        try {
-          const res = await callApi(`/JS/journals/bulk-status/${requestId}`, null, "GET");
-
-          if (res.status === "ERROR") {
-            setIsProcessing(false);
-            setResultStatus("ERROR");
-            setErrorMsg(res.message);
-            clearInterval(interval);
-            showSnackBar(res.message, "error", 5000);
-
-            // Auto Download Error File
-            if (res.hasErrorFile && !autoDlTriggered) {
-              setAutoDlTriggered(true);
-              handleDownloadFile("ERROR", res.requestId);
-            }
-          }
-          else if (res.status === "SUCCESS") {
-            setIsProcessing(false);
-            setResultStatus("SUCCESS");
-            setTotalRows(res.totalRows);
-            if (res.previewDataJson) {
-              const rows = JSON.parse(res.previewDataJson);
-              setPreviewRows(rows);
-              // Check if any row has a real product code
-              setHasProductColumn(rows.some(r => r.productCode && r.productCode !== "A"));
-            }
-            setActiveStep(2); // Move to Preview Step
-            clearInterval(interval);
-            showSnackBar("Validation Successful!", "success", 5000);
-          }
-        } catch (e) { console.error(e); }
-      }, 1000);
-    }
-    return () => clearInterval(interval);
-  }, [isProcessing, requestId, callApi, showSnackBar, autoDlTriggered]);
-
-  const handleDownloadFile = async (type, reqId = requestId) => {
-    try {
-      let token = "";
-      const storageAuth = sessionStorage.getItem("persist:auth") || localStorage.getItem("persist:auth");
-      if (storageAuth) { try { token = JSON.parse(storageAuth).token.replace(/"/g, ""); } catch (e) { } }
-
-      const response = await fetch(`/JS/journals/download-bulk-file/${reqId}?type=${type}`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      if (!response.ok) throw new Error("Download failed");
-
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.setAttribute("download", type === "ERROR" ? "Error_Report.xlsx" : "Success_Batch.csv");
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-
-      if (type === "ERROR") {
-        showSnackBar("Error report downloaded. Please check Site, Date, Year, Period columns.", "info", 6000);
-      }
-    } catch (e) {
-      showSnackBar("Download failed", "error");
-    }
-  };
-
-  const handleCreateBatch = async () => {
-    setIsCreatingBatch(true);
-    try {
-      // Optimized: Send RequestID only. Backend fetches data from Redis cache.
-      const payload = {
-        requestId: requestId,
-        commonBatchRemarks: `Bulk Upload - ${selectedDate}`
-      };
-
-      const res = await callApi("/JS/journals/create-bulk-batch-optimized", payload, "POST");
-
-      if (res.status === "SUCCESS") {
-        showSnackBar(`Batch ${res.batchId} Created Successfully!`, "success", 5000);
-        resetProcess();
-        setFile(null);
-        setSelectedDate("");
-      } else {
-        throw new Error(res.message);
-      }
-    } catch (e) {
-      showSnackBar("Failed to create batch: " + e.message, "error", 5000);
-    } finally {
-      setIsCreatingBatch(false);
-    }
   };
 
   return (
-    <Box sx={styles.mainContainer}>
-      <Paper sx={styles.controlPanel}>
-
-        {/* Header Actions */}
-        <Box sx={{ display: 'flex', justifyContent: 'flex-end', mb: 2 }}>
-          <Button startIcon={<FileDownload />} onClick={handleDownloadTemplate}>
-            Download Template
-          </Button>
-        </Box>
-
-        {/* Stepper */}
-        <Stepper activeStep={activeStep} sx={styles.stepperContainer} alternativeLabel>
-          {steps.map((label, idx) => (
-            <Step key={label}>
-              <StepLabel error={resultStatus === "ERROR" && activeStep === idx}>
-                {label}
-              </StepLabel>
+    <Box sx={{ width: '100%' }}>
+      <Stepper activeStep={activeStep}>
+        {steps.map((label, index) => {
+          const stepProps = {};
+          const labelProps = {};
+          if (isStepOptional(index)) {
+            labelProps.optional = (
+              <Typography variant="caption">Optional</Typography>
+            );
+          }
+          if (isStepSkipped(index)) {
+            stepProps.completed = false;
+          }
+          return (
+            <Step key={label} {...stepProps}>
+              <StepLabel {...labelProps}>{label}</StepLabel>
             </Step>
-          ))}
-        </Stepper>
-
-        {/* --- STEP 0: UPLOAD --- */}
-        {activeStep === 0 && (
-          <>
-            <Box sx={styles.dateInputContainer}>
-              <TextField
-                type="date"
-                label="Posting Date"
-                value={selectedDate}
-                onChange={handleDateChange}
-                InputLabelProps={{ shrink: true }}
-                size="small"
-                helperText="Matches CSV Date (e.g., 02122025)"
-              />
-            </Box>
-
-            <Box
-              sx={styles.uploadBox}
-              onClick={() => {
-                if (selectedDate) fileInputRef.current.click();
-                else showSnackBar("Select Date First", "warning");
-              }}
-            >
-              <input type="file" hidden ref={fileInputRef} onChange={handleFileSelect} accept=".xlsx,.csv" />
-              {file ? (
-                <>
-                  <CheckCircle sx={{ fontSize: 60, color: "success.main" }} />
-                  <Typography sx={styles.uploadText}>{file.name}</Typography>
-                  <Chip label="Ready to Validate" color="primary" sx={{ mt: 1 }} />
-                  <Typography sx={styles.uploadSubText}>Click to change</Typography>
-                </>
-              ) : (
-                <>
-                  <CloudUpload sx={styles.uploadIcon} />
-                  <Typography sx={styles.uploadText}>Click to Upload</Typography>
-                  <Typography sx={styles.uploadSubText}>.xlsx, .csv (Max 50MB)</Typography>
-                </>
-              )}
-            </Box>
-
-            <Box sx={styles.actionButtons}>
-              <Button
-                variant="contained"
-                size="large"
-                onClick={handleStartValidation}
-                disabled={!file || !selectedDate}
-              >
-                Next: Validate
-              </Button>
-            </Box>
-          </>
-        )}
-
-        {/* --- STEP 1: VALIDATION PROGRESS --- */}
-        {activeStep === 1 && (
-          <Box sx={{ textAlign: 'center', py: 5 }}>
-            {resultStatus === "ERROR" ? (
-              <Alert severity="error" sx={{ maxWidth: 600, mx: 'auto', border: '1px solid red' }}>
-                <Typography variant="h6">Validation Failed</Typography>
-                <Typography>{errorMsg}</Typography>
-                <Button startIcon={<RestartAlt />} onClick={resetProcess} sx={{ mt: 2 }} color="error">
-                  Try Again
-                </Button>
-              </Alert>
-            ) : (
-              <>
-                <CircularProgress size={50} />
-                <Typography sx={{ mt: 2 }}>Validating Records...</Typography>
-              </>
-            )}
+          );
+        })}
+      </Stepper>
+      {activeStep === steps.length ? (
+        <React.Fragment>
+          <Typography sx={{ mt: 2, mb: 1 }}>
+            All steps completed - you&apos;re finished
+          </Typography>
+          <Box sx={{ display: 'flex', flexDirection: 'row', pt: 2 }}>
+            <Box sx={{ flex: '1 1 auto' }} />
+            <Button onClick={handleReset}>Reset</Button>
           </Box>
-        )}
-
-        {/* --- STEP 2: PREVIEW & SUBMIT --- */}
-        {activeStep === 2 && (
-          <>
-            <Alert severity="success" icon={<CheckCircle fontSize="inherit" />} sx={{ mb: 2 }}>
-              Validation Successful! {totalRows.toLocaleString()} rows ready.
-            </Alert>
-
-            {totalRows > 2000 && (
-              <Alert severity="warning" sx={{ mb: 2 }}>
-                Displaying first 2000 rows only. The full batch will be created.
-              </Alert>
-            )}
-
-            <TableContainer component={Paper} sx={styles.tableContainer}>
-              <Table stickyHeader size="small">
-                <TableHead>
-                  <TableRow>
-                    <TableCell sx={styles.tableHeader}>ID</TableCell>
-                    <TableCell sx={styles.tableHeader}>Branch</TableCell>
-                    <TableCell sx={styles.tableHeader}>Currency</TableCell>
-                    <TableCell sx={styles.tableHeader}>CGL</TableCell>
-                    <TableCell align="right" sx={styles.tableHeader}>Amount</TableCell>
-                    <TableCell align="center" sx={styles.tableHeader}>Type</TableCell>
-                    <TableCell sx={styles.tableHeader}>Remarks</TableCell>
-                    {hasProductColumn && <TableCell sx={styles.tableHeader}>Product</TableCell>}
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {previewRows.map((row, idx) => (
-                    <TableRow key={idx} hover>
-                      <TableCell>{row.id}</TableCell>
-                      <TableCell>{row.branch}</TableCell>
-                      <TableCell>{row.currency}</TableCell>
-                      <TableCell>{row.cgl}</TableCell>
-                      <TableCell align="right">{row.amount}</TableCell>
-                      <TableCell align="center">
-                        <Chip
-                          label={row.txnType}
-                          size="small"
-                          color={row.txnType.includes("Credit") ? "error" : "success"}
-                          variant="filled"
-                        />
-                      </TableCell>
-                      <TableCell>{row.remarks}</TableCell>
-                      {hasProductColumn && <TableCell>{row.productCode}</TableCell>}
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </TableContainer>
-
-            <Box sx={styles.actionButtons}>
-              <Button variant="outlined" onClick={resetProcess} disabled={isCreatingBatch}>
-                Back / Cancel
+        </React.Fragment>
+      ) : (
+        <React.Fragment>
+          <Typography sx={{ mt: 2, mb: 1 }}>Step {activeStep + 1}</Typography>
+          <Box sx={{ display: 'flex', flexDirection: 'row', pt: 2 }}>
+            <Button
+              color="inherit"
+              disabled={activeStep === 0}
+              onClick={handleBack}
+              sx={{ mr: 1 }}
+            >
+              Back
+            </Button>
+            <Box sx={{ flex: '1 1 auto' }} />
+            {isStepOptional(activeStep) && (
+              <Button color="inherit" onClick={handleSkip} sx={{ mr: 1 }}>
+                Skip
               </Button>
-              <Button
-                variant="contained"
-                color="success"
-                size="large"
-                startIcon={isCreatingBatch ? <CircularProgress size={20} color="inherit" /> : <Send />}
-                onClick={handleCreateBatch}
-                disabled={isCreatingBatch}
-              >
-                {isCreatingBatch ? "Creating Batch..." : "Confirm & Create Batch"}
-              </Button>
-            </Box>
-          </>
-        )}
-      </Paper>
-    </Box>
-  );
-};
-export default JournalBulkUpload;
-
-3. Frontend: JournalRequestApproval.jsx
-Status: Updated.
- * Styling: Internal styling (no imports).
- * Sticky ID: Added CSS logic (stickyColumn, stickyHeaderColumn) to make sure Journal ID sticks when scrolling horizontally.
- * States: Separate loading states for Approve/Reject.
- * Structure: DataGrid for main list, Table for details.
-<!-- end list -->
-import React, { useState, useEffect, useCallback } from "react";
-import {
-  Box, Typography, Chip, Dialog, DialogActions, DialogContent, DialogContentText,
-  DialogTitle, TextField, Button, CircularProgress, IconButton, Stack,
-  Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Paper, Checkbox
-} from "@mui/material";
-import { DataGrid } from "@mui/x-data-grid";
-import {
-  Check as CheckIcon,
-  Clear as ClearIcon,
-  Visibility as VisibilityIcon,
-  AccountCircle
-} from "@mui/icons-material";
-import { alpha } from "@mui/material/styles";
-
-import useApi from "../../hooks/useApi";
-import useCustomSnackbar from "../../utils/useCustomSnackbar";
-
-// --- INTERNAL STYLING ---
-const styles = {
-  mainContainer: {
-    padding: 3,
-    height: "100%",
-    width: "100%",
-    backgroundColor: "background.default",
-  },
-  dataGridContainer: {
-    height: 600,
-    width: "100%",
-    backgroundColor: "background.paper",
-    "& .MuiDataGrid-columnHeaders": {
-      backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.1),
-      fontWeight: "bold",
-    },
-  },
-  tableContainer: {
-    marginTop: 2,
-    borderRadius: "8px",
-    border: "1px solid",
-    borderColor: "divider",
-    overflow: "auto",
-    maxHeight: "600px",
-    boxShadow: "0px 2px 8px rgba(0,0,0,0.05)",
-  },
-  tableHeader: {
-    backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.1),
-    fontWeight: "bold",
-    position: "sticky",
-    top: 0,
-    zIndex: 10,
-    whiteSpace: "nowrap",
-  },
-  // Sticky Column Logic
-  stickyColumn: {
-    position: "sticky",
-    left: 0,
-    backgroundColor: "background.paper",
-    zIndex: 5,
-    borderRight: "2px solid rgba(224, 224, 224, 1)", 
-  },
-  stickyHeaderColumn: {
-    position: "sticky",
-    left: 0,
-    top: 0,
-    zIndex: 15,
-    backgroundColor: "#f5f5f5",
-    fontWeight: "bold",
-    borderRight: "2px solid rgba(224, 224, 224, 1)",
-    borderBottom: "1px solid rgba(224, 224, 224, 1)",
-  },
-  dialogActions: {
-    padding: 2,
-    display: "flex",
-    gap: 1,
-    justifyContent: "flex-end",
-  },
-};
-
-const formatCurrency = (num) => Number(num).toFixed(4);
-
-export default function JournalRequestApproval() {
-  const { callApi } = useApi();
-  const showSnackBar = useCustomSnackbar();
-
-  // --- State ---
-  const [currentUserId, setCurrentUserId] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [rows, setRows] = useState([]);
-
-  // Action Modal
-  const [isModalOpen, setIsModalOpen] = useState(false);
-  const [isApproveLoading, setIsApproveLoading] = useState(false);
-  const [isRejectLoading, setIsRejectLoading] = useState(false);
-  const [selectedBatch, setSelectedBatch] = useState(null);
-  const [modalMode, setModalMode] = useState("ACCEPTED");
-  const [executorRemarks, setExecutorRemarks] = useState("");
-
-  // View Details Modal
-  const [isViewModalOpen, setIsViewModalOpen] = useState(false);
-  const [isViewLoading, setIsViewLoading] = useState(false);
-  const [batchDetails, setBatchDetails] = useState([]);
-  const [viewingBatchId, setViewingBatchId] = useState(null);
-  const [selectedJournalPrefixes, setSelectedJournalPrefixes] = useState([]);
-
-  useEffect(() => {
-    // Basic Auth Check from Storage
-    try {
-      const auth = sessionStorage.getItem("persist:auth") || localStorage.getItem("persist:auth");
-      if (auth) {
-        const parsed = JSON.parse(auth);
-        const user = JSON.parse(parsed.user);
-        if (user?.userId) setCurrentUserId(String(user.userId));
-      }
-    } catch (e) { }
-  }, []);
-
-  const fetchPendingBatches = useCallback(async () => {
-    setLoading(true);
-    try {
-      const pendingRequests = await callApi("/JS/journals/pending-requests", null, "GET");
-
-      if (!Array.isArray(pendingRequests) || pendingRequests.length === 0) {
-        setRows([]);
-        return;
-      }
-
-      // Group individual requests into Batches
-      const groupedBatches = new Map();
-      pendingRequests.forEach(req => {
-        const batchId = req.batchId;
-        if (!groupedBatches.has(batchId)) {
-          groupedBatches.set(batchId, {
-            id: batchId,
-            batchId: batchId,
-            creatorId: req.creatorId,
-            requestStatus: req.requestStatus,
-            requestDate: req.requestDate,
-            commonBatchRemarks: req.commonBatchRemarks,
-            totalDebit: 0,
-            totalCredit: 0,
-            requestCount: 0
-          });
-        }
-        const detail = groupedBatches.get(batchId);
-        detail.requestCount++;
-        try {
-          const pl = JSON.parse(req.payload);
-          const amt = parseFloat(pl.amount) || 0;
-          if (amt < 0) detail.totalCredit += Math.abs(amt);
-          else detail.totalDebit += amt;
-        } catch (e) { }
-      });
-
-      setRows(Array.from(groupedBatches.values()));
-    } catch (err) {
-      showSnackBar("Failed to load requests", "error");
-    } finally {
-      setLoading(false);
-    }
-  }, [callApi, showSnackBar]);
-
-  useEffect(() => { fetchPendingBatches(); }, [fetchPendingBatches]);
-
-  // --- Handlers ---
-  const handleOpenModal = (batch, mode) => {
-    setSelectedBatch(batch);
-    setModalMode(mode);
-    setExecutorRemarks("");
-    setIsModalOpen(true);
-  };
-
-  const handleCloseModal = () => {
-    if (isApproveLoading || isRejectLoading) return;
-    setIsModalOpen(false);
-    setSelectedBatch(null);
-  };
-
-  const handleSubmitAction = async () => {
-    if (modalMode === "REJECTED" && !executorRemarks.trim()) {
-      showSnackBar("Remarks are required for rejection.", "warning");
-      return;
-    }
-
-    const setLoadingFn = modalMode === "ACCEPTED" ? setIsApproveLoading : setIsRejectLoading;
-    setLoadingFn(true);
-
-    try {
-      const payload = {
-        batchId: selectedBatch.batchId,
-        status: modalMode,
-        remarks: executorRemarks.trim() || (modalMode === "ACCEPTED" ? "Accepted" : "Rejected"),
-      };
-
-      await callApi("/JS/journals/process-bulk", payload, "POST");
-      showSnackBar(`Batch ${modalMode === "ACCEPTED" ? "Approved" : "Rejected"} Successfully`, "success", 5000);
-      handleCloseModal();
-      fetchPendingBatches();
-    } catch (e) {
-      showSnackBar("Process Failed", "error");
-    } finally {
-      setLoadingFn(false);
-    }
-  };
-
-  const handleOpenViewModal = async (batchId, creatorId) => {
-    setIsViewModalOpen(true);
-    setIsViewLoading(true);
-    setViewingBatchId(batchId);
-    setBatchDetails([]);
-    setSelectedJournalPrefixes([]);
-
-    try {
-      const data = await callApi(`/JS/journals/by-batch/${batchId}`, null, "GET");
-
-      // Group Requests by Journal Prefix (e.g., JRNL-001-01, JRNL-001-02 -> JRNL-001)
-      const groups = new Map();
-      data.filter(r => r.requestStatus === "PENDING").forEach(req => {
-        const prefix = req.journalId.split("-")[0];
-        if (!groups.has(prefix)) groups.set(prefix, []);
-        try {
-          const pl = JSON.parse(req.payload);
-          groups.get(prefix).push({
-            ...req,
-            payload: pl,
-            journalPrefix: prefix,
-            amount: Math.abs(parseFloat(pl.amount) || 0)
-          });
-        } catch (e) { }
-      });
-
-      setBatchDetails(Array.from(groups.values()));
-    } catch (e) {
-      showSnackBar("Failed to load details", "error");
-    } finally {
-      setIsViewLoading(false);
-    }
-  };
-
-  // --- Render Sticky Detail Rows ---
-  const renderDetailRows = () => {
-    return batchDetails.map((group, gIdx) => (
-      group.map((row, rIdx) => {
-        const isSelected = selectedJournalPrefixes.includes(row.journalPrefix);
-        return (
-          <TableRow key={row.id} selected={isSelected} hover>
-            
-            {/* STICKY COLUMN 1: Checkbox */}
-            {rIdx === 0 && (
-              <TableCell
-                rowSpan={group.length}
-                padding="checkbox"
-                sx={{ ...styles.stickyColumn, top: 0, zIndex: 5 }} // Lower zIndex than header
-              >
-                <Checkbox
-                  checked={isSelected}
-                  onClick={() => {
-                    const newSel = isSelected
-                      ? selectedJournalPrefixes.filter(p => p !== row.journalPrefix)
-                      : [...selectedJournalPrefixes, row.journalPrefix];
-                    setSelectedJournalPrefixes(newSel);
-                  }}
-                />
-              </TableCell>
             )}
-
-            {/* STICKY COLUMN 2: Journal ID */}
-            {rIdx === 0 && (
-              <TableCell
-                rowSpan={group.length}
-                sx={{
-                  ...styles.stickyColumn,
-                  left: 48, // Offset for checkbox width
-                  zIndex: 5,
-                  fontWeight: 'bold'
-                }}
-              >
-                {row.journalPrefix}
-              </TableCell>
-            )}
-
-            {/* Standard Columns */}
-            <TableCell>{row.payload.branch}</TableCell>
-            <TableCell>{row.payload.currency}</TableCell>
-            <TableCell>{row.payload.cgl}</TableCell>
-            <TableCell align="right">{formatCurrency(row.amount)}</TableCell>
-            <TableCell align="center">
-               <Chip label={row.amount < 0 || row.payload.amount < 0 ? "Credit" : "Debit"} 
-                     size="small" 
-                     color={row.amount < 0 || row.payload.amount < 0 ? "error" : "success"} />
-            </TableCell>
-          </TableRow>
-        );
-      })
-    ));
-  };
-
-  const columns = [
-    { field: "batchId", headerName: "Batch ID", width: 130, disableColumnMenu: true, align: 'center', headerAlign: 'center' },
-    {
-      field: "requestStatus", headerName: "Status", width: 120, disableColumnMenu: true, align: 'center', headerAlign: 'center',
-      renderCell: (p) => <Chip label={p.value} color="warning" size="small" />
-    },
-    {
-      field: "creatorId", headerName: "Creator", width: 150, disableColumnMenu: true, align: 'center', headerAlign: 'center',
-      renderCell: (p) => <Chip icon={<AccountCircle />} label={p.value} variant="outlined" size="small" />
-    },
-    {
-      field: "requestDate", headerName: "Date", width: 180, disableColumnMenu: true, align: 'center', headerAlign: 'center',
-      valueFormatter: (p) => new Date(p.value).toLocaleString()
-    },
-    { field: "commonBatchRemarks", headerName: "Remarks", flex: 1, disableColumnMenu: true, headerAlign: 'center' },
-    {
-      field: "actions", headerName: "Actions", width: 180, disableColumnMenu: true, sortable: false, align: 'center', headerAlign: 'center',
-      renderCell: (p) => {
-        const isSelf = String(currentUserId) === String(p.row.creatorId);
-        return (
-          <Stack direction="row" spacing={1}>
-            <IconButton onClick={() => handleOpenViewModal(p.row.batchId, p.row.creatorId)} color="primary">
-              <VisibilityIcon />
-            </IconButton>
-            <IconButton onClick={() => handleOpenModal(p.row, "ACCEPTED")} color="success" disabled={isSelf}>
-              <CheckIcon />
-            </IconButton>
-            <IconButton onClick={() => handleOpenModal(p.row, "REJECTED")} color="error" disabled={isSelf}>
-              <ClearIcon />
-            </IconButton>
-          </Stack>
-        );
-      }
-    }
-  ];
-
-  return (
-    <Box sx={styles.mainContainer}>
-      <DataGrid
-        rows={rows}
-        columns={columns}
-        loading={loading}
-        getRowId={(r) => r.batchId}
-        sx={styles.dataGridContainer}
-        disableRowSelectionOnClick
-      />
-
-      {/* --- Action Dialog --- */}
-      <Dialog open={isModalOpen} onClose={handleCloseModal} fullWidth maxWidth="sm">
-        <DialogTitle>{modalMode === "ACCEPTED" ? "Approve" : "Reject"} Batch</DialogTitle>
-        <DialogContent>
-          <DialogContentText sx={{ mb: 2 }}>
-            Confirm {modalMode === "ACCEPTED" ? "Approval" : "Rejection"} for Batch <strong>{selectedBatch?.batchId}</strong>?
-          </DialogContentText>
-          <TextField
-            autoFocus={modalMode === "REJECTED"}
-            label="Approver Remarks"
-            fullWidth
-            variant="outlined"
-            required={modalMode === "REJECTED"}
-            value={executorRemarks}
-            onChange={(e) => setExecutorRemarks(e.target.value)}
-          />
-        </DialogContent>
-        <DialogActions sx={styles.dialogActions}>
-          <Button onClick={handleCloseModal} disabled={isApproveLoading || isRejectLoading}>
-            Cancel
-          </Button>
-          <Button
-            onClick={handleSubmitAction}
-            variant="contained"
-            color={modalMode === "ACCEPTED" ? "success" : "error"}
-            disabled={isApproveLoading || isRejectLoading}
-            startIcon={(isApproveLoading || isRejectLoading) ? <CircularProgress size={20} color="inherit" /> : null}
-          >
-            Confirm
-          </Button>
-        </DialogActions>
-      </Dialog>
-
-      {/* --- View Details Dialog --- */}
-      <Dialog open={isViewModalOpen} onClose={() => setIsViewModalOpen(false)} fullWidth maxWidth="lg">
-        <DialogTitle>Batch Details: {viewingBatchId}</DialogTitle>
-        <DialogContent dividers>
-          {isViewLoading ? (
-            <Box sx={{ display: 'flex', justifyContent: 'center', p: 5 }}>
-              <CircularProgress />
-            </Box>
-          ) : (
-            <TableContainer component={Paper} sx={styles.tableContainer}>
-              <Table size="small" stickyHeader>
-                <TableHead>
-                  <TableRow>
-                    {/* Header for Sticky Column 1 */}
-                    <TableCell sx={{ ...styles.stickyHeaderColumn, zIndex: 20, left: 0 }} padding="checkbox">
-                      <Checkbox disabled />
-                    </TableCell>
-                    {/* Header for Sticky Column 2 */}
-                    <TableCell sx={{ ...styles.stickyHeaderColumn, zIndex: 20, left: 48 }}>
-                      Journal ID
-                    </TableCell>
-                    <TableCell sx={styles.tableHeader}>Branch</TableCell>
-                    <TableCell sx={styles.tableHeader}>Currency</TableCell>
-                    <TableCell sx={styles.tableHeader}>CGL</TableCell>
-                    <TableCell align="right" sx={styles.tableHeader}>Amount</TableCell>
-                    <TableCell align="center" sx={styles.tableHeader}>Type</TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>{renderDetailRows()}</TableBody>
-              </Table>
-            </TableContainer>
-          )}
-        </DialogContent>
-        <DialogActions sx={styles.dialogActions}>
-          <Button onClick={() => setIsViewModalOpen(false)}>Close</Button>
-        </DialogActions>
-      </Dialog>
+            <Button onClick={handleNext}>
+              {activeStep === steps.length - 1 ? 'Finish' : 'Next'}
+            </Button>
+          </Box>
+        </React.Fragment>
+      )}
     </Box>
   );
 }
 
+
+u did everthing wrong in UI u remove the step wise validation like  first cheak validation then i cheak DB exist then i cheak CR/DR cheak the i give him upload this all need to in first page
+in if all the validation done then take him to next page automatically 
+show table there with 50/ 100  rows below that give him button for batch creation and also give him back option i think we need 2 steppers with diff purpose 
