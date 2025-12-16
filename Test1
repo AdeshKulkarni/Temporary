@@ -1,10 +1,175 @@
-Here are the complete, updated frontend files. I have optimized the code as requested (Stepper, Tables, 5000+ row fix, Sticky headers) while ensuring all original functionality is preserved. I have also synchronized the style names.
-1. Styles: JournalStyles.js
-I have consolidated all styles here. I used the JournalStyles object approach to keep imports clean in the components.
+Here are the updated files.
+Changes Made:
+ * Frontend Styling: Removed the external JournalStyles.js file. All styles are now internal using const styles = { ... } and passed via sx props.
+ * Backend Controller: I have restored the original createBulkBatchRequest endpoint (so existing logic remains) AND kept the new createBulkBatchOptimized endpoint (which is required to fix the 5000+ row limit issue).
+ * Frontend Logic: The Bulk Upload screen now uses the Optimized endpoint to ensure large files work, but the UI follows the Stepper/Table design you requested.
+1. Backend: JournalRequestController.java
+Status: Updated. Restored the original bulk endpoint and kept the new optimized one.
+package com.fincore.JournalService.Controllers;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fincore.JournalService.Dto.*;
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Service.JournalBulkValidationService;
+import com.fincore.JournalService.Service.JournalRequestService;
+import com.fincore.JournalService.Service.JournalRequestServiceImpl;
+import com.fincore.commonutilities.jwt.JwtUtil;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.core.io.Resource;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.Map;
+
+@RestController
+@RequestMapping("journals")
+@RequiredArgsConstructor
+@Slf4j
+public class JournalRequestController {
+
+    private final JournalRequestService journalRequestService;
+    private final JournalBulkValidationService journalBulkValidationService;
+    private final JwtUtil jwtUtil;
+
+    // --- 1. Validation Init ---
+    @PostMapping(value = "/bulk-validate-init", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<?> initiateValidation(@RequestParam("file") MultipartFile file,
+                                                @RequestParam("postingDate") String date) {
+        try {
+            if(file.isEmpty()) return ResponseEntity.badRequest().body(Map.of("error", "File is empty"));
+            // Parse date (Frontend sends YYYY-MM-DD)
+            java.time.LocalDate pDate = java.time.LocalDate.parse(date);
+            String reqId = journalBulkValidationService.initiateValidation(file.getBytes(), file.getOriginalFilename(), pDate);
+            return ResponseEntity.ok(Map.of("status", "QUEUED", "requestId", reqId));
+        } catch (Exception e) {
+            log.error("Validation init failed", e);
+            return ResponseEntity.badRequest().body(Map.of("error", "Invalid Request: " + e.getMessage()));
+        }
+    }
+
+    // --- 2. Validation Status Poll ---
+    @GetMapping("/bulk-status/{requestId}")
+    public ResponseEntity<BulkUploadStateDto> checkStatus(@PathVariable String requestId) {
+        BulkUploadStateDto state = journalBulkValidationService.getState(requestId);
+        if (state == null) return ResponseEntity.notFound().build();
+        return ResponseEntity.ok(state);
+    }
+
+    // --- 3. File Download (Success/Error) ---
+    @GetMapping("/download-bulk-file/{requestId}")
+    public ResponseEntity<Resource> downloadFile(@PathVariable String requestId, @RequestParam String type) {
+        byte[] data = journalBulkValidationService.getFileBytes(requestId, type);
+        if (data == null) return ResponseEntity.notFound().build();
+
+        String name = type.equals("ERROR") ? "Error_Report.xlsx" : "Success.csv";
+        String mime = type.equals("ERROR") ? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" : "text/csv";
+
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + name + "\"")
+                .contentType(MediaType.parseMediaType(mime))
+                .body(new ByteArrayResource(data));
+    }
+
+    // --- 4. Template Download ---
+    @GetMapping("/download-template")
+    public ResponseEntity<Resource> downloadTemplate() throws IOException {
+        byte[] data = journalBulkValidationService.generateTemplateBytes();
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Journal_Upload_Template.xlsx\"")
+                .contentType(MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+                .body(new ByteArrayResource(data));
+    }
+
+    // --- 5. Create Batch (OPTIMIZED for 5000+ rows) ---
+    // Uses cached data from validation step via Request ID
+    @PostMapping("/create-bulk-batch-optimized")
+    public ResponseEntity<Map<String, Object>> createBulkBatchOptimized(@RequestBody Map<String, String> payload,
+                                                                        @RequestHeader("Authorization") String token) {
+        try {
+            String userId = jwtUtil.getUserIdFromToken(token);
+            Integer userRole = jwtUtil.getUserRoleFromToken(token);
+            String requestId = payload.get("requestId");
+            String remarks = payload.getOrDefault("commonBatchRemarks", "Bulk Upload");
+
+            String batchId = journalRequestService.createBatchFromCache(requestId, remarks, userId, userRole);
+            
+            return ResponseEntity.ok(Map.of("status", "SUCCESS", "message", "Batch created successfully", "batchId", batchId));
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("status", "ERROR", "message", e.getMessage()));
+        }
+    }
+
+    // --- 6. Create Batch (Legacy/Standard JSON) ---
+    // RESTORED as requested: If you send raw JSON rows, this handles it.
+    @PostMapping("/create-bulk-batch")
+    public ResponseEntity<Map<String, Object>> createBulkBatchRequest(@RequestBody BatchRequestDto batchDto,
+                                                                      @RequestHeader("Authorization") String token) throws JsonProcessingException {
+        try {
+            String userId = jwtUtil.getUserIdFromToken(token);
+            Integer userRole = jwtUtil.getUserRoleFromToken(token);
+            // This method creates batch from the raw DTO rows sent from frontend
+            String batchId = journalRequestService.createBulkBatchRequest(batchDto, userId, userRole);
+            return ResponseEntity.ok(Map.of("status", "SUCCESS", "message", "Batch created successfully", "batchId", batchId));
+        } catch (Exception e) {
+             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("status", "ERROR", "message", e.getMessage()));
+        }
+    }
+
+    // --- 7. Standard Operations ---
+    @PostMapping("/process-bulk")
+    public List<JournalRequest> processBulkRequests(@RequestHeader("Authorization") String token,
+                                                    @Valid @RequestBody BulkProcessJournalRequestDto processRequestDto) throws JsonProcessingException {
+        String executorId = jwtUtil.getUserIdFromToken(token);
+        Integer executorRole = jwtUtil.getUserRoleFromToken(token);
+        return journalRequestService.processBulkRequests(processRequestDto, executorId, executorRole);
+    }
+    
+    @GetMapping("/pending-requests")
+    public List<JournalRequest> getPendingRequests(@RequestHeader("Authorization") String token) {
+        String userId = jwtUtil.getUserIdFromToken(token);
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+        return journalRequestService.getPendingRequests(userId, userRole);
+    }
+    
+    @GetMapping("/by-batch/{batchId}")
+    public ResponseEntity<List<JournalRequest>> getRequestsByBatchId(@PathVariable String batchId) {
+        return ResponseEntity.ok(journalRequestService.getRequestsByBatchId(batchId));
+    }
+}
+
+2. Frontend: JournalBulkUpload.jsx
+Status: Updated.
+ * Styling: All styling is now internal (no external import).
+ * Logic: Uses Stepper, 3 steps.
+ * 5000 Rows: Uses the create-bulk-batch-optimized endpoint logic to fix the truncation issue.
+ * Validation: Checks empty files, auto-downloads error reports.
+<!-- end list -->
+import React, { useState, useRef, useEffect } from "react";
+import {
+  Box, Typography, Paper, TextField, Button, CircularProgress, Chip, Alert,
+  Stack, Stepper, Step, StepLabel, Table, TableBody, TableCell, TableContainer,
+  TableHead, TableRow
+} from "@mui/material";
+import {
+  CloudUpload, CheckCircle, Error as ErrorIcon, Send, RestartAlt,
+  FileDownload
+} from "@mui/icons-material";
 import { alpha } from "@mui/material/styles";
 
-export const JournalStyles = {
-  // --- Main Containers ---
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
+
+// --- INTERNAL STYLING ---
+const styles = {
   mainContainer: {
     padding: 3,
     height: "100%",
@@ -18,8 +183,6 @@ export const JournalStyles = {
     boxShadow: "0px 4px 12px rgba(0,0,0,0.05)",
     marginBottom: 3,
   },
-
-  // --- Upload Screen ---
   dateInputContainer: {
     display: "flex",
     justifyContent: "center",
@@ -57,23 +220,10 @@ export const JournalStyles = {
     color: "text.secondary",
     fontSize: "0.9rem",
   },
-
-  // --- Stepper ---
   stepperContainer: {
     width: "100%",
     marginTop: 4,
     marginBottom: 4,
-  },
-
-  // --- DataGrid / Table Containers ---
-  dataGridContainer: {
-    height: 600,
-    width: "100%",
-    backgroundColor: "background.paper",
-    "& .MuiDataGrid-columnHeaders": {
-      backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.1),
-      fontWeight: "bold",
-    },
   },
   tableContainer: {
     marginTop: 2,
@@ -84,108 +234,21 @@ export const JournalStyles = {
     maxHeight: "600px",
     boxShadow: "0px 2px 8px rgba(0,0,0,0.05)",
   },
-
-  // --- Sticky Logic for Journal ID ---
-  // The header must sit above the column
   tableHeader: {
     backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.1),
     fontWeight: "bold",
     position: "sticky",
     top: 0,
-    zIndex: 10, 
+    zIndex: 10,
     whiteSpace: "nowrap",
   },
-  // Sticky Column (First Column - Checkbox/ID)
-  stickyColumn: {
-    position: "sticky",
-    left: 0,
-    backgroundColor: "background.paper",
-    zIndex: 5,
-    borderRight: "2px solid rgba(224, 224, 224, 1)", 
-  },
-  // Intersection of Sticky Header and Sticky Column
-  stickyHeaderColumn: {
-    position: "sticky",
-    left: 0,
-    top: 0,
-    zIndex: 15, // Highest z-index to float over everything
-    backgroundColor: "#f5f5f5", // Fallback color
-    fontWeight: "bold",
-    borderRight: "2px solid rgba(224, 224, 224, 1)",
-    borderBottom: "1px solid rgba(224, 224, 224, 1)",
-  },
-
-  // --- Actions & Misc ---
   actionButtons: {
     display: "flex",
     justifyContent: "center",
     marginTop: 3,
     gap: 2,
   },
-  successBox: {
-    padding: 2,
-    marginTop: 2,
-    borderColor: "success.main",
-    backgroundColor: (theme) => alpha(theme.palette.success.main, 0.05),
-    borderWidth: 1,
-    borderStyle: "solid",
-    borderRadius: 2,
-  },
-  chip: {
-    fontWeight: "bold",
-    minWidth: "80px",
-  },
-  
-  // --- Dialogs ---
-  dialogActions: {
-    padding: 2,
-    display: "flex",
-    gap: 1,
-    justifyContent: "flex-end",
-  },
 };
-
-2. Component: JournalBulkUpload.jsx
-Key Features & Fixes:
- * Stepper: Implemented MUI Stepper.
- * 5000+ Row Fix: Sends only requestId to create the batch (fast).
- * Validations: Checks for empty file, empty date.
- * Error Handling: Auto-downloads error file, shows specific messages.
- * Optimization: Uses standard Table for preview (max 2000 rows shown with alert) instead of DataGrid for performance.
-<!-- end list -->
-import React, { useState, useRef, useEffect } from "react";
-import {
-  Box,
-  Typography,
-  Paper,
-  TextField,
-  Button,
-  CircularProgress,
-  Chip,
-  Alert,
-  Stack,
-  Stepper,
-  Step,
-  StepLabel,
-  Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableHead,
-  TableRow,
-} from "@mui/material";
-import {
-  CloudUpload,
-  CheckCircle,
-  Error as ErrorIcon,
-  Send,
-  RestartAlt,
-  FileDownload,
-} from "@mui/icons-material";
-
-import useApi from "../../hooks/useApi";
-import useCustomSnackbar from "../../utils/useCustomSnackbar";
-import { JournalStyles } from "./JournalStyles";
 
 const steps = ["Upload File", "Validation", "Preview & Submit"];
 
@@ -215,7 +278,6 @@ const JournalBulkUpload = () => {
   const [isCreatingBatch, setIsCreatingBatch] = useState(false);
 
   // --- Handlers ---
-
   const handleDateChange = (e) => {
     setSelectedDate(e.target.value);
     // If user changes date after failure, reset the process
@@ -410,8 +472,8 @@ const JournalBulkUpload = () => {
   };
 
   return (
-    <Box sx={JournalStyles.mainContainer}>
-      <Paper sx={JournalStyles.controlPanel}>
+    <Box sx={styles.mainContainer}>
+      <Paper sx={styles.controlPanel}>
 
         {/* Header Actions */}
         <Box sx={{ display: 'flex', justifyContent: 'flex-end', mb: 2 }}>
@@ -421,7 +483,7 @@ const JournalBulkUpload = () => {
         </Box>
 
         {/* Stepper */}
-        <Stepper activeStep={activeStep} sx={JournalStyles.stepperContainer} alternativeLabel>
+        <Stepper activeStep={activeStep} sx={styles.stepperContainer} alternativeLabel>
           {steps.map((label, idx) => (
             <Step key={label}>
               <StepLabel error={resultStatus === "ERROR" && activeStep === idx}>
@@ -434,7 +496,7 @@ const JournalBulkUpload = () => {
         {/* --- STEP 0: UPLOAD --- */}
         {activeStep === 0 && (
           <>
-            <Box sx={JournalStyles.dateInputContainer}>
+            <Box sx={styles.dateInputContainer}>
               <TextField
                 type="date"
                 label="Posting Date"
@@ -447,7 +509,7 @@ const JournalBulkUpload = () => {
             </Box>
 
             <Box
-              sx={JournalStyles.uploadBox}
+              sx={styles.uploadBox}
               onClick={() => {
                 if (selectedDate) fileInputRef.current.click();
                 else showSnackBar("Select Date First", "warning");
@@ -457,20 +519,20 @@ const JournalBulkUpload = () => {
               {file ? (
                 <>
                   <CheckCircle sx={{ fontSize: 60, color: "success.main" }} />
-                  <Typography sx={JournalStyles.uploadText}>{file.name}</Typography>
+                  <Typography sx={styles.uploadText}>{file.name}</Typography>
                   <Chip label="Ready to Validate" color="primary" sx={{ mt: 1 }} />
-                  <Typography sx={JournalStyles.uploadSubText}>Click to change</Typography>
+                  <Typography sx={styles.uploadSubText}>Click to change</Typography>
                 </>
               ) : (
                 <>
-                  <CloudUpload sx={JournalStyles.uploadIcon} />
-                  <Typography sx={JournalStyles.uploadText}>Click to Upload</Typography>
-                  <Typography sx={JournalStyles.uploadSubText}>.xlsx, .csv (Max 50MB)</Typography>
+                  <CloudUpload sx={styles.uploadIcon} />
+                  <Typography sx={styles.uploadText}>Click to Upload</Typography>
+                  <Typography sx={styles.uploadSubText}>.xlsx, .csv (Max 50MB)</Typography>
                 </>
               )}
             </Box>
 
-            <Box sx={JournalStyles.actionButtons}>
+            <Box sx={styles.actionButtons}>
               <Button
                 variant="contained"
                 size="large"
@@ -516,18 +578,18 @@ const JournalBulkUpload = () => {
               </Alert>
             )}
 
-            <TableContainer component={Paper} sx={JournalStyles.tableContainer}>
+            <TableContainer component={Paper} sx={styles.tableContainer}>
               <Table stickyHeader size="small">
                 <TableHead>
                   <TableRow>
-                    <TableCell sx={JournalStyles.tableHeader}>ID</TableCell>
-                    <TableCell sx={JournalStyles.tableHeader}>Branch</TableCell>
-                    <TableCell sx={JournalStyles.tableHeader}>Currency</TableCell>
-                    <TableCell sx={JournalStyles.tableHeader}>CGL</TableCell>
-                    <TableCell align="right" sx={JournalStyles.tableHeader}>Amount</TableCell>
-                    <TableCell align="center" sx={JournalStyles.tableHeader}>Type</TableCell>
-                    <TableCell sx={JournalStyles.tableHeader}>Remarks</TableCell>
-                    {hasProductColumn && <TableCell sx={JournalStyles.tableHeader}>Product</TableCell>}
+                    <TableCell sx={styles.tableHeader}>ID</TableCell>
+                    <TableCell sx={styles.tableHeader}>Branch</TableCell>
+                    <TableCell sx={styles.tableHeader}>Currency</TableCell>
+                    <TableCell sx={styles.tableHeader}>CGL</TableCell>
+                    <TableCell align="right" sx={styles.tableHeader}>Amount</TableCell>
+                    <TableCell align="center" sx={styles.tableHeader}>Type</TableCell>
+                    <TableCell sx={styles.tableHeader}>Remarks</TableCell>
+                    {hasProductColumn && <TableCell sx={styles.tableHeader}>Product</TableCell>}
                   </TableRow>
                 </TableHead>
                 <TableBody>
@@ -554,7 +616,7 @@ const JournalBulkUpload = () => {
               </Table>
             </TableContainer>
 
-            <Box sx={JournalStyles.actionButtons}>
+            <Box sx={styles.actionButtons}>
               <Button variant="outlined" onClick={resetProcess} disabled={isCreatingBatch}>
                 Back / Cancel
               </Button>
@@ -577,13 +639,12 @@ const JournalBulkUpload = () => {
 };
 export default JournalBulkUpload;
 
-3. Component: JournalRequestApproval.jsx
-Key Features & Fixes:
- * Sticky ID: Uses JournalStyles.stickyColumn to keep Journal ID visible while scrolling horizontally.
- * Approval/Reject: Separate loading states (isApproveLoading, isRejectLoading).
- * Snackbars: 5s duration.
- * Details View: Standard Table (not DataGrid) for cleaner detail view.
- * Main List: DataGrid with disabled column menu filters for a cleaner look.
+3. Frontend: JournalRequestApproval.jsx
+Status: Updated.
+ * Styling: Internal styling (no imports).
+ * Sticky ID: Added CSS logic (stickyColumn, stickyHeaderColumn) to make sure Journal ID sticks when scrolling horizontally.
+ * States: Separate loading states for Approve/Reject.
+ * Structure: DataGrid for main list, Table for details.
 <!-- end list -->
 import React, { useState, useEffect, useCallback } from "react";
 import {
@@ -598,10 +659,70 @@ import {
   Visibility as VisibilityIcon,
   AccountCircle
 } from "@mui/icons-material";
+import { alpha } from "@mui/material/styles";
 
 import useApi from "../../hooks/useApi";
 import useCustomSnackbar from "../../utils/useCustomSnackbar";
-import { JournalStyles } from "./JournalStyles";
+
+// --- INTERNAL STYLING ---
+const styles = {
+  mainContainer: {
+    padding: 3,
+    height: "100%",
+    width: "100%",
+    backgroundColor: "background.default",
+  },
+  dataGridContainer: {
+    height: 600,
+    width: "100%",
+    backgroundColor: "background.paper",
+    "& .MuiDataGrid-columnHeaders": {
+      backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.1),
+      fontWeight: "bold",
+    },
+  },
+  tableContainer: {
+    marginTop: 2,
+    borderRadius: "8px",
+    border: "1px solid",
+    borderColor: "divider",
+    overflow: "auto",
+    maxHeight: "600px",
+    boxShadow: "0px 2px 8px rgba(0,0,0,0.05)",
+  },
+  tableHeader: {
+    backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.1),
+    fontWeight: "bold",
+    position: "sticky",
+    top: 0,
+    zIndex: 10,
+    whiteSpace: "nowrap",
+  },
+  // Sticky Column Logic
+  stickyColumn: {
+    position: "sticky",
+    left: 0,
+    backgroundColor: "background.paper",
+    zIndex: 5,
+    borderRight: "2px solid rgba(224, 224, 224, 1)", 
+  },
+  stickyHeaderColumn: {
+    position: "sticky",
+    left: 0,
+    top: 0,
+    zIndex: 15,
+    backgroundColor: "#f5f5f5",
+    fontWeight: "bold",
+    borderRight: "2px solid rgba(224, 224, 224, 1)",
+    borderBottom: "1px solid rgba(224, 224, 224, 1)",
+  },
+  dialogActions: {
+    padding: 2,
+    display: "flex",
+    gap: 1,
+    justifyContent: "flex-end",
+  },
+};
 
 const formatCurrency = (num) => Number(num).toFixed(4);
 
@@ -776,7 +897,7 @@ export default function JournalRequestApproval() {
               <TableCell
                 rowSpan={group.length}
                 padding="checkbox"
-                sx={{ ...JournalStyles.stickyColumn, top: 0, zIndex: 5 }} // Lower zIndex than header
+                sx={{ ...styles.stickyColumn, top: 0, zIndex: 5 }} // Lower zIndex than header
               >
                 <Checkbox
                   checked={isSelected}
@@ -795,7 +916,7 @@ export default function JournalRequestApproval() {
               <TableCell
                 rowSpan={group.length}
                 sx={{
-                  ...JournalStyles.stickyColumn,
+                  ...styles.stickyColumn,
                   left: 48, // Offset for checkbox width
                   zIndex: 5,
                   fontWeight: 'bold'
@@ -858,13 +979,13 @@ export default function JournalRequestApproval() {
   ];
 
   return (
-    <Box sx={JournalStyles.mainContainer}>
+    <Box sx={styles.mainContainer}>
       <DataGrid
         rows={rows}
         columns={columns}
         loading={loading}
         getRowId={(r) => r.batchId}
-        sx={JournalStyles.dataGridContainer}
+        sx={styles.dataGridContainer}
         disableRowSelectionOnClick
       />
 
@@ -885,7 +1006,7 @@ export default function JournalRequestApproval() {
             onChange={(e) => setExecutorRemarks(e.target.value)}
           />
         </DialogContent>
-        <DialogActions sx={JournalStyles.dialogActions}>
+        <DialogActions sx={styles.dialogActions}>
           <Button onClick={handleCloseModal} disabled={isApproveLoading || isRejectLoading}>
             Cancel
           </Button>
@@ -910,23 +1031,23 @@ export default function JournalRequestApproval() {
               <CircularProgress />
             </Box>
           ) : (
-            <TableContainer component={Paper} sx={JournalStyles.tableContainer}>
+            <TableContainer component={Paper} sx={styles.tableContainer}>
               <Table size="small" stickyHeader>
                 <TableHead>
                   <TableRow>
                     {/* Header for Sticky Column 1 */}
-                    <TableCell sx={{ ...JournalStyles.stickyHeaderColumn, zIndex: 20, left: 0 }} padding="checkbox">
+                    <TableCell sx={{ ...styles.stickyHeaderColumn, zIndex: 20, left: 0 }} padding="checkbox">
                       <Checkbox disabled />
                     </TableCell>
                     {/* Header for Sticky Column 2 */}
-                    <TableCell sx={{ ...JournalStyles.stickyHeaderColumn, zIndex: 20, left: 48 }}>
+                    <TableCell sx={{ ...styles.stickyHeaderColumn, zIndex: 20, left: 48 }}>
                       Journal ID
                     </TableCell>
-                    <TableCell sx={JournalStyles.tableHeader}>Branch</TableCell>
-                    <TableCell sx={JournalStyles.tableHeader}>Currency</TableCell>
-                    <TableCell sx={JournalStyles.tableHeader}>CGL</TableCell>
-                    <TableCell align="right" sx={JournalStyles.tableHeader}>Amount</TableCell>
-                    <TableCell align="center" sx={JournalStyles.tableHeader}>Type</TableCell>
+                    <TableCell sx={styles.tableHeader}>Branch</TableCell>
+                    <TableCell sx={styles.tableHeader}>Currency</TableCell>
+                    <TableCell sx={styles.tableHeader}>CGL</TableCell>
+                    <TableCell align="right" sx={styles.tableHeader}>Amount</TableCell>
+                    <TableCell align="center" sx={styles.tableHeader}>Type</TableCell>
                   </TableRow>
                 </TableHead>
                 <TableBody>{renderDetailRows()}</TableBody>
@@ -934,7 +1055,7 @@ export default function JournalRequestApproval() {
             </TableContainer>
           )}
         </DialogContent>
-        <DialogActions sx={JournalStyles.dialogActions}>
+        <DialogActions sx={styles.dialogActions}>
           <Button onClick={() => setIsViewModalOpen(false)}>Close</Button>
         </DialogActions>
       </Dialog>
