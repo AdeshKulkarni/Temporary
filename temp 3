@@ -1,10 +1,3 @@
-This is happening because the createBulkBatchRequest method in your Service Implementation was left as a placeholder (stub) returning "LEGACY_ID" during the transition away from Redis.
-Since we removed the Redis caching layer, the frontend is now sending the full data payload directly to this method. We need to put the actual saving logic back into this method so it processes the data and generates a real Batch ID.
-Here is the corrected JournalRequestServiceImpl.java.
-Backend: JournalRequestServiceImpl.java
-Changes Made:
- * Implemented createBulkBatchRequest: It now contains the full logic to generate a Batch ID, process the rows, create JournalRequest entities, save them to the DB, and trigger notifications. It no longer returns "LEGACY_ID".
-<!-- end list -->
 package com.fincore.JournalService.Service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -48,13 +41,16 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     private final SequenceService sequenceService;
     private final NotificationWriterService notificationWriterService;
     private final PermissionConfigService permissionConfigService;
-    // validationService is not needed here anymore since we receive full DTO
+    
+    // NOTE: validationService is no longer needed for creation as we accept full DTO from frontend
+    // private final JournalBulkValidationService validationService; 
 
-    // --- 1. BULK BATCH CREATION (Direct DTO - No Cache) ---
+    // --- 1. BULK BATCH CREATION (Standard - No Cache) ---
     @Override
     @Transactional
     public String createBulkBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
         
+        // 1. Generate REAL Batch ID
         String batchId = sequenceService.getNextBatchId();
         log.info("Processing Bulk Batch ID: {}", batchId);
        
@@ -65,7 +61,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                                 ? batchDto.getCommonBatchRemarks() 
                                 : "Bulk Upload Batch " + batchId;
 
-        // Grouping logic ensures Journal IDs are sequenced correctly per Branch/Currency
+        // 2. Group by Branch/Currency to generate sequential Journal IDs
         Map<String, List<BatchRequestDto.JournalRequestRow>> groupedRows = batchDto.getRows().stream()
                 .collect(Collectors.groupingBy(row -> row.getBranch() + ":" + row.getCurrency()));
 
@@ -86,7 +82,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                 payloadDto.setBranch(rowDto.getBranch());
                 payloadDto.setCurrency(rowDto.getCurrency());
                 payloadDto.setCgl(rowDto.getCgl());
-                // Amount is passed as-is (Negative for Credit)
+                // Use amount as-is (Negative = Credit)
                 payloadDto.setAmount(rowDto.getAmount()); 
                 payloadDto.setProductType(rowDto.getProductType());
                 payloadDto.setRemarks(rowDto.getRemarks());
@@ -102,7 +98,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                 JournalRequest request = new JournalRequest();
                 request.setCreatorId(creatorId);
                 request.setCreatorRole(creatorRole);
-                request.setChangeType(rowDto.getChangeType()); // Default to ADD
+                request.setChangeType(rowDto.getChangeType());
                 request.setRequestStatus(RequestStatus.PENDING);
                 request.setBatchId(batchId);
                 request.setJournalId(journalId);
@@ -114,28 +110,28 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             }
         }
 
+        // 3. Save to DB
         journalRequestRepository.saveAll(requestsToSave);
+        
+        // 4. Send Notification
         createNotification(batchId, creatorId, requestsToSave.size());
    
-        return batchId; // Returns REAL Batch ID
+        return batchId; // Return the generated ID (Not Legacy ID)
     }
 
-    // --- 2. STANDARD CREATION (Single/Manual) ---
+    // --- 2. STANDARD SINGLE CREATION ---
     @Override
     @Transactional
     public List<JournalRequest> createBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException {
-        // Reuse logic or keep separate if needed. For now, basic implementation:
-        String batchId = sequenceService.getNextBatchId();
-        // ... (Same creation logic as above, but returns List<JournalRequest>)
-        // Simulating by calling bulk and refetching (or duplicating logic if preferred)
-        createBulkBatchRequest(dto, creatorId, creatorRole);
-        return journalRequestRepository.findByBatchId(batchId); 
+        // Reuse the logic from bulk creation, but return the list of objects
+        String batchId = createBulkBatchRequest(dto, creatorId, creatorRole);
+        return journalRequestRepository.findByBatchId(batchId);
     }
 
-    // --- 3. CREATE FROM CACHE (Removed/Deprecated) ---
+    // --- 3. DEPRECATED CACHE METHOD (Required by Interface but unused) ---
     @Override
     public String createBatchFromCache(String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
-        throw new UnsupportedOperationException("Redis Cache creation is disabled.");
+        throw new UnsupportedOperationException("Redis Cache creation is disabled. Use createBulkBatchRequest instead.");
     }
 
     // --- 4. APPROVAL / REJECTION ---
@@ -145,7 +141,9 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         JournalRequest request = journalRequestRepository.findById(dto.getRequestId())
                 .orElseThrow(() -> new ResourceNotFoundException("Journal Request not found."));
 
-        if (request.getRequestStatus() != RequestStatus.PENDING) throw new IllegalStateException("Already processed.");
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            throw new IllegalStateException("Journal Request has already been processed.");
+        }
 
         request.setExecutorId(executorId);
         request.setExecutorRemarks(dto.getRemarks());
@@ -153,7 +151,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         request.setRequestStatus(dto.getStatus());
 
         if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
-            processApproval(request);
+            processApproval(request); 
         }
         return Optional.of(journalRequestRepository.save(request));
     }
@@ -161,10 +159,8 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     @Override
     @Transactional
     public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) throws JsonProcessingException {
-        boolean hasBatchId = StringUtils.hasText(dto.getBatchId());
         List<JournalRequest> requestsToProcess;
-
-        if (hasBatchId) {
+        if (StringUtils.hasText(dto.getBatchId())) {
             requestsToProcess = journalRequestRepository.findByBatchIdAndRequestStatus(dto.getBatchId(), RequestStatus.PENDING);
         } else {
             Specification<JournalRequest> spec = (root, query, criteriaBuilder) -> {
@@ -187,7 +183,11 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         List<JournalRequest> processedRequests = new ArrayList<>();
 
         for (JournalRequest request : requestsToProcess) {
-            if (executorId.equals(request.getCreatorId())) continue;
+            // Prevent self-approval if needed (logic can be adjusted)
+            if (executorId.equals(request.getCreatorId()) && 
+               (executorRole != null && executorRole.equals(request.getCreatorRole()))) {
+                   continue;
+            }
 
             request.setExecutorId(executorId);
             request.setExecutorRemarks(dto.getRemarks());
@@ -200,6 +200,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                     GlTransaction newGlTxn = new GlTransaction();
                     newGlTxn.setBatchId(payloadDto.getBatchId());
                     newGlTxn.setJournalId(payloadDto.getJournalId());
+                    
                     newGlTxn.setPostDate(LocalDateTime.now());
                     newGlTxn.setTransactionDate(payloadDto.getPDate() != null ? payloadDto.getPDate() : LocalDate.now());
                     newGlTxn.setBranchCode(payloadDto.getBranch());
@@ -208,7 +209,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                     newGlTxn.setNarration(payloadDto.getRemarks());
 
                     BigDecimal amount = payloadDto.getAmount();
-                    // DEBIT/CREDIT LOGIC
+                    // DEBIT/CREDIT Logic: Negative -> Credit Column (Positive Value)
                     if (amount.signum() < 0) {
                         newGlTxn.setCreditAmount(amount.abs()); 
                         newGlTxn.setDebitAmount(BigDecimal.ZERO);
@@ -225,41 +226,52 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             processedRequests.add(request);
         }
 
-        if (!transactionsToSave.isEmpty()) glTransactionRepository.saveAll(transactionsToSave);
+        if (!transactionsToSave.isEmpty()) {
+            glTransactionRepository.saveAll(transactionsToSave);
+        }
         return journalRequestRepository.saveAll(processedRequests);
     }
 
     private void processApproval(JournalRequest request) throws JsonProcessingException {
-        CreateJournalRequestDto p = objectMapper.readValue(request.getPayload(), CreateJournalRequestDto.class);
-        if (p.getChangeType() == ChangeType.ADD) {
-            GlTransaction t = new GlTransaction();
-            t.setBatchId(p.getBatchId());
-            t.setJournalId(p.getJournalId());
-            t.setPostDate(LocalDateTime.now());
-            t.setTransactionDate(p.getPDate() != null ? p.getPDate() : LocalDate.now());
-            t.setBranchCode(p.getBranch());
-            t.setCurrency(p.getCurrency());
-            t.setCgl(p.getCgl());
-            t.setNarration(p.getRemarks());
+        CreateJournalRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateJournalRequestDto.class);
+        
+        if (payloadDto.getChangeType() == ChangeType.ADD) {
+            GlTransaction newGlTxn = new GlTransaction();
+            newGlTxn.setBatchId(payloadDto.getBatchId());
+            newGlTxn.setJournalId(payloadDto.getJournalId());
             
-            // DEBIT/CREDIT LOGIC
-            if (p.getAmount().signum() < 0) {
-                t.setCreditAmount(p.getAmount().abs()); t.setDebitAmount(BigDecimal.ZERO);
-            } else {
-                t.setDebitAmount(p.getAmount()); t.setCreditAmount(BigDecimal.ZERO);
+            newGlTxn.setPostDate(LocalDateTime.now());
+            newGlTxn.setTransactionDate(payloadDto.getPDate() != null ? payloadDto.getPDate() : LocalDate.now());
+            newGlTxn.setBranchCode(payloadDto.getBranch());
+            newGlTxn.setCurrency(payloadDto.getCurrency());
+            newGlTxn.setCgl(payloadDto.getCgl());
+            newGlTxn.setNarration(payloadDto.getRemarks());
+            
+            BigDecimal amount = payloadDto.getAmount();
+            if (amount.signum() < 0) { 
+                newGlTxn.setCreditAmount(amount.abs()); 
+                newGlTxn.setDebitAmount(BigDecimal.ZERO);
+            } else { 
+                newGlTxn.setDebitAmount(amount);
+                newGlTxn.setCreditAmount(BigDecimal.ZERO);
             }
             
-            t.setTransactionCount(p.getTransactionCount());
-            t.setSourceFlag("J");
-            glTransactionRepository.save(t);
-        }
+            newGlTxn.setTransactionCount(payloadDto.getTransactionCount());
+            newGlTxn.setSourceFlag("J"); 
+            glTransactionRepository.save(newGlTxn);
+        } 
     }
 
-    // --- FETCH & DELETE ---
+    // --- 5. FETCH & DELETE ---
+    
     @Override
     public List<JournalRequest> getPendingRequests(String userId, Integer userRole) {
-        return journalRequestRepository.findByRequestStatus(RequestStatus.PENDING).stream()
-                .filter(r -> !r.getCreatorId().equals(userId))
+        List<JournalRequest> allPending = journalRequestRepository.findByRequestStatus(RequestStatus.PENDING);
+        return allPending.stream()
+                .filter(request -> {
+                    // Filter out creator's own requests
+                    return !String.valueOf(request.getCreatorId()).equals(String.valueOf(userId));
+                })
                 .collect(Collectors.toList());
     }
 
@@ -275,40 +287,69 @@ public class JournalRequestServiceImpl implements JournalRequestService {
 
     @Override
     public List<JournalRequestStatusDto> getJournalRequestStatusList() {
-        return journalRequestRepository.findAll().stream().map(JournalRequestStatusDto::new).collect(Collectors.toList());
+        return journalRequestRepository.findAll().stream()
+                .map(JournalRequestStatusDto::new)
+                .collect(Collectors.toList());
     }
 
     @Override
     @Transactional
     public void cancelMyRequest(Long requestId, String userId) {
         JournalRequest request = journalRequestRepository.findById(requestId)
-                .orElseThrow(() -> new ResourceNotFoundException("Not found"));
-        if (!userId.equals(request.getCreatorId())) throw new IllegalStateException("Unauthorized");
-        if (request.getRequestStatus() != RequestStatus.PENDING) throw new IllegalStateException("Processed");
+                .orElseThrow(() -> new ResourceNotFoundException("Journal Request not found."));
+
+        if (!userId.equals(request.getCreatorId())) {
+            throw new IllegalStateException("Unauthorized");
+        }
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            throw new IllegalStateException("Already processed");
+        }
         journalRequestRepository.delete(request);
     }
 
     @Override
     @Transactional
     public void cancelMyRequestsByBatchId(String batchId, String userId) {
-        List<JournalRequest> list = journalRequestRepository.findByBatchIdAndCreatorIdAndRequestStatus(batchId, userId, RequestStatus.PENDING);
-        if (list.isEmpty()) throw new ResourceNotFoundException("No pending requests");
-        journalRequestRepository.deleteAll(list);
+        List<JournalRequest> requestsToCancel = journalRequestRepository.findByBatchIdAndCreatorIdAndRequestStatus(
+                batchId, userId, RequestStatus.PENDING);
+
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found.");
+        }
+        journalRequestRepository.deleteAll(requestsToCancel);
     }
 
     @Override
     @Transactional
     public void cancelMyRequestsByJournalPrefix(String journalIdPrefix, String userId) {
-        List<JournalRequest> list = journalRequestRepository.findByJournalIdStartingWithAndCreatorIdAndRequestStatus(journalIdPrefix, userId, RequestStatus.PENDING);
-        if (list.isEmpty()) throw new ResourceNotFoundException("No pending requests");
-        journalRequestRepository.deleteAll(list);
+        List<JournalRequest> requestsToCancel = journalRequestRepository.findByJournalIdStartingWithAndCreatorIdAndRequestStatus(
+                journalIdPrefix, userId, RequestStatus.PENDING);
+
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found.");
+        }
+        journalRequestRepository.deleteAll(requestsToCancel);
     }
 
     @Override
     @Transactional
     public void cancelMyRequestsByJournalPrefixes(List<String> journalIdPrefixes, String userId) {
-        // Implementation similar to processBulk
-        // Omitted for brevity but logic is same as before
+        Specification<JournalRequest> spec = (root, query, criteriaBuilder) -> {
+            List<Predicate> predicates = new ArrayList<>();
+            for (String prefix : journalIdPrefixes) {
+                predicates.add(criteriaBuilder.like(root.get("journalId"), prefix + "%"));
+            }
+            Predicate journalIdOrPredicates = criteriaBuilder.or(predicates.toArray(new Predicate[0]));
+            Predicate statusPredicate = criteriaBuilder.equal(root.get("requestStatus"), RequestStatus.PENDING);
+            Predicate creatorPredicate = criteriaBuilder.equal(root.get("creatorId"), userId);
+            return criteriaBuilder.and(journalIdOrPredicates, statusPredicate, creatorPredicate);
+        };
+
+        List<JournalRequest> requestsToCancel = journalRequestRepository.findAll(spec);
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found.");
+        }
+        journalRequestRepository.deleteAll(requestsToCancel);
     }
 
     private void createNotification(String batchId, String creatorId, int size) {
@@ -321,4 +362,3 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         }
     }
 }
-
