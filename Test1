@@ -1,14 +1,15 @@
-I have analyzed your request and the provided code. The core issue is that your current processAsync method acts as a "Gatekeeper" — if Stage 1 (Format) fails, it stops and reports errors, never running Stage 2 (DB) or Stage 3 (Balance).
-To fulfill your requirement of "Checking all validation errors at once" (so the user sees "Invalid Currency Length" AND "Branch Not Found" AND "Balance Mismatch" in a single report), we need to remove the returns between stages and allow the errors to accumulate in the ExcelRowData object.
-Here is the updated JournalBulkValidationService.java.
-Key Changes Made:
- * Pipeline Execution: In processAsync, it now runs runFormatCheck, runDbCheck, and runBalanceCheck sequentially without stopping, accumulating all errors.
- * New Constraints Added:
-   * Amount: Added check for Max Precision 16 and Max Scale 4 (12 integers, 4 decimals).
-   * Remarks: Added check for Max 30 characters.
-   * Empty CSV: Reinforced logic to catch empty tokens (like ,,).
- * Product Code: The logic was already there, but now it will appear alongside other errors.
-Updated Code: JournalBulkValidationService.java
+Understood. You want to keep the strict sequential logic (Gatekeeper Pattern: Stage 1 fails \rightarrow Stop & Report \rightarrow Don't run DB check), but you want to ensure the Format Validation (Stage 1) specifically covers all the constraints you listed (Amount 16.4, Remarks length, ,, empty CSV checks, etc.).
+Here is the corrected code.
+Changes Summary:
+ * Reverted processAsync: It now stops immediately if Format checks fail (Stage 1), so it won't hit the database if the file format is wrong.
+ * Enhanced runFormatCheck:
+   * Added Amount Precision Check: Total digits \le 16, Decimal places \le 4.
+   * Added Remarks Check: Max 30 characters.
+   * Product Code: Checks for "A" or 8 digits.
+ * Enhanced parseCsvBytes:
+   * Used .split(",", -1) to correctly detect empty columns like ,,.
+   * Added checks for empty strings in mandatory columns.
+Updated JournalBulkValidationService.java
 package com.fincore.JournalService.Service;
 
 import com.fincore.JournalService.Dto.BulkUploadStateDto;
@@ -116,33 +117,31 @@ public class JournalBulkValidationService {
 
             updateState(requestId, s -> {
                 s.setTotalRows(parsedRows.size());
-                s.setMessage("Validating Data...");
+                s.setMessage("Validating Formats...");
             });
 
-            // --- CHANGED LOGIC START: RUN ALL CHECKS SEQUENTIALLY ---
-            
-            // 1. Format Check
-            runFormatCheck(parsedRows);
-            updateState(requestId, s -> { s.setCurrentStage(2); s.setMessage("Checking Database..."); });
-
-            // 2. DB Check (Runs even if format failed, to catch everything)
-            runDbCheck(parsedRows);
-            updateState(requestId, s -> { s.setCurrentStage(3); s.setMessage("Checking Balances..."); });
-
-            // 3. Balance Check
-            runBalanceCheck(parsedRows);
-
-            // 4. Final Decision
-            boolean hasAnyErrors = parsedRows.stream().anyMatch(ExcelRowData::hasErrors);
-
-            if (hasAnyErrors) {
-                // Generate error report with ALL accumulated errors (Format + DB + Balance)
-                failRequest(requestId, parsedRows, "Validation Failed: Please check the Error Report.", 3);
-            } else {
-                completeRequest(requestId, parsedRows, postingDate, isCsv);
+            // --- STAGE 1: FORMAT CHECK ---
+            // If this fails, we STOP and generate the error file immediately.
+            if (runFormatCheck(parsedRows)) {
+                failRequest(requestId, parsedRows, "Format Validation Failed", 1);
+                return; 
             }
-            // --- CHANGED LOGIC END ---
 
+            // --- STAGE 2: DB CHECK ---
+            updateState(requestId, s -> { s.setCurrentStage(2); s.setMessage("Checking Database..."); });
+            if (runDbCheck(parsedRows)) {
+                failRequest(requestId, parsedRows, "Database Validation Failed", 2);
+                return;
+            }
+
+            // --- STAGE 3: BALANCE CHECK ---
+            updateState(requestId, s -> { s.setCurrentStage(3); s.setMessage("Checking Balances..."); });
+            if (runBalanceCheck(parsedRows)) {
+                failRequest(requestId, parsedRows, "Debit/Credit Balance Mismatch", 3);
+                return;
+            }
+
+            completeRequest(requestId, parsedRows, postingDate, isCsv);
         } catch (Exception e) {
             log.error("Async Validation Error for {}", requestId, e);
             updateState(requestId, s -> {
@@ -162,8 +161,8 @@ public class JournalBulkValidationService {
             while((line=br.readLine())!=null) {
                 if(line.trim().isEmpty()) continue;
                 
-                // Use -1 limit to keep empty trailing strings (e.g. "data,data,,")
-                String[] c = line.split(",", -1); 
+                // CRITICAL: Use limit -1 to detect empty trailing columns (e.g. "data,data,,")
+                String[] c = line.split(",", -1);
 
                 if (i == 0) {
                     String headerCheck = c.length > 0 ? c[0].trim().toLowerCase() : "";
@@ -176,16 +175,15 @@ public class JournalBulkValidationService {
                 ExcelRowData d = new ExcelRowData();
                 d.rowIndex = i++;
 
-                // CSV Validation Logic
                 if (c.length != 14) {
                     d.formatErrors.add("Invalid CSV Format: Row has " + c.length + " columns. Expected exactly 14.");
                 } else {
-                    // Explicitly check for Empty/Whitespace strings to handle ",," cases
-                    if(c[0].trim().isEmpty()) d.formatErrors.add("Mandatory: Batch ID (Col 1) is empty");
-                    if(c[4].trim().isEmpty()) d.formatErrors.add("Mandatory: Branch (Col 5) is empty");
-                    if(c[5].trim().isEmpty()) d.formatErrors.add("Mandatory: Currency (Col 6) is empty");
-                    if(c[6].trim().isEmpty()) d.formatErrors.add("Mandatory: CGL (Col 7) is empty");
-                    if(c[7].trim().isEmpty()) d.formatErrors.add("Mandatory: Amount (Col 8) is empty");
+                    // CRITICAL: Check for empty tokens (,,)
+                    if(c[0].trim().isEmpty()) d.formatErrors.add("Batch ID (Col 1) is Mandatory");
+                    if(c[4].trim().isEmpty()) d.formatErrors.add("Branch (Col 5) is Mandatory");
+                    if(c[5].trim().isEmpty()) d.formatErrors.add("Currency (Col 6) is Mandatory");
+                    if(c[6].trim().isEmpty()) d.formatErrors.add("CGL (Col 7) is Mandatory");
+                    if(c[7].trim().isEmpty()) d.formatErrors.add("Amount (Col 8) is Mandatory");
 
                     d.isSystemFormat = true;
                     d.sysSite=c[0]; d.sysDate=c[1]; d.sysYear=c[2]; d.sysPeriod=c[3];
@@ -246,8 +244,8 @@ public class JournalBulkValidationService {
     }
 
     private void validateSystemColumns(ExcelRowData d, String c0, String cDate, String cYear, String cMonth, String c11, String c12, String c13) {
-        if (!"01".equals(c0)) d.formatErrors.add("Batch ID (Col 1) must be '01'");
-        if (cDate == null || cDate.trim().length() != 8) d.formatErrors.add("Invalid Date Format (Expected ddMMyyyy)");
+        if (!"01".equals(c0)) d.formatErrors.add("Batch ID must be '01'");
+        if (cDate == null || cDate.trim().length() != 8) d.formatErrors.add("Invalid Date Format");
         else {
             try {
                 LocalDate date = LocalDate.parse(cDate.trim(), SYSTEM_DATE_FMT);
@@ -257,7 +255,7 @@ public class JournalBulkValidationService {
                 String expectedMonth = String.format("%02d", (month >= 4) ? (month - 3) : (month + 9));
                 if (!expectedYear.equals(cYear.trim())) d.formatErrors.add("Financial Year mismatch");
                 if (!expectedMonth.equals(cMonth.trim())) d.formatErrors.add("Financial Month mismatch");
-            } catch (DateTimeParseException e) { d.formatErrors.add("Invalid Date Value (Expected ddMMyyyy)"); }
+            } catch (DateTimeParseException e) { d.formatErrors.add("Invalid Date Value"); }
         }
         if (!"B".equalsIgnoreCase(c11.trim())) d.formatErrors.add("Col 12 must be 'B'");
         if (!"C".equalsIgnoreCase(c12.trim())) d.formatErrors.add("Col 13 must be 'C'");
@@ -277,114 +275,90 @@ public class JournalBulkValidationService {
         } catch(Exception e) { d.amount = BigDecimal.ZERO; }
     }
 
-    // --- CHECKS ---
-    private void runFormatCheck(List<ExcelRowData> rows) {
+    // --- REFINED FORMAT CHECK (Stage 1) ---
+    private boolean runFormatCheck(List<ExcelRowData> rows) {
         rows.parallelStream().forEach(d -> {
-            // Branch Check
+            // 1. Branch Check
             if (d.branch == null || d.branch.isEmpty()) d.formatErrors.add("Branch is Empty");
             
-            // Currency Check
-            if (d.currency == null) d.formatErrors.add("Currency is Null");
-            else if (d.currency.length() != 3) d.formatErrors.add("Currency must be exactly 3 chars");
+            // 2. Currency Check
+            if (d.currency == null || d.currency.length() != 3) d.formatErrors.add("Currency must be 3 chars (e.g. USD)");
             
-            // CGL Check
+            // 3. CGL Check
             if (d.cgl == null || d.cgl.isEmpty()) d.formatErrors.add("CGL is Empty");
-            else if (!CGL_FORMAT_REGEX.matcher(d.cgl).matches()) d.formatErrors.add("Invalid CGL: Must be 10 digits");
+            else if (!CGL_FORMAT_REGEX.matcher(d.cgl).matches()) d.formatErrors.add("Invalid CGL Format (10 digits required)");
             
-            // Amount Check
+            // 4. Amount Checks
             if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) == 0) {
-                d.formatErrors.add("Amount cannot be Zero or Empty");
+                d.formatErrors.add("Amount cannot be Zero");
             } else {
-                // Rule: Max 16 digits total, max 4 decimal places (Number(16,4))
-                if (d.amount.precision() > 16) d.formatErrors.add("Amount total digits cannot exceed 16");
-                if (d.amount.scale() > 4) d.formatErrors.add("Amount decimal places cannot exceed 4");
-                
-                // INR Specific Rule
+                // Precision (Total digits) <= 16
+                if (d.amount.precision() > 16) d.formatErrors.add("Amount too large (Max 16 digits)");
+                // Scale (Decimal places) <= 4
+                if (d.amount.scale() > 4) d.formatErrors.add("Amount allows max 4 decimal places");
+                // INR specific
                 if ("INR".equalsIgnoreCase(d.currency) && d.amount.stripTrailingZeros().scale() > 2) {
                     d.formatErrors.add("INR Amount allows max 2 decimal places");
                 }
             }
 
-            // Product Code Check
+            // 5. Product Code Check
             if (d.productCode != null && !d.productCode.isEmpty()) {
                 if (!d.productCode.equals("A") && !PRODUCT_CODE_REGEX.matcher(d.productCode).matches()) {
                     d.formatErrors.add("Product Code must be 'A' or 8 digits");
                 }
             }
 
-            // Remarks Check
+            // 6. Remarks Check
             if (d.remarks != null && d.remarks.length() > 30) {
-                d.formatErrors.add("Remarks cannot exceed 30 characters");
+                d.formatErrors.add("Remarks length must be <= 30 chars");
             }
         });
-        // Note: We are NOT returning boolean anymore, just populating errors
+        
+        // Return TRUE if ANY format errors exist -> Stops processing
+        return rows.stream().anyMatch(ExcelRowData::hasErrors);
     }
 
-    private void runDbCheck(List<ExcelRowData> rows) {
-        Set<String> branches = rows.parallelStream()
-                .filter(r -> r.branch != null && !r.branch.isEmpty())
-                .map(r -> r.branch).collect(Collectors.toSet());
-        
-        Set<String> cgls = rows.parallelStream()
-                .filter(r -> r.cgl != null && !r.cgl.isEmpty())
-                .map(r -> r.cgl).collect(Collectors.toSet());
-        
-        Set<String> currs = rows.parallelStream()
-                .filter(r -> r.currency != null && !r.currency.isEmpty())
-                .map(r -> r.currency).collect(Collectors.toSet());
+    private boolean runDbCheck(List<ExcelRowData> rows) {
+        Set<String> branches = rows.parallelStream().map(r -> r.branch).collect(Collectors.toSet());
+        Set<String> cgls = rows.parallelStream().map(r -> r.cgl).collect(Collectors.toSet());
+        Set<String> currs = rows.parallelStream().map(r -> r.currency).collect(Collectors.toSet());
 
-        // Batch fetch from DB
         Set<String> validBranches = branchRepo.findAllById(branches).stream().map(BranchMaster::getCode).collect(Collectors.toSet());
         Set<String> validCgls = cglRepo.findAllById(cgls).stream().map(CglMaster::getCglNumber).collect(Collectors.toSet());
         Set<String> validCurrs = currencyRepo.findAllById(currs).stream().map(CurrencyMaster::getCurrencyCode).collect(Collectors.toSet());
 
         rows.parallelStream().forEach(d -> {
-            // Only check DB if the field itself is not empty (Format check handles emptiness)
-            if (d.branch != null && !d.branch.isEmpty() && !validBranches.contains(d.branch)) {
-                d.dbErrors.add("Branch Not Found in DB: " + d.branch);
-            }
-            if (d.currency != null && !d.currency.isEmpty() && !validCurrs.contains(d.currency)) {
-                d.dbErrors.add("Currency Not Found in DB: " + d.currency);
-            }
-            if (d.cgl != null && !d.cgl.isEmpty() && !validCgls.contains(d.cgl)) {
-                d.dbErrors.add("CGL Not Found in DB: " + d.cgl);
-            }
+            if (!validBranches.contains(d.branch)) d.dbErrors.add("Branch Not Found: " + d.branch);
+            if (!validCurrs.contains(d.currency)) d.dbErrors.add("Currency Not Found: " + d.currency);
+            if (!validCgls.contains(d.cgl)) d.dbErrors.add("CGL Not Found: " + d.cgl);
         });
+        return rows.stream().anyMatch(ExcelRowData::hasErrors);
     }
 
-    private void runBalanceCheck(List<ExcelRowData> rows) {
+    private boolean runBalanceCheck(List<ExcelRowData> rows) {
         ConcurrentHashMap<String, LongAdder> balanceMap = new ConcurrentHashMap<>();
         rows.parallelStream().forEach(d -> {
             if (d.amount != null) {
-                // Determine if it's a Memo or Normal account for balancing logic
-                String type = (d.cgl != null && d.cgl.startsWith("5")) ? "MEMO" : "NORMAL";
+                String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
                 String key = d.branch + "_" + d.currency + "_" + type;
-                
-                // Use Long for atomic addition to avoid floating point issues during summation
                 long val = d.amount.multiply(new BigDecimal("10000")).longValue();
                 balanceMap.computeIfAbsent(key, k -> new LongAdder()).add(val);
             }
         });
-        
         rows.parallelStream().forEach(d -> {
-            String type = (d.cgl != null && d.cgl.startsWith("5")) ? "MEMO" : "NORMAL";
+            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
             String key = d.branch + "_" + d.currency + "_" + type;
             LongAdder adder = balanceMap.get(key);
-            
             if (adder != null && adder.sum() != 0) {
                 BigDecimal diff = BigDecimal.valueOf(adder.sum()).divide(new BigDecimal("10000"));
-                // Synchronized to ensure thread safety when adding to the list
-                synchronized(d.balErrors) { 
-                    if (d.balErrors.isEmpty()) { 
-                        d.balErrors.add(type + " Balance Mismatch: " + diff.toPlainString()); 
-                    } 
-                }
+                synchronized(d.balErrors) { if (d.balErrors.isEmpty()) d.balErrors.add(type + " Balance Mismatch: " + diff.toPlainString()); }
             }
         });
+        return rows.stream().anyMatch(ExcelRowData::hasErrors);
     }
 
     private void failRequest(String reqId, List<ExcelRowData> rows, String msg, int stage) throws IOException {
-        // Generates file with ALL rows, not just errors
         byte[] excel = generateErrorExcelFast(rows);
         fileCache.put(reqId + "_ERROR", excel);
         updateState(reqId, s -> {
@@ -485,7 +459,7 @@ public class JournalBulkValidationService {
 
                 if (d.hasErrors()) {
                     Cell c = r.createCell(col);
-                    c.setCellValue(d.getAllErrors()); // This now includes Format + DB + Balance errors combined
+                    c.setCellValue(d.getAllErrors());
                     c.setCellStyle(errStyle);
                 }
             }
