@@ -1,253 +1,418 @@
-Yes, we can optimize this further.
-For massive datasets ("lakhs of rows"), the previous code had a potential bottleneck: it created one massive list of arguments (batchArgs) in memory before sending it to the database. If you have 100,000 rows, that List consumes a lot of RAM and can cause database packet errors or "Out of Memory" crashes.
-Optimization Strategy: Streaming Insert (Chunking)
-Instead of waiting to build the entire list, we will:
- * Process rows in small batches (e.g., 1,000 at a time).
- * Flush to the database immediately when a batch fills up.
- * Clear memory for the next batch.
-This keeps your server's memory usage low and constant, regardless of whether you upload 1,000 or 1,000,000 rows.
-Updated JournalRequestServiceImpl.java
-package com.fincore.JournalService.Service;
+import React, { useState, useEffect, useCallback } from "react";
+import {
+  Box, Typography, Chip, Dialog, DialogActions, DialogContent, DialogContentText,
+  DialogTitle, TextField, Button, CircularProgress, IconButton, Stack,
+  Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Paper, Checkbox
+} from "@mui/material";
+import { DataGrid } from "@mui/x-data-grid";
+import {
+  Check as CheckIcon,
+  Clear as ClearIcon,
+  Visibility as VisibilityIcon,
+  AccountCircle
+} from "@mui/icons-material";
+import { alpha } from "@mui/material/styles";
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.JournalService.Dto.*;
-import com.fincore.JournalService.Exception.ResourceNotFoundException;
-import com.fincore.JournalService.Models.GlTransaction;
-import com.fincore.JournalService.Models.JournalRequest;
-import com.fincore.JournalService.Models.enums.ChangeType;
-import com.fincore.JournalService.Models.enums.RequestStatus;
-import com.fincore.JournalService.Repository.GlTransactionRepository;
-import com.fincore.JournalService.Repository.JournalRequestRepository;
-import jakarta.transaction.Transactional;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.stereotype.Service;
-import org.springframework.util.StringUtils;
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
 
-import java.math.BigDecimal;
-import java.time.LocalDate;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
-import java.util.*;
-import java.util.stream.Collectors;
+// --- INTERNAL STYLING ---
+const styles = {
+  mainContainer: {
+    padding: 3,
+    height: "100%",
+    width: "100%",
+    backgroundColor: "background.default",
+  },
+  dataGridContainer: {
+    height: 600,
+    width: "100%",
+    backgroundColor: "background.paper",
+    "& .MuiDataGrid-columnHeaders": {
+      backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.1),
+      fontWeight: "bold",
+    },
+  },
+  tableContainer: {
+    marginTop: 2,
+    borderRadius: "8px",
+    border: "1px solid",
+    borderColor: "divider",
+    overflow: "auto",
+    maxHeight: "600px",
+    boxShadow: "0px 2px 8px rgba(0,0,0,0.05)",
+  },
+  tableHeader: {
+    backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.1),
+    fontWeight: "bold",
+    position: "sticky",
+    top: 0,
+    zIndex: 10,
+    whiteSpace: "nowrap",
+  },
+  // Sticky Column Logic
+  stickyColumn: {
+    position: "sticky",
+    left: 0,
+    backgroundColor: "background.paper",
+    zIndex: 5,
+    borderRight: "2px solid rgba(224, 224, 224, 1)", 
+  },
+  stickyHeaderColumn: {
+    position: "sticky",
+    left: 0,
+    top: 0,
+    zIndex: 15,
+    backgroundColor: "#f5f5f5",
+    fontWeight: "bold",
+    borderRight: "2px solid rgba(224, 224, 224, 1)",
+    borderBottom: "1px solid rgba(224, 224, 224, 1)",
+  },
+  dialogActions: {
+    padding: 2,
+    display: "flex",
+    gap: 1,
+    justifyContent: "flex-end",
+  },
+};
 
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class JournalRequestServiceImpl implements JournalRequestService {
+const formatCurrency = (num) => Number(num).toFixed(4);
 
-    private final JournalRequestRepository journalRequestRepository;
-    private final GlTransactionRepository glTransactionRepository;
-    private final ObjectMapper objectMapper;
-    private final SequenceService sequenceService;
-    private final NotificationWriterService notificationWriterService;
-    private final PermissionConfigService permissionConfigService;
-    private final JdbcTemplate jdbcTemplate;
+export default function JournalRequestApproval() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
 
-    // --- SUPER OPTIMIZED BATCH INSERT (CHUNKING) ---
-    @Override
-    @Transactional
-    public String createBulkBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
-        long startTime = System.currentTimeMillis();
+  // --- State ---
+  const [currentUserId, setCurrentUserId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([]);
 
-        // 1. Get Batch ID (One DB Call)
-        String batchId = sequenceService.getNextBatchId();
-        
-        LocalDate postingDate = LocalDate.now();
-        String commonRemarks = (batchDto.getCommonBatchRemarks() != null && !batchDto.getCommonBatchRemarks().isEmpty())
-                ? batchDto.getCommonBatchRemarks()
-                : "Bulk Upload Batch " + batchId;
+  // Action Modal
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isApproveLoading, setIsApproveLoading] = useState(false);
+  const [isRejectLoading, setIsRejectLoading] = useState(false);
+  const [selectedBatch, setSelectedBatch] = useState(null);
+  const [modalMode, setModalMode] = useState("ACCEPTED");
+  const [executorRemarks, setExecutorRemarks] = useState("");
 
-        // 2. Group by Branch+Currency (Group = 1 Journal ID)
-        Map<String, List<BatchRequestDto.JournalRequestRow>> groupedRows = batchDto.getRows().stream()
-                .collect(Collectors.groupingBy(row -> row.getBranch() + ":" + row.getCurrency()));
+  // View Details Modal
+  const [isViewModalOpen, setIsViewModalOpen] = useState(false);
+  const [isViewLoading, setIsViewLoading] = useState(false);
+  const [batchDetails, setBatchDetails] = useState([]);
+  const [viewingBatchId, setViewingBatchId] = useState(null);
+  const [selectedJournalPrefixes, setSelectedJournalPrefixes] = useState([]);
 
-        int totalJournals = groupedRows.size();
-        log.info("Processing {} rows into {} journals for Batch {}", batchDto.getRows().size(), totalJournals, batchId);
+  useEffect(() => {
+    // Basic Auth Check from Storage
+    try {
+      const auth = sessionStorage.getItem("persist:auth") || localStorage.getItem("persist:auth");
+      if (auth) {
+        const parsed = JSON.parse(auth);
+        const user = JSON.parse(parsed.user);
+        if (user?.userId) setCurrentUserId(String(user.userId));
+      }
+    } catch (e) { }
+  }, []);
 
-        // 3. Bulk Fetch Journal Sequences (One DB Call)
-        List<String> journalPrefixes = fetchJournalSequences(totalJournals);
-        Iterator<String> prefixIterator = journalPrefixes.iterator();
-        
-        DateTimeFormatter dateFmt = DateTimeFormatter.ISO_DATE;
-        
-        String sql = "INSERT INTO JOURNAL_REQUEST " +
-                     "(REQ_ID, REQ_STATUS, CHANGE_TYPE, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD) " +
-                     "VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+  const fetchPendingBatches = useCallback(async () => {
+    setLoading(true);
+    try {
+      const pendingRequests = await callApi("/JS/journals/pending-requests", null, "GET");
 
-        // 4. CHUNKING LOGIC: Flush to DB every 1000 rows to save Memory
-        final int INSERT_BATCH_SIZE = 1000;
-        List<Object[]> batchArgs = new ArrayList<>(INSERT_BATCH_SIZE);
-        int processedCount = 0;
+      if (!Array.isArray(pendingRequests) || pendingRequests.length === 0) {
+        setRows([]);
+        return;
+      }
 
-        for (Map.Entry<String, List<BatchRequestDto.JournalRequestRow>> entry : groupedRows.entrySet()) {
-            String journalIdPrefix = prefixIterator.next();
-            int journalSequence = 1;
-
-            for (BatchRequestDto.JournalRequestRow rowDto : entry.getValue()) {
-                String journalId = String.format("%s-%03d", journalIdPrefix, journalSequence);
-                
-                // Manual JSON builder (No Jackson overhead)
-                String payload = buildJsonPayloadFast(rowDto, postingDate, batchId, journalId, commonRemarks, journalSequence, dateFmt);
-
-                batchArgs.add(new Object[]{
-                    "PENDING", rowDto.getChangeType().name(), LocalDateTime.now(), creatorId, creatorRole,
-                    batchId, journalId, commonRemarks, payload
-                });
-                
-                // FLUSH CONDITION
-                if (batchArgs.size() >= INSERT_BATCH_SIZE) {
-                    jdbcTemplate.batchUpdate(sql, batchArgs);
-                    batchArgs.clear(); // Free up memory immediately
-                }
-                
-                journalSequence++;
-                processedCount++;
-            }
+      // Group individual requests into Batches
+      const groupedBatches = new Map();
+      pendingRequests.forEach(req => {
+        const batchId = req.batchId;
+        if (!groupedBatches.has(batchId)) {
+          groupedBatches.set(batchId, {
+            id: batchId,
+            batchId: batchId,
+            creatorId: req.creatorId,
+            requestStatus: req.requestStatus,
+            requestDate: req.requestDate,
+            commonBatchRemarks: req.commonBatchRemarks,
+            totalDebit: 0,
+            totalCredit: 0,
+            requestCount: 0
+          });
         }
-
-        // 5. Final Flush (for remaining rows)
-        if (!batchArgs.isEmpty()) {
-            jdbcTemplate.batchUpdate(sql, batchArgs);
-        }
-
-        log.info("Finished inserting {} rows in {} ms", processedCount, (System.currentTimeMillis() - startTime));
-        createNotification(batchId, creatorId, processedCount);
-
-        return batchId;
-    }
-
-    // --- Helper: Fetch Multiple Sequences at once ---
-    private List<String> fetchJournalSequences(int count) {
-        if (count == 0) return Collections.emptyList();
-        // Oracle specific syntax to fetch N sequences efficiently
-        String sql = "SELECT JRNL_SEQ.nextval FROM dual CONNECT BY LEVEL <= ?";
-        List<Long> seqs = jdbcTemplate.queryForList(sql, Long.class, count);
-        return seqs.stream().map(id -> String.format("%07d", id)).collect(Collectors.toList());
-    }
-
-    // --- Helper: Fast JSON Builder (String Concatenation is faster here than Object Mapping) ---
-    private String buildJsonPayloadFast(BatchRequestDto.JournalRequestRow row, LocalDate pDate, String batchId, String jId, String rem, int count, DateTimeFormatter fmt) {
-        // Pre-allocating size reduces resizing overhead
-        StringBuilder sb = new StringBuilder(400); 
-        sb.append("{");
-        sb.append("\"changeType\":\"").append(row.getChangeType()).append("\",");
-        sb.append("\"masterJournalId\":").append(row.getMasterJournalId() == null ? "null" : row.getMasterJournalId()).append(",");
-        sb.append("\"pDate\":\"").append(pDate.format(fmt)).append("\",");
-        sb.append("\"branch\":\"").append(row.getBranch()).append("\",");
-        sb.append("\"currency\":\"").append(row.getCurrency()).append("\",");
-        sb.append("\"cgl\":\"").append(row.getCgl()).append("\",");
-        sb.append("\"amount\":").append(row.getAmount()).append(","); 
-        sb.append("\"productType\":").append(row.getProductType() == null ? "null" : "\"" + row.getProductType() + "\"").append(",");
-        sb.append("\"remarks\":").append(row.getRemarks() == null ? "null" : "\"" + escapeJson(row.getRemarks()) + "\"").append(",");
-        sb.append("\"arFlag\":\"").append(row.getArFlag() == null ? "A" : row.getArFlag()).append("\",");
-        sb.append("\"acClassification\":\"").append(row.getAcClassification() == null ? "A" : row.getAcClassification()).append("\",");
-        sb.append("\"batchId\":\"").append(batchId).append("\",");
-        sb.append("\"journalId\":\"").append(jId).append("\",");
-        sb.append("\"commonBatchRemarks\":\"").append(escapeJson(rem)).append("\",");
-        sb.append("\"transactionCount\":").append(count);
-        sb.append("}");
-        return sb.toString();
-    }
-    
-    private String escapeJson(String s) {
-        if(s == null) return "";
-        return s.replace("\"", "\\\"").replace("\\", "\\\\");
-    }
-
-    // --- STANDARD METHODS (Unchanged) ---
-    @Override
-    @Transactional
-    public List<JournalRequest> createBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException {
-        String batchId = createBulkBatchRequest(dto, creatorId, creatorRole);
-        return journalRequestRepository.findByBatchId(batchId);
-    }
-
-    @Override
-    @Transactional
-    public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) throws JsonProcessingException {
-        List<JournalRequest> requestsToProcess = StringUtils.hasText(dto.getBatchId()) 
-             ? journalRequestRepository.findByBatchIdAndRequestStatus(dto.getBatchId(), RequestStatus.PENDING)
-             : journalRequestRepository.findAll((root, query, cb) -> { return null; }); // Stub for brevity
-
-        if (requestsToProcess.isEmpty()) return Collections.emptyList();
-
-        List<GlTransaction> transactionsToSave = new ArrayList<>();
-        List<JournalRequest> processedRequests = new ArrayList<>();
-
-        for (JournalRequest request : requestsToProcess) {
-            if (executorId.equals(request.getCreatorId()) &&
-                    (executorRole != null && executorRole.equals(request.getCreatorRole()))) {
-                continue;
-            }
-
-            request.setExecutorId(executorId);
-            request.setExecutorRemarks(dto.getRemarks());
-            request.setExecutionDate(LocalDateTime.now());
-            request.setRequestStatus(dto.getStatus());
-
-            if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
-                CreateJournalRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateJournalRequestDto.class);
-                if (payloadDto.getChangeType() == ChangeType.ADD) {
-                    GlTransaction newGlTxn = new GlTransaction();
-                    newGlTxn.setBatchId(payloadDto.getBatchId());
-                    newGlTxn.setJournalId(payloadDto.getJournalId());
-                    newGlTxn.setPostDate(LocalDateTime.now());
-                    newGlTxn.setTransactionDate(payloadDto.getPDate() != null ? payloadDto.getPDate() : LocalDate.now());
-                    newGlTxn.setBranchCode(payloadDto.getBranch());
-                    newGlTxn.setCurrency(payloadDto.getCurrency());
-                    newGlTxn.setCgl(payloadDto.getCgl());
-                    newGlTxn.setNarration(payloadDto.getRemarks());
-
-                    BigDecimal amount = payloadDto.getAmount(); 
-                    
-                    // Logic to handle Positive Payload Amount -> Dr/Cr
-                    // Assuming frontend logic handles sign or we assume defaults.
-                    // Ideally, pass 'txnType' in payload, but using basic +/- logic here:
-                    if (amount.signum() < 0) {
-                        newGlTxn.setCreditAmount(amount.abs());
-                        newGlTxn.setDebitAmount(BigDecimal.ZERO);
-                    } else {
-                        newGlTxn.setDebitAmount(amount);
-                        newGlTxn.setCreditAmount(BigDecimal.ZERO);
-                    }
-                    
-                    newGlTxn.setTransactionCount(payloadDto.getTransactionCount());
-                    newGlTxn.setSourceFlag("J");
-                    transactionsToSave.add(newGlTxn);
-                }
-            }
-            processedRequests.add(request);
-        }
-
-        if (!transactionsToSave.isEmpty()) {
-            glTransactionRepository.saveAll(transactionsToSave);
-        }
-        return journalRequestRepository.saveAll(processedRequests);
-    }
-
-    // --- Stubs for interface compliance ---
-    @Override public String createBatchFromCache(String r, String c, String i, Integer role) { return null; }
-    @Override public Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto d, String i, Integer r) { return Optional.empty(); }
-    @Override public List<JournalRequest> getMyRequests(String u) { return null; }
-    @Override public List<JournalRequest> getPendingRequests(String u, Integer r) { return null; }
-    @Override public List<JournalRequest> getRequestsByBatchId(String b) { return null; }
-    @Override public List<JournalRequestStatusDto> getJournalRequestStatusList() { return null; }
-    @Override public void cancelMyRequest(Long i, String u) {}
-    @Override public void cancelMyRequestsByBatchId(String b, String u) {}
-    @Override public void cancelMyRequestsByJournalPrefixes(List<String> p, String u) {}
-    @Override public void cancelMyRequestsByJournalPrefix(String p, String u) {}
-
-    private void createNotification(String batchId, String creatorId, int size) {
+        const detail = groupedBatches.get(batchId);
+        detail.requestCount++;
         try {
-            NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
-            String message = String.format("Bulk Journal Batch %s (%d rows) by %s pending approval.", batchId, size, creatorId);
-            notificationWriterService.createNotification(null, config.getTargetRoles(), message, config.getTargetUrl(), batchId, "JournalService");
-        } catch (Exception e) {
-            log.error("Failed to create notification", e);
-        }
+          const pl = JSON.parse(req.payload);
+          const amt = parseFloat(pl.amount) || 0;
+          if (amt < 0) detail.totalCredit += Math.abs(amt);
+          else detail.totalDebit += amt;
+        } catch (e) { }
+      });
+
+      setRows(Array.from(groupedBatches.values()));
+    } catch (err) {
+      showSnackBar("Failed to load requests", "error");
+    } finally {
+      setLoading(false);
     }
+  }, [callApi, showSnackBar]);
+
+  useEffect(() => { fetchPendingBatches(); }, [fetchPendingBatches]);
+
+  // --- Handlers ---
+  const handleOpenModal = (batch, mode) => {
+    setSelectedBatch(batch);
+    setModalMode(mode);
+    setExecutorRemarks("");
+    setIsModalOpen(true);
+  };
+
+  const handleCloseModal = () => {
+    if (isApproveLoading || isRejectLoading) return;
+    setIsModalOpen(false);
+    setSelectedBatch(null);
+  };
+
+  const handleSubmitAction = async () => {
+    if (modalMode === "REJECTED" && !executorRemarks.trim()) {
+      showSnackBar("Remarks are required for rejection.", "warning");
+      return;
+    }
+
+    const setLoadingFn = modalMode === "ACCEPTED" ? setIsApproveLoading : setIsRejectLoading;
+    setLoadingFn(true);
+
+    try {
+      const payload = {
+        batchId: selectedBatch.batchId,
+        status: modalMode,
+        remarks: executorRemarks.trim() || (modalMode === "ACCEPTED" ? "Accepted" : "Rejected"),
+      };
+
+      await callApi("/JS/journals/process-bulk", payload, "POST");
+      showSnackBar(`Batch ${modalMode === "ACCEPTED" ? "Approved" : "Rejected"} Successfully`, "success", 5000);
+      handleCloseModal();
+      fetchPendingBatches();
+    } catch (e) {
+      showSnackBar("Process Failed", "error");
+    } finally {
+      setLoadingFn(false);
+    }
+  };
+
+  const handleOpenViewModal = async (batchId, creatorId) => {
+    setIsViewModalOpen(true);
+    setIsViewLoading(true);
+    setViewingBatchId(batchId);
+    setBatchDetails([]);
+    setSelectedJournalPrefixes([]);
+
+    try {
+      const data = await callApi(`/JS/journals/by-batch/${batchId}`, null, "GET");
+
+      // Group Requests by Journal Prefix (e.g., JRNL-001-01, JRNL-001-02 -> JRNL-001)
+      const groups = new Map();
+      data.filter(r => r.requestStatus === "PENDING").forEach(req => {
+        const prefix = req.journalId.split("-")[0];
+        if (!groups.has(prefix)) groups.set(prefix, []);
+        try {
+          const pl = JSON.parse(req.payload);
+          groups.get(prefix).push({
+            ...req,
+            payload: pl,
+            journalPrefix: prefix,
+            amount: Math.abs(parseFloat(pl.amount) || 0)
+          });
+        } catch (e) { }
+      });
+
+      setBatchDetails(Array.from(groups.values()));
+    } catch (e) {
+      showSnackBar("Failed to load details", "error");
+    } finally {
+      setIsViewLoading(false);
+    }
+  };
+
+  // --- Render Sticky Detail Rows ---
+  const renderDetailRows = () => {
+    return batchDetails.map((group, gIdx) => (
+      group.map((row, rIdx) => {
+        const isSelected = selectedJournalPrefixes.includes(row.journalPrefix);
+        return (
+          <TableRow key={row.id} selected={isSelected} hover>
+            
+            {/* STICKY COLUMN 1: Checkbox */}
+            {rIdx === 0 && (
+              <TableCell
+                rowSpan={group.length}
+                padding="checkbox"
+                sx={{ ...styles.stickyColumn, top: 0, zIndex: 5 }} // Lower zIndex than header
+              >
+                <Checkbox
+                  checked={isSelected}
+                  onClick={() => {
+                    const newSel = isSelected
+                      ? selectedJournalPrefixes.filter(p => p !== row.journalPrefix)
+                      : [...selectedJournalPrefixes, row.journalPrefix];
+                    setSelectedJournalPrefixes(newSel);
+                  }}
+                />
+              </TableCell>
+            )}
+
+            {/* STICKY COLUMN 2: Journal ID */}
+            {rIdx === 0 && (
+              <TableCell
+                rowSpan={group.length}
+                sx={{
+                  ...styles.stickyColumn,
+                  left: 48, // Offset for checkbox width
+                  zIndex: 5,
+                  fontWeight: 'bold'
+                }}
+              >
+                {row.journalPrefix}
+              </TableCell>
+            )}
+
+            {/* Standard Columns */}
+            <TableCell>{row.payload.branch}</TableCell>
+            <TableCell>{row.payload.currency}</TableCell>
+            <TableCell>{row.payload.cgl}</TableCell>
+            <TableCell align="right">{formatCurrency(row.amount)}</TableCell>
+            <TableCell align="center">
+               <Chip label={row.amount < 0 || row.payload.amount < 0 ? "Credit" : "Debit"} 
+                     size="small" 
+                     color={row.amount < 0 || row.payload.amount < 0 ? "error" : "success"} />
+            </TableCell>
+          </TableRow>
+        );
+      })
+    ));
+  };
+
+  const columns = [
+    { field: "batchId", headerName: "Batch ID", width: 130, disableColumnMenu: true, align: 'center', headerAlign: 'center' },
+    {
+      field: "requestStatus", headerName: "Status", width: 120, disableColumnMenu: true, align: 'center', headerAlign: 'center',
+      renderCell: (p) => <Chip label={p.value} color="warning" size="small" />
+    },
+    {
+      field: "creatorId", headerName: "Creator", width: 150, disableColumnMenu: true, align: 'center', headerAlign: 'center',
+      renderCell: (p) => <Chip icon={<AccountCircle />} label={p.value} variant="outlined" size="small" />
+    },
+    {
+      field: "requestDate", headerName: "Date", width: 180, disableColumnMenu: true, align: 'center', headerAlign: 'center',
+      valueFormatter: (p) => new Date(p.value).toLocaleString()
+    },
+    { field: "commonBatchRemarks", headerName: "Remarks", flex: 1, disableColumnMenu: true, headerAlign: 'center' },
+    {
+      field: "actions", headerName: "Actions", width: 180, disableColumnMenu: true, sortable: false, align: 'center', headerAlign: 'center',
+      renderCell: (p) => {
+        const isSelf = String(currentUserId) === String(p.row.creatorId);
+        return (
+          <Stack direction="row" spacing={1}>
+            <IconButton onClick={() => handleOpenViewModal(p.row.batchId, p.row.creatorId)} color="primary">
+              <VisibilityIcon />
+            </IconButton>
+            <IconButton onClick={() => handleOpenModal(p.row, "ACCEPTED")} color="success" disabled={isSelf}>
+              <CheckIcon />
+            </IconButton>
+            <IconButton onClick={() => handleOpenModal(p.row, "REJECTED")} color="error" disabled={isSelf}>
+              <ClearIcon />
+            </IconButton>
+          </Stack>
+        );
+      }
+    }
+  ];
+
+  return (
+    <Box sx={styles.mainContainer}>
+      <DataGrid
+        rows={rows}
+        columns={columns}
+        loading={loading}
+        getRowId={(r) => r.batchId}
+        sx={styles.dataGridContainer}
+        disableRowSelectionOnClick
+      />
+
+      {/* --- Action Dialog --- */}
+      <Dialog open={isModalOpen} onClose={handleCloseModal} fullWidth maxWidth="sm">
+        <DialogTitle>{modalMode === "ACCEPTED" ? "Approve" : "Reject"} Batch</DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ mb: 2 }}>
+            Confirm {modalMode === "ACCEPTED" ? "Approval" : "Rejection"} for Batch <strong>{selectedBatch?.batchId}</strong>?
+          </DialogContentText>
+          <TextField
+            autoFocus={modalMode === "REJECTED"}
+            label="Approver Remarks"
+            fullWidth
+            variant="outlined"
+            required={modalMode === "REJECTED"}
+            value={executorRemarks}
+            onChange={(e) => setExecutorRemarks(e.target.value)}
+          />
+        </DialogContent>
+        <DialogActions sx={styles.dialogActions}>
+          <Button onClick={handleCloseModal} disabled={isApproveLoading || isRejectLoading}>
+            Cancel
+          </Button>
+          <Button
+            onClick={handleSubmitAction}
+            variant="contained"
+            color={modalMode === "ACCEPTED" ? "success" : "error"}
+            disabled={isApproveLoading || isRejectLoading}
+            startIcon={(isApproveLoading || isRejectLoading) ? <CircularProgress size={20} color="inherit" /> : null}
+          >
+            Confirm
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* --- View Details Dialog --- */}
+      <Dialog open={isViewModalOpen} onClose={() => setIsViewModalOpen(false)} fullWidth maxWidth="lg">
+        <DialogTitle>Batch Details: {viewingBatchId}</DialogTitle>
+        <DialogContent dividers>
+          {isViewLoading ? (
+            <Box sx={{ display: 'flex', justifyContent: 'center', p: 5 }}>
+              <CircularProgress />
+            </Box>
+          ) : (
+            <TableContainer component={Paper} sx={styles.tableContainer}>
+              <Table size="small" stickyHeader>
+                <TableHead>
+                  <TableRow>
+                    {/* Header for Sticky Column 1 */}
+                    <TableCell sx={{ ...styles.stickyHeaderColumn, zIndex: 20, left: 0 }} padding="checkbox">
+                      <Checkbox disabled />
+                    </TableCell>
+                    {/* Header for Sticky Column 2 */}
+                    <TableCell sx={{ ...styles.stickyHeaderColumn, zIndex: 20, left: 48 }}>
+                      Journal ID
+                    </TableCell>
+                    <TableCell sx={styles.tableHeader}>Branch</TableCell>
+                    <TableCell sx={styles.tableHeader}>Currency</TableCell>
+                    <TableCell sx={styles.tableHeader}>CGL</TableCell>
+                    <TableCell align="right" sx={styles.tableHeader}>Amount</TableCell>
+                    <TableCell align="center" sx={styles.tableHeader}>Type</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>{renderDetailRows()}</TableBody>
+              </Table>
+            </TableContainer>
+          )}
+        </DialogContent>
+        <DialogActions sx={styles.dialogActions}>
+          <Button onClick={() => setIsViewModalOpen(false)}>Close</Button>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
 }
 
+this is autrization screen in which we are authrizaiing the request can u tell why this is not working Failed to load requests this apis use hered that apis also there in the backend code cheak that and optimize that also dont change logic what ever there 
