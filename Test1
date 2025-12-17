@@ -1,15 +1,3 @@
-Understood. You want to keep the strict sequential logic (Gatekeeper Pattern: Stage 1 fails \rightarrow Stop & Report \rightarrow Don't run DB check), but you want to ensure the Format Validation (Stage 1) specifically covers all the constraints you listed (Amount 16.4, Remarks length, ,, empty CSV checks, etc.).
-Here is the corrected code.
-Changes Summary:
- * Reverted processAsync: It now stops immediately if Format checks fail (Stage 1), so it won't hit the database if the file format is wrong.
- * Enhanced runFormatCheck:
-   * Added Amount Precision Check: Total digits \le 16, Decimal places \le 4.
-   * Added Remarks Check: Max 30 characters.
-   * Product Code: Checks for "A" or 8 digits.
- * Enhanced parseCsvBytes:
-   * Used .split(",", -1) to correctly detect empty columns like ,,.
-   * Added checks for empty strings in mandatory columns.
-Updated JournalBulkValidationService.java
 package com.fincore.JournalService.Service;
 
 import com.fincore.JournalService.Dto.BulkUploadStateDto;
@@ -121,10 +109,10 @@ public class JournalBulkValidationService {
             });
 
             // --- STAGE 1: FORMAT CHECK ---
-            // If this fails, we STOP and generate the error file immediately.
+            // Stops here if formats are invalid (e.g. invalid date, non-numeric amount)
             if (runFormatCheck(parsedRows)) {
                 failRequest(requestId, parsedRows, "Format Validation Failed", 1);
-                return; 
+                return;
             }
 
             // --- STAGE 2: DB CHECK ---
@@ -160,8 +148,7 @@ public class JournalBulkValidationService {
             int i=0;
             while((line=br.readLine())!=null) {
                 if(line.trim().isEmpty()) continue;
-                
-                // CRITICAL: Use limit -1 to detect empty trailing columns (e.g. "data,data,,")
+                // Use -1 limit to capture trailing empty columns
                 String[] c = line.split(",", -1);
 
                 if (i == 0) {
@@ -178,7 +165,7 @@ public class JournalBulkValidationService {
                 if (c.length != 14) {
                     d.formatErrors.add("Invalid CSV Format: Row has " + c.length + " columns. Expected exactly 14.");
                 } else {
-                    // CRITICAL: Check for empty tokens (,,)
+                    // Mandatory Checks for Empty Tokens
                     if(c[0].trim().isEmpty()) d.formatErrors.add("Batch ID (Col 1) is Mandatory");
                     if(c[4].trim().isEmpty()) d.formatErrors.add("Branch (Col 5) is Mandatory");
                     if(c[5].trim().isEmpty()) d.formatErrors.add("Currency (Col 6) is Mandatory");
@@ -194,6 +181,8 @@ public class JournalBulkValidationService {
                     d.cgl = c[6].trim();
                     parseAmount(d, c[7].trim(), c[8].trim());
                     d.remarks = c[9].trim();
+                    
+                    // Product Code Parsing: Defaults to "A" if empty
                     String rawProd = c[10].trim();
                     d.productCode = rawProd.isEmpty() ? "A" : rawProd;
                 }
@@ -220,6 +209,7 @@ public class JournalBulkValidationService {
             d.rowIndex = r.getRowNum();
             String col0 = parseCode(r.getCell(0), fmt);
 
+            // System Format (Starts with 01)
             if (col0.equals("01")) {
                 d.isSystemFormat = true;
                 d.sysSite=col0; d.sysDate=parseCode(r.getCell(1), fmt); d.sysYear=parseCode(r.getCell(2), fmt); d.sysPeriod=parseCode(r.getCell(3), fmt);
@@ -228,13 +218,19 @@ public class JournalBulkValidationService {
                 d.branch = parseCode(r.getCell(4), fmt); d.currency = fmt.formatCellValue(r.getCell(5)).trim().toUpperCase(); d.cgl = parseCode(r.getCell(6), fmt);
                 parseAmount(d, fmt.formatCellValue(r.getCell(7)), fmt.formatCellValue(r.getCell(8)));
                 d.remarks = fmt.formatCellValue(r.getCell(9));
+                
+                // Product Code (Col 10 in System Layout)
                 String rawProd = parseCode(r.getCell(10), fmt);
                 d.productCode = rawProd.isEmpty() ? "A" : rawProd;
+            
+            // Standard User Format
             } else {
                 d.branch = col0;
                 d.currency = fmt.formatCellValue(r.getCell(1)).trim().toUpperCase(); d.cgl = parseCode(r.getCell(2), fmt);
                 parseAmount(d, fmt.formatCellValue(r.getCell(3)), fmt.formatCellValue(r.getCell(4)));
                 d.remarks = fmt.formatCellValue(r.getCell(5));
+                
+                // Product Code (Col 6 in Standard Layout)
                 String rawProd = parseCode(r.getCell(6), fmt);
                 d.productCode = rawProd.isEmpty() ? "A" : rawProd;
             }
@@ -275,47 +271,44 @@ public class JournalBulkValidationService {
         } catch(Exception e) { d.amount = BigDecimal.ZERO; }
     }
 
-    // --- REFINED FORMAT CHECK (Stage 1) ---
+    // --- REFINED FORMAT CHECK ---
     private boolean runFormatCheck(List<ExcelRowData> rows) {
         rows.parallelStream().forEach(d -> {
-            // 1. Branch Check
+            // 1. Branch
             if (d.branch == null || d.branch.isEmpty()) d.formatErrors.add("Branch is Empty");
             
-            // 2. Currency Check
+            // 2. Currency
             if (d.currency == null || d.currency.length() != 3) d.formatErrors.add("Currency must be 3 chars (e.g. USD)");
             
-            // 3. CGL Check
+            // 3. CGL
             if (d.cgl == null || d.cgl.isEmpty()) d.formatErrors.add("CGL is Empty");
             else if (!CGL_FORMAT_REGEX.matcher(d.cgl).matches()) d.formatErrors.add("Invalid CGL Format (10 digits required)");
             
-            // 4. Amount Checks
+            // 4. Amount
             if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) == 0) {
                 d.formatErrors.add("Amount cannot be Zero");
             } else {
-                // Precision (Total digits) <= 16
                 if (d.amount.precision() > 16) d.formatErrors.add("Amount too large (Max 16 digits)");
-                // Scale (Decimal places) <= 4
                 if (d.amount.scale() > 4) d.formatErrors.add("Amount allows max 4 decimal places");
-                // INR specific
                 if ("INR".equalsIgnoreCase(d.currency) && d.amount.stripTrailingZeros().scale() > 2) {
                     d.formatErrors.add("INR Amount allows max 2 decimal places");
                 }
             }
 
-            // 5. Product Code Check
-            if (d.productCode != null && !d.productCode.isEmpty()) {
+            // 5. Product Code
+            if (d.productCode != null) {
+                // If it is NOT "A" (the default for blank) AND it does NOT match 8 digits -> Error
                 if (!d.productCode.equals("A") && !PRODUCT_CODE_REGEX.matcher(d.productCode).matches()) {
-                    d.formatErrors.add("Product Code must be 'A' or 8 digits");
+                    d.formatErrors.add("Product Code must be 8 digits or keep it blank");
                 }
             }
 
-            // 6. Remarks Check
+            // 6. Remarks
             if (d.remarks != null && d.remarks.length() > 30) {
                 d.formatErrors.add("Remarks length must be <= 30 chars");
             }
         });
         
-        // Return TRUE if ANY format errors exist -> Stops processing
         return rows.stream().anyMatch(ExcelRowData::hasErrors);
     }
 
@@ -411,7 +404,10 @@ public class JournalBulkValidationService {
             String col8 = String.format("%16s", intPart).replace(' ', '0') + "." + decPart;
             String col9 = (row.amount.compareTo(BigDecimal.ZERO) < 0) ? "Cr" : "Dr";
             String col10 = (row.remarks != null) ? row.remarks.replace(",", " ") : "";
+            
+            // Product Code defaults to A if missing (logic already handled in parsing, but safe here)
             String col11 = (row.productCode != null && !row.productCode.isEmpty()) ? row.productCode : "A";
+            
             csv.append("01,").append(cDate).append(",").append(cYear).append(",").append(cMonth).append(",")
                     .append(col5).append(",").append(col6).append(",").append(row.cgl).append(",").append(col8).append(",")
                     .append(col9).append(",").append(col10).append(",").append(col11).append(",B,C,D\n");
@@ -511,4 +507,3 @@ public class JournalBulkValidationService {
     public BulkUploadStateDto getState(String reqId) { return statusCache.get(reqId); }
     public byte[] getFileBytes(String reqId, String type) { return fileCache.get(reqId + "_" + type); }
 }
-
