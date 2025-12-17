@@ -1,43 +1,3 @@
-Here are the Full Updated Files with the optimizations and fixes included.
-1. JournalRequestRepository.java (Backend)
-Change: Added findByRequestStatusAndCreatorIdNot to filter data at the database level instead of in memory.
-package com.fincore.JournalService.Repository;
-
-import java.util.List;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.JpaSpecificationExecutor; 
-import org.springframework.stereotype.Repository;
-
-import com.fincore.JournalService.Models.JournalRequest;
-import com.fincore.JournalService.Models.enums.RequestStatus;
-
-@Repository
-public interface JournalRequestRepository extends JpaRepository<JournalRequest, Long>, JpaSpecificationExecutor<JournalRequest> { 
-    
-    List<JournalRequest> findByJournalIdAndRequestStatus(String journalId, RequestStatus status);
-    
-    List<JournalRequest> findByCreatorId(String creatorId);
-    List<JournalRequest> findByRequestStatus(RequestStatus status);
-    List<JournalRequest> findByBatchIdAndRequestStatus(String batchId, RequestStatus status);
-
-    List<JournalRequest> findByJournalIdInAndRequestStatus(List<String> journalIds, RequestStatus status);
-    
-    List<JournalRequest> findByJournalIdStartingWithAndRequestStatus(String journalIdPrefix, RequestStatus status);
-    
-    List<JournalRequest> findByBatchId(String batchId);
-
-    List<JournalRequest> findByJournalIdStartingWith(String journalIdPrefix);
-
-    List<JournalRequest> findByBatchIdAndCreatorIdAndRequestStatus(String batchId, String creatorId, RequestStatus status);
-    List<JournalRequest> findByJournalIdStartingWithAndCreatorIdAndRequestStatus(String journalIdPrefix, String creatorId, RequestStatus status);
-
-    // --- NEW OPTIMIZED QUERY ---
-    // Filters Pending requests where Creator is NOT the current user directly in DB
-    List<JournalRequest> findByRequestStatusAndCreatorIdNot(RequestStatus status, String creatorId);
-}
-
-2. JournalRequestServiceImpl.java (Backend)
-Change: Updated getPendingRequests to use the optimized repository method. Also includes the super-fast batch insert logic from previous steps.
 package com.fincore.JournalService.Service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -57,6 +17,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
+import jakarta.persistence.criteria.Predicate;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -77,7 +38,9 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     private final PermissionConfigService permissionConfigService;
     private final JdbcTemplate jdbcTemplate;
 
-    // --- SUPER OPTIMIZED BATCH INSERT (CHUNKING) ---
+    // ==================================================================================
+    // 1. OPTIMIZED BATCH CREATION (JDBC CHUNKING)
+    // ==================================================================================
     @Override
     @Transactional
     public String createBulkBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
@@ -184,7 +147,6 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         return s.replace("\"", "\\\"").replace("\\", "\\\\");
     }
 
-    // --- STANDARD SINGLE CREATION ---
     @Override
     @Transactional
     public List<JournalRequest> createBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException {
@@ -192,76 +154,18 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         return journalRequestRepository.findByBatchId(batchId);
     }
 
-    // --- OPTIMIZED PENDING REQUEST FETCH ---
+    // ==================================================================================
+    // 2. OPTIMIZED FETCHING
+    // ==================================================================================
     @Override
     public List<JournalRequest> getPendingRequests(String userId, Integer userRole) {
         if (userId == null) {
             return Collections.emptyList();
         }
-        // Using the optimized repository method to filter at DB level
+        // Filters at DB level instead of loading all rows into memory
         return journalRequestRepository.findByRequestStatusAndCreatorIdNot(RequestStatus.PENDING, userId);
     }
 
-    @Override
-    @Transactional
-    public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) throws JsonProcessingException {
-        List<JournalRequest> requestsToProcess = StringUtils.hasText(dto.getBatchId()) 
-             ? journalRequestRepository.findByBatchIdAndRequestStatus(dto.getBatchId(), RequestStatus.PENDING)
-             : journalRequestRepository.findAll((root, query, cb) -> null); // Stub for brevity
-
-        if (requestsToProcess.isEmpty()) return Collections.emptyList();
-
-        List<GlTransaction> transactionsToSave = new ArrayList<>();
-        List<JournalRequest> processedRequests = new ArrayList<>();
-
-        for (JournalRequest request : requestsToProcess) {
-            if (executorId.equals(request.getCreatorId()) &&
-                    (executorRole != null && executorRole.equals(request.getCreatorRole()))) {
-                continue;
-            }
-
-            request.setExecutorId(executorId);
-            request.setExecutorRemarks(dto.getRemarks());
-            request.setExecutionDate(LocalDateTime.now());
-            request.setRequestStatus(dto.getStatus());
-
-            if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
-                CreateJournalRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateJournalRequestDto.class);
-                if (payloadDto.getChangeType() == ChangeType.ADD) {
-                    GlTransaction newGlTxn = new GlTransaction();
-                    newGlTxn.setBatchId(payloadDto.getBatchId());
-                    newGlTxn.setJournalId(payloadDto.getJournalId());
-                    newGlTxn.setPostDate(LocalDateTime.now());
-                    newGlTxn.setTransactionDate(payloadDto.getPDate() != null ? payloadDto.getPDate() : LocalDate.now());
-                    newGlTxn.setBranchCode(payloadDto.getBranch());
-                    newGlTxn.setCurrency(payloadDto.getCurrency());
-                    newGlTxn.setCgl(payloadDto.getCgl());
-                    newGlTxn.setNarration(payloadDto.getRemarks());
-
-                    BigDecimal amount = payloadDto.getAmount(); 
-                    if (amount.signum() < 0) {
-                        newGlTxn.setCreditAmount(amount.abs());
-                        newGlTxn.setDebitAmount(BigDecimal.ZERO);
-                    } else {
-                        newGlTxn.setDebitAmount(amount);
-                        newGlTxn.setCreditAmount(BigDecimal.ZERO);
-                    }
-                    
-                    newGlTxn.setTransactionCount(payloadDto.getTransactionCount());
-                    newGlTxn.setSourceFlag("J");
-                    transactionsToSave.add(newGlTxn);
-                }
-            }
-            processedRequests.add(request);
-        }
-
-        if (!transactionsToSave.isEmpty()) {
-            glTransactionRepository.saveAll(transactionsToSave);
-        }
-        return journalRequestRepository.saveAll(processedRequests);
-    }
-
-    // --- OTHER INTERFACE METHODS ---
     @Override
     public List<JournalRequest> getMyRequests(String userId) {
         return journalRequestRepository.findByCreatorId(userId);
@@ -279,6 +183,131 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                 .collect(Collectors.toList());
     }
 
+    // ==================================================================================
+    // 3. STATUS UPDATES (APPROVE / REJECT) - FULLY IMPLEMENTED
+    // ==================================================================================
+    @Override
+    @Transactional
+    public Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto dto, String executorId, Integer executorRole) throws JsonProcessingException {
+        JournalRequest request = journalRequestRepository.findById(dto.getRequestId())
+                .orElseThrow(() -> new ResourceNotFoundException("Journal Request not found."));
+
+        if (request.getRequestStatus() != RequestStatus.PENDING) {
+            throw new IllegalStateException("Journal Request has already been processed.");
+        }
+
+        // Prevent Self-Approval
+        if (executorId.equals(request.getCreatorId())) {
+             throw new IllegalStateException("You cannot approve your own request.");
+        }
+
+        request.setExecutorId(executorId);
+        request.setExecutorRemarks(dto.getRemarks());
+        request.setExecutionDate(LocalDateTime.now());
+        request.setRequestStatus(dto.getStatus());
+
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            processApproval(request);
+        }
+        return Optional.of(journalRequestRepository.save(request));
+    }
+
+    @Override
+    @Transactional
+    public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) throws JsonProcessingException {
+        List<JournalRequest> requestsToProcess;
+        
+        if (StringUtils.hasText(dto.getBatchId())) {
+            requestsToProcess = journalRequestRepository.findByBatchIdAndRequestStatus(dto.getBatchId(), RequestStatus.PENDING);
+        } else {
+            // Filter by Prefix List if BatchID not provided
+             requestsToProcess = journalRequestRepository.findAll((root, query, cb) -> {
+                List<Predicate> predicates = new ArrayList<>();
+                if (dto.getJournalIdPrefixes() != null) {
+                    for (String prefix : dto.getJournalIdPrefixes()) {
+                        predicates.add(cb.like(root.get("journalId"), prefix + "%"));
+                    }
+                }
+                Predicate journalIdOrPredicates = cb.or(predicates.toArray(new Predicate[0]));
+                Predicate statusPredicate = cb.equal(root.get("requestStatus"), RequestStatus.PENDING);
+                return cb.and(journalIdOrPredicates, statusPredicate);
+            });
+        }
+
+        if (requestsToProcess.isEmpty()) return Collections.emptyList();
+
+        List<GlTransaction> transactionsToSave = new ArrayList<>();
+        List<JournalRequest> processedRequests = new ArrayList<>();
+
+        for (JournalRequest request : requestsToProcess) {
+            // Skip self-approval
+            if (executorId.equals(request.getCreatorId())) {
+                continue;
+            }
+
+            request.setExecutorId(executorId);
+            request.setExecutorRemarks(dto.getRemarks());
+            request.setExecutionDate(LocalDateTime.now());
+            request.setRequestStatus(dto.getStatus());
+
+            if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+                CreateJournalRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateJournalRequestDto.class);
+                if (payloadDto.getChangeType() == ChangeType.ADD) {
+                    GlTransaction newGlTxn = mapPayloadToTransaction(payloadDto);
+                    transactionsToSave.add(newGlTxn);
+                }
+            }
+            processedRequests.add(request);
+        }
+
+        if (!transactionsToSave.isEmpty()) {
+            glTransactionRepository.saveAll(transactionsToSave);
+        }
+        return journalRequestRepository.saveAll(processedRequests);
+    }
+
+    private void processApproval(JournalRequest request) throws JsonProcessingException {
+        CreateJournalRequestDto payloadDto = objectMapper.readValue(request.getPayload(), CreateJournalRequestDto.class);
+        if (payloadDto.getChangeType() == ChangeType.ADD) {
+            GlTransaction newGlTxn = mapPayloadToTransaction(payloadDto);
+            glTransactionRepository.save(newGlTxn);
+        }
+    }
+
+    private GlTransaction mapPayloadToTransaction(CreateJournalRequestDto payloadDto) {
+        GlTransaction newGlTxn = new GlTransaction();
+        newGlTxn.setBatchId(payloadDto.getBatchId());
+        newGlTxn.setJournalId(payloadDto.getJournalId());
+        newGlTxn.setPostDate(LocalDateTime.now());
+        newGlTxn.setTransactionDate(payloadDto.getPDate() != null ? payloadDto.getPDate() : LocalDate.now());
+        newGlTxn.setBranchCode(payloadDto.getBranch());
+        newGlTxn.setCurrency(payloadDto.getCurrency());
+        newGlTxn.setCgl(payloadDto.getCgl());
+        newGlTxn.setNarration(payloadDto.getRemarks());
+
+        BigDecimal amount = payloadDto.getAmount(); 
+        
+        // Handling Positive Payload Amount mapping to Dr/Cr
+        // Since we enforced Positive Amount in validation, we assume basic Dr/Cr logic here.
+        // NOTE: In a real system, you might want to pass 'drCrFlag' in Payload. 
+        // Here we assume signed amount from FrontEnd creation or defaults.
+        if (amount.signum() < 0) {
+            newGlTxn.setCreditAmount(amount.abs());
+            newGlTxn.setDebitAmount(BigDecimal.ZERO);
+        } else {
+            newGlTxn.setDebitAmount(amount);
+            newGlTxn.setCreditAmount(BigDecimal.ZERO);
+        }
+        
+        newGlTxn.setTransactionCount(payloadDto.getTransactionCount());
+        newGlTxn.setSourceFlag("J");
+        return newGlTxn;
+    }
+
+    // ==================================================================================
+    // 4. DELETION / CANCELLATION LOGIC - FULLY IMPLEMENTED
+    // ==================================================================================
+
     @Override
     @Transactional
     public void cancelMyRequest(Long requestId, String userId) {
@@ -286,10 +315,10 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                 .orElseThrow(() -> new ResourceNotFoundException("Journal Request not found."));
 
         if (!userId.equals(request.getCreatorId())) {
-            throw new IllegalStateException("Unauthorized");
+            throw new IllegalStateException("Unauthorized: You can only cancel your own requests.");
         }
         if (request.getRequestStatus() != RequestStatus.PENDING) {
-            throw new IllegalStateException("Already processed");
+            throw new IllegalStateException("Cannot cancel processed request.");
         }
         journalRequestRepository.delete(request);
     }
@@ -301,7 +330,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                 batchId, userId, RequestStatus.PENDING);
 
         if (requestsToCancel.isEmpty()) {
-            throw new ResourceNotFoundException("No pending requests found.");
+            throw new ResourceNotFoundException("No pending requests found for this batch.");
         }
         journalRequestRepository.deleteAll(requestsToCancel);
     }
@@ -311,8 +340,9 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     public void cancelMyRequestsByJournalPrefix(String journalIdPrefix, String userId) {
         List<JournalRequest> requestsToCancel = journalRequestRepository.findByJournalIdStartingWithAndCreatorIdAndRequestStatus(
                 journalIdPrefix, userId, RequestStatus.PENDING);
+
         if (requestsToCancel.isEmpty()) {
-            throw new ResourceNotFoundException("No pending requests found.");
+            throw new ResourceNotFoundException("No pending requests found for this journal.");
         }
         journalRequestRepository.deleteAll(requestsToCancel);
     }
@@ -320,20 +350,33 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     @Override
     @Transactional
     public void cancelMyRequestsByJournalPrefixes(List<String> journalIdPrefixes, String userId) {
-        // Implementation omitted for brevity, logic remains same
+         List<JournalRequest> requestsToCancel = journalRequestRepository.findAll((root, query, cb) -> {
+            List<Predicate> predicates = new ArrayList<>();
+            for (String prefix : journalIdPrefixes) {
+                predicates.add(cb.like(root.get("journalId"), prefix + "%"));
+            }
+            Predicate journalIdOrPredicates = cb.or(predicates.toArray(new Predicate[0]));
+            Predicate statusPredicate = cb.equal(root.get("requestStatus"), RequestStatus.PENDING);
+            Predicate creatorPredicate = cb.equal(root.get("creatorId"), userId);
+            return cb.and(journalIdOrPredicates, statusPredicate, creatorPredicate);
+        });
+
+        if (requestsToCancel.isEmpty()) {
+            throw new ResourceNotFoundException("No pending requests found.");
+        }
+        journalRequestRepository.deleteAll(requestsToCancel);
     }
+
+    // ==================================================================================
+    // 5. MISC HELPERS
+    // ==================================================================================
 
     @Override
     public String createBatchFromCache(String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
-         return null; 
+        // Explicitly disabled as per requirement to not use Redis/Cache logic
+        throw new UnsupportedOperationException("Redis Cache creation is disabled. Use createBulkBatchRequest instead.");
     }
     
-    @Override
-    public Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto dto, String executorId, Integer executorRole) throws JsonProcessingException {
-        // Implementation omitted for brevity
-        return Optional.empty();
-    }
-
     private void createNotification(String batchId, String creatorId, int size) {
         try {
             NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
@@ -344,433 +387,3 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         }
     }
 }
-
-3. JournalRequestApproval.js (Frontend)
-Change: Added robust error checks (e.g., checking if API returns array), loading state management, and console logging for debugging "Failed to load" errors.
-import React, { useState, useEffect, useCallback } from "react";
-import {
-  Box, Typography, Chip, Dialog, DialogActions, DialogContent, DialogContentText,
-  DialogTitle, TextField, Button, CircularProgress, IconButton, Stack,
-  Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Paper, Checkbox
-} from "@mui/material";
-import { DataGrid } from "@mui/x-data-grid";
-import {
-  Check as CheckIcon,
-  Clear as ClearIcon,
-  Visibility as VisibilityIcon,
-  AccountCircle
-} from "@mui/icons-material";
-import { alpha } from "@mui/material/styles";
-
-import useApi from "../../hooks/useApi";
-import useCustomSnackbar from "../../utils/useCustomSnackbar";
-
-// --- INTERNAL STYLING ---
-const styles = {
-  mainContainer: {
-    padding: 3,
-    height: "100%",
-    width: "100%",
-    backgroundColor: "background.default",
-  },
-  dataGridContainer: {
-    height: 600,
-    width: "100%",
-    backgroundColor: "background.paper",
-    "& .MuiDataGrid-columnHeaders": {
-      backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.1),
-      fontWeight: "bold",
-    },
-  },
-  tableContainer: {
-    marginTop: 2,
-    borderRadius: "8px",
-    border: "1px solid",
-    borderColor: "divider",
-    overflow: "auto",
-    maxHeight: "600px",
-    boxShadow: "0px 2px 8px rgba(0,0,0,0.05)",
-  },
-  tableHeader: {
-    backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.1),
-    fontWeight: "bold",
-    position: "sticky",
-    top: 0,
-    zIndex: 10,
-    whiteSpace: "nowrap",
-  },
-  stickyColumn: {
-    position: "sticky",
-    left: 0,
-    backgroundColor: "background.paper",
-    zIndex: 5,
-    borderRight: "2px solid rgba(224, 224, 224, 1)", 
-  },
-  stickyHeaderColumn: {
-    position: "sticky",
-    left: 0,
-    top: 0,
-    zIndex: 15,
-    backgroundColor: "#f5f5f5",
-    fontWeight: "bold",
-    borderRight: "2px solid rgba(224, 224, 224, 1)",
-    borderBottom: "1px solid rgba(224, 224, 224, 1)",
-  },
-  dialogActions: {
-    padding: 2,
-    display: "flex",
-    gap: 1,
-    justifyContent: "flex-end",
-  },
-};
-
-const formatCurrency = (num) => Number(num).toFixed(4);
-
-export default function JournalRequestApproval() {
-  const { callApi } = useApi();
-  const showSnackBar = useCustomSnackbar();
-
-  // --- State ---
-  const [currentUserId, setCurrentUserId] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [rows, setRows] = useState([]);
-
-  // Action Modal
-  const [isModalOpen, setIsModalOpen] = useState(false);
-  const [isApproveLoading, setIsApproveLoading] = useState(false);
-  const [isRejectLoading, setIsRejectLoading] = useState(false);
-  const [selectedBatch, setSelectedBatch] = useState(null);
-  const [modalMode, setModalMode] = useState("ACCEPTED");
-  const [executorRemarks, setExecutorRemarks] = useState("");
-
-  // View Details Modal
-  const [isViewModalOpen, setIsViewModalOpen] = useState(false);
-  const [isViewLoading, setIsViewLoading] = useState(false);
-  const [batchDetails, setBatchDetails] = useState([]);
-  const [viewingBatchId, setViewingBatchId] = useState(null);
-  const [selectedJournalPrefixes, setSelectedJournalPrefixes] = useState([]);
-
-  useEffect(() => {
-    // Basic Auth Check from Storage
-    try {
-      const auth = sessionStorage.getItem("persist:auth") || localStorage.getItem("persist:auth");
-      if (auth) {
-        const parsed = JSON.parse(auth);
-        const user = JSON.parse(parsed.user);
-        if (user?.userId) setCurrentUserId(String(user.userId));
-      }
-    } catch (e) { }
-  }, []);
-
-  const fetchPendingBatches = useCallback(async () => {
-    setLoading(true);
-    try {
-      const pendingRequests = await callApi("/JS/journals/pending-requests", null, "GET");
-
-      if (!Array.isArray(pendingRequests)) {
-        // If API returns null or undefined instead of array, handle it gracefully
-        console.warn("API returned invalid data format:", pendingRequests);
-        setRows([]);
-        setLoading(false);
-        return;
-      }
-
-      if (pendingRequests.length === 0) {
-        setRows([]);
-        setLoading(false);
-        return;
-      }
-
-      // Group individual requests into Batches
-      const groupedBatches = new Map();
-      pendingRequests.forEach(req => {
-        const batchId = req.batchId;
-        if (!groupedBatches.has(batchId)) {
-          groupedBatches.set(batchId, {
-            id: batchId,
-            batchId: batchId,
-            creatorId: req.creatorId,
-            requestStatus: req.requestStatus,
-            requestDate: req.requestDate,
-            commonBatchRemarks: req.commonBatchRemarks,
-            totalDebit: 0,
-            totalCredit: 0,
-            requestCount: 0
-          });
-        }
-        const detail = groupedBatches.get(batchId);
-        detail.requestCount++;
-        try {
-          const pl = JSON.parse(req.payload);
-          const amt = parseFloat(pl.amount) || 0;
-          if (amt < 0) detail.totalCredit += Math.abs(amt);
-          else detail.totalDebit += amt;
-        } catch (e) {
-             console.error("Error parsing payload for req:", req.id, e);
-        }
-      });
-
-      setRows(Array.from(groupedBatches.values()));
-    } catch (err) {
-      console.error("Load Requests Error:", err);
-      showSnackBar("Failed to load requests. Please retry.", "error");
-    } finally {
-      setLoading(false);
-    }
-  }, [callApi, showSnackBar]);
-
-  useEffect(() => { fetchPendingBatches(); }, [fetchPendingBatches]);
-
-  // --- Handlers ---
-  const handleOpenModal = (batch, mode) => {
-    setSelectedBatch(batch);
-    setModalMode(mode);
-    setExecutorRemarks("");
-    setIsModalOpen(true);
-  };
-
-  const handleCloseModal = () => {
-    if (isApproveLoading || isRejectLoading) return;
-    setIsModalOpen(false);
-    setSelectedBatch(null);
-  };
-
-  const handleSubmitAction = async () => {
-    if (modalMode === "REJECTED" && !executorRemarks.trim()) {
-      showSnackBar("Remarks are required for rejection.", "warning");
-      return;
-    }
-
-    const setLoadingFn = modalMode === "ACCEPTED" ? setIsApproveLoading : setIsRejectLoading;
-    setLoadingFn(true);
-
-    try {
-      const payload = {
-        batchId: selectedBatch.batchId,
-        status: modalMode,
-        remarks: executorRemarks.trim() || (modalMode === "ACCEPTED" ? "Accepted" : "Rejected"),
-      };
-
-      await callApi("/JS/journals/process-bulk", payload, "POST");
-      showSnackBar(`Batch ${modalMode === "ACCEPTED" ? "Approved" : "Rejected"} Successfully`, "success", 5000);
-      handleCloseModal();
-      fetchPendingBatches();
-    } catch (e) {
-      showSnackBar("Process Failed", "error");
-    } finally {
-      setLoadingFn(false);
-    }
-  };
-
-  const handleOpenViewModal = async (batchId, creatorId) => {
-    setIsViewModalOpen(true);
-    setIsViewLoading(true);
-    setViewingBatchId(batchId);
-    setBatchDetails([]);
-    setSelectedJournalPrefixes([]);
-
-    try {
-      const data = await callApi(`/JS/journals/by-batch/${batchId}`, null, "GET");
-
-      // Group Requests by Journal Prefix (e.g., JRNL-001-01, JRNL-001-02 -> JRNL-001)
-      const groups = new Map();
-      if(Array.isArray(data)){
-          data.filter(r => r.requestStatus === "PENDING").forEach(req => {
-            const prefix = req.journalId.split("-")[0];
-            if (!groups.has(prefix)) groups.set(prefix, []);
-            try {
-              const pl = JSON.parse(req.payload);
-              groups.get(prefix).push({
-                ...req,
-                payload: pl,
-                journalPrefix: prefix,
-                amount: Math.abs(parseFloat(pl.amount) || 0)
-              });
-            } catch (e) { }
-          });
-      }
-
-      setBatchDetails(Array.from(groups.values()));
-    } catch (e) {
-      showSnackBar("Failed to load details", "error");
-    } finally {
-      setIsViewLoading(false);
-    }
-  };
-
-  // --- Render Sticky Detail Rows ---
-  const renderDetailRows = () => {
-    return batchDetails.map((group, gIdx) => (
-      group.map((row, rIdx) => {
-        const isSelected = selectedJournalPrefixes.includes(row.journalPrefix);
-        return (
-          <TableRow key={row.id} selected={isSelected} hover>
-            
-            {/* STICKY COLUMN 1: Checkbox */}
-            {rIdx === 0 && (
-              <TableCell
-                rowSpan={group.length}
-                padding="checkbox"
-                sx={{ ...styles.stickyColumn, top: 0, zIndex: 5 }} 
-              >
-                <Checkbox
-                  checked={isSelected}
-                  onClick={() => {
-                    const newSel = isSelected
-                      ? selectedJournalPrefixes.filter(p => p !== row.journalPrefix)
-                      : [...selectedJournalPrefixes, row.journalPrefix];
-                    setSelectedJournalPrefixes(newSel);
-                  }}
-                />
-              </TableCell>
-            )}
-
-            {/* STICKY COLUMN 2: Journal ID */}
-            {rIdx === 0 && (
-              <TableCell
-                rowSpan={group.length}
-                sx={{
-                  ...styles.stickyColumn,
-                  left: 48, 
-                  zIndex: 5,
-                  fontWeight: 'bold'
-                }}
-              >
-                {row.journalPrefix}
-              </TableCell>
-            )}
-
-            <TableCell>{row.payload.branch}</TableCell>
-            <TableCell>{row.payload.currency}</TableCell>
-            <TableCell>{row.payload.cgl}</TableCell>
-            <TableCell align="right">{formatCurrency(row.amount)}</TableCell>
-            <TableCell align="center">
-               <Chip label={row.amount < 0 || row.payload.amount < 0 ? "Credit" : "Debit"} 
-                     size="small" 
-                     color={row.amount < 0 || row.payload.amount < 0 ? "error" : "success"} />
-            </TableCell>
-          </TableRow>
-        );
-      })
-    ));
-  };
-
-  const columns = [
-    { field: "batchId", headerName: "Batch ID", width: 130, disableColumnMenu: true, align: 'center', headerAlign: 'center' },
-    {
-      field: "requestStatus", headerName: "Status", width: 120, disableColumnMenu: true, align: 'center', headerAlign: 'center',
-      renderCell: (p) => <Chip label={p.value} color="warning" size="small" />
-    },
-    {
-      field: "creatorId", headerName: "Creator", width: 150, disableColumnMenu: true, align: 'center', headerAlign: 'center',
-      renderCell: (p) => <Chip icon={<AccountCircle />} label={p.value} variant="outlined" size="small" />
-    },
-    {
-      field: "requestDate", headerName: "Date", width: 180, disableColumnMenu: true, align: 'center', headerAlign: 'center',
-      valueFormatter: (p) => new Date(p.value).toLocaleString()
-    },
-    { field: "commonBatchRemarks", headerName: "Remarks", flex: 1, disableColumnMenu: true, headerAlign: 'center' },
-    {
-      field: "actions", headerName: "Actions", width: 180, disableColumnMenu: true, sortable: false, align: 'center', headerAlign: 'center',
-      renderCell: (p) => {
-        const isSelf = String(currentUserId) === String(p.row.creatorId);
-        return (
-          <Stack direction="row" spacing={1}>
-            <IconButton onClick={() => handleOpenViewModal(p.row.batchId, p.row.creatorId)} color="primary">
-              <VisibilityIcon />
-            </IconButton>
-            <IconButton onClick={() => handleOpenModal(p.row, "ACCEPTED")} color="success" disabled={isSelf}>
-              <CheckIcon />
-            </IconButton>
-            <IconButton onClick={() => handleOpenModal(p.row, "REJECTED")} color="error" disabled={isSelf}>
-              <ClearIcon />
-            </IconButton>
-          </Stack>
-        );
-      }
-    }
-  ];
-
-  return (
-    <Box sx={styles.mainContainer}>
-      <DataGrid
-        rows={rows}
-        columns={columns}
-        loading={loading}
-        getRowId={(r) => r.batchId}
-        sx={styles.dataGridContainer}
-        disableRowSelectionOnClick
-      />
-
-      {/* --- Action Dialog --- */}
-      <Dialog open={isModalOpen} onClose={handleCloseModal} fullWidth maxWidth="sm">
-        <DialogTitle>{modalMode === "ACCEPTED" ? "Approve" : "Reject"} Batch</DialogTitle>
-        <DialogContent>
-          <DialogContentText sx={{ mb: 2 }}>
-            Confirm {modalMode === "ACCEPTED" ? "Approval" : "Rejection"} for Batch <strong>{selectedBatch?.batchId}</strong>?
-          </DialogContentText>
-          <TextField
-            autoFocus={modalMode === "REJECTED"}
-            label="Approver Remarks"
-            fullWidth
-            variant="outlined"
-            required={modalMode === "REJECTED"}
-            value={executorRemarks}
-            onChange={(e) => setExecutorRemarks(e.target.value)}
-          />
-        </DialogContent>
-        <DialogActions sx={styles.dialogActions}>
-          <Button onClick={handleCloseModal} disabled={isApproveLoading || isRejectLoading}>
-            Cancel
-          </Button>
-          <Button
-            onClick={handleSubmitAction}
-            variant="contained"
-            color={modalMode === "ACCEPTED" ? "success" : "error"}
-            disabled={isApproveLoading || isRejectLoading}
-            startIcon={(isApproveLoading || isRejectLoading) ? <CircularProgress size={20} color="inherit" /> : null}
-          >
-            Confirm
-          </Button>
-        </DialogActions>
-      </Dialog>
-
-      {/* --- View Details Dialog --- */}
-      <Dialog open={isViewModalOpen} onClose={() => setIsViewModalOpen(false)} fullWidth maxWidth="lg">
-        <DialogTitle>Batch Details: {viewingBatchId}</DialogTitle>
-        <DialogContent dividers>
-          {isViewLoading ? (
-            <Box sx={{ display: 'flex', justifyContent: 'center', p: 5 }}>
-              <CircularProgress />
-            </Box>
-          ) : (
-            <TableContainer component={Paper} sx={styles.tableContainer}>
-              <Table size="small" stickyHeader>
-                <TableHead>
-                  <TableRow>
-                    <TableCell sx={{ ...styles.stickyHeaderColumn, zIndex: 20, left: 0 }} padding="checkbox">
-                      <Checkbox disabled />
-                    </TableCell>
-                    <TableCell sx={{ ...styles.stickyHeaderColumn, zIndex: 20, left: 48 }}>
-                      Journal ID
-                    </TableCell>
-                    <TableCell sx={styles.tableHeader}>Branch</TableCell>
-                    <TableCell sx={styles.tableHeader}>Currency</TableCell>
-                    <TableCell sx={styles.tableHeader}>CGL</TableCell>
-                    <TableCell align="right" sx={styles.tableHeader}>Amount</TableCell>
-                    <TableCell align="center" sx={styles.tableHeader}>Type</TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>{renderDetailRows()}</TableBody>
-              </Table>
-            </TableContainer>
-          )}
-        </DialogContent>
-        <DialogActions sx={styles.dialogActions}>
-          <Button onClick={() => setIsViewModalOpen(false)}>Close</Button>
-        </DialogActions>
-      </Dialog>
-    </Box>
-  );
-}
-
