@@ -17,6 +17,8 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
+import jakarta.persistence.criteria.Predicate;
+import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -29,36 +31,140 @@ import java.util.stream.Collectors;
 public class JournalRequestServiceImpl implements JournalRequestService {
 
     private final JournalRequestRepository journalRequestRepository;
+    private final GlTransactionRepository glTransactionRepository;
+    private final ObjectMapper objectMapper;
     private final SequenceService sequenceService;
     private final NotificationWriterService notificationWriterService;
     private final PermissionConfigService permissionConfigService;
     private final JdbcTemplate jdbcTemplate;
 
-    // --- OPTIMIZED APPROVAL / REJECTION LOGIC ---
+    // ==================================================================================
+    // 1. OPTIMIZED BATCH CREATION (JDBC CHUNKING)
+    // ==================================================================================
+    @Override
+    @Transactional
+    public String createBulkBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+        long startTime = System.currentTimeMillis();
 
+        String batchId = sequenceService.getNextBatchId();
+        LocalDate postingDate = LocalDate.now();
+        String commonRemarks = (batchDto.getCommonBatchRemarks() != null && !batchDto.getCommonBatchRemarks().isEmpty())
+                ? batchDto.getCommonBatchRemarks()
+                : "Bulk Upload Batch " + batchId;
+
+        // Group rows by Branch + Currency
+        Map<String, List<BatchRequestDto.JournalRequestRow>> groupedRows = batchDto.getRows().stream()
+                .collect(Collectors.groupingBy(row -> row.getBranch() + ":" + row.getCurrency()));
+
+        int totalJournals = groupedRows.size();
+        log.info("Processing {} rows into {} journals for Batch {}", batchDto.getRows().size(), totalJournals, batchId);
+
+        // Fetch Sequences in Bulk
+        List<String> journalPrefixes = fetchJournalSequences(totalJournals);
+        Iterator<String> prefixIterator = journalPrefixes.iterator();
+        
+        DateTimeFormatter dateFmt = DateTimeFormatter.ISO_DATE;
+        
+        String sql = "INSERT INTO JOURNAL_REQUEST " +
+                     "(REQ_ID, REQ_STATUS, CHANGE_TYPE, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD) " +
+                     "VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+        final int INSERT_BATCH_SIZE = 1000;
+        List<Object[]> batchArgs = new ArrayList<>(INSERT_BATCH_SIZE);
+        int processedCount = 0;
+
+        for (Map.Entry<String, List<BatchRequestDto.JournalRequestRow>> entry : groupedRows.entrySet()) {
+            String journalIdPrefix = prefixIterator.next();
+            int journalSequence = 1;
+
+            for (BatchRequestDto.JournalRequestRow rowDto : entry.getValue()) {
+                String journalId = String.format("%s-%03d", journalIdPrefix, journalSequence);
+                
+                // Manual JSON builder (Faster)
+                String payload = buildJsonPayloadFast(rowDto, postingDate, batchId, journalId, commonRemarks, journalSequence, dateFmt);
+
+                batchArgs.add(new Object[]{
+                    "PENDING", rowDto.getChangeType().name(), LocalDateTime.now(), creatorId, creatorRole,
+                    batchId, journalId, commonRemarks, payload
+                });
+                
+                // Flush to DB if batch is full
+                if (batchArgs.size() >= INSERT_BATCH_SIZE) {
+                    jdbcTemplate.batchUpdate(sql, batchArgs);
+                    batchArgs.clear();
+                }
+                
+                journalSequence++;
+                processedCount++;
+            }
+        }
+
+        // Final Flush
+        if (!batchArgs.isEmpty()) {
+            jdbcTemplate.batchUpdate(sql, batchArgs);
+        }
+
+        log.info("Batch Creation Complete: {} rows in {} ms", processedCount, (System.currentTimeMillis() - startTime));
+        createNotification(batchId, creatorId, processedCount);
+
+        return batchId;
+    }
+
+    private List<String> fetchJournalSequences(int count) {
+        if (count == 0) return Collections.emptyList();
+        String sql = "SELECT JRNL_SEQ.nextval FROM dual CONNECT BY LEVEL <= ?";
+        List<Long> seqs = jdbcTemplate.queryForList(sql, Long.class, count);
+        return seqs.stream().map(id -> String.format("%07d", id)).collect(Collectors.toList());
+    }
+
+    private String buildJsonPayloadFast(BatchRequestDto.JournalRequestRow row, LocalDate pDate, String batchId, String jId, String rem, int count, DateTimeFormatter fmt) {
+        StringBuilder sb = new StringBuilder(400); 
+        sb.append("{");
+        sb.append("\"changeType\":\"").append(row.getChangeType()).append("\",");
+        sb.append("\"masterJournalId\":").append(row.getMasterJournalId() == null ? "null" : row.getMasterJournalId()).append(",");
+        sb.append("\"pDate\":\"").append(pDate.format(fmt)).append("\",");
+        sb.append("\"branch\":\"").append(row.getBranch()).append("\",");
+        sb.append("\"currency\":\"").append(row.getCurrency()).append("\",");
+        sb.append("\"cgl\":\"").append(row.getCgl()).append("\",");
+        sb.append("\"amount\":").append(row.getAmount()).append(","); 
+        sb.append("\"productType\":").append(row.getProductType() == null ? "null" : "\"" + row.getProductType() + "\"").append(",");
+        sb.append("\"remarks\":").append(row.getRemarks() == null ? "null" : "\"" + escapeJson(row.getRemarks()) + "\"").append(",");
+        sb.append("\"arFlag\":\"").append(row.getArFlag() == null ? "A" : row.getArFlag()).append("\",");
+        sb.append("\"acClassification\":\"").append(row.getAcClassification() == null ? "A" : row.getAcClassification()).append("\",");
+        sb.append("\"batchId\":\"").append(batchId).append("\",");
+        sb.append("\"journalId\":\"").append(jId).append("\",");
+        sb.append("\"commonBatchRemarks\":\"").append(escapeJson(rem)).append("\",");
+        sb.append("\"transactionCount\":").append(count);
+        sb.append("}");
+        return sb.toString();
+    }
+    
+    private String escapeJson(String s) {
+        if(s == null) return "";
+        return s.replace("\"", "\\\"").replace("\\", "\\\\");
+    }
+
+    // ==================================================================================
+    // 2. OPTIMIZED APPROVAL (NATIVE SQL INSERT)
+    // ==================================================================================
     @Override
     @Transactional
     public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) {
         long startTime = System.currentTimeMillis();
         
-        // 1. Validate Input
+        // Validation
         if (!StringUtils.hasText(dto.getBatchId()) && (dto.getJournalIdPrefixes() == null || dto.getJournalIdPrefixes().isEmpty())) {
             throw new IllegalArgumentException("Either Batch ID or Journal ID list is required.");
         }
 
-        // 2. Identify Target Requests (Standard JPA is fine for selecting IDs, or use JDBC for speed)
-        // We need to ensure we don't approve our own requests.
-        // Instead of fetching entities, we execute updates directly.
-
+        // 1. Build Target Clause (Batch or List of IDs)
         String targetClause;
         List<Object> args = new ArrayList<>();
         
-        // Build WHERE clause based on input
         if (StringUtils.hasText(dto.getBatchId())) {
             targetClause = "BATCH_ID = ?";
             args.add(dto.getBatchId());
         } else {
-            // "JOURNAL_ID LIKE 'PREFIX%'" logic
             List<String> conditions = new ArrayList<>();
             for (String prefix : dto.getJournalIdPrefixes()) {
                 conditions.add("JOURNAL_ID LIKE ?");
@@ -67,13 +173,9 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             targetClause = "(" + String.join(" OR ", conditions) + ")";
         }
 
-        // 3. IF APPROVING: Perform Bulk Insert into GL_TRANSACTIONS directly from JOURNAL_REQUEST
+        // 2. IF APPROVED: Native SQL Insert (Bypasses Java Loop)
         if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
             log.info("Starting Bulk Approval Insert for executor: {}", executorId);
-            
-            // SQL Explanation:
-            // Selects JSON fields from JOURNAL_REQUEST and Inserts directly into GL_TRANSACTIONS
-            // Filters out Self-Approval (CREATOR_ID != executorId)
             
             String insertSql = """
                 INSERT INTO GL_TRANSACTIONS (
@@ -85,20 +187,23 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                     GL_TRANSACTIONS_SEQ.nextval,
                     jr.BATCH_ID,
                     jr.JOURNAL_ID,
-                    TO_DATE(JSON_VALUE(jr.PAYLOAD, '$.pDate'), 'YYYY-MM-DD'), -- Extract Date
+                    TO_DATE(JSON_VALUE(jr.PAYLOAD, '$.pDate'), 'YYYY-MM-DD'),
                     SYSTIMESTAMP,
                     JSON_VALUE(jr.PAYLOAD, '$.branch'),
                     JSON_VALUE(jr.PAYLOAD, '$.currency'),
                     JSON_VALUE(jr.PAYLOAD, '$.cgl'),
                     JSON_VALUE(jr.PAYLOAD, '$.remarks'),
-                    -- Debit Amount Logic: If Amount > 0, use it, else 0
+                    
+                    -- DEBIT: If Amount > 0, it's Debit. Else 0.
                     CASE WHEN TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.amount')) > 0 
                          THEN TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.amount')) 
                          ELSE 0 END,
-                    -- Credit Amount Logic: If Amount < 0, use ABS(Amount), else 0
+                         
+                    -- CREDIT: If Amount < 0, use exact Negative Value (as requested). Else 0.
                     CASE WHEN TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.amount')) < 0 
-                         THEN ABS(TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.amount'))) 
+                         THEN TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.amount')) 
                          ELSE 0 END,
+                         
                     TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.transactionCount')),
                     'J'
                 FROM JOURNAL_REQUEST jr
@@ -107,7 +212,6 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                   AND 
             """ + targetClause;
 
-            // Add executorId to the beginning of args list for the query
             List<Object> insertArgs = new ArrayList<>();
             insertArgs.add(executorId);
             insertArgs.addAll(args);
@@ -116,39 +220,73 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             log.info("Bulk Approval: Inserted {} rows into GL_TRANSACTIONS", rowsInserted);
         }
 
-        // 4. Update Status in JOURNAL_REQUEST (Bulk Update)
+        // 3. Update Status in JOURNAL_REQUEST (Bulk Update)
         String updateSql = "UPDATE JOURNAL_REQUEST SET REQ_STATUS = ?, EXECUTOR_ID = ?, EXECUTOR_REMARKS = ?, EXECUTION_DATE = SYSDATE " +
                            "WHERE REQ_STATUS = 'PENDING' AND CREATOR_ID != ? AND " + targetClause;
 
         List<Object> updateArgs = new ArrayList<>();
-        updateArgs.add(dto.getStatus().getCode()); // 'A' or 'R'
+        updateArgs.add(dto.getStatus().getCode());
         updateArgs.add(executorId);
         updateArgs.add(dto.getRemarks());
-        updateArgs.add(executorId); // For CREATOR_ID != ? check
-        updateArgs.addAll(args); // Add the Batch/Journal filters
+        updateArgs.add(executorId); // Security Check
+        updateArgs.addAll(args);
 
         int rowsUpdated = jdbcTemplate.update(updateSql, updateArgs.toArray());
         log.info("Bulk Status Update: Updated {} rows to {}", rowsUpdated, dto.getStatus());
-
         log.info("Total Processing Time: {} ms", (System.currentTimeMillis() - startTime));
         
-        // Return empty list to avoid fetching back 200,000 rows to Java
         return Collections.emptyList(); 
     }
 
     // ==================================================================================
-    // [KEEP] BATCH CREATION & OTHER METHODS (Unchanged from previous Optimization)
+    // 3. SINGLE REQUEST APPROVAL (Also Optimized)
+    // ==================================================================================
+    @Override
+    @Transactional
+    public Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto dto, String executorId, Integer executorRole) {
+        JournalRequest request = journalRequestRepository.findById(dto.getRequestId())
+                .orElseThrow(() -> new ResourceNotFoundException("Journal Request not found."));
+
+        if (request.getRequestStatus() != RequestStatus.PENDING) throw new IllegalStateException("Already processed.");
+        if (executorId.equals(request.getCreatorId())) throw new IllegalStateException("Self-approval not allowed.");
+
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+             // Native SQL Insert for consistency and speed
+             String insertSql = """
+                INSERT INTO GL_TRANSACTIONS (
+                    TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
+                    BRANCH_CODE, CURRENCY, CGL, NARRATION,
+                    DEBIT_AMOUNT, CREDIT_AMOUNT, TRANSACTION_COUNT, SOURCE_FLAG
+                )
+                SELECT
+                    GL_TRANSACTIONS_SEQ.nextval,
+                    BATCH_ID, JOURNAL_ID, TO_DATE(JSON_VALUE(PAYLOAD, '$.pDate'), 'YYYY-MM-DD'), SYSTIMESTAMP,
+                    JSON_VALUE(PAYLOAD, '$.branch'), JSON_VALUE(PAYLOAD, '$.currency'), JSON_VALUE(PAYLOAD, '$.cgl'), JSON_VALUE(PAYLOAD, '$.remarks'),
+                    CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) > 0 THEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) ELSE 0 END,
+                    CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) < 0 THEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) ELSE 0 END,
+                    TO_NUMBER(JSON_VALUE(PAYLOAD, '$.transactionCount')), 'J'
+                FROM JOURNAL_REQUEST WHERE REQ_ID = ?
+            """;
+            jdbcTemplate.update(insertSql, request.getId());
+        }
+
+        request.setExecutorId(executorId);
+        request.setExecutorRemarks(dto.getRemarks());
+        request.setExecutionDate(LocalDateTime.now());
+        request.setRequestStatus(dto.getStatus());
+        return Optional.of(journalRequestRepository.save(request));
+    }
+
+    // ==================================================================================
+    // 4. FETCHING & CANCELLATION (STANDARD)
     // ==================================================================================
     
     @Override
     @Transactional
-    public String createBulkBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
-        // ... (Keep existing Chunking Implementation) ...
-        // [Reference previous code block for createBulkBatchRequest logic]
-        return sequenceService.getNextBatchId(); // Stub for brevity in this snippet
+    public List<JournalRequest> createBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+        String batchId = createBulkBatchRequest(dto, creatorId, creatorRole);
+        return journalRequestRepository.findByBatchId(batchId);
     }
-    
-    // ... [Copy createBulkBatchRequest implementation from previous response here] ...
 
     @Override
     public List<JournalRequest> getPendingRequests(String userId, Integer userRole) {
@@ -172,56 +310,6 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                 .collect(Collectors.toList());
     }
 
-    // --- SINGLE APPROVAL (Also Optimized) ---
-    @Override
-    @Transactional
-    public Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto dto, String executorId, Integer executorRole) {
-        // Since we want speed, even single approval can use the bulk logic logic under hood
-        // But for single items, JPA is acceptable. For consistency, let's use the bulk logic 
-        // targeted at one specific ID to reuse the SQL optimization.
-        
-        BulkProcessJournalRequestDto bulkDto = new BulkProcessJournalRequestDto();
-        bulkDto.setStatus(dto.getStatus());
-        bulkDto.setRemarks(dto.getRemarks());
-        // We need to fetch the specific journal ID first to use the Bulk Logic filter
-        // OR just keep JPA for single item as 1 row is fast.
-        
-        // Keeping JPA for Single Item for simplicity unless you want it changed:
-        JournalRequest request = journalRequestRepository.findById(dto.getRequestId())
-                .orElseThrow(() -> new ResourceNotFoundException("Journal Request not found."));
-
-        if (request.getRequestStatus() != RequestStatus.PENDING) throw new IllegalStateException("Already processed.");
-        if (executorId.equals(request.getCreatorId())) throw new IllegalStateException("Self-approval not allowed.");
-
-        // If Approved, Insert into GL
-        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
-             // Use the same native SQL approach for single item to ensure consistency
-             String insertSql = """
-                INSERT INTO GL_TRANSACTIONS (
-                    TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
-                    BRANCH_CODE, CURRENCY, CGL, NARRATION,
-                    DEBIT_AMOUNT, CREDIT_AMOUNT, TRANSACTION_COUNT, SOURCE_FLAG
-                )
-                SELECT
-                    GL_TRANSACTIONS_SEQ.nextval,
-                    BATCH_ID, JOURNAL_ID, TO_DATE(JSON_VALUE(PAYLOAD, '$.pDate'), 'YYYY-MM-DD'), SYSTIMESTAMP,
-                    JSON_VALUE(PAYLOAD, '$.branch'), JSON_VALUE(PAYLOAD, '$.currency'), JSON_VALUE(PAYLOAD, '$.cgl'), JSON_VALUE(PAYLOAD, '$.remarks'),
-                    CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) > 0 THEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) ELSE 0 END,
-                    CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) < 0 THEN ABS(TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount'))) ELSE 0 END,
-                    TO_NUMBER(JSON_VALUE(PAYLOAD, '$.transactionCount')), 'J'
-                FROM JOURNAL_REQUEST WHERE REQ_ID = ?
-            """;
-            jdbcTemplate.update(insertSql, request.getId());
-        }
-
-        request.setExecutorId(executorId);
-        request.setExecutorRemarks(dto.getRemarks());
-        request.setExecutionDate(LocalDateTime.now());
-        request.setRequestStatus(dto.getStatus());
-        return Optional.of(journalRequestRepository.save(request));
-    }
-
-    // --- CANCELLATION METHODS ---
     @Override
     @Transactional
     public void cancelMyRequest(Long requestId, String userId) {
@@ -266,11 +354,15 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     }
 
     @Override
-    public List<JournalRequest> createBatchRequest(BatchRequestDto dto, String creatorId, Integer role) throws JsonProcessingException {
-        // Stub: Not used in optimized flow
-        return Collections.emptyList();
-    }
-
-    @Override
     public String createBatchFromCache(String r, String c, String i, Integer role) { return null; }
+    
+    private void createNotification(String batchId, String creatorId, int size) {
+        try {
+            NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
+            String message = String.format("Batch %s (%d rows) by %s pending.", batchId, size, creatorId);
+            notificationWriterService.createNotification(null, config.getTargetRoles(), message, config.getTargetUrl(), batchId, "JournalService");
+        } catch (Exception e) {
+            log.error("Notification failed", e);
+        }
+    }
 }
