@@ -1,3 +1,84 @@
+The reason your frontend is failing with "Failed to load requests" is almost certainly a Performance/Timeout issue on the Backend.
+The Problem
+Currently, your backend fetches ALL pending requests from the database into Java memory (potentially thousands of rows with heavy JSON payloads) and then loops through them to filter out the user's own requests.
+ * Result: If you have 5,000 pending rows, the server tries to load all 5,000 heavy objects into RAM. This takes too long, causing the API request to Timeout (504) or the Server to crash (Out of Memory).
+The Fix (Optimization)
+We will move the filtering logic from Java to the Database.
+Instead of fetching everything and filtering, we will tell the Database: "Give me only the Pending requests where Creator is NOT me."
+This drastically reduces the data sent from the DB to the Backend, making the API fast and stable.
+1. Backend: JournalRequestRepository.java
+Change: Added a specific query method findByRequestStatusAndCreatorIdNot to filter data at the database level.
+package com.fincore.JournalService.Repository;
+
+import java.util.List;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.JpaSpecificationExecutor; 
+import org.springframework.stereotype.Repository;
+
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Models.enums.RequestStatus;
+
+@Repository
+public interface JournalRequestRepository extends JpaRepository<JournalRequest, Long>, JpaSpecificationExecutor<JournalRequest> { 
+    
+    // Existing methods
+    List<JournalRequest> findByJournalIdAndRequestStatus(String journalId, RequestStatus status);
+    List<JournalRequest> findByCreatorId(String creatorId);
+    List<JournalRequest> findByRequestStatus(RequestStatus status);
+    List<JournalRequest> findByBatchIdAndRequestStatus(String batchId, RequestStatus status);
+    List<JournalRequest> findByJournalIdInAndRequestStatus(List<String> journalIds, RequestStatus status);
+    List<JournalRequest> findByJournalIdStartingWithAndRequestStatus(String journalIdPrefix, RequestStatus status);
+    List<JournalRequest> findByBatchId(String batchId);
+    List<JournalRequest> findByJournalIdStartingWith(String journalIdPrefix);
+    List<JournalRequest> findByBatchIdAndCreatorIdAndRequestStatus(String batchId, String creatorId, RequestStatus status);
+    List<JournalRequest> findByJournalIdStartingWithAndCreatorIdAndRequestStatus(String journalIdPrefix, String creatorId, RequestStatus status);
+
+    // --- NEW OPTIMIZED METHOD ---
+    // Fetches pending requests excluding the specific creator in one DB query
+    List<JournalRequest> findByRequestStatusAndCreatorIdNot(RequestStatus status, String creatorId);
+}
+
+2. Backend: JournalRequestServiceImpl.java
+Change: Updated getPendingRequests to use the new optimized Repository method.
+// ... [Keep Imports, no changes needed to imports] ...
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class JournalRequestServiceImpl implements JournalRequestService {
+
+    // ... [Keep all Dependencies] ...
+    private final JournalRequestRepository journalRequestRepository;
+    private final GlTransactionRepository glTransactionRepository;
+    private final ObjectMapper objectMapper;
+    private final SequenceService sequenceService;
+    private final NotificationWriterService notificationWriterService;
+    private final PermissionConfigService permissionConfigService;
+    private final JdbcTemplate jdbcTemplate;
+
+    // ... [Keep createBulkBatchRequest and other methods exactly as they are] ...
+
+    // --- OPTIMIZED FETCH METHOD ---
+    @Override
+    public List<JournalRequest> getPendingRequests(String userId, Integer userRole) {
+        // OLD SLOW WAY:
+        // List<JournalRequest> allPending = journalRequestRepository.findByRequestStatus(RequestStatus.PENDING);
+        // return allPending.stream().filter(...).collect(...);
+
+        // NEW FAST WAY:
+        // Let the Database filter out the records created by 'userId'. 
+        // This prevents loading unnecessary data into memory.
+        if (userId == null) {
+            return Collections.emptyList();
+        }
+        return journalRequestRepository.findByRequestStatusAndCreatorIdNot(RequestStatus.PENDING, userId);
+    }
+
+    // ... [Keep rest of the file exactly as it is] ...
+}
+
+3. Frontend: JournalRequestApproval.js
+Change: Added better error handling to fetchPendingBatches so you know exactly why it fails (e.g., if it returns a 500 or 401).
 import React, { useState, useEffect, useCallback } from "react";
 import {
   Box, Typography, Chip, Dialog, DialogActions, DialogContent, DialogContentText,
@@ -50,7 +131,6 @@ const styles = {
     zIndex: 10,
     whiteSpace: "nowrap",
   },
-  // Sticky Column Logic
   stickyColumn: {
     position: "sticky",
     left: 0,
@@ -119,8 +199,17 @@ export default function JournalRequestApproval() {
     try {
       const pendingRequests = await callApi("/JS/journals/pending-requests", null, "GET");
 
-      if (!Array.isArray(pendingRequests) || pendingRequests.length === 0) {
+      if (!Array.isArray(pendingRequests)) {
+        // If API returns null or undefined instead of array, handle it gracefully
+        console.warn("API returned invalid data format:", pendingRequests);
         setRows([]);
+        setLoading(false);
+        return;
+      }
+
+      if (pendingRequests.length === 0) {
+        setRows([]);
+        setLoading(false);
         return;
       }
 
@@ -148,12 +237,15 @@ export default function JournalRequestApproval() {
           const amt = parseFloat(pl.amount) || 0;
           if (amt < 0) detail.totalCredit += Math.abs(amt);
           else detail.totalDebit += amt;
-        } catch (e) { }
+        } catch (e) {
+             console.error("Error parsing payload for req:", req.id, e);
+        }
       });
 
       setRows(Array.from(groupedBatches.values()));
     } catch (err) {
-      showSnackBar("Failed to load requests", "error");
+      console.error("Load Requests Error:", err);
+      showSnackBar("Failed to load requests. Please retry.", "error");
     } finally {
       setLoading(false);
     }
@@ -214,19 +306,21 @@ export default function JournalRequestApproval() {
 
       // Group Requests by Journal Prefix (e.g., JRNL-001-01, JRNL-001-02 -> JRNL-001)
       const groups = new Map();
-      data.filter(r => r.requestStatus === "PENDING").forEach(req => {
-        const prefix = req.journalId.split("-")[0];
-        if (!groups.has(prefix)) groups.set(prefix, []);
-        try {
-          const pl = JSON.parse(req.payload);
-          groups.get(prefix).push({
-            ...req,
-            payload: pl,
-            journalPrefix: prefix,
-            amount: Math.abs(parseFloat(pl.amount) || 0)
+      if(Array.isArray(data)){
+          data.filter(r => r.requestStatus === "PENDING").forEach(req => {
+            const prefix = req.journalId.split("-")[0];
+            if (!groups.has(prefix)) groups.set(prefix, []);
+            try {
+              const pl = JSON.parse(req.payload);
+              groups.get(prefix).push({
+                ...req,
+                payload: pl,
+                journalPrefix: prefix,
+                amount: Math.abs(parseFloat(pl.amount) || 0)
+              });
+            } catch (e) { }
           });
-        } catch (e) { }
-      });
+      }
 
       setBatchDetails(Array.from(groups.values()));
     } catch (e) {
@@ -249,7 +343,7 @@ export default function JournalRequestApproval() {
               <TableCell
                 rowSpan={group.length}
                 padding="checkbox"
-                sx={{ ...styles.stickyColumn, top: 0, zIndex: 5 }} // Lower zIndex than header
+                sx={{ ...styles.stickyColumn, top: 0, zIndex: 5 }} 
               >
                 <Checkbox
                   checked={isSelected}
@@ -269,7 +363,7 @@ export default function JournalRequestApproval() {
                 rowSpan={group.length}
                 sx={{
                   ...styles.stickyColumn,
-                  left: 48, // Offset for checkbox width
+                  left: 48, 
                   zIndex: 5,
                   fontWeight: 'bold'
                 }}
@@ -278,7 +372,6 @@ export default function JournalRequestApproval() {
               </TableCell>
             )}
 
-            {/* Standard Columns */}
             <TableCell>{row.payload.branch}</TableCell>
             <TableCell>{row.payload.currency}</TableCell>
             <TableCell>{row.payload.cgl}</TableCell>
@@ -387,11 +480,9 @@ export default function JournalRequestApproval() {
               <Table size="small" stickyHeader>
                 <TableHead>
                   <TableRow>
-                    {/* Header for Sticky Column 1 */}
                     <TableCell sx={{ ...styles.stickyHeaderColumn, zIndex: 20, left: 0 }} padding="checkbox">
                       <Checkbox disabled />
                     </TableCell>
-                    {/* Header for Sticky Column 2 */}
                     <TableCell sx={{ ...styles.stickyHeaderColumn, zIndex: 20, left: 48 }}>
                       Journal ID
                     </TableCell>
@@ -415,4 +506,3 @@ export default function JournalRequestApproval() {
   );
 }
 
-this is autrization screen in which we are authrizaiing the request can u tell why this is not working Failed to load requests this apis use hered that apis also there in the backend code cheak that and optimize that also dont change logic what ever there 
