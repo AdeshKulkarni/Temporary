@@ -72,11 +72,42 @@ const JournalBulkUpload = () => {
   const [downloadMsg, setDownloadMsg] = useState("Downloading Error Report...");
 
   const [previewRows, setPreviewRows] = useState([]);
-  const [totalRows, setTotalRows] = useState(0); // This holds the REAL total (e.g. 2400)
+  const [totalRows, setTotalRows] = useState(0); 
 
   const [page, setPage] = useState(0);
   const [rowsPerPage, setRowsPerPage] = useState(50);
   const [isCreatingBatch, setIsCreatingBatch] = useState(false);
+
+  // --- HELPER: Consistent Token Retrieval for Blobs ---
+  const getAuthToken = () => {
+    try {
+      const sAuth = sessionStorage.getItem("persist:auth") || localStorage.getItem("persist:auth");
+      if (sAuth) return JSON.parse(sAuth).token.replace(/"/g, "");
+    } catch (e) { console.error("Token error", e); }
+    return "";
+  };
+
+  // --- HELPER: Safe File Download (Binary Handling) ---
+  const apiDownload = async (url, filename) => {
+    try {
+      const res = await fetch(url, {
+        method: "GET",
+        headers: { "Authorization": `Bearer ${getAuthToken()}` }
+      });
+      if (!res.ok) throw new Error("Download failed");
+      const blob = await res.blob();
+      const link = document.createElement("a");
+      link.href = window.URL.createObjectURL(blob);
+      link.setAttribute("download", filename);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      return true;
+    } catch (e) {
+      showSnackBar(e.message, "error");
+      return false;
+    }
+  };
 
   const handleDateChange = (e) => setSelectedDate(e.target.value);
 
@@ -103,21 +134,18 @@ const JournalBulkUpload = () => {
 
   const handleBack = () => { setActiveStep(0); setResultStatus(null); setValidationStage(0); setResultMsg(""); setIsProcessing(false); setAutoDlTriggered(false); setDownloadMsg("Downloading Error Report..."); };
 
-  const handleDownloadTemplate = async () => {
-    try {
-      let token = "";
-      const sAuth = sessionStorage.getItem("persist:auth") || localStorage.getItem("persist:auth");
-      if (sAuth) { try { token = JSON.parse(sAuth).token.replace(/"/g, ""); } catch (e) { } }
-      const res = await fetch("/JS/journals/download-template", { headers: { Authorization: `Bearer ${token}` } });
-      if (!res.ok) throw new Error("Template download failed");
-      const blob = await res.blob();
-      const url = window.URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url; link.setAttribute("download", "Journal_Upload_Template.xlsx");
-      document.body.appendChild(link); link.click(); link.remove();
-    } catch (e) { showSnackBar("Failed to download template", "error"); }
+  // --- DOWNLOAD ACTIONS ---
+  const handleDownloadTemplate = () => apiDownload("/JS/journals/download-template", "Journal_Upload_Template.xlsx");
+
+  const handleDownloadFile = async (type, reqId = requestId) => {
+    if(type === "ERROR") showSnackBar("Downloading Error Report...", "info");
+    const success = await apiDownload(`/JS/journals/download-bulk-file/${reqId}?type=${type}`, type === "ERROR" ? "Error_Report.xlsx" : "Success_Batch.csv");
+    if(success && type === "SUCCESS") showSnackBar("Downloaded successfully.", "success");
+    if(success && type === "ERROR") setDownloadMsg("Error Report Downloaded");
   };
 
+  // --- MAIN ACTIONS (USING useApi/callApi) ---
+  
   const handleStartValidation = async () => {
     if (!selectedDate || !file) { showSnackBar("Please select Date and File.", "warning"); return; }
     setResultStatus(null); setResultMsg(""); setValidationStage(0); setIsProcessing(true); setAutoDlTriggered(false); setDownloadMsg("Downloading Error Report...");
@@ -127,19 +155,42 @@ const JournalBulkUpload = () => {
     formData.append("postingDate", selectedDate);
 
     try {
-      let token = "";
-      const sAuth = sessionStorage.getItem("persist:auth") || localStorage.getItem("persist:auth");
-      if (sAuth) { try { token = JSON.parse(sAuth).token.replace(/"/g, ""); } catch (e) { } }
-
-      const res = await fetch("/JS/journals/bulk-validate-init", {
-        method: "POST", headers: { "Authorization": `Bearer ${token}` }, body: formData
-      });
-      if (!res.ok) throw new Error(await res.text());
-      const data = await res.json();
-      setRequestId(data.requestId);
-    } catch (err) { setIsProcessing(false); setResultStatus("ERROR"); setResultMsg("Init Failed: " + err.message); }
+      // FIX: Use callApi for consistency. 
+      // Note: Do NOT manually set 'Content-Type': 'multipart/form-data'. callApi/Browser will handle boundary.
+      const data = await callApi("/JS/journals/bulk-validate-init", formData, "POST");
+      
+      if (data && data.requestId) {
+          setRequestId(data.requestId);
+      } else {
+          throw new Error("Invalid response from server");
+      }
+    } catch (err) { 
+      setIsProcessing(false); 
+      setResultStatus("ERROR"); 
+      setResultMsg("Init Failed: " + (err.message || "Unknown Error")); 
+    }
   };
 
+  const handleCreateBatch = async () => {
+    setIsCreatingBatch(true);
+    try {
+      const payload = { requestId: requestId, commonBatchRemarks: `Bulk Upload - ${selectedDate}` };
+      const response = await callApi("/JS/journals/create-batch-from-cache", payload, "POST");
+      
+      if (response && response.status === "SUCCESS") {
+        showSnackBar(`Batch Created! ID: ${response.batchId}`, "success", 5000);
+        resetAll();
+      } else { 
+        throw new Error(response.message || "Failed"); 
+      }
+    } catch (e) { 
+      showSnackBar("Failed to create batch: " + e.message, "error");
+    } finally { 
+      setIsCreatingBatch(false); 
+    }
+  };
+
+  // --- POLLING STATUS ---
   useEffect(() => {
     let interval;
     if (isProcessing && requestId) {
@@ -165,47 +216,6 @@ const JournalBulkUpload = () => {
     }
     return () => clearInterval(interval);
   }, [isProcessing, requestId, callApi, showSnackBar, autoDlTriggered]);
-
-  const handleDownloadFile = async (type, reqId = requestId) => {
-    try {
-      if(type === "ERROR") showSnackBar("Downloading Error Report...", "info");
-      let token = "";
-      const sAuth = sessionStorage.getItem("persist:auth") || localStorage.getItem("persist:auth");
-      if (sAuth) { try { token = JSON.parse(sAuth).token.replace(/"/g, ""); } catch (e) { } }
-      const response = await fetch(`/JS/journals/download-bulk-file/${reqId}?type=${type}`, { headers: { Authorization: `Bearer ${token}` } });
-      if (!response.ok) throw new Error("Download failed");
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url; link.setAttribute("download", type === "ERROR" ? "Error_Report.xlsx" : "Success_Batch.csv");
-      document.body.appendChild(link); link.click(); link.remove();
-      if(type === "SUCCESS") showSnackBar("Downloaded successfully.", "success");
-      if(type === "ERROR") setDownloadMsg("Error Report Downloaded");
-    } catch (e) { showSnackBar("Download failed", "error"); }
-  };
-
-  const handleCreateBatch = async () => {
-    setIsCreatingBatch(true);
-    try {
-      const payload = { 
-          requestId: requestId, 
-          commonBatchRemarks: `Bulk Upload - ${selectedDate}` 
-      };
-      
-      const response = await callApi("/JS/journals/create-batch-from-cache", payload, "POST");
-      
-      if (response && response.status === "SUCCESS") {
-        showSnackBar(`Batch Created! ID: ${response.batchId}`, "success", 5000);
-        resetAll();
-      } else { 
-        throw new Error(response.message || "Failed"); 
-      }
-    } catch (e) { 
-      showSnackBar("Failed to create batch: " + e.message, "error");
-    } finally { 
-      setIsCreatingBatch(false); 
-    }
-  };
 
   const handleChangePage = (event, newPage) => setPage(newPage);
   const handleChangeRowsPerPage = (event) => { setRowsPerPage(parseInt(event.target.value, 10)); setPage(0); };
@@ -300,7 +310,7 @@ const JournalBulkUpload = () => {
                       <TableCell align="center">{row.cgl}</TableCell>
                       <TableCell align="right">{row.amount}</TableCell>
                       <TableCell align="center">
-                        <Chip label={row.txnType} color={row.txnType.includes("Credit") ? "error" : "success"} size="small" variant="filled" sx={{ fontWeight: "bold", width: "80px" }} />
+                        <Chip label={row.txnType} color={row.txnType.includes("Credit") ? "error" : "success"} size="small" variant="filled" />
                       </TableCell>
                       <TableCell align="center">{row.remarks}</TableCell>
                       <TableCell align="center">{row.productCode || "-"}</TableCell>
@@ -333,5 +343,3 @@ const JournalBulkUpload = () => {
   );
 };
 export default JournalBulkUpload;
-
-IN THIS FILE  const res = await fetch("/JS/journals/download-template", { headers: { Authorization: `Bearer ${token}` } }); why are using this fetch we need constiancy use useApi which we use every where and give mi accordinly
