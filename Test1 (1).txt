@@ -1,13 +1,216 @@
- Resolved [org.springframework.web.HttpMediaTypeNotSupportedException: Content-Type 'application/json' is not supported] backend log
+// useApi.js
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import axios from "axios";
+import { useLocation, useNavigate } from "react-router-dom";
+import useCustomSnackbar from "../utils/useCustomSnackbar";
+import { useSelector } from "react-redux";
+import { resolveConfig } from "../config/EnvironmentConfig";
+import { convertToKebabCase } from "../utils/CommonUtilities";
 
+const useApi = () => {
+  const [data, setData] = useState(null); // Store API response data
+  const [error, setError] = useState(null); // Store error info
+  const [loading, setLoading] = useState(false); // Loading state
 
-Request URL
-https://localhost:1000/JS/journals/bulk-validate-init
-Request Method
-POST
-Status Code
-415 Unsupported Media Type
-Remote Address
-[::1]:1000
-Referrer Policy
-strict-origin-when-cross-origin
+  const navigate = useNavigate();
+  const location = useLocation();
+  const snackbar = useCustomSnackbar();
+
+  const token = useSelector((state) => state.auth.token);
+  const menus = useSelector((s) => s.menus.menus);
+  const selectedMenuItem = useSelector((s) => s.menus.selectedMenuItem);
+
+  // Keep track of active requests for cancellation
+  const activeRequestsRef = useRef(new Set());
+
+  /** Refresh token handler (if required) */
+  const refreshToken = async () => {
+    try {
+      await axios.post(
+        `${resolveConfig("/LS") ?? ""}/refresh-token`,
+        {},
+        { withCredentials: true }
+      );
+    } catch (err) {
+      console.error("Token refresh failed", err);
+    }
+  };
+
+  /** Cancel all ongoing requests */
+  const cancelAllRequests = () => {
+    activeRequestsRef.current.forEach((controller) => {
+      if (controller && !controller.signal.aborted) {
+        controller.abort();
+      }
+    });
+    activeRequestsRef.current.clear();
+    setLoading(false);
+  };
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => cancelAllRequests();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** Find menu item from route (same idea as in Sidebar) */
+  const findMenuItem = useCallback((items, route) => {
+    if (!items || !items.length) return null;
+
+    for (const item of items) {
+      // Direct route match
+      if (item.route === route) return item;
+
+      // Children / nested routes
+      if (item.children && item.children.length > 0) {
+        const isSubmenuSelectionPage = route.includes("/choose-option");
+
+        if (isSubmenuSelectionPage) {
+          const prefix = "/choose-option/";
+          const startIndex = route.indexOf(prefix) + prefix.length;
+          const parameter = route.substring(startIndex);
+          if (parameter === convertToKebabCase(item.title)) {
+            return item;
+          }
+        }
+
+        const childMatch = findMenuItem(item.children, route);
+        if (childMatch) return childMatch;
+      }
+    }
+
+    return null;
+  }, []);
+
+  /** Current menu from route (for latest screen) */
+  const currentMenuFromRoute = useMemo(() => {
+    if (!menus || !menus.length) return null;
+    return findMenuItem(menus, location.pathname);
+  }, [menus, location.pathname, findMenuItem]);
+
+  /** X-Request-Type – always try to use the route-based menu first */
+  const xRequestType = useMemo(() => {
+    return (
+      currentMenuFromRoute?.requestType || selectedMenuItem?.requestType || "*"
+    );
+  }, [currentMenuFromRoute, selectedMenuItem]);
+
+  /**
+   * Generic API caller
+   * @param {string} url - API endpoint
+   * @param {object|null} payload - Request body or query params
+   * @param {string} method - HTTP method (GET, POST, PUT, PATCH, DELETE)
+   * @param {string} responseType - Axios response type
+   * @param {string} contentType - Content-Type header
+   * @param {object} extraConfig - Additional axios config
+   * @param {boolean} returnDataOnly - for returning only response data or whole response (with headers)
+   */
+  const callApi = useCallback(
+    async (
+      url,
+      payload = null,
+      method = "GET",
+      responseType = "json",
+      contentType = "application/json",
+      extraConfig = {},
+      returnDataOnly = true
+    ) => {
+      // Build final URL using service resolution
+      const parts = url.split("/");
+      const service = parts[1];
+      const resolved = resolveConfig(`/${service}`);
+      parts[1] = resolved;
+      const Final_Url = parts.slice(1).join("/");
+
+      const controller = new AbortController();
+      activeRequestsRef.current.add(controller);
+
+      setLoading(true);
+      setError(null);
+
+      try {
+        const headers = {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": contentType,
+          "X-Request-Type": xRequestType,
+        };
+
+        const config = {
+          method: method.toUpperCase(),
+          url: Final_Url,
+          headers,
+          responseType,
+          withCredentials: true,
+          signal: controller.signal,
+          ...extraConfig,
+        };
+
+        // Attach payload depending on method type
+        if (payload !== null) {
+          if (method.toUpperCase() === "GET") {
+            config.params = payload;
+          } else {
+            config.data = payload;
+          }
+        }
+
+        const response = await axios(config);
+        // console.log(response);
+
+        if (!controller.signal.aborted) {
+          if (response.data.status === 440) {
+            console.error("You have logged in another session");
+            navigate("/");
+          }
+
+          if (response?.data?.status === 401) {
+            console.error("You have to login again as the session is expired");
+            navigate("/");
+          }
+
+          setData(response.data);
+          return returnDataOnly ? response.data : response;
+        }
+      } catch (err) {
+        const status = err.response?.status;
+
+        if (status === 440) {
+          console.error("You have logged in another session");
+          navigate("/");
+        }
+
+        // if (status === 401) {
+        //   console.error("You have to login again as the session is expired");
+        //   navigate("/");
+        // }
+
+        if (!axios.isCancel(err) && !controller.signal.aborted) {
+          console.error("API call error:", err);
+
+          const apiMessage =
+            err.response?.data?.result?.message ||
+            err.response?.data?.message ||
+            err.response?.statusText ||
+            "Something went wrong";
+
+          snackbar(apiMessage, "error");
+          setError(err);
+        }
+
+        if (axios.isCancel(err)) {
+          // Let caller handle cancellation if they care
+          throw err;
+        }
+      } finally {
+        activeRequestsRef.current.delete(controller);
+        setLoading(false);
+      }
+    },
+    // Precise deps: callApi only changes when these change
+    [navigate, snackbar, token, xRequestType]
+  );
+
+  return { data, error, loading, callApi, cancelAllRequests, refreshToken };
+};
+
+export default useApi;
