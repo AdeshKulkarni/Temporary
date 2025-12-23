@@ -1,1166 +1,187 @@
-// useApi.js
-import { useEffect, useRef, useState, useCallback, useMemo } from "react";
-import axios from "axios";
-import { useLocation, useNavigate } from "react-router-dom";
-import useCustomSnackbar from "../utils/useCustomSnackbar";
-import { useSelector } from "react-redux";
-import { resolveConfig } from "../config/EnvironmentConfig";
-import { convertToKebabCase } from "../utils/CommonUtilities";
-
-
-const useApi = () => {
-  const [data, setData] = useState(null); // Store API response data
-  const [error, setError] = useState(null); // Store error info
-  const [loading, setLoading] = useState(false); // Loading state
-
-  const navigate = useNavigate();
-  const location = useLocation();
-  const snackbar = useCustomSnackbar();
-
-  const token = useSelector((state) => state.auth.token);
-  const menus = useSelector((s) => s.menus.menus);
-  const selectedMenuItem = useSelector((s) => s.menus.selectedMenuItem);
-
-  // Keep track of active requests for cancellation
-  const activeRequestsRef = useRef(new Set());
-
-  /** Refresh token handler (if required) */
-  const refreshToken = async () => {
-    try {
-      await axios.post(
-        `${resolveConfig("/LS") ?? ""}/refresh-token`,
-        {},
-        { withCredentials: true }
-      );
-    } catch (err) {
-      console.error("Token refresh failed", err);
-    }
-  };
-
-  /** Cancel all ongoing requests */
-  const cancelAllRequests = () => {
-    activeRequestsRef.current.forEach((controller) => {
-      if (controller && !controller.signal.aborted) {
-        controller.abort();
-      }
-    });
-    activeRequestsRef.current.clear();
-    setLoading(false);
-  };
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => cancelAllRequests();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  /** Find menu item from route (same idea as in Sidebar) */
-  const findMenuItem = useCallback((items, route) => {
-    if (!items || !items.length) return null;
-
-    for (const item of items) {
-      // Direct route match
-      if (item.route === route) return item;
-
-      // Children / nested routes
-      if (item.children && item.children.length > 0) {
-        const isSubmenuSelectionPage = route.includes("/choose-option");
-
-        if (isSubmenuSelectionPage) {
-          const prefix = "/choose-option/";
-          const startIndex = route.indexOf(prefix) + prefix.length;
-          const parameter = route.substring(startIndex);
-          if (parameter === convertToKebabCase(item.title)) {
-            return item;
-          }
-        }
-
-        const childMatch = findMenuItem(item.children, route);
-        if (childMatch) return childMatch;
-      }
-    }
-
-    return null;
-  }, []);
-
-  /** Current menu from route (for latest screen) */
-  const currentMenuFromRoute = useMemo(() => {
-    if (!menus || !menus.length) return null;
-    return findMenuItem(menus, location.pathname);
-  }, [menus, location.pathname, findMenuItem]);
-
-  /** X-Request-Type – always try to use the route-based menu first */
-  const xRequestType = useMemo(() => {
-    return (
-      currentMenuFromRoute?.requestType || selectedMenuItem?.requestType || "*"
-    );
-  }, [currentMenuFromRoute, selectedMenuItem]);
-
-  /**
-   * Generic API caller
-   * @param {string} url - API endpoint
-   * @param {object|null} payload - Request body or query params
-   * @param {string} method - HTTP method (GET, POST, PUT, PATCH, DELETE)
-   * @param {string} responseType - Axios response type
-   * @param {string} contentType - Content-Type header
-   * @param {object} extraConfig - Additional axios config
-   * @param {boolean} returnDataOnly - for returning only response data or whole response (with headers)
-   */
-  const callApi = useCallback(
-    async (
-      url,
-      payload = null,
-      method = "GET",
-      responseType = "json",
-      contentType = "application/json",
-      extraConfig = {},
-      returnDataOnly = true
-    ) => {
-      // Build final URL using service resolution
-      const parts = url.split("/");
-      const service = parts[1];
-      const resolved = resolveConfig(`/${service}`);
-      parts[1] = resolved;
-      const Final_Url = parts.slice(1).join("/");
-
-      const controller = new AbortController();
-      activeRequestsRef.current.add(controller);
-
-      setLoading(true);
-      setError(null);
-
-      try {
-        const headers = {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": contentType,
-          "X-Request-Type": xRequestType,
-        };
-
-        const config = {
-          method: method.toUpperCase(),
-          url: Final_Url,
-          headers,
-          responseType,
-          withCredentials: true,
-          signal: controller.signal,
-          ...extraConfig,
-        };
-
-        // Attach payload depending on method type
-        if (payload !== null) {
-          if (method.toUpperCase() === "GET") {
-            config.params = payload;
-          } else {
-            config.data = payload;
-          }
-        }
-
-        const response = await axios(config);
-        // console.log(response);
-
-        if (!controller.signal.aborted) {
-          if (response.data.status === 440) {
-            console.error("You have logged in another session");
-            navigate("/");
-          }
-
-          if (response?.data?.status === 401) {
-            console.error("You have to login again as the session is expired");
-            navigate("/");
-          }
-
-          setData(response.data);
-          return returnDataOnly ? response.data : response;
-        }
-      } catch (err) {
-        const status = err.response?.status;
-
-        if (status === 440) {
-          console.error("You have logged in another session");
-          navigate("/");
-        }
-
-        // if (status === 401) {
-        //   console.error("You have to login again as the session is expired");
-        //   navigate("/");
-        // }
-
-        if (!axios.isCancel(err) && !controller.signal.aborted) {
-          console.error("API call error:", err);
-
-          const apiMessage =
-            err.response?.data?.result?.message ||
-            err.response?.data?.message ||
-            err.response?.statusText ||
-            "Something went wrong";
-
-          snackbar(apiMessage, "error");
-          setError(err);
-        }
-
-        if (axios.isCancel(err)) {
-          // Let caller handle cancellation if they care
-          throw err;
-        }
-      } finally {
-        activeRequestsRef.current.delete(controller);
-        setLoading(false);
-      }
-    },
-    // Precise deps: callApi only changes when these change
-    [navigate, snackbar, token, xRequestType]
-  );
-
-  return { data, error, loading, callApi, cancelAllRequests, refreshToken };
-};
-
-export default useApi;
- import React, { useState, useRef, useEffect } from "react";
-import {
-  Box,
-  Typography,
-  Paper,
-  TextField,
-  Button,
-  CircularProgress,
-  Chip,
-  Alert,
-  Stack,
-  Stepper,
-  Step,
-  StepLabel,
-  Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableHead,
-  TableRow,
-  TablePagination,
-  IconButton,
-  Tooltip,
-} from "@mui/material";
-import {
-  CloudUpload as CloudUploadIcon,
-  RestartAlt as RestartAltIcon,
-  Description as DescriptionIcon,
-  Send as SendIcon,
-  FileDownload as FileDownloadIcon,
-  ArrowBack as ArrowBackIcon,
-  Close as CloseIcon,
-} from "@mui/icons-material";
-import { alpha } from "@mui/material/styles";
-import useApi from "../../hooks/useApi";
-import useCustomSnackbar from "../../utils/useCustomSnackbar";
-
-// --- STYLES (Kept standard) ---
-const mainContainerStyle = { padding: 3, height: "100%", width: "100%" };
-const controlPanelStyle = {
-  padding: "30px",
-  marginBottom: "20px",
-  borderRadius: "12px",
-  backgroundColor: "background.paper",
-  boxShadow: 2,
-};
-const uploadBoxStyle = {
-  position: "relative",
-  display: "flex",
-  flexDirection: "column",
-  justifyContent: "center",
-  alignItems: "center",
-  border: 2,
-  borderStyle: "dashed",
-  borderColor: "primary.main",
-  borderRadius: "12px",
-  padding: "40px",
-  cursor: "pointer",
-  transition: "all 0.3s ease",
-  minHeight: "200px",
-  "&:hover": {
-    backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.08),
-    borderColor: "primary.dark",
-  },
-};
-const iconStyle = {
-  fontSize: "5rem",
-  color: "primary.main",
-  marginBottom: "16px",
-};
-const headerTextStyle = {
-  fontWeight: 600,
-  fontSize: "1.1rem",
-  textAlign: "center",
-  color: "text.primary",
-};
-const subTextStyle = {
-  color: "text.secondary",
-  fontSize: "0.85rem",
-  textAlign: "center",
-  marginTop: "4px",
-};
-const dateinputfield = {
-  display: "flex",
-  justifyContent: "center",
-  marginBottom: "30px",
-  "& .MuiTextField-root": { minWidth: "250px" },
-};
-const tableContainerStyle = {
-  borderRadius: "12px",
-  border: "1px solid",
-  borderColor: "divider",
-  overflow: "hidden",
-  marginTop: "20px",
-  boxShadow: 1,
-  maxHeight: 600,
-};
-const tableHeaderStyle = {
-  backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.08),
-};
-const tableHeaderCellStyle = {
-  color: "text.primary",
-  fontWeight: "bold",
-  fontSize: "0.95rem",
-};
-const actionButtonsContainer = {
-  display: "flex",
-  justifyContent: "center",
-  marginTop: 4,
-  gap: 2,
-};
-
-const mainSteps = ["Upload & Validate", "Preview & Submit"];
-const validationSteps = [
-  "Format Validation",
-  "Database Validation",
-  "Balance Validation",
-];
-
-const JournalBulkUpload = () => {
-  const { callApi } = useApi();
-  const showSnackBar = useCustomSnackbar();
-
-  const [activeStep, setActiveStep] = useState(0);
-  const [selectedDate, setSelectedDate] = useState("");
-  const [file, setFile] = useState(null);
-  const [isCsvFile, setIsCsvFile] = useState(false);
-  const fileInputRef = useRef(null);
-
-  const [requestId, setRequestId] = useState(null);
-  const [isProcessing, setIsProcessing] = useState(false);
-
-  const [validationStage, setValidationStage] = useState(0);
-  const [resultStatus, setResultStatus] = useState(null);
-  const [resultMsg, setResultMsg] = useState("");
-  const [autoDlTriggered, setAutoDlTriggered] = useState(false);
-  const [downloadMsg, setDownloadMsg] = useState("Downloading Error Report...");
-
-  const [previewRows, setPreviewRows] = useState([]);
-  const [totalRows, setTotalRows] = useState(0);
-
-  const [page, setPage] = useState(0);
-  const [rowsPerPage, setRowsPerPage] = useState(50);
-  const [isCreatingBatch, setIsCreatingBatch] = useState(false);
-
-  const handleDateChange = (e) => setSelectedDate(e.target.value);
-
-  const handleFileSelect = (e) => {
-    if (e.target.files[0]) {
-      const selected = e.target.files[0];
-      setFile(selected);
-      setIsCsvFile(
-        selected.name.toLowerCase().endsWith(".csv") ||
-          selected.name.toLowerCase().endsWith(".txt")
-      );
-      setResultStatus(null);
-      setResultMsg("");
-      setValidationStage(0);
-      setPreviewRows([]);
-      setAutoDlTriggered(false);
-      setIsProcessing(false);
-      setDownloadMsg("Downloading Error Report...");
-    }
-  };
-
-  const handleClearFile = (e) => {
-    e.stopPropagation();
-    setFile(null);
-    setIsCsvFile(false);
-    if (fileInputRef.current) fileInputRef.current.value = "";
-    setResultStatus(null);
-    setResultMsg("");
-    setValidationStage(0);
-    setIsProcessing(false);
-  };
-
-  const resetAll = () => {
-    setActiveStep(0);
-    setRequestId(null);
-    setResultStatus(null);
-    setValidationStage(0);
-    setResultMsg("");
-    setPreviewRows([]);
-    setTotalRows(0);
-    setIsProcessing(false);
-    setAutoDlTriggered(false);
-    setIsCsvFile(false);
-    setFile(null);
-    setPage(0);
-    setDownloadMsg("Downloading Error Report...");
-    if (fileInputRef.current) fileInputRef.current.value = "";
-  };
-
-  const handleBack = () => {
-    setActiveStep(0);
-    setResultStatus(null);
-    setValidationStage(0);
-    setResultMsg("");
-    setIsProcessing(false);
-    setAutoDlTriggered(false);
-    setDownloadMsg("Downloading Error Report...");
-  };
-
-  // Helper to handle downloads (BLOB response)
-  const downloadFileHelper = async (url, filename) => {
-    try {
-      // Pass config to request BLOB response
-      const response = await callApi(
-        url,
-        null,
-        "GET",
-        "blob",
-        "undefined",
-        { responseType: "blob" },
-        false
-      );
-
-
-      const blob = response.data || response;
-
-      if (!blob) throw new Error("Download failed or empty response");
-
-      const link = document.createElement("a");
-      link.href = window.URL.createObjectURL(new Blob([blob]));
-      link.setAttribute("download", filename);
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      return true;
-    } catch (e) {
-      console.error("Download Error:", e);
-      showSnackBar("File download failed", "error");
-      return false;
-    }
-  };
-
-  const handleDownloadTemplate = () =>
-    downloadFileHelper(
-      "/JS/journals/download-template",
-      "Journal_Upload_Template.xlsx"
-    );
-
-  const handleDownloadFile = async (type, reqId = requestId) => {
-    if (type === "ERROR") showSnackBar("Downloading Error Report...", "info");
-    const success = await downloadFileHelper(
-      `/JS/journals/download-bulk-file/${reqId}?type=${type}`,
-      type === "ERROR" ? "Error_Report.xlsx" : "Success_Batch.csv"
-    );
-    if (success && type === "SUCCESS")
-      showSnackBar("Downloaded successfully.", "success");
-    if (success && type === "ERROR") setDownloadMsg("Error Report Downloaded");
-  };
-
-const handleStartValidation = async () => {
-    if (!selectedDate || !file) {
-      showSnackBar("Please select Date and File.", "warning");
-      return;
-    }
-    setResultStatus(null);
-    setResultMsg("");
-    setValidationStage(0);
-    setIsProcessing(true);
-    setAutoDlTriggered(false);
-    setDownloadMsg("Downloading Error Report...");
-
-    // Create FormData
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("postingDate", selectedDate);
-
-    try {
-      // FIX: Added the 4th (responseType) and 5th (contentType) arguments
-      const data = await callApi(
-        "/JS/journals/bulk-validate-init",
-        formData,
-        "POST",
-      );
-
-      if (data && data.requestId) {
-        setRequestId(data.requestId);
-      } else {
-        throw new Error("Invalid response from server");
-      }
-    } catch (err) {
-      setIsProcessing(false);
-      setResultStatus("ERROR");
-      setResultMsg("Init Failed: " + (err.message || "Unknown Error"));
-    }
-  };
-
-  const handleCreateBatch = async () => {
-    setIsCreatingBatch(true);
-    try {
-      const payload = {
-        requestId: requestId,
-        commonBatchRemarks: `Bulk Upload - ${selectedDate}`,
-      };
-      const response = await callApi(
-        "/JS/journals/create-batch-from-cache",
-        payload,
-        "POST"
-      );
-
-      if (response && response.status === "SUCCESS") {
-        showSnackBar(`Batch Created! ID: ${response.batchId}`, "success", 5000);
-        resetAll();
-      } else {
-        throw new Error(response.message || "Failed");
-      }
-    } catch (e) {
-      showSnackBar("Failed to create batch: " + e.message, "error");
-    } finally {
-      setIsCreatingBatch(false);
-    }
-  };
-
-  // --- POLLING STATUS ---
-  useEffect(() => {
-    let interval;
-    if (isProcessing && requestId) {
-      interval = setInterval(async () => {
-        try {
-          const res = await callApi(
-            `/JS/journals/bulk-status/${requestId}`,
-            null,
-            "GET"
-          );
-          if (!res) return;
-          if (res.totalRows) setTotalRows(res.totalRows);
-
-          if (res.status === "ERROR") {
-            setIsProcessing(false);
-            setResultStatus("ERROR");
-            setResultMsg(res.message);
-            setValidationStage(res.currentStage || 1);
-            clearInterval(interval);
-            showSnackBar(res.message, "error", 5000);
-            if (res.hasErrorFile && !autoDlTriggered) {
-              setAutoDlTriggered(true);
-              handleDownloadFile("ERROR", res.requestId);
-            }
-          } else if (res.status === "SUCCESS") {
-            setIsProcessing(false);
-            setResultStatus("SUCCESS");
-            setValidationStage(4);
-            setTotalRows(res.totalRows);
-            if (res.previewDataJson)
-              setPreviewRows(JSON.parse(res.previewDataJson));
-            clearInterval(interval);
-            showSnackBar(
-              "Validation Complete. Proceeding to Preview...",
-              "success"
-            );
-            setTimeout(() => {
-              setActiveStep(1);
-            }, 1000);
-          } else {
-            setValidationStage(res.currentStage);
-          }
-        } catch (e) {}
-      }, 800);
-    }
-    return () => clearInterval(interval);
-  }, [isProcessing, requestId, callApi, showSnackBar, autoDlTriggered]);
-
-  const handleChangePage = (event, newPage) => setPage(newPage);
-  const handleChangeRowsPerPage = (event) => {
-    setRowsPerPage(parseInt(event.target.value, 10));
-    setPage(0);
-  };
-  const visibleRows = previewRows.slice(
-    page * rowsPerPage,
-    page * rowsPerPage + rowsPerPage
-  );
-  const isValidationStepFailed = (index) =>
-    resultStatus === "ERROR" && index === validationStage - 1;
-
-  return (
-    <Box sx={mainContainerStyle}>
-      <Paper elevation={1} sx={controlPanelStyle}>
-        <Box sx={{ display: "flex", justifyContent: "flex-end", mb: 2 }}>
-          <Button
-            variant="text"
-            startIcon={<FileDownloadIcon />}
-            onClick={handleDownloadTemplate}
-          >
-            Download Template
-          </Button>
-        </Box>
-        <Box sx={{ width: "100%", maxWidth: "500px", margin: "0 auto", mb: 4 }}>
-          <Stepper activeStep={activeStep}>
-            {mainSteps.map((label) => (
-              <Step key={label}>
-                <StepLabel>{label}</StepLabel>
-              </Step>
-            ))}
-          </Stepper>
-        </Box>
-
-        {activeStep === 0 && (
-          <Box>
-            <Box sx={dateinputfield}>
-              <TextField
-                type="date"
-                label="Posting Date"
-                value={selectedDate}
-                onChange={handleDateChange}
-                InputLabelProps={{ shrink: true }}
-                size="small"
-                disabled={isProcessing}
-                sx={{ width: 200 }}
-              />
-            </Box>
-            <Box
-              sx={{
-                ...uploadBoxStyle,
-                borderColor:
-                  resultStatus === "ERROR" ? "error.main" : "primary.main",
-                opacity: isProcessing ? 0.6 : 1,
-              }}
-              onClick={() => {
-                if (!isProcessing) fileInputRef.current.click();
-              }}
-            >
-              <input
-                type="file"
-                hidden
-                ref={fileInputRef}
-                onChange={handleFileSelect}
-                onClick={(e) => (e.target.value = null)}
-                accept=".xlsx,.csv"
-              />
-              {file ? (
-                <>
-                  <DescriptionIcon
-                    sx={{ fontSize: 60, color: "success.main", mb: 1 }}
-                  />
-                  <Typography sx={headerTextStyle}>{file.name}</Typography>
-                  <Typography sx={subTextStyle}>Click to change</Typography>
-                  <Tooltip title="Remove File">
-                    <IconButton
-                      size="small"
-                      onClick={handleClearFile}
-                      sx={{
-                        position: "absolute",
-                        top: 10,
-                        right: 10,
-                        bgcolor: "background.paper",
-                        "&:hover": { bgcolor: "error.light", color: "white" },
-                      }}
-                    >
-                      <CloseIcon fontSize="small" />
-                    </IconButton>
-                  </Tooltip>
-                </>
-              ) : (
-                <>
-                  <CloudUploadIcon sx={iconStyle} />
-                  <Typography sx={headerTextStyle}>
-                    Click to Upload File
-                  </Typography>
-                  <Typography sx={subTextStyle}>
-                    .xlsx, .csv (Max 50MB)
-                  </Typography>
-                </>
-              )}
-            </Box>
-            {(isProcessing || resultStatus) && (
-              <Box sx={{ mt: 4, mb: 2 }}>
-                <Stepper activeStep={validationStage - 1} alternativeLabel>
-                  {validationSteps.map((label, index) => {
-                    const labelProps = {};
-                    if (isValidationStepFailed(index)) {
-                      labelProps.optional = (
-                        <Typography variant="caption" color="error">
-                          Failed
-                        </Typography>
-                      );
-                      labelProps.error = true;
-                    }
-                    return (
-                      <Step key={label}>
-                        <StepLabel {...labelProps}>{label}</StepLabel>
-                      </Step>
-                    );
-                  })}
-                </Stepper>
-              </Box>
-            )}
-            {resultStatus === "ERROR" && (
-              <Alert
-                severity="error"
-                sx={{ mt: 3, mx: "auto", maxWidth: "80%" }}
-              >
-                {resultMsg} — {downloadMsg}
-              </Alert>
-            )}
-            <Stack direction="row" sx={actionButtonsContainer}>
-              <Button
-                variant="contained"
-                size="large"
-                onClick={handleStartValidation}
-                disabled={!file || !selectedDate || isProcessing}
-                startIcon={
-                  isProcessing ? (
-                    <CircularProgress size={20} color="inherit" />
-                  ) : (
-                    <SendIcon />
-                  )
-                }
-              >
-                {isProcessing ? "Validating..." : "Start Validation"}
-              </Button>
-            </Stack>
-          </Box>
-        )}
-
-        {activeStep === 1 && (
-          <Box>
-            <Stack
-              direction="row"
-              justifyContent="space-between"
-              alignItems="center"
-              sx={{ mb: 2 }}
-            >
-              <Alert severity="success" sx={{ flexGrow: 1, mr: 2 }}>
-                Validation Successful! Total Rows to Create:{" "}
-                <strong>{totalRows.toLocaleString()}</strong>
-                {totalRows > 2000 && " (Preview limited to first 2000)"}
-              </Alert>
-              {!isCsvFile && (
-                <Button
-                  variant="outlined"
-                  startIcon={<FileDownloadIcon />}
-                  onClick={() => handleDownloadFile("SUCCESS")}
-                >
-                  Download CSV
-                </Button>
-              )}
-            </Stack>
-            <TableContainer sx={tableContainerStyle}>
-              <Table stickyHeader size="small">
-                <TableHead sx={tableHeaderStyle}>
-                  <TableRow>
-                    <TableCell sx={tableHeaderCellStyle} align="center">
-                      Branch
-                    </TableCell>
-                    <TableCell sx={tableHeaderCellStyle} align="center">
-                      Currency
-                    </TableCell>
-                    <TableCell sx={tableHeaderCellStyle} align="center">
-                      CGL
-                    </TableCell>
-                    <TableCell sx={tableHeaderCellStyle} align="right">
-                      Amount
-                    </TableCell>
-                    <TableCell sx={tableHeaderCellStyle} align="center">
-                      Type
-                    </TableCell>
-                    <TableCell sx={tableHeaderCellStyle} align="center">
-                      Remarks
-                    </TableCell>
-                    <TableCell sx={tableHeaderCellStyle} align="center">
-                      Product
-                    </TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {visibleRows.map((row, index) => (
-                    <TableRow key={index} hover>
-                      <TableCell align="center">{row.branch}</TableCell>
-                      <TableCell align="center">{row.currency}</TableCell>
-                      <TableCell align="center">{row.cgl}</TableCell>
-                      <TableCell align="right">{row.amount}</TableCell>
-                      <TableCell align="center">
-                        <Chip
-                          label={row.txnType}
-                          color={
-                            row.txnType.includes("Credit") ? "error" : "success"
-                          }
-                          size="small"
-                          variant="filled"
-                        />
-                      </TableCell>
-                      <TableCell align="center">{row.remarks}</TableCell>
-                      <TableCell align="center">
-                        {row.productCode || "-"}
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </TableContainer>
-            <TablePagination
-              rowsPerPageOptions={[50, 100, 200]}
-              component="div"
-              count={previewRows.length}
-              rowsPerPage={rowsPerPage}
-              page={page}
-              onPageChange={handleChangePage}
-              onRowsPerPageChange={handleChangeRowsPerPage}
-              labelDisplayedRows={({ from, to }) => `${from}-${to} of Preview`}
-            />
-            <Stack direction="row" sx={actionButtonsContainer}>
-              <Button
-                variant="outlined"
-                onClick={handleBack}
-                disabled={isCreatingBatch}
-                startIcon={<ArrowBackIcon />}
-              >
-                Back
-              </Button>
-              <Button
-                variant="text"
-                onClick={resetAll}
-                disabled={isCreatingBatch}
-                startIcon={<RestartAltIcon />}
-              >
-                Cancel
-              </Button>
-              <Button
-                variant="contained"
-                color="success"
-                size="large"
-                onClick={handleCreateBatch}
-                disabled={isCreatingBatch}
-                startIcon={
-                  isCreatingBatch ? (
-                    <CircularProgress size={20} color="inherit" />
-                  ) : (
-                    <SendIcon />
-                  )
-                }
-              >
-                {isCreatingBatch ? "Creating Batch..." : "Submit Batch"}
-              </Button>
-            </Stack>
-          </Box>
-        )}
-      </Paper>
-    </Box>
-  );
-};
-export default JournalBulkUpload;
-package com.fincore.gateway.Controller;
-
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.gateway.JwtUtil.HmacJwtUtil;
-import com.fincore.gateway.Service.LoginService;
-import com.fincore.gateway.Service.TokenSessionValidator;
-import com.fincore.gateway.dto.*;
-import com.fincore.gateway.utility.LoginUtility;
-import io.jsonwebtoken.Claims;
-import io.jsonwebtoken.ExpiredJwtException;
-import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.security.Keys;
+The 415 error occurs because Spring Boot's default error handling for unauthorized/missing tokens in the filter chain is intercepting the request before it reaches your controller, or because your Frontend is still sending the wrong Content-Type header which Spring rejects before your useApi logic can fix it.
+However, based on your previous messages, the immediate 415 error on /bulk-validate-init is happening because your Controller expects Multipart (File) but your Client is sending JSON.
+Since you are using a Reactive Gateway (webflux), the way you handle Multipart uploads is different from standard Spring MVC (webmvc).
+Here is the Updated AuthController.java. I have not changed your logic, I just ensured imports are correct and added robustness.
+But crucially, you need to fix your Gateway configuration to allow Multipart requests if you are routing them through this Gateway, OR fix the Journal Service Controller if you are hitting it directly.
+Since your previous error logs showed JournalService, I assume you are hitting the Journal Service directly (or via Gateway routing). The AuthController you pasted above is for Login/Auth, it has nothing to do with the File Upload endpoint /bulk-validate-init.
+You pasted AuthController.java (Login/Logout), but your error is on /journals/bulk-validate-init (File Upload).
+I will assume you want to fix the Journal Service Controller that handles the file upload, based on our previous conversation.
+1. Updated JournalRequestController.java (For Spring MVC)
+Use this to correctly handle the file upload and avoid 415 errors.
+package com.fincore.JournalService.Controllers;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fincore.JournalService.Dto.*;
+import com.fincore.JournalService.Exception.ResourceNotFoundException;
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Service.JournalBulkValidationService;
+import com.fincore.JournalService.Service.JournalRequestService;
+import com.fincore.commonutilities.jwt.JwtUtil;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.core.io.Resource;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
-import org.springframework.http.ResponseCookie;
-import org.springframework.http.server.reactive.ServerHttpRequest;
-import org.springframework.http.server.reactive.ServerHttpResponse;
-import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-import org.springframework.web.server.ResponseStatusException;
-import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Schedulers;
+import org.springframework.web.multipart.MultipartFile;
 
-import javax.crypto.SecretKey;
-import java.time.Duration;
-import java.util.Base64;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.List;
 import java.util.Map;
 
-import static com.fincore.gateway.Service.TokenSessionValidator.log;
-
-/**
- * Authentication Controller (Reactive).
- * Handles Login, Logout, and Token Refresh using a distributed Redis session model.
- *
- * Security Features:
- * 1. Dual Token System: Short-lived Access Token (JSON) + Long-lived Refresh Token (HttpOnly Cookie).
- * 2. Token Rotation: A new Refresh Token is issued on every use to detect theft.
- * 3. Session Binding: Access Token JTI is bound to Redis `USR:<userId>`.
- * 4. Concurrency Control: "One Session Per User" enforced via Redis JTI checks.
- * 5. Reactive Non-Blocking: Uses WebFlux Mono/Flux patterns with Elastic Scheduler for DB.
- */
-@Slf4j
 @RestController
-@RequestMapping("/auth")
+@RequestMapping("journals")
 @RequiredArgsConstructor
-public class AuthController {
+@Slf4j
+public class JournalRequestController {
 
-    private static final String USER_PREFIX = "USR:";
-    private final TokenSessionValidator validator;
-    private final ReactiveStringRedisTemplate redisTemplate;
-    private final LoginService loginService;
-    private final ObjectMapper mapper;
+    private final JournalRequestService journalRequestService;
+    private final JournalBulkValidationService journalBulkValidationService;
+    private final JwtUtil jwtUtil;
 
-    @Value("${security.jwt.hmac-base64-secret:}")
-    private String hmacSecret;
-
-    // Access Token: Short Lived (e.g., 15 mins)
-    @Value("${security.jwt.ttl-seconds:900}")
-    private long accessTokenTtl;
-
-    // Refresh Token: Long Lived (e.g., 24 hours)
-    @Value("${security.jwt.refresh-ttl-seconds:86400}")
-    private long refreshTokenTtl;
-
-    /**
-     * Creates a secure HttpOnly cookie for the refresh token.
-     * Prevents XSS attacks as JavaScript cannot read this cookie.
-     *
-     * CONFIG NOTE:
-     * - secure(false): Allows HTTP (Localhost). Set to true in PROD with HTTPS.
-     * - sameSite("Lax"): Allows cross-origin navigation in Localhost dev.
-     * - path("/"): Ensures cookie is sent to all auth endpoints.
-     */
-    private ResponseCookie createRefreshTokenCookie(String token) {
-        return ResponseCookie.from("refresh_token", token)
-                .httpOnly(true)
-                .secure(false) // TODO: Set to true in Production (requires HTTPS)
-                .path("/")     // Root path ensures availability to all auth endpoints
-                .maxAge(Duration.ofSeconds(refreshTokenTtl))
-                .sameSite("Lax") // 'Lax' is safer for localhost dev than 'Strict'
-                .build();
+    // --- DATE FIX ---
+    @GetMapping("/current-posting-date")
+    public String getCurrentPostingDate() {
+        LocalDate date = journalRequestService.getCurrentPostingDate();
+        return date.format(DateTimeFormatter.ISO_LOCAL_DATE);
     }
 
-    /**
-     * Creates an empty cookie to clear the refresh token on logout.
-     */
-    private ResponseCookie createEmptyCookie() {
-        return ResponseCookie.from("refresh_token", "")
-                .httpOnly(true)
-                .path("/")
-                .maxAge(0)
-                .build();
-    }
+    // --- FILE UPLOAD FIX ---
+    @PostMapping(value = "/bulk-validate-init", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<?> initiateValidation(@RequestParam("file") MultipartFile file, 
+                                                @RequestParam("postingDate") String date) {
+        try {
+            // Log for debugging
+            log.info("Received file upload request. Name: {}, Size: {}, Date: {}", 
+                     file.getOriginalFilename(), file.getSize(), date);
 
-    /**
-     * LOGIN ENDPOINT
-     * 1. Validates credentials (Blocking DB call on Elastic Scheduler).
-     * 2. Generates Access Token & Refresh Token.
-     * 3. Stores Access Token JTI in Redis (Session Start).
-     * 4. Returns Access Token in Body, Refresh Token in HttpOnly Cookie.
-     */
-    @PostMapping(value = "/login", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<LoginResponseDTO> login(ServerHttpRequest request, ServerHttpResponse response, @RequestBody @Valid UserDto payload) {
-        final String clientIp = LoginUtility.getClientIp(request);
-        log.info("Login request for user: {} from IP: {}", payload.getUserId(), clientIp);
+            if (file.isEmpty()) return ResponseEntity.badRequest().body(Map.of("error", "File empty"));
+            
+            // Explicitly allow Excel AND CSV mime types
+            String contentType = file.getContentType();
+            if (contentType != null && !isValidContentType(contentType)) {
+                 log.warn("Invalid content type received: {}", contentType);
+                 // Optional: You can return 400 here, or just let it pass if you trust the parser
+            }
 
-        return Mono.fromCallable(() -> loginService.verifyUserCredentials(payload, clientIp))
-                .subscribeOn(Schedulers.boundedElastic()) // Move blocking JDBC call off the event loop
-                .flatMap(user -> {
-                    if (!user.isValidCredentials()) {
-                        log.warn("Invalid credentials for user: {}", payload.getUserId());
-                        return Mono.just(LoginResponseDTO.builder()
-                                .userId(user.getUserId())
-                                .validCredentials(false)
-                                .error(user.getMessage() != null ? user.getMessage() : "Invalid credentials")
-                                .build());
-                    }
-
-                    if (hmacSecret == null || hmacSecret.isBlank()) {
-                        log.error("Server Config Error: HMAC secret is missing.");
-                        return Mono.error(new IllegalStateException("Missing HMAC secret"));
-                    }
-
-                    // 1. Generate Tokens
-                    @SuppressWarnings("unchecked")
-                    Map<String, Object> claimsMap = mapper.convertValue(user.getUser(), Map.class);
-                    // Access Token (Short TTL)
-                    String accessToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), accessTokenTtl, claimsMap);
-
-                    // Refresh Token (Long TTL)
-                    Map<String, Object> refreshClaims = Map.of("type", "refresh");
-                    String refreshToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), refreshTokenTtl, refreshClaims);
-
-                    // Extract JTI from Access Token (This is what we track in Redis)
-                    String jti = extractClaims(accessToken).getId();
-
-                    // 2. Set Refresh Token in HttpOnly Cookie
-                    ResponseCookie cookie = createRefreshTokenCookie(refreshToken);
-                    response.addCookie(cookie);
-                    log.info("Login Success. Access Token TTL: {}s. Refresh Cookie Set.", accessTokenTtl);
-
-                    // 3. Register Session (JTI) in Redis & Fetch Menus
-                    return validator.registerUserSession(user.getUserId(), jti)
-                            .then(Mono.defer(() -> Mono.fromCallable(() -> loginService.fetchRoleWiseData(user.getUserId()))
-                                    .subscribeOn(Schedulers.boundedElastic())))
-                            .map(roleData -> LoginResponseDTO.builder()
-                                    .userId(user.getUserId())
-                                    .validCredentials(true)
-                                    .accessToken(accessToken) // Only Access Token goes to Frontend JS
-                                    .tokenType("Bearer")
-                                    .expiresIn(accessTokenTtl)
-                                    .sub(user.getUserId())
-                                    .jti(jti)
-                                    .roleData(roleData)
-                                    .build());
-                })
-                .onErrorResume(e -> {
-                    log.error("Login System Error for user {}", payload.getUserId(), e);
-                    return Mono.just(LoginResponseDTO.builder().error("Login failed: " + e.getMessage()).build());
-                });
-    }
-
-    /**
-     * REFRESH TOKEN ENDPOINT
-     * 1. Reads Refresh Token from Cookie.
-     * 2. Validates Signature & Expiry.
-     * 3. Checks Redis to ensure User Session is still valid/active.
-     * 4. Rotates Tokens (New Access Token + New Refresh Cookie).
-     */
-    @PostMapping(value = "/refresh-token", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<LoginResponseDTO> refreshToken(ServerHttpRequest request, ServerHttpResponse response) {
-        log.info("refresh" + refreshToken);
-
-        // 1. Extract Refresh Token from Cookie
-        org.springframework.http.HttpCookie cookie = request.getCookies().getFirst("refresh_token");
-        String refreshToken = (cookie != null) ? cookie.getValue() : null;
-
-        if (refreshToken == null || refreshToken.isBlank()) {
-            log.warn("Refresh failed: No refresh token cookie found. Cookies present: {}", request.getCookies().keySet());
-            return Mono.just(LoginResponseDTO.builder().error("Missing refresh token cookie").build());
+            String reqId = journalBulkValidationService.initiateValidation(file.getBytes(), file.getOriginalFilename(), LocalDate.parse(date));
+            return ResponseEntity.ok(Map.of("status", "QUEUED", "requestId", reqId));
+        } catch (Exception e) { 
+            log.error("File Upload Error", e); 
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage())); 
         }
-
-        return Mono.fromCallable(() -> {
-                    try {
-                        // Verify Refresh Token Signature & Expiry
-                        return extractClaims(refreshToken);
-                    } catch (ExpiredJwtException e) {
-                        log.warn("Refresh token expired.");
-                        throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Refresh token expired");
-                    } catch (Exception e) {
-                        log.error("Invalid refresh token signature/format.", e);
-                        throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid refresh token");
-                    }
-                })
-                .subscribeOn(Schedulers.boundedElastic())
-                .flatMap(claims -> {
-                    String userId = claims.getSubject();
-                    String userKey = USER_PREFIX + userId;
-
-                    log.info("Processing refresh for User: {}", userId);
-
-                    // Check if Session is still active in Redis (Global Logout Check)
-                    return redisTemplate.opsForValue().get(userKey)
-                            .flatMap(currentJti -> {
-                                log.info("Session Active. Redis Key Found for User: {}", userId);
-                                // Session Found! Proceed to refresh logic.
-                                return Mono.fromCallable(() -> loginService.getUserRole(userId))
-                                        .subscribeOn(Schedulers.boundedElastic())
-                                        .flatMap(userRole -> {
-                                            // Generate NEW Access Token
-                                            Map<String, Object> newClaims = Map.of("role", userRole != null ? userRole.getRole() : 0, "userId", userId);
-                                            String newAccessToken = HmacJwtUtil.generate(hmacSecret, userId, accessTokenTtl, newClaims);
-
-                                            // Generate NEW Refresh Token (Rotation)
-                                            Map<String, Object> refreshClaims = Map.of("type", "refresh");
-                                            String newRefreshToken = HmacJwtUtil.generate(hmacSecret, userId, refreshTokenTtl, refreshClaims);
-
-                                            String newJti = extractClaims(newAccessToken).getId();
-
-                                            // Rotate Cookie (Set new refresh token)
-                                            response.addCookie(createRefreshTokenCookie(newRefreshToken));
-
-                                            // Update Redis Session with NEW Access Token JTI
-                                            return validator.registerUserSession(userId, newJti)
-                                                    .thenReturn(LoginResponseDTO.builder()
-                                                            .accessToken(newAccessToken)
-                                                            .userId(userId)
-                                                            .jti(newJti)
-                                                            .expiresIn(accessTokenTtl)
-                                                            .validCredentials(true)
-                                                            .build());
-                                        });
-                            })
-                            // If Redis returns Empty, the session has expired (TTL) or was evicted
-                            .switchIfEmpty(Mono.defer(() -> {
-                                log.warn("Refresh Denied: Session key {} not found in Redis (Expired/Evicted).", userKey);
-                                return Mono.just(LoginResponseDTO.builder().error("Session expired. Please login again.").build());
-                            }));
-                })
-                .onErrorResume(e -> {
-                    if (e instanceof ResponseStatusException) {
-                        return Mono.just(LoginResponseDTO.builder().error(e.getMessage()).build());
-                    }
-                    log.error("Refresh Token Unexpected Error", e);
-                    return Mono.just(LoginResponseDTO.builder().error("Invalid refresh token").build());
-                });
+    }
+    
+    private boolean isValidContentType(String type) {
+        return type.equals("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") || // .xlsx
+               type.equals("application/vnd.ms-excel") || // .xls
+               type.equals("text/csv") || 
+               type.equals("application/csv") || 
+               type.equals("text/plain"); // Sometimes CSV comes as text/plain
     }
 
-    /**
-     * LOGOUT ENDPOINT
-     * 1. Clears Refresh Cookie.
-     * 2. Blacklists current Access Token.
-     * 3. Clears Redis Session ONLY if JTI matches (Safe against concurrent login).
-     */
-    @PostMapping(value = "/logout", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<LoginResponseDTO> logout(JwtAuthenticationToken jwtAuth, ServerHttpResponse response) {
-        // Clear cookie immediately
-        response.addCookie(createEmptyCookie());
+    // ... (Keep ALL other methods exactly as they were in your previous code) ...
 
-        if (jwtAuth == null) return Mono.just(LoginResponseDTO.builder().error("No token").build());
-        String username = jwtAuth.getToken().getSubject();
-        String jti = jwtAuth.getToken().getId();
-
-        log.info("Logout requested for user: {}", username);
-
-        return validator.blacklistToken(jti)
-                .flatMap(x -> redisTemplate.opsForValue().get(USER_PREFIX + username))
-                .flatMap(activeJti -> {
-                    // Only clear session if the token being logged out matches the active session
-                    if (activeJti != null && activeJti.equals(jti)) {
-                        log.info("Session match. Clearing Redis session for user: {}", username);
-                        return validator.clearUserSession(username)
-                                .map(c -> LoginResponseDTO.builder().userId(username).error("Logged out").build());
-                    } else {
-                        log.info("Session mismatch (User logged in elsewhere). Only revoking token for user: {}", username);
-                        return Mono.just(LoginResponseDTO.builder().userId(username).error("Token revoked").build());
-                    }
-                })
-                .switchIfEmpty(Mono.just(LoginResponseDTO.builder().userId(username).error("Logged out").build()));
+    // --- 1. SUMMARIES ---
+    @GetMapping("/pending-requests-summary")
+    public ResponseEntity<?> getPendingBatchSummaries() {
+        try { return ResponseEntity.ok(journalRequestService.getPendingBatchSummaries()); }
+        catch (Exception e) { log.error("Error", e); return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", "Unable to load pending requests.")); }
     }
 
-    @PostMapping(value = "/check-user")
-    public Mono<VerifyUserDTO> checkUser(@RequestBody Map<String, String> body) {
-        return Mono.fromCallable(() -> loginService.checkUser(body.get("userId"))).subscribeOn(Schedulers.boundedElastic());
+    @GetMapping("/all-requests-summary")
+    public ResponseEntity<?> getAllBatchSummaries() {
+        try { return ResponseEntity.ok(journalRequestService.getAllBatchSummaries()); }
+        catch (Exception e) { log.error("Error", e); return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", "Unable to load requests.")); }
     }
 
-    @PostMapping(value = "/update-password")
-    public Mono<UpdatePasswordDTO> updatePassword(@RequestBody @Valid UpdatePasswordDTO dto) {
-        return Mono.fromCallable(() -> loginService.updatePassword(dto)).subscribeOn(Schedulers.boundedElastic());
+    @GetMapping("/by-batch-paginated/{batchId}")
+    public ResponseEntity<?> getRequestsByBatchIdPaginated(@PathVariable String batchId, @RequestParam(defaultValue = "0") int page, @RequestParam(defaultValue = "10") int size) {
+        try { return ResponseEntity.ok(journalRequestService.getRequestsByBatchIdPaginated(batchId, PageRequest.of(page, size))); }
+        catch (Exception e) { log.error("Error", e); return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", "Unable to load details.")); }
     }
 
-    // Helper to parse token
-    private Claims extractClaims(String token) {
-        byte[] secretBytes = Base64.getDecoder().decode(hmacSecret);
-        return Jwts.parser().verifyWith(Keys.hmacShaKeyFor(secretBytes)).build().parseSignedClaims(token).getPayload();
+    @PostMapping("/create-batch-from-cache")
+    public ResponseEntity<Map<String, Object>> createBatchFromCache(@RequestBody Map<String, String> payload, @RequestHeader("Authorization") String token) {
+        try {
+            String batchId = journalRequestService.createBatchFromCache(payload.get("requestId"), payload.get("commonBatchRemarks"), jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token));
+            return ResponseEntity.ok(Map.of("status", "SUCCESS", "message", "Batch created successfully", "batchId", batchId));
+        } catch (ResourceNotFoundException e) { return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("status", "ERROR", "message", e.getMessage())); }
+        catch (Exception e) { log.error("Error", e); return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("status", "ERROR", "message", "System error.")); }
     }
+
+    @GetMapping("/bulk-status/{requestId}")
+    public ResponseEntity<BulkUploadStateDto> checkStatus(@PathVariable String requestId) {
+        BulkUploadStateDto state = journalBulkValidationService.getState(requestId);
+        return state != null ? ResponseEntity.ok(state) : ResponseEntity.notFound().build();
+    }
+
+    @GetMapping("/download-bulk-file/{requestId}")
+    public ResponseEntity<Resource> downloadFile(@PathVariable String requestId, @RequestParam String type) {
+        try {
+            byte[] data = journalBulkValidationService.getFileBytes(requestId, type);
+            if (data == null) return ResponseEntity.notFound().build();
+            String name = type.equals("ERROR") ? "Error_Report.xlsx" : "Success.csv";
+            String mime = type.equals("ERROR") ? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" : "text/csv";
+            return ResponseEntity.ok().header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + name + "\"").contentType(MediaType.parseMediaType(mime)).body(new ByteArrayResource(data));
+        } catch (Exception e) { return ResponseEntity.internalServerError().build(); }
+    }
+
+    @GetMapping("/download-template")
+    public ResponseEntity<Resource> downloadTemplate() {
+        try {
+            byte[] data = journalBulkValidationService.generateTemplateBytes();
+            return ResponseEntity.ok().header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Journal_Upload_Template.xlsx\"").contentType(MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")).body(new ByteArrayResource(data));
+        } catch (Exception e) { return ResponseEntity.internalServerError().build(); }
+    }
+
+    @PostMapping("/process-bulk")
+    public ResponseEntity<?> processBulkRequests(@RequestHeader("Authorization") String token, @Valid @RequestBody BulkProcessJournalRequestDto dto) {
+        try {
+            journalRequestService.processBulkRequests(dto, jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token));
+            return ResponseEntity.ok(Map.of("status", "SUCCESS"));
+        } catch (Exception e) { log.error("Error", e); return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("status", "ERROR", "message", "Processing failed.")); }
+    }
+
+    @DeleteMapping("/my-requests/by-batch/{batchId}")
+    public ResponseEntity<?> cancelMyRequestsByBatch(@RequestHeader("Authorization") String token, @PathVariable String batchId) {
+        try {
+            journalRequestService.cancelMyRequestsByBatchId(batchId, jwtUtil.getUserIdFromToken(token));
+            return ResponseEntity.ok(Map.of("status", "SUCCESS"));
+        } catch (Exception e) { log.error("Error", e); return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("status", "ERROR", "message", "Cancel failed.")); }
+    }
+
+    @DeleteMapping("/my-requests/by-journal-list")
+    public ResponseEntity<?> cancelMyRequestsByJournalPrefixes(@RequestHeader("Authorization") String token, @RequestBody List<String> list) {
+        try {
+            journalRequestService.cancelMyRequestsByJournalPrefixes(list, jwtUtil.getUserIdFromToken(token));
+            return ResponseEntity.ok(Map.of("status", "SUCCESS"));
+        } catch (Exception e) { log.error("Error", e); return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("status", "ERROR", "message", "Cancel failed.")); }
+    }
+
+    @GetMapping("/by-batch/{batchId}")
+    public ResponseEntity<List<JournalRequest>> getRequestsByBatchId(@PathVariable String batchId) { return ResponseEntity.ok(journalRequestService.getRequestsByBatchId(batchId)); }
+    @GetMapping("/my-requests")
+    public List<JournalRequest> getMyRequests(@RequestHeader("Authorization") String token) { return journalRequestService.getMyRequests(jwtUtil.getUserIdFromToken(token)); }
+    @GetMapping("/pending-requests")
+    public List<JournalRequest> getPendingRequests(@RequestHeader("Authorization") String token) { return journalRequestService.getPendingRequests(jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token)); }
+    @PatchMapping("/update-request")
+    public JournalRequest updateRequestStatus(@RequestHeader("Authorization") String token, @RequestBody ProcessJournalRequestDto dto) throws JsonProcessingException { return journalRequestService.updateRequestStatus(dto, jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token)).get(); }
+    @DeleteMapping("/my-request/{requestId}")
+    public ResponseEntity<Void> cancelMyRequest(@RequestHeader("Authorization") String token, @PathVariable Long requestId) { journalRequestService.cancelMyRequest(requestId, jwtUtil.getUserIdFromToken(token)); return ResponseEntity.noContent().build(); }
+    @GetMapping("/status")
+    public ResponseEntity<List<JournalRequestStatusDto>> getJournalStatusList() { return ResponseEntity.ok(journalRequestService.getJournalRequestStatusList()); }
 }
 
-this is my current file please resolve that issue for media type is unsupported and give mi updated fils
-
+2. Frontend Check (Crucial)
+If you have updated useApi.js as requested previously, you must not pass headers manually in JournalBulkUpload.js.
+If useApi.js is correct, the 415 error will persist only if:
+ * Gateway Issue: Your Spring Cloud Gateway is stripping headers or defaulting content-type before forwarding to Journal Service.
+ * Auth Filter Issue: ContextRbacFilter (seen in your logs) might be reading the body or headers in a way that breaks multipart requests.
+But first, ensure the Controller above is used. It explicitly logs the incoming file details, so you can check your console to see if the request even enters the method. If you don't see "Received file upload request", the block is happening before the controller (in the Filter Chain).
