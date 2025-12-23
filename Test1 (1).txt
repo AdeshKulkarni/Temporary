@@ -1,10 +1,1166 @@
+// useApi.js
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import axios from "axios";
+import { useLocation, useNavigate } from "react-router-dom";
+import useCustomSnackbar from "../utils/useCustomSnackbar";
+import { useSelector } from "react-redux";
+import { resolveConfig } from "../config/EnvironmentConfig";
+import { convertToKebabCase } from "../utils/CommonUtilities";
 
 
-2025-12-23T16:40:50.336+05:30  INFO 29168 --- [JournalService] [           main] r$InitializeUserDetailsManagerConfigurer : Global AuthenticationManager configured with UserDetailsService bean with name inMemoryUserDetailsManager
-2025-12-23T16:40:50.524+05:30  INFO 29168 --- [JournalService] [           main] o.s.s.web.DefaultSecurityFilterChain     : Will secure any request with [org.springframework.security.web.session.DisableEncodeUrlFilter@1264dbc9, org.springframework.security.web.context.request.async.WebAsyncManagerIntegrationFilter@77f2807f, org.springframework.security.web.context.SecurityContextHolderFilter@77376e83, org.springframework.security.web.header.HeaderWriterFilter@26c75b91, org.springframework.web.filter.CorsFilter@47b6f580, org.springframework.security.web.authentication.logout.LogoutFilter@3787eac3, com.fincore.commonutilities.security.ContextRbacFilter@5eb054, org.springframework.security.web.savedrequest.RequestCacheAwareFilter@23cf78f9, org.springframework.security.web.servletapi.SecurityContextHolderAwareRequestFilter@46199519, org.springframework.security.web.authentication.AnonymousAuthenticationFilter@34d08905, org.springframework.security.web.session.SessionManagementFilter@4228a2f6, org.springframework.security.web.access.ExceptionTranslationFilter@3d8c3d0a, org.springframework.security.web.access.intercept.AuthorizationFilter@570cef1e]
-2025-12-23T16:40:50.797+05:30  INFO 29168 --- [JournalService] [           main] o.s.b.w.embedded.tomcat.TomcatWebServer  : Tomcat started on port 9999 (http) with context path '/'
-2025-12-23T16:40:50.802+05:30  INFO 29168 --- [JournalService] [           main] c.f.J.JournalServiceApplication          : Started JournalServiceApplication in 4.92 seconds (process running for 5.343)
-2025-12-23T16:40:55.232+05:30  INFO 29168 --- [JournalService] [nio-9999-exec-1] o.a.c.c.C.[Tomcat].[localhost].[/]       : Initializing Spring DispatcherServlet 'dispatcherServlet'
-2025-12-23T16:40:55.232+05:30  INFO 29168 --- [JournalService] [nio-9999-exec-1] o.s.web.servlet.DispatcherServlet        : Initializing Servlet 'dispatcherServlet'
-2025-12-23T16:40:55.233+05:30  INFO 29168 --- [JournalService] [nio-9999-exec-1] o.s.web.servlet.DispatcherServlet        : Completed initialization in 1 ms
-2025-12-23T16:40:55.743+05:30  WARN 29168 --- [JournalService] [nio-9999-exec-1] .w.s.m.s.DefaultHandlerExceptionResolver : Resolved [org.springframework.web.HttpMediaTypeNotSupportedException: Content-Type 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' is not supported]
+const useApi = () => {
+  const [data, setData] = useState(null); // Store API response data
+  const [error, setError] = useState(null); // Store error info
+  const [loading, setLoading] = useState(false); // Loading state
+
+  const navigate = useNavigate();
+  const location = useLocation();
+  const snackbar = useCustomSnackbar();
+
+  const token = useSelector((state) => state.auth.token);
+  const menus = useSelector((s) => s.menus.menus);
+  const selectedMenuItem = useSelector((s) => s.menus.selectedMenuItem);
+
+  // Keep track of active requests for cancellation
+  const activeRequestsRef = useRef(new Set());
+
+  /** Refresh token handler (if required) */
+  const refreshToken = async () => {
+    try {
+      await axios.post(
+        `${resolveConfig("/LS") ?? ""}/refresh-token`,
+        {},
+        { withCredentials: true }
+      );
+    } catch (err) {
+      console.error("Token refresh failed", err);
+    }
+  };
+
+  /** Cancel all ongoing requests */
+  const cancelAllRequests = () => {
+    activeRequestsRef.current.forEach((controller) => {
+      if (controller && !controller.signal.aborted) {
+        controller.abort();
+      }
+    });
+    activeRequestsRef.current.clear();
+    setLoading(false);
+  };
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => cancelAllRequests();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** Find menu item from route (same idea as in Sidebar) */
+  const findMenuItem = useCallback((items, route) => {
+    if (!items || !items.length) return null;
+
+    for (const item of items) {
+      // Direct route match
+      if (item.route === route) return item;
+
+      // Children / nested routes
+      if (item.children && item.children.length > 0) {
+        const isSubmenuSelectionPage = route.includes("/choose-option");
+
+        if (isSubmenuSelectionPage) {
+          const prefix = "/choose-option/";
+          const startIndex = route.indexOf(prefix) + prefix.length;
+          const parameter = route.substring(startIndex);
+          if (parameter === convertToKebabCase(item.title)) {
+            return item;
+          }
+        }
+
+        const childMatch = findMenuItem(item.children, route);
+        if (childMatch) return childMatch;
+      }
+    }
+
+    return null;
+  }, []);
+
+  /** Current menu from route (for latest screen) */
+  const currentMenuFromRoute = useMemo(() => {
+    if (!menus || !menus.length) return null;
+    return findMenuItem(menus, location.pathname);
+  }, [menus, location.pathname, findMenuItem]);
+
+  /** X-Request-Type – always try to use the route-based menu first */
+  const xRequestType = useMemo(() => {
+    return (
+      currentMenuFromRoute?.requestType || selectedMenuItem?.requestType || "*"
+    );
+  }, [currentMenuFromRoute, selectedMenuItem]);
+
+  /**
+   * Generic API caller
+   * @param {string} url - API endpoint
+   * @param {object|null} payload - Request body or query params
+   * @param {string} method - HTTP method (GET, POST, PUT, PATCH, DELETE)
+   * @param {string} responseType - Axios response type
+   * @param {string} contentType - Content-Type header
+   * @param {object} extraConfig - Additional axios config
+   * @param {boolean} returnDataOnly - for returning only response data or whole response (with headers)
+   */
+  const callApi = useCallback(
+    async (
+      url,
+      payload = null,
+      method = "GET",
+      responseType = "json",
+      contentType = "application/json",
+      extraConfig = {},
+      returnDataOnly = true
+    ) => {
+      // Build final URL using service resolution
+      const parts = url.split("/");
+      const service = parts[1];
+      const resolved = resolveConfig(`/${service}`);
+      parts[1] = resolved;
+      const Final_Url = parts.slice(1).join("/");
+
+      const controller = new AbortController();
+      activeRequestsRef.current.add(controller);
+
+      setLoading(true);
+      setError(null);
+
+      try {
+        const headers = {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": contentType,
+          "X-Request-Type": xRequestType,
+        };
+
+        const config = {
+          method: method.toUpperCase(),
+          url: Final_Url,
+          headers,
+          responseType,
+          withCredentials: true,
+          signal: controller.signal,
+          ...extraConfig,
+        };
+
+        // Attach payload depending on method type
+        if (payload !== null) {
+          if (method.toUpperCase() === "GET") {
+            config.params = payload;
+          } else {
+            config.data = payload;
+          }
+        }
+
+        const response = await axios(config);
+        // console.log(response);
+
+        if (!controller.signal.aborted) {
+          if (response.data.status === 440) {
+            console.error("You have logged in another session");
+            navigate("/");
+          }
+
+          if (response?.data?.status === 401) {
+            console.error("You have to login again as the session is expired");
+            navigate("/");
+          }
+
+          setData(response.data);
+          return returnDataOnly ? response.data : response;
+        }
+      } catch (err) {
+        const status = err.response?.status;
+
+        if (status === 440) {
+          console.error("You have logged in another session");
+          navigate("/");
+        }
+
+        // if (status === 401) {
+        //   console.error("You have to login again as the session is expired");
+        //   navigate("/");
+        // }
+
+        if (!axios.isCancel(err) && !controller.signal.aborted) {
+          console.error("API call error:", err);
+
+          const apiMessage =
+            err.response?.data?.result?.message ||
+            err.response?.data?.message ||
+            err.response?.statusText ||
+            "Something went wrong";
+
+          snackbar(apiMessage, "error");
+          setError(err);
+        }
+
+        if (axios.isCancel(err)) {
+          // Let caller handle cancellation if they care
+          throw err;
+        }
+      } finally {
+        activeRequestsRef.current.delete(controller);
+        setLoading(false);
+      }
+    },
+    // Precise deps: callApi only changes when these change
+    [navigate, snackbar, token, xRequestType]
+  );
+
+  return { data, error, loading, callApi, cancelAllRequests, refreshToken };
+};
+
+export default useApi;
+ import React, { useState, useRef, useEffect } from "react";
+import {
+  Box,
+  Typography,
+  Paper,
+  TextField,
+  Button,
+  CircularProgress,
+  Chip,
+  Alert,
+  Stack,
+  Stepper,
+  Step,
+  StepLabel,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  TablePagination,
+  IconButton,
+  Tooltip,
+} from "@mui/material";
+import {
+  CloudUpload as CloudUploadIcon,
+  RestartAlt as RestartAltIcon,
+  Description as DescriptionIcon,
+  Send as SendIcon,
+  FileDownload as FileDownloadIcon,
+  ArrowBack as ArrowBackIcon,
+  Close as CloseIcon,
+} from "@mui/icons-material";
+import { alpha } from "@mui/material/styles";
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
+
+// --- STYLES (Kept standard) ---
+const mainContainerStyle = { padding: 3, height: "100%", width: "100%" };
+const controlPanelStyle = {
+  padding: "30px",
+  marginBottom: "20px",
+  borderRadius: "12px",
+  backgroundColor: "background.paper",
+  boxShadow: 2,
+};
+const uploadBoxStyle = {
+  position: "relative",
+  display: "flex",
+  flexDirection: "column",
+  justifyContent: "center",
+  alignItems: "center",
+  border: 2,
+  borderStyle: "dashed",
+  borderColor: "primary.main",
+  borderRadius: "12px",
+  padding: "40px",
+  cursor: "pointer",
+  transition: "all 0.3s ease",
+  minHeight: "200px",
+  "&:hover": {
+    backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.08),
+    borderColor: "primary.dark",
+  },
+};
+const iconStyle = {
+  fontSize: "5rem",
+  color: "primary.main",
+  marginBottom: "16px",
+};
+const headerTextStyle = {
+  fontWeight: 600,
+  fontSize: "1.1rem",
+  textAlign: "center",
+  color: "text.primary",
+};
+const subTextStyle = {
+  color: "text.secondary",
+  fontSize: "0.85rem",
+  textAlign: "center",
+  marginTop: "4px",
+};
+const dateinputfield = {
+  display: "flex",
+  justifyContent: "center",
+  marginBottom: "30px",
+  "& .MuiTextField-root": { minWidth: "250px" },
+};
+const tableContainerStyle = {
+  borderRadius: "12px",
+  border: "1px solid",
+  borderColor: "divider",
+  overflow: "hidden",
+  marginTop: "20px",
+  boxShadow: 1,
+  maxHeight: 600,
+};
+const tableHeaderStyle = {
+  backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.08),
+};
+const tableHeaderCellStyle = {
+  color: "text.primary",
+  fontWeight: "bold",
+  fontSize: "0.95rem",
+};
+const actionButtonsContainer = {
+  display: "flex",
+  justifyContent: "center",
+  marginTop: 4,
+  gap: 2,
+};
+
+const mainSteps = ["Upload & Validate", "Preview & Submit"];
+const validationSteps = [
+  "Format Validation",
+  "Database Validation",
+  "Balance Validation",
+];
+
+const JournalBulkUpload = () => {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+
+  const [activeStep, setActiveStep] = useState(0);
+  const [selectedDate, setSelectedDate] = useState("");
+  const [file, setFile] = useState(null);
+  const [isCsvFile, setIsCsvFile] = useState(false);
+  const fileInputRef = useRef(null);
+
+  const [requestId, setRequestId] = useState(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+
+  const [validationStage, setValidationStage] = useState(0);
+  const [resultStatus, setResultStatus] = useState(null);
+  const [resultMsg, setResultMsg] = useState("");
+  const [autoDlTriggered, setAutoDlTriggered] = useState(false);
+  const [downloadMsg, setDownloadMsg] = useState("Downloading Error Report...");
+
+  const [previewRows, setPreviewRows] = useState([]);
+  const [totalRows, setTotalRows] = useState(0);
+
+  const [page, setPage] = useState(0);
+  const [rowsPerPage, setRowsPerPage] = useState(50);
+  const [isCreatingBatch, setIsCreatingBatch] = useState(false);
+
+  const handleDateChange = (e) => setSelectedDate(e.target.value);
+
+  const handleFileSelect = (e) => {
+    if (e.target.files[0]) {
+      const selected = e.target.files[0];
+      setFile(selected);
+      setIsCsvFile(
+        selected.name.toLowerCase().endsWith(".csv") ||
+          selected.name.toLowerCase().endsWith(".txt")
+      );
+      setResultStatus(null);
+      setResultMsg("");
+      setValidationStage(0);
+      setPreviewRows([]);
+      setAutoDlTriggered(false);
+      setIsProcessing(false);
+      setDownloadMsg("Downloading Error Report...");
+    }
+  };
+
+  const handleClearFile = (e) => {
+    e.stopPropagation();
+    setFile(null);
+    setIsCsvFile(false);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+    setResultStatus(null);
+    setResultMsg("");
+    setValidationStage(0);
+    setIsProcessing(false);
+  };
+
+  const resetAll = () => {
+    setActiveStep(0);
+    setRequestId(null);
+    setResultStatus(null);
+    setValidationStage(0);
+    setResultMsg("");
+    setPreviewRows([]);
+    setTotalRows(0);
+    setIsProcessing(false);
+    setAutoDlTriggered(false);
+    setIsCsvFile(false);
+    setFile(null);
+    setPage(0);
+    setDownloadMsg("Downloading Error Report...");
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const handleBack = () => {
+    setActiveStep(0);
+    setResultStatus(null);
+    setValidationStage(0);
+    setResultMsg("");
+    setIsProcessing(false);
+    setAutoDlTriggered(false);
+    setDownloadMsg("Downloading Error Report...");
+  };
+
+  // Helper to handle downloads (BLOB response)
+  const downloadFileHelper = async (url, filename) => {
+    try {
+      // Pass config to request BLOB response
+      const response = await callApi(
+        url,
+        null,
+        "GET",
+        "blob",
+        "undefined",
+        { responseType: "blob" },
+        false
+      );
+
+
+      const blob = response.data || response;
+
+      if (!blob) throw new Error("Download failed or empty response");
+
+      const link = document.createElement("a");
+      link.href = window.URL.createObjectURL(new Blob([blob]));
+      link.setAttribute("download", filename);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      return true;
+    } catch (e) {
+      console.error("Download Error:", e);
+      showSnackBar("File download failed", "error");
+      return false;
+    }
+  };
+
+  const handleDownloadTemplate = () =>
+    downloadFileHelper(
+      "/JS/journals/download-template",
+      "Journal_Upload_Template.xlsx"
+    );
+
+  const handleDownloadFile = async (type, reqId = requestId) => {
+    if (type === "ERROR") showSnackBar("Downloading Error Report...", "info");
+    const success = await downloadFileHelper(
+      `/JS/journals/download-bulk-file/${reqId}?type=${type}`,
+      type === "ERROR" ? "Error_Report.xlsx" : "Success_Batch.csv"
+    );
+    if (success && type === "SUCCESS")
+      showSnackBar("Downloaded successfully.", "success");
+    if (success && type === "ERROR") setDownloadMsg("Error Report Downloaded");
+  };
+
+const handleStartValidation = async () => {
+    if (!selectedDate || !file) {
+      showSnackBar("Please select Date and File.", "warning");
+      return;
+    }
+    setResultStatus(null);
+    setResultMsg("");
+    setValidationStage(0);
+    setIsProcessing(true);
+    setAutoDlTriggered(false);
+    setDownloadMsg("Downloading Error Report...");
+
+    // Create FormData
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("postingDate", selectedDate);
+
+    try {
+      // FIX: Added the 4th (responseType) and 5th (contentType) arguments
+      const data = await callApi(
+        "/JS/journals/bulk-validate-init",
+        formData,
+        "POST",
+      );
+
+      if (data && data.requestId) {
+        setRequestId(data.requestId);
+      } else {
+        throw new Error("Invalid response from server");
+      }
+    } catch (err) {
+      setIsProcessing(false);
+      setResultStatus("ERROR");
+      setResultMsg("Init Failed: " + (err.message || "Unknown Error"));
+    }
+  };
+
+  const handleCreateBatch = async () => {
+    setIsCreatingBatch(true);
+    try {
+      const payload = {
+        requestId: requestId,
+        commonBatchRemarks: `Bulk Upload - ${selectedDate}`,
+      };
+      const response = await callApi(
+        "/JS/journals/create-batch-from-cache",
+        payload,
+        "POST"
+      );
+
+      if (response && response.status === "SUCCESS") {
+        showSnackBar(`Batch Created! ID: ${response.batchId}`, "success", 5000);
+        resetAll();
+      } else {
+        throw new Error(response.message || "Failed");
+      }
+    } catch (e) {
+      showSnackBar("Failed to create batch: " + e.message, "error");
+    } finally {
+      setIsCreatingBatch(false);
+    }
+  };
+
+  // --- POLLING STATUS ---
+  useEffect(() => {
+    let interval;
+    if (isProcessing && requestId) {
+      interval = setInterval(async () => {
+        try {
+          const res = await callApi(
+            `/JS/journals/bulk-status/${requestId}`,
+            null,
+            "GET"
+          );
+          if (!res) return;
+          if (res.totalRows) setTotalRows(res.totalRows);
+
+          if (res.status === "ERROR") {
+            setIsProcessing(false);
+            setResultStatus("ERROR");
+            setResultMsg(res.message);
+            setValidationStage(res.currentStage || 1);
+            clearInterval(interval);
+            showSnackBar(res.message, "error", 5000);
+            if (res.hasErrorFile && !autoDlTriggered) {
+              setAutoDlTriggered(true);
+              handleDownloadFile("ERROR", res.requestId);
+            }
+          } else if (res.status === "SUCCESS") {
+            setIsProcessing(false);
+            setResultStatus("SUCCESS");
+            setValidationStage(4);
+            setTotalRows(res.totalRows);
+            if (res.previewDataJson)
+              setPreviewRows(JSON.parse(res.previewDataJson));
+            clearInterval(interval);
+            showSnackBar(
+              "Validation Complete. Proceeding to Preview...",
+              "success"
+            );
+            setTimeout(() => {
+              setActiveStep(1);
+            }, 1000);
+          } else {
+            setValidationStage(res.currentStage);
+          }
+        } catch (e) {}
+      }, 800);
+    }
+    return () => clearInterval(interval);
+  }, [isProcessing, requestId, callApi, showSnackBar, autoDlTriggered]);
+
+  const handleChangePage = (event, newPage) => setPage(newPage);
+  const handleChangeRowsPerPage = (event) => {
+    setRowsPerPage(parseInt(event.target.value, 10));
+    setPage(0);
+  };
+  const visibleRows = previewRows.slice(
+    page * rowsPerPage,
+    page * rowsPerPage + rowsPerPage
+  );
+  const isValidationStepFailed = (index) =>
+    resultStatus === "ERROR" && index === validationStage - 1;
+
+  return (
+    <Box sx={mainContainerStyle}>
+      <Paper elevation={1} sx={controlPanelStyle}>
+        <Box sx={{ display: "flex", justifyContent: "flex-end", mb: 2 }}>
+          <Button
+            variant="text"
+            startIcon={<FileDownloadIcon />}
+            onClick={handleDownloadTemplate}
+          >
+            Download Template
+          </Button>
+        </Box>
+        <Box sx={{ width: "100%", maxWidth: "500px", margin: "0 auto", mb: 4 }}>
+          <Stepper activeStep={activeStep}>
+            {mainSteps.map((label) => (
+              <Step key={label}>
+                <StepLabel>{label}</StepLabel>
+              </Step>
+            ))}
+          </Stepper>
+        </Box>
+
+        {activeStep === 0 && (
+          <Box>
+            <Box sx={dateinputfield}>
+              <TextField
+                type="date"
+                label="Posting Date"
+                value={selectedDate}
+                onChange={handleDateChange}
+                InputLabelProps={{ shrink: true }}
+                size="small"
+                disabled={isProcessing}
+                sx={{ width: 200 }}
+              />
+            </Box>
+            <Box
+              sx={{
+                ...uploadBoxStyle,
+                borderColor:
+                  resultStatus === "ERROR" ? "error.main" : "primary.main",
+                opacity: isProcessing ? 0.6 : 1,
+              }}
+              onClick={() => {
+                if (!isProcessing) fileInputRef.current.click();
+              }}
+            >
+              <input
+                type="file"
+                hidden
+                ref={fileInputRef}
+                onChange={handleFileSelect}
+                onClick={(e) => (e.target.value = null)}
+                accept=".xlsx,.csv"
+              />
+              {file ? (
+                <>
+                  <DescriptionIcon
+                    sx={{ fontSize: 60, color: "success.main", mb: 1 }}
+                  />
+                  <Typography sx={headerTextStyle}>{file.name}</Typography>
+                  <Typography sx={subTextStyle}>Click to change</Typography>
+                  <Tooltip title="Remove File">
+                    <IconButton
+                      size="small"
+                      onClick={handleClearFile}
+                      sx={{
+                        position: "absolute",
+                        top: 10,
+                        right: 10,
+                        bgcolor: "background.paper",
+                        "&:hover": { bgcolor: "error.light", color: "white" },
+                      }}
+                    >
+                      <CloseIcon fontSize="small" />
+                    </IconButton>
+                  </Tooltip>
+                </>
+              ) : (
+                <>
+                  <CloudUploadIcon sx={iconStyle} />
+                  <Typography sx={headerTextStyle}>
+                    Click to Upload File
+                  </Typography>
+                  <Typography sx={subTextStyle}>
+                    .xlsx, .csv (Max 50MB)
+                  </Typography>
+                </>
+              )}
+            </Box>
+            {(isProcessing || resultStatus) && (
+              <Box sx={{ mt: 4, mb: 2 }}>
+                <Stepper activeStep={validationStage - 1} alternativeLabel>
+                  {validationSteps.map((label, index) => {
+                    const labelProps = {};
+                    if (isValidationStepFailed(index)) {
+                      labelProps.optional = (
+                        <Typography variant="caption" color="error">
+                          Failed
+                        </Typography>
+                      );
+                      labelProps.error = true;
+                    }
+                    return (
+                      <Step key={label}>
+                        <StepLabel {...labelProps}>{label}</StepLabel>
+                      </Step>
+                    );
+                  })}
+                </Stepper>
+              </Box>
+            )}
+            {resultStatus === "ERROR" && (
+              <Alert
+                severity="error"
+                sx={{ mt: 3, mx: "auto", maxWidth: "80%" }}
+              >
+                {resultMsg} — {downloadMsg}
+              </Alert>
+            )}
+            <Stack direction="row" sx={actionButtonsContainer}>
+              <Button
+                variant="contained"
+                size="large"
+                onClick={handleStartValidation}
+                disabled={!file || !selectedDate || isProcessing}
+                startIcon={
+                  isProcessing ? (
+                    <CircularProgress size={20} color="inherit" />
+                  ) : (
+                    <SendIcon />
+                  )
+                }
+              >
+                {isProcessing ? "Validating..." : "Start Validation"}
+              </Button>
+            </Stack>
+          </Box>
+        )}
+
+        {activeStep === 1 && (
+          <Box>
+            <Stack
+              direction="row"
+              justifyContent="space-between"
+              alignItems="center"
+              sx={{ mb: 2 }}
+            >
+              <Alert severity="success" sx={{ flexGrow: 1, mr: 2 }}>
+                Validation Successful! Total Rows to Create:{" "}
+                <strong>{totalRows.toLocaleString()}</strong>
+                {totalRows > 2000 && " (Preview limited to first 2000)"}
+              </Alert>
+              {!isCsvFile && (
+                <Button
+                  variant="outlined"
+                  startIcon={<FileDownloadIcon />}
+                  onClick={() => handleDownloadFile("SUCCESS")}
+                >
+                  Download CSV
+                </Button>
+              )}
+            </Stack>
+            <TableContainer sx={tableContainerStyle}>
+              <Table stickyHeader size="small">
+                <TableHead sx={tableHeaderStyle}>
+                  <TableRow>
+                    <TableCell sx={tableHeaderCellStyle} align="center">
+                      Branch
+                    </TableCell>
+                    <TableCell sx={tableHeaderCellStyle} align="center">
+                      Currency
+                    </TableCell>
+                    <TableCell sx={tableHeaderCellStyle} align="center">
+                      CGL
+                    </TableCell>
+                    <TableCell sx={tableHeaderCellStyle} align="right">
+                      Amount
+                    </TableCell>
+                    <TableCell sx={tableHeaderCellStyle} align="center">
+                      Type
+                    </TableCell>
+                    <TableCell sx={tableHeaderCellStyle} align="center">
+                      Remarks
+                    </TableCell>
+                    <TableCell sx={tableHeaderCellStyle} align="center">
+                      Product
+                    </TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {visibleRows.map((row, index) => (
+                    <TableRow key={index} hover>
+                      <TableCell align="center">{row.branch}</TableCell>
+                      <TableCell align="center">{row.currency}</TableCell>
+                      <TableCell align="center">{row.cgl}</TableCell>
+                      <TableCell align="right">{row.amount}</TableCell>
+                      <TableCell align="center">
+                        <Chip
+                          label={row.txnType}
+                          color={
+                            row.txnType.includes("Credit") ? "error" : "success"
+                          }
+                          size="small"
+                          variant="filled"
+                        />
+                      </TableCell>
+                      <TableCell align="center">{row.remarks}</TableCell>
+                      <TableCell align="center">
+                        {row.productCode || "-"}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </TableContainer>
+            <TablePagination
+              rowsPerPageOptions={[50, 100, 200]}
+              component="div"
+              count={previewRows.length}
+              rowsPerPage={rowsPerPage}
+              page={page}
+              onPageChange={handleChangePage}
+              onRowsPerPageChange={handleChangeRowsPerPage}
+              labelDisplayedRows={({ from, to }) => `${from}-${to} of Preview`}
+            />
+            <Stack direction="row" sx={actionButtonsContainer}>
+              <Button
+                variant="outlined"
+                onClick={handleBack}
+                disabled={isCreatingBatch}
+                startIcon={<ArrowBackIcon />}
+              >
+                Back
+              </Button>
+              <Button
+                variant="text"
+                onClick={resetAll}
+                disabled={isCreatingBatch}
+                startIcon={<RestartAltIcon />}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="contained"
+                color="success"
+                size="large"
+                onClick={handleCreateBatch}
+                disabled={isCreatingBatch}
+                startIcon={
+                  isCreatingBatch ? (
+                    <CircularProgress size={20} color="inherit" />
+                  ) : (
+                    <SendIcon />
+                  )
+                }
+              >
+                {isCreatingBatch ? "Creating Batch..." : "Submit Batch"}
+              </Button>
+            </Stack>
+          </Box>
+        )}
+      </Paper>
+    </Box>
+  );
+};
+export default JournalBulkUpload;
+package com.fincore.gateway.Controller;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.gateway.JwtUtil.HmacJwtUtil;
+import com.fincore.gateway.Service.LoginService;
+import com.fincore.gateway.Service.TokenSessionValidator;
+import com.fincore.gateway.dto.*;
+import com.fincore.gateway.utility.LoginUtility;
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.ExpiredJwtException;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.security.Keys;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseCookie;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.http.server.reactive.ServerHttpResponse;
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
+
+import javax.crypto.SecretKey;
+import java.time.Duration;
+import java.util.Base64;
+import java.util.Map;
+
+import static com.fincore.gateway.Service.TokenSessionValidator.log;
+
+/**
+ * Authentication Controller (Reactive).
+ * Handles Login, Logout, and Token Refresh using a distributed Redis session model.
+ *
+ * Security Features:
+ * 1. Dual Token System: Short-lived Access Token (JSON) + Long-lived Refresh Token (HttpOnly Cookie).
+ * 2. Token Rotation: A new Refresh Token is issued on every use to detect theft.
+ * 3. Session Binding: Access Token JTI is bound to Redis `USR:<userId>`.
+ * 4. Concurrency Control: "One Session Per User" enforced via Redis JTI checks.
+ * 5. Reactive Non-Blocking: Uses WebFlux Mono/Flux patterns with Elastic Scheduler for DB.
+ */
+@Slf4j
+@RestController
+@RequestMapping("/auth")
+@RequiredArgsConstructor
+public class AuthController {
+
+    private static final String USER_PREFIX = "USR:";
+    private final TokenSessionValidator validator;
+    private final ReactiveStringRedisTemplate redisTemplate;
+    private final LoginService loginService;
+    private final ObjectMapper mapper;
+
+    @Value("${security.jwt.hmac-base64-secret:}")
+    private String hmacSecret;
+
+    // Access Token: Short Lived (e.g., 15 mins)
+    @Value("${security.jwt.ttl-seconds:900}")
+    private long accessTokenTtl;
+
+    // Refresh Token: Long Lived (e.g., 24 hours)
+    @Value("${security.jwt.refresh-ttl-seconds:86400}")
+    private long refreshTokenTtl;
+
+    /**
+     * Creates a secure HttpOnly cookie for the refresh token.
+     * Prevents XSS attacks as JavaScript cannot read this cookie.
+     *
+     * CONFIG NOTE:
+     * - secure(false): Allows HTTP (Localhost). Set to true in PROD with HTTPS.
+     * - sameSite("Lax"): Allows cross-origin navigation in Localhost dev.
+     * - path("/"): Ensures cookie is sent to all auth endpoints.
+     */
+    private ResponseCookie createRefreshTokenCookie(String token) {
+        return ResponseCookie.from("refresh_token", token)
+                .httpOnly(true)
+                .secure(false) // TODO: Set to true in Production (requires HTTPS)
+                .path("/")     // Root path ensures availability to all auth endpoints
+                .maxAge(Duration.ofSeconds(refreshTokenTtl))
+                .sameSite("Lax") // 'Lax' is safer for localhost dev than 'Strict'
+                .build();
+    }
+
+    /**
+     * Creates an empty cookie to clear the refresh token on logout.
+     */
+    private ResponseCookie createEmptyCookie() {
+        return ResponseCookie.from("refresh_token", "")
+                .httpOnly(true)
+                .path("/")
+                .maxAge(0)
+                .build();
+    }
+
+    /**
+     * LOGIN ENDPOINT
+     * 1. Validates credentials (Blocking DB call on Elastic Scheduler).
+     * 2. Generates Access Token & Refresh Token.
+     * 3. Stores Access Token JTI in Redis (Session Start).
+     * 4. Returns Access Token in Body, Refresh Token in HttpOnly Cookie.
+     */
+    @PostMapping(value = "/login", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<LoginResponseDTO> login(ServerHttpRequest request, ServerHttpResponse response, @RequestBody @Valid UserDto payload) {
+        final String clientIp = LoginUtility.getClientIp(request);
+        log.info("Login request for user: {} from IP: {}", payload.getUserId(), clientIp);
+
+        return Mono.fromCallable(() -> loginService.verifyUserCredentials(payload, clientIp))
+                .subscribeOn(Schedulers.boundedElastic()) // Move blocking JDBC call off the event loop
+                .flatMap(user -> {
+                    if (!user.isValidCredentials()) {
+                        log.warn("Invalid credentials for user: {}", payload.getUserId());
+                        return Mono.just(LoginResponseDTO.builder()
+                                .userId(user.getUserId())
+                                .validCredentials(false)
+                                .error(user.getMessage() != null ? user.getMessage() : "Invalid credentials")
+                                .build());
+                    }
+
+                    if (hmacSecret == null || hmacSecret.isBlank()) {
+                        log.error("Server Config Error: HMAC secret is missing.");
+                        return Mono.error(new IllegalStateException("Missing HMAC secret"));
+                    }
+
+                    // 1. Generate Tokens
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> claimsMap = mapper.convertValue(user.getUser(), Map.class);
+                    // Access Token (Short TTL)
+                    String accessToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), accessTokenTtl, claimsMap);
+
+                    // Refresh Token (Long TTL)
+                    Map<String, Object> refreshClaims = Map.of("type", "refresh");
+                    String refreshToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), refreshTokenTtl, refreshClaims);
+
+                    // Extract JTI from Access Token (This is what we track in Redis)
+                    String jti = extractClaims(accessToken).getId();
+
+                    // 2. Set Refresh Token in HttpOnly Cookie
+                    ResponseCookie cookie = createRefreshTokenCookie(refreshToken);
+                    response.addCookie(cookie);
+                    log.info("Login Success. Access Token TTL: {}s. Refresh Cookie Set.", accessTokenTtl);
+
+                    // 3. Register Session (JTI) in Redis & Fetch Menus
+                    return validator.registerUserSession(user.getUserId(), jti)
+                            .then(Mono.defer(() -> Mono.fromCallable(() -> loginService.fetchRoleWiseData(user.getUserId()))
+                                    .subscribeOn(Schedulers.boundedElastic())))
+                            .map(roleData -> LoginResponseDTO.builder()
+                                    .userId(user.getUserId())
+                                    .validCredentials(true)
+                                    .accessToken(accessToken) // Only Access Token goes to Frontend JS
+                                    .tokenType("Bearer")
+                                    .expiresIn(accessTokenTtl)
+                                    .sub(user.getUserId())
+                                    .jti(jti)
+                                    .roleData(roleData)
+                                    .build());
+                })
+                .onErrorResume(e -> {
+                    log.error("Login System Error for user {}", payload.getUserId(), e);
+                    return Mono.just(LoginResponseDTO.builder().error("Login failed: " + e.getMessage()).build());
+                });
+    }
+
+    /**
+     * REFRESH TOKEN ENDPOINT
+     * 1. Reads Refresh Token from Cookie.
+     * 2. Validates Signature & Expiry.
+     * 3. Checks Redis to ensure User Session is still valid/active.
+     * 4. Rotates Tokens (New Access Token + New Refresh Cookie).
+     */
+    @PostMapping(value = "/refresh-token", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<LoginResponseDTO> refreshToken(ServerHttpRequest request, ServerHttpResponse response) {
+        log.info("refresh" + refreshToken);
+
+        // 1. Extract Refresh Token from Cookie
+        org.springframework.http.HttpCookie cookie = request.getCookies().getFirst("refresh_token");
+        String refreshToken = (cookie != null) ? cookie.getValue() : null;
+
+        if (refreshToken == null || refreshToken.isBlank()) {
+            log.warn("Refresh failed: No refresh token cookie found. Cookies present: {}", request.getCookies().keySet());
+            return Mono.just(LoginResponseDTO.builder().error("Missing refresh token cookie").build());
+        }
+
+        return Mono.fromCallable(() -> {
+                    try {
+                        // Verify Refresh Token Signature & Expiry
+                        return extractClaims(refreshToken);
+                    } catch (ExpiredJwtException e) {
+                        log.warn("Refresh token expired.");
+                        throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Refresh token expired");
+                    } catch (Exception e) {
+                        log.error("Invalid refresh token signature/format.", e);
+                        throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid refresh token");
+                    }
+                })
+                .subscribeOn(Schedulers.boundedElastic())
+                .flatMap(claims -> {
+                    String userId = claims.getSubject();
+                    String userKey = USER_PREFIX + userId;
+
+                    log.info("Processing refresh for User: {}", userId);
+
+                    // Check if Session is still active in Redis (Global Logout Check)
+                    return redisTemplate.opsForValue().get(userKey)
+                            .flatMap(currentJti -> {
+                                log.info("Session Active. Redis Key Found for User: {}", userId);
+                                // Session Found! Proceed to refresh logic.
+                                return Mono.fromCallable(() -> loginService.getUserRole(userId))
+                                        .subscribeOn(Schedulers.boundedElastic())
+                                        .flatMap(userRole -> {
+                                            // Generate NEW Access Token
+                                            Map<String, Object> newClaims = Map.of("role", userRole != null ? userRole.getRole() : 0, "userId", userId);
+                                            String newAccessToken = HmacJwtUtil.generate(hmacSecret, userId, accessTokenTtl, newClaims);
+
+                                            // Generate NEW Refresh Token (Rotation)
+                                            Map<String, Object> refreshClaims = Map.of("type", "refresh");
+                                            String newRefreshToken = HmacJwtUtil.generate(hmacSecret, userId, refreshTokenTtl, refreshClaims);
+
+                                            String newJti = extractClaims(newAccessToken).getId();
+
+                                            // Rotate Cookie (Set new refresh token)
+                                            response.addCookie(createRefreshTokenCookie(newRefreshToken));
+
+                                            // Update Redis Session with NEW Access Token JTI
+                                            return validator.registerUserSession(userId, newJti)
+                                                    .thenReturn(LoginResponseDTO.builder()
+                                                            .accessToken(newAccessToken)
+                                                            .userId(userId)
+                                                            .jti(newJti)
+                                                            .expiresIn(accessTokenTtl)
+                                                            .validCredentials(true)
+                                                            .build());
+                                        });
+                            })
+                            // If Redis returns Empty, the session has expired (TTL) or was evicted
+                            .switchIfEmpty(Mono.defer(() -> {
+                                log.warn("Refresh Denied: Session key {} not found in Redis (Expired/Evicted).", userKey);
+                                return Mono.just(LoginResponseDTO.builder().error("Session expired. Please login again.").build());
+                            }));
+                })
+                .onErrorResume(e -> {
+                    if (e instanceof ResponseStatusException) {
+                        return Mono.just(LoginResponseDTO.builder().error(e.getMessage()).build());
+                    }
+                    log.error("Refresh Token Unexpected Error", e);
+                    return Mono.just(LoginResponseDTO.builder().error("Invalid refresh token").build());
+                });
+    }
+
+    /**
+     * LOGOUT ENDPOINT
+     * 1. Clears Refresh Cookie.
+     * 2. Blacklists current Access Token.
+     * 3. Clears Redis Session ONLY if JTI matches (Safe against concurrent login).
+     */
+    @PostMapping(value = "/logout", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<LoginResponseDTO> logout(JwtAuthenticationToken jwtAuth, ServerHttpResponse response) {
+        // Clear cookie immediately
+        response.addCookie(createEmptyCookie());
+
+        if (jwtAuth == null) return Mono.just(LoginResponseDTO.builder().error("No token").build());
+        String username = jwtAuth.getToken().getSubject();
+        String jti = jwtAuth.getToken().getId();
+
+        log.info("Logout requested for user: {}", username);
+
+        return validator.blacklistToken(jti)
+                .flatMap(x -> redisTemplate.opsForValue().get(USER_PREFIX + username))
+                .flatMap(activeJti -> {
+                    // Only clear session if the token being logged out matches the active session
+                    if (activeJti != null && activeJti.equals(jti)) {
+                        log.info("Session match. Clearing Redis session for user: {}", username);
+                        return validator.clearUserSession(username)
+                                .map(c -> LoginResponseDTO.builder().userId(username).error("Logged out").build());
+                    } else {
+                        log.info("Session mismatch (User logged in elsewhere). Only revoking token for user: {}", username);
+                        return Mono.just(LoginResponseDTO.builder().userId(username).error("Token revoked").build());
+                    }
+                })
+                .switchIfEmpty(Mono.just(LoginResponseDTO.builder().userId(username).error("Logged out").build()));
+    }
+
+    @PostMapping(value = "/check-user")
+    public Mono<VerifyUserDTO> checkUser(@RequestBody Map<String, String> body) {
+        return Mono.fromCallable(() -> loginService.checkUser(body.get("userId"))).subscribeOn(Schedulers.boundedElastic());
+    }
+
+    @PostMapping(value = "/update-password")
+    public Mono<UpdatePasswordDTO> updatePassword(@RequestBody @Valid UpdatePasswordDTO dto) {
+        return Mono.fromCallable(() -> loginService.updatePassword(dto)).subscribeOn(Schedulers.boundedElastic());
+    }
+
+    // Helper to parse token
+    private Claims extractClaims(String token) {
+        byte[] secretBytes = Base64.getDecoder().decode(hmacSecret);
+        return Jwts.parser().verifyWith(Keys.hmacShaKeyFor(secretBytes)).build().parseSignedClaims(token).getPayload();
+    }
+}
+
+this is my current file please resolve that issue for media type is unsupported and give mi updated fils
+
