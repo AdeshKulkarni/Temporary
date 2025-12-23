@@ -1,13 +1,89 @@
-The 415 error occurs because Spring Boot's default error handling for unauthorized/missing tokens in the filter chain is intercepting the request before it reaches your controller, or because your Frontend is still sending the wrong Content-Type header which Spring rejects before your useApi logic can fix it.
-However, based on your previous messages, the immediate 415 error on /bulk-validate-init is happening because your Controller expects Multipart (File) but your Client is sending JSON.
-Since you are using a Reactive Gateway (webflux), the way you handle Multipart uploads is different from standard Spring MVC (webmvc).
-Here is the Updated AuthController.java. I have not changed your logic, I just ensured imports are correct and added robustness.
-But crucially, you need to fix your Gateway configuration to allow Multipart requests if you are routing them through this Gateway, OR fix the Journal Service Controller if you are hitting it directly.
-Since your previous error logs showed JournalService, I assume you are hitting the Journal Service directly (or via Gateway routing). The AuthController you pasted above is for Login/Auth, it has nothing to do with the File Upload endpoint /bulk-validate-init.
-You pasted AuthController.java (Login/Logout), but your error is on /journals/bulk-validate-init (File Upload).
-I will assume you want to fix the Journal Service Controller that handles the file upload, based on our previous conversation.
-1. Updated JournalRequestController.java (For Spring MVC)
-Use this to correctly handle the file upload and avoid 415 errors.
+This happens because FormData is tricky—you cannot simply console.log(formData) to see its contents. It will always look empty in the console unless you iterator over it.
+Here is the complete solution with Debug Logging on both Frontend and Backend to prove exactly what is being sent and received.
+1. Frontend: JournalBulkUpload.js (Updated)
+I have added a loop to log the FormData entries so you can verify the file is actually attached before sending.
+// ... imports
+
+  const handleStartValidation = async () => {
+    if (!selectedDate || !file) {
+      showSnackBar("Please select Date and File.", "warning");
+      return;
+    }
+    
+    // Reset States
+    setResultStatus(null);
+    setResultMsg("");
+    setValidationStage(0);
+    setIsProcessing(true);
+    setAutoDlTriggered(false);
+    setDownloadMsg("Downloading Error Report...");
+
+    // 1. Prepare FormData
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("postingDate", selectedDate);
+
+    // --- DEBUG LOGS (Check Browser Console) ---
+    console.log("--- STARTING UPLOAD ---");
+    console.log("Selected File:", file.name, file.size, file.type);
+    console.log("Posting Date:", selectedDate);
+    
+    // Verify FormData is not empty
+    for (var pair of formData.entries()) {
+        console.log("FormData Entry -> " + pair[0] + ': ' + pair[1]);
+    }
+    // ------------------------------------------
+
+    try {
+      // 2. Call API
+      // CRITICAL: We pass 'undefined' as the Content-Type.
+      // This forces useApi.js to let the Browser generate the boundary.
+      const data = await callApi(
+        "/JS/journals/bulk-validate-init",
+        formData,
+        "POST",
+        "json",      // responseType
+        undefined    // contentType (Let Browser Handle It)
+      );
+
+      if (data && data.requestId) {
+        console.log("Upload Success. Request ID:", data.requestId);
+        setRequestId(data.requestId);
+      } else {
+        throw new Error("Invalid response from server");
+      }
+    } catch (err) {
+      console.error("Upload Failed:", err);
+      setIsProcessing(false);
+      setResultStatus("ERROR");
+      setResultMsg("Init Failed: " + (err.message || "Unknown Error"));
+    }
+  };
+
+// ... rest of the file
+
+2. Frontend: useApi.js (Verify This Logic)
+Ensure your useApi.js has this exact logic inside callApi. This is what prevents the "Empty FormData" issue.
+// ... inside callApi ...
+
+        const headers = {
+          Authorization: `Bearer ${token}`,
+          "X-Request-Type": xRequestType,
+        };
+
+        // --- CRITICAL LOGIC ---
+        // If payload is FormData, we DELETE Content-Type.
+        // The browser will automatically add: "Content-Type: multipart/form-data; boundary=----WebKitFormBoundary..."
+        if (payload instanceof FormData) {
+             // Do NOT set Content-Type
+        } else {
+             headers["Content-Type"] = contentType;
+        }
+        
+        // ... rest of config
+
+3. Backend: JournalRequestController.java (Updated with Logs)
+I have added aggressive logging at the start of the method. Check your Server Console/Logs when you hit "Start Validation".
 package com.fincore.JournalService.Controllers;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -17,6 +93,7 @@ import com.fincore.JournalService.Models.JournalRequest;
 import com.fincore.JournalService.Service.JournalBulkValidationService;
 import com.fincore.JournalService.Service.JournalRequestService;
 import com.fincore.commonutilities.jwt.JwtUtil;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -52,42 +129,52 @@ public class JournalRequestController {
         return date.format(DateTimeFormatter.ISO_LOCAL_DATE);
     }
 
-    // --- FILE UPLOAD FIX ---
+    // --- FILE UPLOAD (WITH DEBUG LOGS) ---
     @PostMapping(value = "/bulk-validate-init", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public ResponseEntity<?> initiateValidation(@RequestParam("file") MultipartFile file, 
-                                                @RequestParam("postingDate") String date) {
+    public ResponseEntity<?> initiateValidation(
+            @RequestParam("file") MultipartFile file, 
+            @RequestParam("postingDate") String date,
+            HttpServletRequest request) { // Added Request to log headers
+        
         try {
-            // Log for debugging
-            log.info("Received file upload request. Name: {}, Size: {}, Date: {}", 
-                     file.getOriginalFilename(), file.getSize(), date);
+            // 1. LOG HEADER DETAILS
+            log.info(">>> INCOMING UPLOAD REQUEST <<<");
+            log.info("Content-Type Header: {}", request.getContentType());
+            log.info("Content-Length Header: {}", request.getContentLength());
 
-            if (file.isEmpty()) return ResponseEntity.badRequest().body(Map.of("error", "File empty"));
+            // 2. LOG FILE DETAILS
+            if (file == null) {
+                log.error("File is NULL");
+                return ResponseEntity.badRequest().body(Map.of("error", "File parameter is missing"));
+            }
             
-            // Explicitly allow Excel AND CSV mime types
-            String contentType = file.getContentType();
-            if (contentType != null && !isValidContentType(contentType)) {
-                 log.warn("Invalid content type received: {}", contentType);
-                 // Optional: You can return 400 here, or just let it pass if you trust the parser
+            log.info("File Name: {}", file.getOriginalFilename());
+            log.info("File Size: {} bytes", file.getSize());
+            log.info("File ContentType: {}", file.getContentType());
+            log.info("Posting Date Param: {}", date);
+
+            if (file.isEmpty()) {
+                log.error("File is EMPTY (0 bytes)");
+                return ResponseEntity.badRequest().body(Map.of("error", "File is empty"));
             }
 
-            String reqId = journalBulkValidationService.initiateValidation(file.getBytes(), file.getOriginalFilename(), LocalDate.parse(date));
+            // 3. PROCESS
+            String reqId = journalBulkValidationService.initiateValidation(
+                file.getBytes(), 
+                file.getOriginalFilename(), 
+                LocalDate.parse(date)
+            );
+            
+            log.info("Validation Queued. ReqID: {}", reqId);
             return ResponseEntity.ok(Map.of("status", "QUEUED", "requestId", reqId));
-        } catch (Exception e) { 
-            log.error("File Upload Error", e); 
-            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage())); 
+
+        } catch (Exception e) {
+            log.error("File Upload Exception", e);
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
         }
     }
-    
-    private boolean isValidContentType(String type) {
-        return type.equals("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") || // .xlsx
-               type.equals("application/vnd.ms-excel") || // .xls
-               type.equals("text/csv") || 
-               type.equals("application/csv") || 
-               type.equals("text/plain"); // Sometimes CSV comes as text/plain
-    }
 
-    // ... (Keep ALL other methods exactly as they were in your previous code) ...
-
+    // ... (Keep remaining methods as they are) ...
     // --- 1. SUMMARIES ---
     @GetMapping("/pending-requests-summary")
     public ResponseEntity<?> getPendingBatchSummaries() {
@@ -179,9 +266,4 @@ public class JournalRequestController {
     public ResponseEntity<List<JournalRequestStatusDto>> getJournalStatusList() { return ResponseEntity.ok(journalRequestService.getJournalRequestStatusList()); }
 }
 
-2. Frontend Check (Crucial)
-If you have updated useApi.js as requested previously, you must not pass headers manually in JournalBulkUpload.js.
-If useApi.js is correct, the 415 error will persist only if:
- * Gateway Issue: Your Spring Cloud Gateway is stripping headers or defaulting content-type before forwarding to Journal Service.
- * Auth Filter Issue: ContextRbacFilter (seen in your logs) might be reading the body or headers in a way that breaks multipart requests.
-But first, ensure the Controller above is used. It explicitly logs the incoming file details, so you can check your console to see if the request even enters the method. If you don't see "Received file upload request", the block is happening before the controller (in the Filter Chain).
+
