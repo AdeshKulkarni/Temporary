@@ -1,66 +1,219 @@
-The error 415 Unsupported Media Type occurs because your Frontend is sending the request with a Content-Type of application/json (which is likely the default in your useApi hook), but your Backend Controller explicitly requires multipart/form-data.
-To fix this, you need to update the handleStartValidation function in your frontend file JournalBulkUpload.js to explicitly tell useApi to handle multipart/form-data.
-The Fix
-Open JournalBulkUpload.js and modify the handleStartValidation function.
-Based on how you used callApi in other parts of your code (specifically handleDownloadFile), the 5th argument appears to be the Content-Type. You need to pass "multipart/form-data" (or null, depending on your hook's implementation) to ensure the browser sets the correct headers with the boundary.
-Corrected Code:
-  const handleStartValidation = async () => {
-    if (!selectedDate || !file) {
-      showSnackBar("Please select Date and File.", "warning");
-      return;
-    }
-    setResultStatus(null);
-    setResultMsg("");
-    setValidationStage(0);
-    setIsProcessing(true);
-    setAutoDlTriggered(false);
-    setDownloadMsg("Downloading Error Report...");
+// useApi.js
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import axios from "axios";
+import { useLocation, useNavigate } from "react-router-dom";
+import useCustomSnackbar from "../utils/useCustomSnackbar";
+import { useSelector } from "react-redux";
+import { resolveConfig } from "../config/EnvironmentConfig";
+import { convertToKebabCase } from "../utils/CommonUtilities";
 
-    // Create FormData
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("postingDate", selectedDate);
 
+const useApi = () => {
+  const [data, setData] = useState(null); // Store API response data
+  const [error, setError] = useState(null); // Store error info
+  const [loading, setLoading] = useState(false); // Loading state
+
+  const navigate = useNavigate();
+  const location = useLocation();
+  const snackbar = useCustomSnackbar();
+
+  const token = useSelector((state) => state.auth.token);
+  const menus = useSelector((s) => s.menus.menus);
+  const selectedMenuItem = useSelector((s) => s.menus.selectedMenuItem);
+
+  // Keep track of active requests for cancellation
+  const activeRequestsRef = useRef(new Set());
+
+  /** Refresh token handler (if required) */
+  const refreshToken = async () => {
     try {
-      // FIX: Added the 4th (responseType) and 5th (contentType) arguments
-      const data = await callApi(
-        "/JS/journals/bulk-validate-init",
-        formData,
-        "POST",
-        null, // responseType (defaults to json)
-        "multipart/form-data" // contentType (Overrides application/json)
+      await axios.post(
+        `${resolveConfig("/LS") ?? ""}/refresh-token`,
+        {},
+        { withCredentials: true }
       );
-
-      if (data && data.requestId) {
-        setRequestId(data.requestId);
-      } else {
-        throw new Error("Invalid response from server");
-      }
     } catch (err) {
-      setIsProcessing(false);
-      setResultStatus("ERROR");
-      setResultMsg("Init Failed: " + (err.message || "Unknown Error"));
+      console.error("Token refresh failed", err);
     }
   };
 
-Why this happens
- * Backend Requirement: In JournalRequestController.java, you have:
-   @PostMapping(value = "/bulk-validate-init", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+  /** Cancel all ongoing requests */
+  const cancelAllRequests = () => {
+    activeRequestsRef.current.forEach((controller) => {
+      if (controller && !controller.signal.aborted) {
+        controller.abort();
+      }
+    });
+    activeRequestsRef.current.clear();
+    setLoading(false);
+  };
 
-   This strictly enforces that the incoming request must have the header Content-Type: multipart/form-data.
- * Frontend Default: Your useApi hook likely defaults headers to {"Content-Type": "application/json"} if not specified. When you send FormData with a JSON header, Spring Boot rejects it immediately with a 415 error because it cannot parse binary file data as JSON.
-Important Note on useApi Implementation
-Depending on how your useApi hook is written, passing "multipart/form-data" manually can sometimes cause a "Missing Boundary" error.
-If the fix above results in a 400 Bad Request, change the string "multipart/form-data" to null or undefined in the call.
-Alternative Fix (if the above gives Error 400):
-const data = await callApi(
-  "/JS/journals/bulk-validate-init",
-  formData,
-  "POST",
-  null, 
-  null // Passing null often tells Axios/Fetch to let the browser set the header automatically
-);
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => cancelAllRequests();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-The Browser's Job: When sending FormData, the browser automatically sets the content type to:
-Content-Type: multipart/form-data; boundary=----WebKitFormBoundary...
-The boundary is critical. If your API wrapper forces a hardcoded string Content-Type: multipart/form-data without the boundary, the backend will fail. Ensure your useApi allows the browser to handle this when FormData is detected.
+  /** Find menu item from route (same idea as in Sidebar) */
+  const findMenuItem = useCallback((items, route) => {
+    if (!items || !items.length) return null;
+
+    for (const item of items) {
+      // Direct route match
+      if (item.route === route) return item;
+
+      // Children / nested routes
+      if (item.children && item.children.length > 0) {
+        const isSubmenuSelectionPage = route.includes("/choose-option");
+
+        if (isSubmenuSelectionPage) {
+          const prefix = "/choose-option/";
+          const startIndex = route.indexOf(prefix) + prefix.length;
+          const parameter = route.substring(startIndex);
+          if (parameter === convertToKebabCase(item.title)) {
+            return item;
+          }
+        }
+
+        const childMatch = findMenuItem(item.children, route);
+        if (childMatch) return childMatch;
+      }
+    }
+
+    return null;
+  }, []);
+
+  /** Current menu from route (for latest screen) */
+  const currentMenuFromRoute = useMemo(() => {
+    if (!menus || !menus.length) return null;
+    return findMenuItem(menus, location.pathname);
+  }, [menus, location.pathname, findMenuItem]);
+
+  /** X-Request-Type – always try to use the route-based menu first */
+  const xRequestType = useMemo(() => {
+    return (
+      currentMenuFromRoute?.requestType || selectedMenuItem?.requestType || "*"
+    );
+  }, [currentMenuFromRoute, selectedMenuItem]);
+
+  /**
+   * Generic API caller
+   * @param {string} url - API endpoint
+   * @param {object|null} payload - Request body or query params
+   * @param {string} method - HTTP method (GET, POST, PUT, PATCH, DELETE)
+   * @param {string} responseType - Axios response type
+   * @param {string} contentType - Content-Type header
+   * @param {object} extraConfig - Additional axios config
+   * @param {boolean} returnDataOnly - for returning only response data or whole response (with headers)
+   */
+  const callApi = useCallback(
+    async (
+      url,
+      payload = null,
+      method = "GET",
+      responseType = "json",
+      contentType = "application/json",
+      extraConfig = {},
+      returnDataOnly = true
+    ) => {
+      // Build final URL using service resolution
+      const parts = url.split("/");
+      const service = parts[1];
+      const resolved = resolveConfig(`/${service}`);
+      parts[1] = resolved;
+      const Final_Url = parts.slice(1).join("/");
+
+      const controller = new AbortController();
+      activeRequestsRef.current.add(controller);
+
+      setLoading(true);
+      setError(null);
+
+      try {
+        const headers = {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": contentType,
+          "X-Request-Type": xRequestType,
+        };
+
+        const config = {
+          method: method.toUpperCase(),
+          url: Final_Url,
+          headers,
+          responseType,
+          withCredentials: true,
+          signal: controller.signal,
+          ...extraConfig,
+        };
+
+        // Attach payload depending on method type
+        if (payload !== null) {
+          if (method.toUpperCase() === "GET") {
+            config.params = payload;
+          } else {
+            config.data = payload;
+          }
+        }
+
+        const response = await axios(config);
+        // console.log(response);
+
+        if (!controller.signal.aborted) {
+          if (response.data.status === 440) {
+            console.error("You have logged in another session");
+            navigate("/");
+          }
+
+          if (response?.data?.status === 401) {
+            console.error("You have to login again as the session is expired");
+            navigate("/");
+          }
+
+          setData(response.data);
+          return returnDataOnly ? response.data : response;
+        }
+      } catch (err) {
+        const status = err.response?.status;
+
+        if (status === 440) {
+          console.error("You have logged in another session");
+          navigate("/");
+        }
+
+        // if (status === 401) {
+        //   console.error("You have to login again as the session is expired");
+        //   navigate("/");
+        // }
+
+        if (!axios.isCancel(err) && !controller.signal.aborted) {
+          console.error("API call error:", err);
+
+          const apiMessage =
+            err.response?.data?.result?.message ||
+            err.response?.data?.message ||
+            err.response?.statusText ||
+            "Something went wrong";
+
+          snackbar(apiMessage, "error");
+          setError(err);
+        }
+
+        if (axios.isCancel(err)) {
+          // Let caller handle cancellation if they care
+          throw err;
+        }
+      } finally {
+        activeRequestsRef.current.delete(controller);
+        setLoading(false);
+      }
+    },
+    // Precise deps: callApi only changes when these change
+    [navigate, snackbar, token, xRequestType]
+  );
+
+  return { data, error, loading, callApi, cancelAllRequests, refreshToken };
+};
+
+export default useApi;
+
+this is my use api code dont change any other functility existing one
