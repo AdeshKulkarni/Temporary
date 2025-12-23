@@ -1,7 +1,184 @@
-/CM
-JournalBulkUpload.jsx:266 --- STARTING UPLOAD ---
-JournalBulkUpload.jsx:267 Selected File: Success_Journal_f9c67fc5-9d46-44c4-84f8-152bb681b4df.csv 181 text/csv
-JournalBulkUpload.jsx:268 Posting Date: 2025-12-02
-JournalBulkUpload.jsx:272 FormData Entry -> file: [object File]
-JournalBulkUpload.jsx:272 FormData Entry -> postingDate: 2025-12-02
-EnvironmentConfig.js:4 /JS
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import axios from "axios";
+import { useLocation, useNavigate } from "react-router-dom";
+import useCustomSnackbar from "../utils/useCustomSnackbar";
+import { useSelector } from "react-redux";
+import { resolveConfig } from "../config/EnvironmentConfig";
+import { convertToKebabCase } from "../utils/CommonUtilities";
+
+const useApi = () => {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const navigate = useNavigate();
+  const location = useLocation();
+  const snackbar = useCustomSnackbar();
+
+  const token = useSelector((state) => state.auth.token);
+  const menus = useSelector((s) => s.menus.menus);
+  const selectedMenuItem = useSelector((s) => s.menus.selectedMenuItem);
+
+  const activeRequestsRef = useRef(new Set());
+
+  const cancelAllRequests = () => {
+    activeRequestsRef.current.forEach((controller) => {
+      if (controller && !controller.signal.aborted) {
+        controller.abort();
+      }
+    });
+    activeRequestsRef.current.clear();
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    return () => cancelAllRequests();
+  }, []);
+
+  const refreshToken = async () => {
+    // ... (keep existing logic if needed)
+  };
+
+  // ... (keep findMenuItem logic) ...
+    const findMenuItem = useCallback((items, route) => {
+    if (!items || !items.length) return null;
+    for (const item of items) {
+      if (item.route === route) return item;
+      if (item.children && item.children.length > 0) {
+        const isSubmenuSelectionPage = route.includes("/choose-option");
+        if (isSubmenuSelectionPage) {
+          const prefix = "/choose-option/";
+          const startIndex = route.indexOf(prefix) + prefix.length;
+          const parameter = route.substring(startIndex);
+          if (parameter === convertToKebabCase(item.title)) {
+            return item;
+          }
+        }
+        const childMatch = findMenuItem(item.children, route);
+        if (childMatch) return childMatch;
+      }
+    }
+    return null;
+  }, []);
+
+  const currentMenuFromRoute = useMemo(() => {
+    if (!menus || !menus.length) return null;
+    return findMenuItem(menus, location.pathname);
+  }, [menus, location.pathname, findMenuItem]);
+
+  const xRequestType = useMemo(() => {
+    return (
+      currentMenuFromRoute?.requestType || selectedMenuItem?.requestType || "*"
+    );
+  }, [currentMenuFromRoute, selectedMenuItem]);
+
+  // --- DEBUGGED CALL API FUNCTION ---
+  const callApi = useCallback(
+    async (
+      url,
+      payload = null,
+      method = "GET",
+      responseType = "json",
+      contentType = "application/json",
+      extraConfig = {},
+      returnDataOnly = true
+    ) => {
+      console.log("--------------------------------------");
+      console.log(`[useApi] Step 1: Initiating Call to: ${url}`);
+      
+      // 1. URL RESOLUTION DEBUG
+      let Final_Url = "";
+      try {
+          const parts = url.split("/");
+          const service = parts[1]; // e.g. "JS"
+          
+          console.log(`[useApi] Step 2: resolving config for /${service}`);
+          const resolved = resolveConfig(`/${service}`);
+          
+          console.log(`[useApi] Step 3: Resolved Base URL: ${resolved}`);
+          if (!resolved) {
+              console.error("[useApi] CRITICAL: resolveConfig returned undefined/null!");
+              snackbar("System Error: API Configuration Missing", "error");
+              return;
+          }
+
+          parts[1] = resolved;
+          Final_Url = parts.slice(1).join("/");
+          console.log(`[useApi] Step 4: Final Request URL: ${Final_Url}`);
+          
+      } catch (err) {
+          console.error("[useApi] CRITICAL: URL Construction Failed", err);
+          return;
+      }
+
+      const controller = new AbortController();
+      activeRequestsRef.current.add(controller);
+      setLoading(true);
+      setError(null);
+
+      try {
+        const headers = {
+          Authorization: `Bearer ${token}`,
+          "X-Request-Type": xRequestType,
+        };
+
+        // 2. HEADER DEBUG
+        if (!(payload instanceof FormData)) {
+          headers["Content-Type"] = contentType;
+        } else {
+            console.log("[useApi] Step 5: FormData detected. Content-Type removed.");
+        }
+
+        const config = {
+          method: method.toUpperCase(),
+          url: Final_Url,
+          headers,
+          responseType,
+          withCredentials: true,
+          signal: controller.signal,
+          ...extraConfig,
+        };
+
+        if (payload !== null) {
+          if (method.toUpperCase() === "GET") config.params = payload;
+          else config.data = payload;
+        }
+
+        console.log("[useApi] Step 6: Sending Axios Request...", config);
+
+        // 3. EXECUTE REQUEST
+        const response = await axios(config);
+        
+        console.log("[useApi] Step 7: Response Received", response.status);
+
+        if (!controller.signal.aborted) {
+          setData(response.data);
+          return returnDataOnly ? response.data : response;
+        }
+      } catch (err) {
+        console.error("[useApi] Step 8: REQUEST FAILED", err);
+        
+        const status = err.response?.status;
+        if (status === 440) {
+            console.error("Session Expired (440)");
+            navigate("/");
+        }
+
+        if (!axios.isCancel(err) && !controller.signal.aborted) {
+          const apiMessage = err.response?.data?.result?.message || err.response?.data?.message || err.message || "Unknown Error";
+          snackbar(apiMessage, "error");
+          setError(err);
+        }
+        if (axios.isCancel(err)) throw err;
+      } finally {
+        activeRequestsRef.current.delete(controller);
+        setLoading(false);
+      }
+    },
+    [navigate, snackbar, token, xRequestType]
+  );
+
+  return { data, error, loading, callApi, cancelAllRequests, refreshToken };
+};
+
+export default useApi;
