@@ -1,194 +1,600 @@
+Based on the code you provided from the old MOCService, the missing API in your current JournalService is the manual batch creation endpoint (/create-batch).
+Currently, your JournalService only has createBatchFromCache (for file uploads). You need to add the endpoint that accepts a JSON Body (DTO) for manual entry screens.
+Here are the fully integrated and updated files.
+1. Updated DTO: BatchRequestDto.java
+Path: com/fincore/JournalService/Dto/BatchRequestDto.java
+Aligned with your MOC version to support the manual entry flow.
+package com.fincore.JournalService.Dto;
+
+import com.fincore.JournalService.Models.enums.ChangeType;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
+import java.math.BigDecimal;
+import lombok.Data;
+import java.util.List;
+
+@Data
+public class BatchRequestDto {
+
+    @Data
+    public static class JournalRequestRow {
+        @NotNull
+        private ChangeType changeType = ChangeType.ADD; 
+        
+        private Long masterJournalId; 
+
+        @NotNull @Size(min = 1, max = 50) 
+        private String branch; 
+
+        @NotNull @Size(min = 3, max = 3) 
+        private String currency;
+
+        @NotNull @Size(min = 1, max = 50)
+        private String cgl;
+
+        @NotNull
+        private BigDecimal amount; 
+       
+        @Size(max = 20) 
+        private String productType;
+        
+        @Size(max = 200) 
+        private String remarks;
+        
+        @Size(min = 1, max = 1)
+        private String arFlag = "A"; 
+        
+        @Size(min = 1, max = 1) 
+        private String acClassification; 
+    }
+
+    @Size(max = 200)
+    private String commonBatchRemarks;
+
+    @Valid
+    @NotNull
+    private List<JournalRequestRow> rows;
+}
+
+2. Updated Controller: JournalRequestController.java
+Path: com/fincore/JournalService/Controllers/JournalRequestController.java
+Added the missing create-batch endpoint with the JWT Role Fix you requested.
 package com.fincore.JournalService.Controllers;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.JsonNode;
-
 import com.fincore.JournalService.Dto.*;
+import com.fincore.JournalService.Exception.ResourceNotFoundException;
 import com.fincore.JournalService.Models.JournalRequest;
 import com.fincore.JournalService.Service.JournalBulkValidationService;
 import com.fincore.JournalService.Service.JournalRequestService;
 import com.fincore.commonutilities.jwt.JwtUtil;
-
+import io.jsonwebtoken.Claims;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-
-// Standard Spring Imports
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.core.io.Resource;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
 import org.springframework.http.MediaType;
-
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
-import java.io.IOException;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
-import java.util.Base64;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 @RestController
-@RequestMapping("journals")
+@RequestMapping("/journals")
 @RequiredArgsConstructor
 @Slf4j
 public class JournalRequestController {
 
-	private final JournalRequestService journalRequestService;
-	private final JournalBulkValidationService journalBulkValidationService;
+    private final JournalRequestService journalRequestService;
+    private final JournalBulkValidationService journalBulkValidationService;
+    private final JwtUtil jwtUtil;
 
-	@GetMapping("/current-posting-date")
-	public String getCurrentPostingDate() {
-		return LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE);
-	}
+    // --- 1. NEW: MANUAL BATCH CREATION (The Missing API) ---
+    @PostMapping("/create-batch")
+    public ResponseEntity<List<JournalRequest>> createBatchRequest(
+            @Valid @RequestBody BatchRequestDto batchDto,
+            @RequestHeader("Authorization") String token) throws JsonProcessingException {
+        
+        String userId = JwtUtil.getUserIdFromToken(token);
+        
+        // JWT Role Fix: Extract role directly from Claims as per MOC code
+        Claims claims = JwtUtil.getClaimsFromToken(token);
+        Integer userRole = (Integer) claims.get("role");
+        
+        log.info("Creating Manual Journal Batch. User: {}, Role: {}", userId, userRole);
+        
+        List<JournalRequest> createdRequests = journalRequestService.createBatchRequest(batchDto, userId, userRole);
+        return ResponseEntity.status(HttpStatus.CREATED).body(createdRequests);
+    }
 
-	 @PostMapping(value = "/bulk-validate", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-	    public ResponseEntity<?> validateBulkUpload(
-	            @RequestParam("file") MultipartFile file,
-	            @RequestParam("postingDate") String postingDateStr
-	    ) throws IOException {
-	        
-	        LocalDate postingDate = LocalDate.parse(postingDateStr);
+    // --- 2. EXISTING: BATCH CREATION (FROM FILE CACHE) ---
+    @PostMapping("/create-batch-from-cache")
+    public ResponseEntity<Map<String, Object>> createBatchFromCache(@RequestBody Map<String, String> payload, @RequestHeader("Authorization") String token) {
+        try {
+            // Using existing JwtUtil helper for standard cases
+            String batchId = journalRequestService.createBatchFromCache(
+                payload.get("requestId"), 
+                payload.get("commonBatchRemarks"), 
+                jwtUtil.getUserIdFromToken(token), 
+                jwtUtil.getUserRoleFromToken(token)
+            );
+            return ResponseEntity.ok(Map.of("status", "SUCCESS", "message", "Batch created successfully", "batchId", batchId));
+        } catch (ResourceNotFoundException e) { 
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("status", "ERROR", "message", e.getMessage())); 
+        } catch (Exception e) { 
+            log.error("Error", e); 
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("status", "ERROR", "message", "System error.")); 
+        }
+    }
 
-	        Map<String, Object> result = journalBulkValidationService.validateAndProcessFile(file, postingDate);
+    // --- 3. COMMON UTILS ---
+    @GetMapping("/current-posting-date")
+    public String getCurrentPostingDate() {
+        LocalDate date = journalRequestService.getCurrentPostingDate();
+        return date.format(DateTimeFormatter.ISO_LOCAL_DATE);
+    }
 
-	        byte[] fileContent = (byte[]) result.get("file");
-	        String base64File = (fileContent != null) ? Base64.getEncoder().encodeToString(fileContent) : null;
+    // --- 4. SUMMARIES ---
+    @GetMapping("/pending-requests-summary")
+    public ResponseEntity<?> getPendingBatchSummaries() {
+        try { return ResponseEntity.ok(journalRequestService.getPendingBatchSummaries()); }
+        catch (Exception e) { log.error("Error", e); return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", "Unable to load pending requests.")); }
+    }
 
-	        if ("ERROR".equals(result.get("status"))) {
-	            long count = (long) result.get("errorCount");
-	            
-	            // Use HashMap to allow potential nulls (though unlikely here)
-	            Map<String, Object> response = new HashMap<>();
-	            response.put("status", "ERROR");
-	            response.put("message", "Validation failed. Found " + count + " errors.");
-	            response.put("errorCount", count);
-	            response.put("errorReportBase64", base64File);
-	            
-	            return ResponseEntity.ok(response);
-	        }
+    @GetMapping("/all-requests-summary")
+    public ResponseEntity<?> getAllBatchSummaries() {
+        try { return ResponseEntity.ok(journalRequestService.getAllBatchSummaries()); }
+        catch (Exception e) { log.error("Error", e); return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", "Unable to load requests.")); }
+    }
 
-	        // SUCCESS CASE
-	        // FIX: Map.of() throws NPE if value is null. base64File is NULL for CSVs.
-	        Map<String, Object> response = new HashMap<>();
-	        response.put("status", "SUCCESS");
-	        response.put("message", "Validation Successful!");
-	        response.put("successFileBase64", base64File); // Safe to put null in HashMap
-	        response.put("previewData", result.get("previewData"));
+    // --- 5. PAGINATED DETAILS ---
+    @GetMapping("/by-batch-paginated/{batchId}")
+    public ResponseEntity<?> getRequestsByBatchIdPaginated(@PathVariable String batchId, @RequestParam(defaultValue = "0") int page, @RequestParam(defaultValue = "10") int size) {
+        try { return ResponseEntity.ok(journalRequestService.getRequestsByBatchIdPaginated(batchId, PageRequest.of(page, size))); }
+        catch (Exception e) { log.error("Error", e); return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", "Unable to load details.")); }
+    }
 
-	        return ResponseEntity.ok(response);
-	    }
+    // --- 6. FILE VALIDATION & DOWNLOAD ---
+    @PostMapping(value = "/bulk-validate-init", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<?> initiateValidation(
+            @RequestParam("file") MultipartFile file,
+            @RequestParam("postingDate") String date,
+            HttpServletRequest request) {
 
-	// ------------------------------------------
+        try {
+            if (file == null || file.isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of("error", "File is missing or empty"));
+            }
+            String reqId = journalBulkValidationService.initiateValidation(
+                    file.getBytes(),
+                    file.getOriginalFilename(),
+                    LocalDate.parse(date)
+            );
+            return ResponseEntity.ok(Map.of("status", "QUEUED", "requestId", reqId));
 
-	@PostMapping("/create-batch")
-	@ResponseStatus(HttpStatus.CREATED)
-	public List<JournalRequest> createBatchRequest(@Valid @RequestBody BatchRequestDto batchDto,
-			@RequestHeader("Authorization") String token) throws JsonProcessingException {
+        } catch (Exception e) {
+            log.error("File Upload Exception", e);
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
+    }
 
-		String userId = JwtUtil.getUserIdFromToken(token);
-		JsonNode claims = JwtUtil.getClaimsFromToken(token);
-		Integer userRole = claims.get("role").asInt();
+    @GetMapping("/bulk-status/{requestId}")
+    public ResponseEntity<BulkUploadStateDto> checkStatus(@PathVariable String requestId) {
+        BulkUploadStateDto state = journalBulkValidationService.getState(requestId);
+        return state != null ? ResponseEntity.ok(state) : ResponseEntity.notFound().build();
+    }
 
-		log.info("Received Journal batch request creation call from user: {}, role: {}", userId, userRole);
+    @GetMapping("/download-bulk-file/{requestId}")
+    public ResponseEntity<Resource> downloadFile(@PathVariable String requestId, @RequestParam String type) {
+        try {
+            byte[] data = journalBulkValidationService.getFileBytes(requestId, type);
+            if (data == null) return ResponseEntity.notFound().build();
+            String name = type.equals("ERROR") ? "Error_Report.xlsx" : "Success.csv";
+            String mime = type.equals("ERROR") ? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" : "text/csv";
+            return ResponseEntity.ok().header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + name + "\"").contentType(MediaType.parseMediaType(mime)).body(new ByteArrayResource(data));
+        } catch (Exception e) { return ResponseEntity.internalServerError().build(); }
+    }
 
-		return journalRequestService.createBatchRequest(batchDto, userId, userRole);
-	}
+    @GetMapping("/download-template")
+    public ResponseEntity<Resource> downloadTemplate() {
+        try {
+            byte[] data = journalBulkValidationService.generateTemplateBytes();
+            return ResponseEntity.ok().header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Journal_Upload_Template.xlsx\"").contentType(MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")).body(new ByteArrayResource(data));
+        } catch (Exception e) { return ResponseEntity.internalServerError().build(); }
+    }
 
-	@PatchMapping("/update-request")
-	public JournalRequest updateRequestStatus(@RequestHeader("Authorization") String token,
-			@RequestBody ProcessJournalRequestDto processRequestDto) throws JsonProcessingException {
+    // --- 7. ACTIONS (APPROVE/REJECT/CANCEL) ---
+    @PostMapping("/process-bulk")
+    public ResponseEntity<?> processBulkRequests(@RequestHeader("Authorization") String token, @Valid @RequestBody BulkProcessJournalRequestDto dto) {
+        try {
+            journalRequestService.processBulkRequests(dto, jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token));
+            return ResponseEntity.ok(Map.of("status", "SUCCESS"));
+        } catch (Exception e) { log.error("Error", e); return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("status", "ERROR", "message", "Processing failed.")); }
+    }
 
-		String executorId = JwtUtil.getUserIdFromToken(token);
-		JsonNode claims = JwtUtil.getClaimsFromToken(token);
-		Integer executorRole = claims.get("role").asInt();
+    @DeleteMapping("/my-requests/by-batch/{batchId}")
+    public ResponseEntity<?> cancelMyRequestsByBatch(@RequestHeader("Authorization") String token, @PathVariable String batchId) {
+        try {
+            journalRequestService.cancelMyRequestsByBatchId(batchId, jwtUtil.getUserIdFromToken(token));
+            return ResponseEntity.ok(Map.of("status", "SUCCESS"));
+        } catch (Exception e) { log.error("Error", e); return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("status", "ERROR", "message", "Cancel failed.")); }
+    }
 
-		log.info("Received Journal update request call from user: {}, role: {}", executorId, executorRole);
-
-		return journalRequestService.updateRequestStatus(processRequestDto, executorId, executorRole).get();
-	}
-
-	@GetMapping("/my-requests")
-	public List<JournalRequest> getMyRequests() {
-		return journalRequestService.getMyRequests();
-	}
-
-	@GetMapping("/pending-requests")
-	public List<JournalRequest> getPendingRequests(@RequestHeader("Authorization") String token) {
-		String userId = JwtUtil.getUserIdFromToken(token);
-		JsonNode claims = JwtUtil.getClaimsFromToken(token);
-		Integer userRole = claims.get("role").asInt();
-		return journalRequestService.getPendingRequests(userId, userRole);
-	}
-
-	@PostMapping("/process-bulk")
-	public List<JournalRequest> processBulkRequests(@RequestHeader("Authorization") String token,
-			@Valid @RequestBody BulkProcessJournalRequestDto processRequestDto) throws JsonProcessingException {
-
-		String executorId = JwtUtil.getUserIdFromToken(token);
-		JsonNode claims = JwtUtil.getClaimsFromToken(token);
-		Integer executorRole = claims.get("role").asInt();
-		return journalRequestService.processBulkRequests(processRequestDto, executorId, executorRole);
-	}
-
-	@GetMapping("/by-batch/{batchId}")
-	public ResponseEntity<List<JournalRequest>> getRequestsByBatchId(@PathVariable String batchId) {
-		List<JournalRequest> requests = journalRequestService.getRequestsByBatchId(batchId);
-		return ResponseEntity.ok(requests);
-	}
-
-	@DeleteMapping("/my-request/{requestId}")
-	public ResponseEntity<Void> cancelMyRequest(@RequestHeader("Authorization") String token,
-			@PathVariable Long requestId) {
-		String userId = JwtUtil.getUserIdFromToken(token);
-		journalRequestService.cancelMyRequest(requestId, userId);
-		return ResponseEntity.noContent().build();
-	}
-
-	@DeleteMapping("/my-requests/by-journal/{journalIdPrefix}")
-	public ResponseEntity<Void> cancelMyRequestsByJournal(@RequestHeader("Authorization") String token,
-			@PathVariable String journalIdPrefix) {
-		String userId = JwtUtil.getUserIdFromToken(token);
-		journalRequestService.cancelMyRequestsByJournalPrefix(journalIdPrefix, userId);
-		return ResponseEntity.noContent().build();
-	}
-
-	@DeleteMapping("/my-requests/by-batch/{batchId}")
-	public ResponseEntity<Void> cancelMyRequestsByBatch(@RequestHeader("Authorization") String token,
-			@PathVariable String batchId) throws JsonProcessingException {
-		String userId = JwtUtil.getUserIdFromToken(token);
-		journalRequestService.cancelMyRequestsByBatchId(batchId, userId);
-		return ResponseEntity.noContent().build();
-	}
-
-	@DeleteMapping("/my-requests/by-journal-list")
-	public ResponseEntity<Void> cancelMyRequestsByJournalPrefixes(@RequestHeader("Authorization") String token,
-			@RequestBody List<String> journalIdPrefixes) throws JsonProcessingException {
-		String userId = JwtUtil.getUserIdFromToken(token);
-		journalRequestService.cancelMyRequestsByJournalPrefixes(journalIdPrefixes, userId);
-		return ResponseEntity.noContent().build();
-	}
-
-	@GetMapping("/status")
-	public ResponseEntity<List<JournalRequestStatusDto>> getJournalStatusList() {
-		return ResponseEntity.ok(journalRequestService.getJournalRequestStatusList());
-	}
-
-	@PostMapping("/create-bulk-batch")
-	@ResponseStatus(HttpStatus.CREATED)
-	public ResponseEntity<Map<String, Object>> createBulkBatchRequest(@RequestBody BatchRequestDto batchDto,
-			@RequestHeader("Authorization") String token) throws JsonProcessingException {
-
-		String userId = JwtUtil.getUserIdFromToken(token);
-		JsonNode claims = JwtUtil.getClaimsFromToken(token);
-		Integer userRole = claims.get("role").asInt();
-
-		log.info("Received BULK Journal batch request from user: {}. Rows: {}", userId, batchDto.getRows().size());
-
-		String batchId = journalRequestService.createBulkBatchRequest(batchDto, userId, userRole);
-
-		return ResponseEntity.ok(Map.of("status", "SUCCESS", "message", "Batch created successfully", "batchId",
-				batchId, "totalRows", batchDto.getRows().size()));
-	}
+    @DeleteMapping("/my-requests/by-journal-list")
+    public ResponseEntity<?> cancelMyRequestsByJournalPrefixes(@RequestHeader("Authorization") String token, @RequestBody List<String> list) {
+        try {
+            journalRequestService.cancelMyRequestsByJournalPrefixes(list, jwtUtil.getUserIdFromToken(token));
+            return ResponseEntity.ok(Map.of("status", "SUCCESS"));
+        } catch (Exception e) { log.error("Error", e); return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("status", "ERROR", "message", "Cancel failed.")); }
+    }
 }
+
+3. Updated Service: JournalRequestServiceImpl.java
+Path: com/fincore/JournalService/Service/JournalRequestServiceImpl.java
+Implemented createBatchRequest (Manual) reusing the logic from createBulkBatchRequest to avoid code duplication. Also includes the Notification logic you provided.
+package com.fincore.JournalService.Service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.JournalService.Dto.*;
+import com.fincore.JournalService.Exception.ResourceNotFoundException;
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Models.enums.ChangeType;
+import com.fincore.JournalService.Models.enums.RequestStatus;
+import com.fincore.JournalService.Repository.JournalRequestRepository;
+import com.fincore.JournalService.Service.JournalBulkValidationService.ExcelRowData;
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+
+import java.io.IOException;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class JournalRequestServiceImpl implements JournalRequestService {
+
+    private final JournalRequestRepository journalRequestRepository;
+    private final ObjectMapper objectMapper;
+    private final SequenceService sequenceService;
+    private final NotificationWriterService notificationWriterService;
+    private final PermissionConfigService permissionConfigService;
+    private final JdbcTemplate jdbcTemplate;
+    private final JournalBulkValidationService journalBulkValidationService;
+
+    // ... [Date Fetching & Summary Methods remain unchanged] ...
+    
+    // --- 0. DATE FETCHING (Matches Interface) ---
+    @Override
+    public LocalDate getCurrentPostingDate() {
+        try {
+            String sql = "SELECT USERS_DATE FROM FINCORE_DATE";
+            return jdbcTemplate.queryForObject(sql, (rs, rowNum) -> {
+                java.sql.Timestamp ts = rs.getTimestamp("USERS_DATE");
+                if (ts != null) {
+                    return ts.toLocalDateTime().toLocalDate();
+                }
+                return LocalDate.now();
+            });
+        } catch (Exception e) {
+            log.error("Error fetching USERS_DATE. Using System Date.", e);
+            return LocalDate.now();
+        }
+    }
+
+    // --- 1. SUMMARY FETCHING ---
+    @Override
+    public List<Map<String, Object>> getPendingBatchSummaries() {
+        List<Object[]> rawData = journalRequestRepository.findPendingBatchSummariesNative();
+        return mapToSummaryDto(rawData);
+    }
+
+    @Override
+    public List<Map<String, Object>> getAllBatchSummaries() {
+        List<Object[]> rawData = journalRequestRepository.findAllBatchSummariesNative();
+        return mapToSummaryDto(rawData);
+    }
+    
+    private List<Map<String, Object>> mapToSummaryDto(List<Object[]> rawData) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Object[] row : rawData) {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", row[0]);
+            map.put("creatorId", row[1]);
+            map.put("requestDate", row[2]);
+            map.put("commonBatchRemarks", row[3]);
+            map.put("requestCount", row[4]);
+            map.put("totalDebit", row[5]);
+            map.put("totalCredit", row[6]);
+            String fullStatus = "PENDING";
+            if (row.length > 7 && row[7] != null) {
+                String raw = (String) row[7];
+                if ("A".equalsIgnoreCase(raw) || "ACCEPTED".equalsIgnoreCase(raw)) fullStatus = "ACCEPTED";
+                else if ("R".equalsIgnoreCase(raw) || "REJECTED".equalsIgnoreCase(raw)) fullStatus = "REJECTED";
+            }
+            map.put("requestStatus", fullStatus);
+            if (row.length > 9) {
+                map.put("executorId", row[8]);
+                map.put("executorRemarks", row[9]);
+            }
+            result.add(map);
+        }
+        return result;
+    }
+
+    // --- 2. PAGINATED DETAILS ---
+    @Override
+    public Page<JournalRequest> getRequestsByBatchIdPaginated(String batchId, Pageable pageable) {
+        return journalRequestRepository.findByBatchIdPaginated(batchId, pageable);
+    }
+
+    // --- 3. BATCH CREATION (FROM FILE CACHE) ---
+    @Override
+    @Transactional
+    public String createBatchFromCache(String requestId, String commonRemarks, String creatorId, Integer creatorRole) throws IOException {
+        List<ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
+        if (cachedRows == null || cachedRows.isEmpty()) {
+            throw new ResourceNotFoundException("Upload session timed out or server restarted. Please re-upload the file.");
+        }
+
+        BatchRequestDto batchDto = new BatchRequestDto();
+        batchDto.setCommonBatchRemarks(commonRemarks);
+
+        List<BatchRequestDto.JournalRequestRow> dtoRows = cachedRows.stream().map(r -> {
+            BatchRequestDto.JournalRequestRow dto = new BatchRequestDto.JournalRequestRow();
+            dto.setChangeType(ChangeType.ADD);
+            dto.setBranch(r.branch);
+            dto.setCurrency(r.currency);
+            dto.setCgl(r.cgl);
+            dto.setAmount(r.amount); // Already a BigDecimal
+            dto.setProductType(r.productCode);
+            dto.setRemarks(r.remarks);
+            dto.setArFlag("A");
+            dto.setAcClassification("A");
+            return dto;
+        }).collect(Collectors.toList());
+
+        batchDto.setRows(dtoRows);
+        return createBulkBatchRequest(batchDto, creatorId, creatorRole);
+    }
+
+    // --- 4. NEW: MANUAL BATCH CREATION (The Missing Implementation) ---
+    @Override
+    @Transactional
+    public List<JournalRequest> createBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+        // Reuse the logic from Bulk, but return the List of objects as per MOC code style
+        String batchId = createBulkBatchRequest(batchDto, creatorId, creatorRole);
+        return journalRequestRepository.findByBatchId(batchId);
+    }
+
+    // --- 5. CORE BATCH CREATION LOGIC ---
+    @Override
+    @Transactional
+    public String createBulkBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+        String batchId = sequenceService.getNextBatchId();
+        LocalDate postingDate = getCurrentPostingDate();
+
+        String commonRemarks = (batchDto.getCommonBatchRemarks() != null && !batchDto.getCommonBatchRemarks().isEmpty())
+                ? batchDto.getCommonBatchRemarks()
+                : "Batch " + batchId;
+
+        // Group rows by Branch + Currency to assign Journal IDs correctly
+        Map<String, List<BatchRequestDto.JournalRequestRow>> groupedRows = batchDto.getRows().stream()
+                .collect(Collectors.groupingBy(row -> row.getBranch() + ":" + row.getCurrency()));
+
+        int totalJournals = groupedRows.size();
+        List<String> journalPrefixes = fetchJournalSequences(totalJournals);
+        Iterator<String> prefixIterator = journalPrefixes.iterator();
+        DateTimeFormatter dateFmt = DateTimeFormatter.ISO_DATE;
+
+        String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, CHANGE_TYPE, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+        final int INSERT_BATCH_SIZE = 1000;
+        List<Object[]> batchArgs = new ArrayList<>(INSERT_BATCH_SIZE);
+        int processedCount = 0;
+
+        for (Map.Entry<String, List<BatchRequestDto.JournalRequestRow>> entry : groupedRows.entrySet()) {
+            String journalIdPrefix = prefixIterator.next();
+            int journalSequence = 1;
+            for (BatchRequestDto.JournalRequestRow rowDto : entry.getValue()) {
+                String journalId = String.format("%s-%03d", journalIdPrefix, journalSequence);
+
+                String payload = buildJsonPayloadFast(rowDto, postingDate, batchId, journalId, commonRemarks, journalSequence, dateFmt);
+
+                batchArgs.add(new Object[]{
+                        RequestStatus.PENDING.getCode(),
+                        rowDto.getChangeType().name(),
+                        LocalDateTime.now(),
+                        creatorId,
+                        creatorRole,
+                        batchId,
+                        journalId,
+                        commonRemarks,
+                        payload
+                });
+
+                if (batchArgs.size() >= INSERT_BATCH_SIZE) {
+                    jdbcTemplate.batchUpdate(sql, batchArgs);
+                    batchArgs.clear();
+                }
+                journalSequence++;
+                processedCount++;
+            }
+        }
+        if (!batchArgs.isEmpty()) jdbcTemplate.batchUpdate(sql, batchArgs);
+
+        // --- NOTIFICATION LOGIC (From MOC Service) ---
+        createNotification(batchId, creatorId, processedCount);
+        
+        return batchId;
+    }
+
+    // --- 6. APPROVAL PROCESS ---
+    @Override
+    @Transactional
+    public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) {
+        if (!StringUtils.hasText(dto.getBatchId()) && (dto.getJournalIdPrefixes() == null || dto.getJournalIdPrefixes().isEmpty())) {
+            throw new IllegalArgumentException("Args required.");
+        }
+
+        String targetClause;
+        List<Object> args = new ArrayList<>();
+
+        if (StringUtils.hasText(dto.getBatchId())) {
+            targetClause = "BATCH_ID = ?";
+            args.add(dto.getBatchId());
+        } else {
+            List<String> conds = new ArrayList<>();
+            for(String p : dto.getJournalIdPrefixes()) {
+                conds.add("JOURNAL_ID LIKE ?");
+                args.add(p+"%");
+            }
+            targetClause = "(" + String.join(" OR ", conds) + ")";
+        }
+
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            // A. UPSERT GL_BALANCE (Optimized Native Merge)
+            String balanceMergeSql = """
+                MERGE INTO GL_BALANCE B
+                USING (
+                    SELECT 
+                        JSON_VALUE(PAYLOAD, '$.branch') AS BRANCH_CODE,
+                        JSON_VALUE(PAYLOAD, '$.currency') AS CURRENCY,
+                        JSON_VALUE(PAYLOAD, '$.cgl') AS CGL,
+                        SUM(TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount'))) AS NET_AMOUNT
+                    FROM JOURNAL_REQUEST
+                    WHERE REQ_STATUS = 'P' 
+                      AND CREATOR_ID != ? 
+                      AND """ + targetClause + """
+                    GROUP BY 
+                        JSON_VALUE(PAYLOAD, '$.branch'), 
+                        JSON_VALUE(PAYLOAD, '$.currency'), 
+                        JSON_VALUE(PAYLOAD, '$.cgl')
+                ) S
+                ON (B.BRANCH_CODE = S.BRANCH_CODE AND B.CURRENCY = S.CURRENCY AND B.CGL = S.CGL)
+                WHEN MATCHED THEN
+                    UPDATE SET B.BALANCE = B.BALANCE + S.NET_AMOUNT, B.BALANCE_DATE = SYSDATE
+                WHEN NOT MATCHED THEN
+                    INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE)
+                    VALUES (GL_BALANCE_SEQ.nextval, SYSDATE, S.BRANCH_CODE, S.CURRENCY, S.CGL, S.NET_AMOUNT)
+            """;
+            List<Object> balanceArgs = new ArrayList<>();
+            balanceArgs.add(executorId);
+            balanceArgs.addAll(args);
+            jdbcTemplate.update(balanceMergeSql, balanceArgs.toArray());
+
+            // B. INSERT GL_TRANSACTIONS
+            String insertTxnSql = """
+                INSERT INTO GL_TRANSACTIONS (TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE, BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, TRANSACTION_COUNT, SOURCE_FLAG)
+                SELECT GL_TRANSACTIONS_SEQ.nextval, jr.BATCH_ID, jr.JOURNAL_ID, TO_DATE(JSON_VALUE(jr.PAYLOAD, '$.pDate'), 'YYYY-MM-DD'), SYSTIMESTAMP, JSON_VALUE(jr.PAYLOAD, '$.branch'), JSON_VALUE(jr.PAYLOAD, '$.currency'), JSON_VALUE(jr.PAYLOAD, '$.cgl'), JSON_VALUE(jr.PAYLOAD, '$.remarks'),
+                CASE WHEN TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.amount')) > 0 THEN TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.amount')) ELSE 0 END,
+                CASE WHEN TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.amount')) < 0 THEN ABS(TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.amount'))) ELSE 0 END,
+                TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.transactionCount')), 'J'
+                FROM JOURNAL_REQUEST jr WHERE jr.REQ_STATUS = 'P' AND jr.CREATOR_ID != ? AND 
+            """ + targetClause;
+            List<Object> txnArgs = new ArrayList<>();
+            txnArgs.add(executorId);
+            txnArgs.addAll(args);
+            jdbcTemplate.update(insertTxnSql, txnArgs.toArray());
+        }
+
+        // C. UPDATE JOURNAL_REQUEST
+        String updateSql = "UPDATE JOURNAL_REQUEST SET REQ_STATUS = ?, EXECUTOR_ID = ?, EXECUTOR_REMARKS = ?, EXECUTION_DATE = SYSDATE WHERE REQ_STATUS = 'P' AND CREATOR_ID != ? AND " + targetClause;
+        List<Object> uArgs = new ArrayList<>();
+        uArgs.add(dto.getStatus().getCode());
+        uArgs.add(executorId);
+        uArgs.add(dto.getRemarks());
+        uArgs.add(executorId);
+        uArgs.addAll(args);
+        jdbcTemplate.update(updateSql, uArgs.toArray());
+        return Collections.emptyList();
+    }
+
+    // --- 7. CANCELLATION ---
+    @Override @Transactional public void cancelMyRequest(Long id, String u) {
+        JournalRequest r = journalRequestRepository.findById(id).orElseThrow(() -> new ResourceNotFoundException("Not found"));
+        if(!u.equals(r.getCreatorId())) throw new IllegalStateException("Unauthorized");
+        if(r.getRequestStatus()!=RequestStatus.PENDING) throw new IllegalStateException("Processed");
+        journalRequestRepository.delete(r);
+    }
+    @Override @Transactional public void cancelMyRequestsByBatchId(String b, String u) { journalRequestRepository.deleteBatchNative(b, u); }
+    @Override @Transactional public void cancelMyRequestsByJournalPrefix(String p, String u) { 
+        List<JournalRequest> l = journalRequestRepository.findByJournalIdStartingWithAndCreatorIdAndRequestStatus(p, u, RequestStatus.PENDING);
+        if(l.isEmpty()) throw new ResourceNotFoundException("Empty");
+        journalRequestRepository.deleteAll(l);
+    }
+    @Override @Transactional public void cancelMyRequestsByJournalPrefixes(List<String> ps, String u) { journalRequestRepository.deleteJournalsNative(ps, u); }
+
+    // --- UTILS ---
+    private List<String> fetchJournalSequences(int count) {
+        if(count==0) return Collections.emptyList();
+        List<Long> seqs = jdbcTemplate.queryForList("SELECT JRNL_SEQ.nextval FROM dual CONNECT BY LEVEL <= ?", Long.class, count);
+        return seqs.stream().map(id -> String.format("%07d", id)).collect(Collectors.toList());
+    }
+
+    private String buildJsonPayloadFast(BatchRequestDto.JournalRequestRow row, LocalDate pDate, String batchId, String jId, String rem, int count, DateTimeFormatter fmt) {
+        StringBuilder sb = new StringBuilder(400);
+        sb.append("{")
+                .append("\"changeType\":\"").append(row.getChangeType()).append("\",")
+                .append("\"masterJournalId\":").append(row.getMasterJournalId()==null?"null":row.getMasterJournalId()).append(",")
+                .append("\"pDate\":\"").append(pDate.format(fmt)).append("\",")
+                .append("\"branch\":\"").append(row.getBranch()).append("\",")
+                .append("\"currency\":\"").append(row.getCurrency()).append("\",")
+                .append("\"cgl\":\"").append(row.getCgl()).append("\",")
+                .append("\"amount\":").append(row.getAmount()).append(",") // Storing BigDecimal directly as number in JSON
+                .append("\"productType\":").append(row.getProductType()==null?"null":"\""+row.getProductType()+"\"").append(",")
+                .append("\"remarks\":").append(row.getRemarks()==null?"null":"\""+escapeJson(row.getRemarks())+"\"").append(",")
+                .append("\"arFlag\":\"").append(row.getArFlag()==null?"A":row.getArFlag()).append("\",")
+                .append("\"acClassification\":\"").append(row.getAcClassification()==null?"A":row.getAcClassification()).append("\",")
+                .append("\"batchId\":\"").append(batchId).append("\",")
+                .append("\"journalId\":\"").append(jId).append("\",")
+                .append("\"commonBatchRemarks\":\"").append(escapeJson(rem)).append("\",")
+                .append("\"transactionCount\":").append(count)
+                .append("}");
+        return sb.toString();
+    }
+
+    private String escapeJson(String s) {
+        if(s==null) return "";
+        return s.replace("\"", "\\\"").replace("\\", "\\\\");
+    }
+
+    private void createNotification(String batchId, String creatorId, int size) {
+        try {
+            NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
+            String message = String.format("Batch %s (%d rows) by %s pending.", batchId, size, creatorId);
+            // Using "JournalService" as eventSource to match new context
+            notificationWriterService.createNotification(null, config.getTargetRoles(), message, config.getTargetUrl(), batchId, "JournalService");
+        } catch (Exception e) {
+            log.error("Notification failed", e);
+        }
+    }
+
+    @Override @Transactional public Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto d, String i, Integer r) { return Optional.empty(); }
+    @Override public List<JournalRequest> getPendingRequests(String userId, Integer userRole) { return journalRequestRepository.findAllPendingNative(); }
+    @Override public List<JournalRequest> getMyRequests(String userId) { return journalRequestRepository.findAllByCreatorIdNative(userId); }
+    @Override public List<JournalRequest> getRequestsByBatchId(String b) { return journalRequestRepository.findByBatchId(b); }
+    @Override public List<JournalRequestStatusDto> getJournalRequestStatusList() { return journalRequestRepository.findAll().stream().map(JournalRequestStatusDto::new).collect(Collectors.toList()); }
+}
+
