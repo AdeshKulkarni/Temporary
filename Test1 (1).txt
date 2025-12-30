@@ -195,7 +195,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         return batchId;
     }
 
-    // --- 6. APPROVAL PROCESS & GL UPDATE (FIXED SQL GRAMMAR) ---
+    // --- 6. APPROVAL PROCESS & GL UPDATE ---
     @Override
     @Transactional
     public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) {
@@ -221,46 +221,48 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
 
             // A. UPSERT GL_BALANCE
-            // FIX: Manually ensuring spaces around "AND" to prevent "ANDBATCH_ID" error
-            String balanceMergeSql = 
-                "MERGE INTO GL_BALANCE B " +
-                "USING ( " +
-                "    SELECT " +
-                "        JSON_VALUE(PAYLOAD, '$.branch') AS BRANCH_CODE, " +
-                "        JSON_VALUE(PAYLOAD, '$.currency') AS CURRENCY, " +
-                "        JSON_VALUE(PAYLOAD, '$.cgl') AS CGL, " +
-                "        SUM(TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount'))) AS NET_AMOUNT " +
-                "    FROM JOURNAL_REQUEST " +
-                "    WHERE REQ_STATUS = 'P' " +
-                "      AND CREATOR_ID != ? " +
-                "      AND " + targetClause + " " + // Explicit Spaces Added Here
-                "    GROUP BY " +
-                "        JSON_VALUE(PAYLOAD, '$.branch'), " +
-                "        JSON_VALUE(PAYLOAD, '$.currency'), " +
-                "        JSON_VALUE(PAYLOAD, '$.cgl') " +
-                ") S " +
-                "ON (B.BRANCH_CODE = S.BRANCH_CODE AND B.CURRENCY = S.CURRENCY AND B.CGL = S.CGL) " +
-                "WHEN MATCHED THEN " +
-                "    UPDATE SET B.BALANCE = B.BALANCE + S.NET_AMOUNT, B.BALANCE_DATE = SYSDATE " +
-                "WHEN NOT MATCHED THEN " +
-                "    INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE) " +
-                "    VALUES (GL_BALANCE_SEQ.nextval, SYSDATE, S.BRANCH_CODE, S.CURRENCY, S.CGL, S.NET_AMOUNT)";
+            // FIX: Added explicit " AND " string to prevent concatenation errors like "ANDBATCH_ID"
+            String balanceMergeSql = """
+                MERGE INTO GL_BALANCE B
+                USING (
+                    SELECT 
+                        JSON_VALUE(PAYLOAD, '$.branch') AS BRANCH_CODE,
+                        JSON_VALUE(PAYLOAD, '$.currency') AS CURRENCY,
+                        JSON_VALUE(PAYLOAD, '$.cgl') AS CGL,
+                        SUM(TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount'))) AS NET_AMOUNT
+                    FROM JOURNAL_REQUEST
+                    WHERE REQ_STATUS = 'P' 
+                      AND CREATOR_ID != ? 
+                      AND """ + targetClause + """
+                    GROUP BY 
+                        JSON_VALUE(PAYLOAD, '$.branch'), 
+                        JSON_VALUE(PAYLOAD, '$.currency'), 
+                        JSON_VALUE(PAYLOAD, '$.cgl')
+                ) S
+                ON (B.BRANCH_CODE = S.BRANCH_CODE AND B.CURRENCY = S.CURRENCY AND B.CGL = S.CGL)
+                WHEN MATCHED THEN
+                    UPDATE SET B.BALANCE = B.BALANCE + S.NET_AMOUNT, B.BALANCE_DATE = SYSDATE
+                WHEN NOT MATCHED THEN
+                    INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE)
+                    VALUES (GL_BALANCE_SEQ.nextval, SYSDATE, S.BRANCH_CODE, S.CURRENCY, S.CGL, S.NET_AMOUNT)
+            """;
 
             List<Object> balanceArgs = new ArrayList<>();
-            balanceArgs.add(executorId);
-            balanceArgs.addAll(args);
+            balanceArgs.add(executorId); 
+            balanceArgs.addAll(args);    
 
             jdbcTemplate.update(balanceMergeSql, balanceArgs.toArray());
 
             // B. INSERT GL_TRANSACTIONS
-            // FIX: Manually ensuring spaces
-            String insertTxnSql = 
-                "INSERT INTO GL_TRANSACTIONS (TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE, BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, TRANSACTION_COUNT, SOURCE_FLAG) " +
-                "SELECT GL_TRANSACTIONS_SEQ.nextval, jr.BATCH_ID, jr.JOURNAL_ID, TO_DATE(JSON_VALUE(jr.PAYLOAD, '$.pDate'), 'YYYY-MM-DD'), SYSTIMESTAMP, JSON_VALUE(jr.PAYLOAD, '$.branch'), JSON_VALUE(jr.PAYLOAD, '$.currency'), JSON_VALUE(jr.PAYLOAD, '$.cgl'), JSON_VALUE(jr.PAYLOAD, '$.remarks'), " +
-                "CASE WHEN TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.amount')) > 0 THEN TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.amount')) ELSE 0 END, " +
-                "CASE WHEN TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.amount')) < 0 THEN ABS(TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.amount'))) ELSE 0 END, " +
-                "TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.transactionCount')), 'J' " +
-                "FROM JOURNAL_REQUEST jr WHERE jr.REQ_STATUS = 'P' AND jr.CREATOR_ID != ? AND " + targetClause; // Explicit Space
+            // FIX: Added explicit " AND " here as well for safety
+            String insertTxnSql = """
+                INSERT INTO GL_TRANSACTIONS (TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE, BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, TRANSACTION_COUNT, SOURCE_FLAG)
+                SELECT GL_TRANSACTIONS_SEQ.nextval, jr.BATCH_ID, jr.JOURNAL_ID, TO_DATE(JSON_VALUE(jr.PAYLOAD, '$.pDate'), 'YYYY-MM-DD'), SYSTIMESTAMP, JSON_VALUE(jr.PAYLOAD, '$.branch'), JSON_VALUE(jr.PAYLOAD, '$.currency'), JSON_VALUE(jr.PAYLOAD, '$.cgl'), JSON_VALUE(jr.PAYLOAD, '$.remarks'),
+                CASE WHEN TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.amount')) > 0 THEN TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.amount')) ELSE 0 END,
+                CASE WHEN TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.amount')) < 0 THEN ABS(TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.amount'))) ELSE 0 END,
+                TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.transactionCount')), 'J'
+                FROM JOURNAL_REQUEST jr WHERE jr.REQ_STATUS = 'P' AND jr.CREATOR_ID != ? AND 
+            """ + targetClause;
 
             List<Object> txnArgs = new ArrayList<>();
             txnArgs.add(executorId);
@@ -270,9 +272,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         }
 
         // C. UPDATE JOURNAL_REQUEST
-        // FIX: Manually ensuring spaces
         String updateSql = "UPDATE JOURNAL_REQUEST SET REQ_STATUS = ?, EXECUTOR_ID = ?, EXECUTOR_REMARKS = ?, EXECUTION_DATE = SYSDATE WHERE REQ_STATUS = 'P' AND CREATOR_ID != ? AND " + targetClause;
-
         List<Object> uArgs = new ArrayList<>();
         uArgs.add(dto.getStatus().getCode());
         uArgs.add(executorId);
@@ -285,9 +285,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     }
 
     // --- 7. CANCELLATION ---
-    @Override
-    @Transactional
-    public void cancelMyRequest(Long id, String u) {
+    @Override @Transactional public void cancelMyRequest(Long id, String u) {
         JournalRequest r = journalRequestRepository.findById(id).orElseThrow(() -> new ResourceNotFoundException("Not found"));
         if(!u.equals(r.getCreatorId())) throw new IllegalStateException("Unauthorized");
         if(r.getRequestStatus()!=RequestStatus.PENDING) throw new IllegalStateException("Processed");
