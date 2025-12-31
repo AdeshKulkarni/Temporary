@@ -1,44 +1,413 @@
-spring.application.name=JournalService
-spring.datasource.driver-class-name=oracle.jdbc.OracleDriver
-spring.profiles.active=dev
-server.port=9999
+package com.fincore.JournalService.Service;
 
-#todo Expose all actuator endpoints over HTTP.
-management.endpoints.web.exposure.include=*
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.JournalService.Dto.*;
+import com.fincore.JournalService.Exception.ResourceNotFoundException;
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Models.enums.ChangeType;
+import com.fincore.JournalService.Models.enums.RequestStatus;
+import com.fincore.JournalService.Repository.JournalRequestRepository;
+import com.fincore.JournalService.Service.JournalBulkValidationService.ExcelRowData;
 
-# Always show full details on the health endpoint (e.g., database connection status)
-management.endpoint.health.show-details=always
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
 
-# Add some custom info to the /info endpoint
-info.app.name=JournalService
-info.app.description=Service for managing journals.
-info.app.version=1.0.0
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.stream.Collectors;
 
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class JournalRequestServiceImpl implements JournalRequestService {
 
-# --- Redis Configuration ---
-spring.data.redis.host=10.0.17.242
-spring.data.redis.port=6379
-spring.cache.type=redis
+    private final JournalRequestRepository journalRequestRepository;
+    private final ObjectMapper objectMapper;
+    private final SequenceService sequenceService;
+    private final NotificationWriterService notificationWriterService;
+    private final PermissionConfigService permissionConfigService;
+    private final JournalBulkValidationService journalBulkValidationService;
 
+    @Autowired
+    @Qualifier("oracleJdbcTemplate")
+    private JdbcTemplate jdbcTemplate;
 
-# LOGIN SERVICE KEY
-jwt.secret=bWV0aGlvbnlsdGhyZW9ueWx0aHJlb255bGdsdXRhbWlueWxhbGFueWw=
+    // --- 0. DATE FETCHING ---
+    @Override
+    public LocalDate getCurrentPostingDate() {
+        try {
+            String sql = "SELECT USERS_DATE FROM FINCORE_DATE FETCH FIRST 1 ROWS ONLY";
+            return jdbcTemplate.queryForObject(sql, (rs, rowNum) -> {
+                java.sql.Timestamp ts = rs.getTimestamp("USERS_DATE");
+                if (ts != null) return ts.toLocalDateTime().toLocalDate();
+                return LocalDate.now();
+            });
+        } catch (Exception e) {
+            log.error("Error fetching USERS_DATE. Using System Date.", e);
+            return LocalDate.now();
+        }
+    }
 
+    // --- 1. SUMMARIES ---
+    @Override
+    public List<Map<String, Object>> getPendingBatchSummaries() {
+        List<Object[]> rawData = journalRequestRepository.findPendingBatchSummariesNative();
+        return mapToSummaryDto(rawData);
+    }
 
-spring.servlet.multipart.max-file-size=-1
-spring.servlet.multipart.max-request-size=-1
-spring.datasource.oracle.jdbc-url=jdbc:oracle:thin:@10.177.103.192:1523/fincorepdb1
-spring.datasource.oracle.username=fincore
-spring.datasource.oracle.password=Password#1234
-spring.datasource.oracle.driver-class-name=oracle.jdbc.OracleDriver
-# Hibernate specific config for Oracle
-spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.OracleDialect
-spring.jpa.show-sql=true
+    @Override
+    public List<Map<String, Object>> getAllBatchSummaries() {
+        List<Object[]> rawData = journalRequestRepository.findAllBatchSummariesNative();
+        return mapToSummaryDto(rawData);
+    }
 
-# --- 2. Secondary DataSource (Hive / Thrift / Delta Lake) ---
-# Used for Data Lake connectivity
-spring.datasource.hive.jdbc-url=jdbc:hive2://spark-thrift:10000/default
-spring.datasource.hive.driver-class-name=org.apache.hive.jdbc.HiveDriver
-# Validation query to ensure connection is alive (Hive specific)
-spring.datasource.hive.test-on-borrow=true
-spring.datasource.hive.validation-query=SELECT 1
+    private List<Map<String, Object>> mapToSummaryDto(List<Object[]> rawData) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Object[] row : rawData) {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", row[0]);
+            map.put("creatorId", row[1]);
+            map.put("requestDate", row[2]);
+            map.put("commonBatchRemarks", row[3]);
+            map.put("requestCount", row[4]);
+            map.put("totalDebit", row[5]);
+            map.put("totalCredit", row[6]);
+            String fullStatus = "PENDING";
+            if (row.length > 7 && row[7] != null) {
+                String raw = (String) row[7];
+                if ("A".equalsIgnoreCase(raw) || "ACCEPTED".equalsIgnoreCase(raw)) fullStatus = "ACCEPTED";
+                else if ("R".equalsIgnoreCase(raw) || "REJECTED".equalsIgnoreCase(raw)) fullStatus = "REJECTED";
+            }
+            map.put("requestStatus", fullStatus);
+            if (row.length > 9) {
+                map.put("executorId", row[8]);
+                map.put("executorRemarks", row[9]);
+            }
+            result.add(map);
+        }
+        return result;
+    }
+
+    // --- 2. PAGINATION ---
+    @Override
+    public Page<JournalRequest> getRequestsByBatchIdPaginated(String batchId, Pageable pageable) {
+        return journalRequestRepository.findByBatchIdPaginated(batchId, pageable);
+    }
+
+    // --- 3. BATCH CREATION (CACHE) ---
+    @Override
+    @Transactional
+    public String createBatchFromCache(String requestId, String commonRemarks, String creatorId, Integer creatorRole) throws IOException {
+        List<ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
+        if (cachedRows == null || cachedRows.isEmpty()) throw new ResourceNotFoundException("Upload session timed out or server restarted. Please re-upload.");
+
+        BatchRequestDto batchDto = new BatchRequestDto();
+        batchDto.setCommonBatchRemarks(commonRemarks);
+
+        List<BatchRequestDto.JournalRequestRow> dtoRows = cachedRows.stream().map(r -> {
+            BatchRequestDto.JournalRequestRow dto = new BatchRequestDto.JournalRequestRow();
+            dto.setChangeType(ChangeType.ADD);
+            dto.setBranch(r.branch);
+            dto.setCurrency(r.currency);
+            dto.setCgl(r.cgl);
+            dto.setAmount(r.amount);
+            dto.setProductType(r.productCode);
+            dto.setRemarks(r.remarks);
+            dto.setArFlag("A");
+            dto.setAcClassification("A");
+            return dto;
+        }).collect(Collectors.toList());
+
+        batchDto.setRows(dtoRows);
+        return createBulkBatchRequest(batchDto, creatorId, creatorRole);
+    }
+
+    // --- 4. MANUAL BATCH ---
+    @Override
+    @Transactional
+    public List<JournalRequest> createBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+        String batchId = createBulkBatchRequest(batchDto, creatorId, creatorRole);
+        return journalRequestRepository.findByBatchId(batchId);
+    }
+
+    // --- 5. CORE INSERT LOGIC ---
+    @Override
+    @Transactional
+    public String createBulkBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+        String batchId = sequenceService.getNextBatchId();
+        LocalDate postingDate = getCurrentPostingDate();
+
+        String commonRemarks = (batchDto.getCommonBatchRemarks() != null && !batchDto.getCommonBatchRemarks().isEmpty())
+                ? batchDto.getCommonBatchRemarks()
+                : "Batch " + batchId;
+
+        Map<String, List<BatchRequestDto.JournalRequestRow>> groupedRows = batchDto.getRows().stream()
+                .collect(Collectors.groupingBy(row -> row.getBranch() + ":" + row.getCurrency()));
+
+        int totalJournals = groupedRows.size();
+        List<String> journalPrefixes = fetchJournalSequences(totalJournals);
+        Iterator<String> prefixIterator = journalPrefixes.iterator();
+        DateTimeFormatter dateFmt = DateTimeFormatter.ISO_DATE;
+
+        // --- FIX IS HERE: Exactly 9 Question Marks ---
+        // Columns: REQ_STATUS(1), CHANGE_TYPE(2), REQ_DATE(3), CREATOR_ID(4), CREATOR_ROLE(5), BATCH_ID(6), JOURNAL_ID(7), COMMON_BATCH_REMARKS(8), PAYLOAD(9)
+        String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, CHANGE_TYPE, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+        final int INSERT_BATCH_SIZE = 1000;
+        List<Object[]> batchArgs = new ArrayList<>(INSERT_BATCH_SIZE);
+        int processedCount = 0;
+
+        for (Map.Entry<String, List<BatchRequestDto.JournalRequestRow>> entry : groupedRows.entrySet()) {
+            String journalIdPrefix = prefixIterator.next();
+            int journalSequence = 1;
+            for (BatchRequestDto.JournalRequestRow rowDto : entry.getValue()) {
+                String journalId = String.format("%s-%03d", journalIdPrefix, journalSequence);
+
+                String payload = buildJsonPayloadFast(rowDto, postingDate, batchId, journalId, commonRemarks, journalSequence, dateFmt);
+
+                batchArgs.add(new Object[]{
+                        RequestStatus.PENDING.getCode(), // 1
+                        rowDto.getChangeType().name(),   // 2
+                        LocalDateTime.now(),             // 3
+                        creatorId,                       // 4
+                        creatorRole,                     // 5
+                        batchId,                         // 6
+                        journalId,                       // 7
+                        commonRemarks,                   // 8
+                        payload                          // 9
+                });
+
+                if (batchArgs.size() >= INSERT_BATCH_SIZE) {
+                    jdbcTemplate.batchUpdate(sql, batchArgs);
+                    batchArgs.clear();
+                }
+                journalSequence++;
+                processedCount++;
+            }
+        }
+        if (!batchArgs.isEmpty()) jdbcTemplate.batchUpdate(sql, batchArgs);
+
+        createNotification(batchId, creatorId, processedCount);
+        return batchId;
+    }
+
+    // --- 6. APPROVAL PROCESS & GL UPDATE (OPTIMIZED) ---
+    @Override
+    @Transactional
+    public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) {
+        if (!StringUtils.hasText(dto.getBatchId()) && (dto.getJournalIdPrefixes() == null || dto.getJournalIdPrefixes().isEmpty())) {
+            throw new IllegalArgumentException("Batch ID or Journal Prefixes required.");
+        }
+
+        String targetClause;
+        List<Object> args = new ArrayList<>();
+        List<Object> fetchArgs = new ArrayList<>();
+
+        if (StringUtils.hasText(dto.getBatchId())) {
+            targetClause = "BATCH_ID = ?";
+            args.add(dto.getBatchId());
+        } else {
+            List<String> conds = new ArrayList<>();
+            for(String p : dto.getJournalIdPrefixes()) {
+                conds.add("JOURNAL_ID LIKE ?");
+                args.add(p+"%");
+            }
+            targetClause = "(" + String.join(" OR ", conds) + ")";
+        }
+
+        // 2. Perform GL Logic (If Approved)
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+
+            String fetchSql = "SELECT PAYLOAD FROM JOURNAL_REQUEST WHERE REQ_STATUS = 'P' AND CREATOR_ID != ? AND " + targetClause;
+            fetchArgs.add(executorId);
+            fetchArgs.addAll(args);
+
+            class AggKey {
+                final String b; final String c; final String g;
+                AggKey(String b, String c, String g) { this.b=b; this.c=c; this.g=g; }
+                @Override public boolean equals(Object o) { if(this==o)return true; if(o==null||getClass()!=o.getClass())return false; AggKey k=(AggKey)o; return b.equals(k.b)&&c.equals(k.c)&&g.equals(k.g); }
+                @Override public int hashCode() { return Objects.hash(b,c,g); }
+            }
+
+            Map<AggKey, BigDecimal> aggregates = new HashMap<>();
+
+            try {
+                jdbcTemplate.query(fetchSql, fetchArgs.toArray(), rs -> {
+                    String json = rs.getString("PAYLOAD");
+                    try {
+                        JsonNode node = objectMapper.readTree(json);
+                        String branch = node.get("branch").asText();
+                        String curr = node.get("currency").asText();
+                        String cgl = node.get("cgl").asText();
+                        BigDecimal amt = new BigDecimal(node.get("amount").asText());
+
+                        AggKey key = new AggKey(branch, curr, cgl);
+                        aggregates.merge(key, amt, BigDecimal::add);
+                    } catch (Exception e) {
+                        log.error("JSON Parse Error", e);
+                    }
+                });
+
+                if (!aggregates.isEmpty()) {
+                    List<AggKey> keys = new ArrayList<>(aggregates.keySet());
+                    
+                    // 1. Batch Update (Balance ONLY)
+                    String updateSql = "UPDATE GL_BALANCE SET BALANCE = BALANCE + ? WHERE BRANCH_CODE = ? AND CURRENCY = ? AND CGL = ?";
+                    List<Object[]> updateBatchArgs = new ArrayList<>();
+                    
+                    for (AggKey k : keys) {
+                        updateBatchArgs.add(new Object[]{ aggregates.get(k), k.b, k.c, k.g });
+                    }
+
+                    int[] updateCounts = jdbcTemplate.batchUpdate(updateSql, updateBatchArgs);
+
+                    // 2. Insert Missing Rows
+                    String insertSql = "INSERT INTO GL_BALANCE (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE) VALUES (GL_BALANCE_SEQ.nextval, SYSDATE, ?, ?, ?, ?)";
+                    List<Object[]> insertBatchArgs = new ArrayList<>();
+
+                    for (int i = 0; i < updateCounts.length; i++) {
+                        if (updateCounts[i] == 0) {
+                            AggKey k = keys.get(i);
+                            insertBatchArgs.add(new Object[]{ k.b, k.c, k.g, aggregates.get(k) });
+                        }
+                    }
+
+                    if (!insertBatchArgs.isEmpty()) {
+                        jdbcTemplate.batchUpdate(insertSql, insertBatchArgs);
+                    }
+                    
+                    log.info("GL Balance Sync: Updated {} rows, Inserted {} rows.", updateBatchArgs.size() - insertBatchArgs.size(), insertBatchArgs.size());
+                }
+
+            } catch (Exception e) {
+                log.error("GL Balance Batch Error", e);
+                throw new RuntimeException("Failed to sync GL Balances: " + e.getMessage());
+            }
+
+            // C. INSERT GL_TRANSACTIONS
+            String insertTxnSql = """
+                INSERT INTO GL_TRANSACTIONS (
+                    TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE, 
+                    BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, 
+                    TRANSACTION_COUNT, SOURCE_FLAG
+                )
+                SELECT 
+                    GL_TRANSACTIONS_SEQ.nextval, 
+                    jr.BATCH_ID, 
+                    jr.JOURNAL_ID, 
+                    TO_DATE(JSON_VALUE(jr.PAYLOAD, '$.pDate'), 'YYYY-MM-DD'), 
+                    SYSTIMESTAMP, 
+                    JSON_VALUE(jr.PAYLOAD, '$.branch'), 
+                    JSON_VALUE(jr.PAYLOAD, '$.currency'), 
+                    JSON_VALUE(jr.PAYLOAD, '$.cgl'), 
+                    JSON_VALUE(jr.PAYLOAD, '$.remarks'),
+                    CASE WHEN TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.amount')) > 0 THEN TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.amount')) ELSE 0 END,
+                    CASE WHEN TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.amount')) < 0 THEN ABS(TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.amount'))) ELSE 0 END,
+                    TO_NUMBER(JSON_VALUE(jr.PAYLOAD, '$.transactionCount')), 
+                    'J'
+                FROM JOURNAL_REQUEST jr 
+                WHERE jr.REQ_STATUS = 'P' 
+                  AND jr.CREATOR_ID != ? 
+                  AND 
+            """ + " " + targetClause; 
+
+            List<Object> txnArgs = new ArrayList<>();
+            txnArgs.add(executorId);
+            txnArgs.addAll(args);
+
+            jdbcTemplate.update(insertTxnSql, txnArgs.toArray());
+        }
+
+        // 3. Update Status
+        String updateSql = "UPDATE JOURNAL_REQUEST SET REQ_STATUS = ?, EXECUTOR_ID = ?, EXECUTOR_REMARKS = ?, EXECUTION_DATE = SYSDATE WHERE REQ_STATUS = 'P' AND CREATOR_ID != ? AND " + targetClause;
+        List<Object> uArgs = new ArrayList<>();
+        uArgs.add(dto.getStatus().getCode());
+        uArgs.add(executorId);
+        uArgs.add(dto.getRemarks());
+        uArgs.add(executorId);
+        uArgs.addAll(args);
+
+        jdbcTemplate.update(updateSql, uArgs.toArray());
+
+        return Collections.emptyList();
+    }
+
+    // --- 7. CANCELLATION ---
+    @Override @Transactional public void cancelMyRequest(Long id, String u) {
+        JournalRequest r = journalRequestRepository.findById(id).orElseThrow(() -> new ResourceNotFoundException("Not found"));
+        if(!u.equals(r.getCreatorId())) throw new IllegalStateException("Unauthorized");
+        if(r.getRequestStatus()!=RequestStatus.PENDING) throw new IllegalStateException("Processed");
+        journalRequestRepository.delete(r);
+    }
+    @Override @Transactional public void cancelMyRequestsByBatchId(String b, String u) { journalRequestRepository.deleteBatchNative(b, u); }
+    @Override @Transactional public void cancelMyRequestsByJournalPrefix(String p, String u) {
+        List<JournalRequest> l = journalRequestRepository.findByJournalIdStartingWithAndCreatorIdAndRequestStatus(p, u, RequestStatus.PENDING);
+        if(l.isEmpty()) throw new ResourceNotFoundException("Empty");
+        journalRequestRepository.deleteAll(l);
+    }
+    @Override @Transactional public void cancelMyRequestsByJournalPrefixes(List<String> ps, String u) { journalRequestRepository.deleteJournalsNative(ps, u); }
+
+    // --- UTILS ---
+    private List<String> fetchJournalSequences(int count) {
+        if(count==0) return Collections.emptyList();
+        List<Long> seqs = jdbcTemplate.queryForList("SELECT JRNL_SEQ.nextval FROM dual CONNECT BY LEVEL <= ?", Long.class, count);
+        return seqs.stream().map(id -> String.format("%07d", id)).collect(Collectors.toList());
+    }
+
+    private String buildJsonPayloadFast(BatchRequestDto.JournalRequestRow row, LocalDate pDate, String batchId, String jId, String rem, int count, DateTimeFormatter fmt) {
+        StringBuilder sb = new StringBuilder(400);
+        sb.append("{")
+                .append("\"changeType\":\"").append(row.getChangeType()).append("\",")
+                .append("\"masterJournalId\":").append(row.getMasterJournalId()==null?"null":row.getMasterJournalId()).append(",")
+                .append("\"pDate\":\"").append(pDate.format(fmt)).append("\",")
+                .append("\"branch\":\"").append(row.getBranch()).append("\",")
+                .append("\"currency\":\"").append(row.getCurrency()).append("\",")
+                .append("\"cgl\":\"").append(row.getCgl()).append("\",")
+                .append("\"amount\":").append(row.getAmount()).append(",")
+                .append("\"productType\":").append(row.getProductType()==null?"null":"\""+row.getProductType()+"\"").append(",")
+                .append("\"remarks\":").append(row.getRemarks()==null?"null":"\""+escapeJson(row.getRemarks())+"\"").append(",")
+                .append("\"arFlag\":\"").append(row.getArFlag()==null?"A":row.getArFlag()).append("\",")
+                .append("\"acClassification\":\"").append(row.getAcClassification()==null?"A":row.getAcClassification()).append("\",")
+                .append("\"batchId\":\"").append(batchId).append("\",")
+                .append("\"journalId\":\"").append(jId).append("\",")
+                .append("\"commonBatchRemarks\":\"").append(escapeJson(rem)).append("\",")
+                .append("\"transactionCount\":").append(count)
+                .append("}");
+        return sb.toString();
+    }
+
+    private String escapeJson(String s) {
+        if(s==null) return "";
+        return s.replace("\"", "\\\"").replace("\\", "\\\\");
+    }
+
+    private void createNotification(String batchId, String creatorId, int size) {
+        try {
+            NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
+            String message = String.format("Batch %s (%d rows) by %s pending.", batchId, size, creatorId);
+            notificationWriterService.createNotification(null, config.getTargetRoles(), message, config.getTargetUrl(), batchId, "JournalService");
+        } catch (Exception e) {
+            log.error("Notification failed", e);
+        }
+    }
+
+    @Override @Transactional public Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto d, String i, Integer r) { return Optional.empty(); }
+    @Override public List<JournalRequest> getPendingRequests(String userId, Integer userRole) { return journalRequestRepository.findAllPendingNative(); }
+    @Override public List<JournalRequest> getMyRequests(String userId) { return journalRequestRepository.findAllByCreatorIdNative(userId); }
+    @Override public List<JournalRequest> getRequestsByBatchId(String b) { return journalRequestRepository.findByBatchId(b); }
+    @Override public List<JournalRequestStatusDto> getJournalRequestStatusList() { return journalRequestRepository.findAll().stream().map(JournalRequestStatusDto::new).collect(Collectors.toList()); }
+}
