@@ -1,7 +1,6 @@
 package com.fincore.JournalService.Service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fincore.JournalService.Dto.*;
 import com.fincore.JournalService.Exception.ResourceNotFoundException;
@@ -23,7 +22,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
 import java.io.IOException;
-import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -163,7 +161,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         Iterator<String> prefixIterator = journalPrefixes.iterator();
         DateTimeFormatter dateFmt = DateTimeFormatter.ISO_DATE;
 
-        // Corrected SQL: Exactly 9 placeholders for 9 parameters
+        // FIXED SQL: 9 Question marks for 9 Parameters
         String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, CHANGE_TYPE, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
         final int INSERT_BATCH_SIZE = 1000;
@@ -204,7 +202,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         return batchId;
     }
 
-    // --- 6. APPROVAL PROCESS & GL UPDATE (WITH LOGGING) ---
+    // --- 6. APPROVAL PROCESS & GL UPDATE (ORACLE NATIVE OPTIMIZED) ---
     @Override
     @Transactional
     public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) {
@@ -212,9 +210,9 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             throw new IllegalArgumentException("Batch ID or Journal Prefixes required.");
         }
 
+        // 1. Build WHERE Clause
         String targetClause;
         List<Object> args = new ArrayList<>();
-        List<Object> fetchArgs = new ArrayList<>();
 
         if (StringUtils.hasText(dto.getBatchId())) {
             targetClause = "BATCH_ID = ?";
@@ -228,89 +226,45 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             targetClause = "(" + String.join(" OR ", conds) + ")";
         }
 
+        // 2. Oracle Native MERGE (The Fastest Optimization)
         if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
-            log.info("Starting Approval Process. Fetching pending requests...");
+            
+            // This query aggregates ALL pending requests in one go inside DB and Updates/Inserts GL_BALANCE
+            // FIX: Removed updating BALANCE_DATE in the UPDATE clause to prevent ORA-14402
+            String mergeSql = """
+                MERGE INTO GL_BALANCE B
+                USING (
+                    SELECT 
+                        JSON_VALUE(PAYLOAD, '$.branch') AS BRANCH_CODE,
+                        JSON_VALUE(PAYLOAD, '$.currency') AS CURRENCY,
+                        JSON_VALUE(PAYLOAD, '$.cgl') AS CGL,
+                        SUM(TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount'))) AS NET_AMOUNT
+                    FROM JOURNAL_REQUEST
+                    WHERE REQ_STATUS = 'P' 
+                      AND CREATOR_ID != ? 
+                      AND 
+            """ + " " + targetClause + " " + """
+                    GROUP BY 
+                        JSON_VALUE(PAYLOAD, '$.branch'), 
+                        JSON_VALUE(PAYLOAD, '$.currency'), 
+                        JSON_VALUE(PAYLOAD, '$.cgl')
+                ) S
+                ON (B.BRANCH_CODE = S.BRANCH_CODE AND B.CURRENCY = S.CURRENCY AND B.CGL = S.CGL)
+                WHEN MATCHED THEN
+                    UPDATE SET B.BALANCE = B.BALANCE + S.NET_AMOUNT
+                WHEN NOT MATCHED THEN
+                    INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE)
+                    VALUES (GL_BALANCE_SEQ.nextval, SYSDATE, S.BRANCH_CODE, S.CURRENCY, S.CGL, S.NET_AMOUNT)
+            """;
 
-            String fetchSql = "SELECT PAYLOAD FROM JOURNAL_REQUEST WHERE REQ_STATUS = 'P' AND CREATOR_ID != ? AND " + targetClause;
-            fetchArgs.add(executorId);
-            fetchArgs.addAll(args);
+            List<Object> mergeArgs = new ArrayList<>();
+            mergeArgs.add(executorId); 
+            mergeArgs.addAll(args);
 
-            class AggKey {
-                final String b; final String c; final String g;
-                AggKey(String b, String c, String g) { this.b=b; this.c=c; this.g=g; }
-                @Override public boolean equals(Object o) { if(this==o)return true; if(o==null||getClass()!=o.getClass())return false; AggKey k=(AggKey)o; return b.equals(k.b)&&c.equals(k.c)&&g.equals(k.g); }
-                @Override public int hashCode() { return Objects.hash(b,c,g); }
-                @Override public String toString() { return "Branch:" + b + ", CGL:" + g + ", Curr:" + c; }
-            }
+            log.info("Executing Optimized Oracle MERGE for GL Balances...");
+            jdbcTemplate.update(mergeSql, mergeArgs.toArray());
 
-            Map<AggKey, BigDecimal> aggregates = new HashMap<>();
-
-            try {
-                jdbcTemplate.query(fetchSql, fetchArgs.toArray(), rs -> {
-                    String json = rs.getString("PAYLOAD");
-                    try {
-                        JsonNode node = objectMapper.readTree(json);
-                        String branch = node.get("branch").asText();
-                        String curr = node.get("currency").asText();
-                        String cgl = node.get("cgl").asText();
-                        BigDecimal amt = new BigDecimal(node.get("amount").asText());
-
-                        // LOGGING: Show individual transaction data being processed
-                        log.info("Processing Request for GL: Branch={}, CGL={}, Amount={}", branch, cgl, amt);
-
-                        AggKey key = new AggKey(branch, curr, cgl);
-                        aggregates.merge(key, amt, BigDecimal::add);
-                    } catch (Exception e) {
-                        log.error("JSON Parse Error", e);
-                    }
-                });
-
-                if (!aggregates.isEmpty()) {
-                    List<AggKey> keys = new ArrayList<>(aggregates.keySet());
-                    
-                    // LOGGING: Show aggregated totals before database update
-                    log.info("--- Aggregated GL Updates to perform: {} ---", keys.size());
-                    for(AggKey k : keys) {
-                        log.info("Will Update GL: {} with Net Amount: {}", k, aggregates.get(k));
-                    }
-
-                    // 1. Batch Update (Balance ONLY)
-                    String updateSql = "UPDATE GL_BALANCE SET BALANCE = BALANCE + ? WHERE BRANCH_CODE = ? AND CURRENCY = ? AND CGL = ?";
-                    List<Object[]> updateBatchArgs = new ArrayList<>();
-                    
-                    for (AggKey k : keys) {
-                        updateBatchArgs.add(new Object[]{ aggregates.get(k), k.b, k.c, k.g });
-                    }
-
-                    int[] updateCounts = jdbcTemplate.batchUpdate(updateSql, updateBatchArgs);
-
-                    // 2. Insert Missing Rows
-                    String insertSql = "INSERT INTO GL_BALANCE (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE) VALUES (GL_BALANCE_SEQ.nextval, SYSDATE, ?, ?, ?, ?)";
-                    List<Object[]> insertBatchArgs = new ArrayList<>();
-
-                    for (int i = 0; i < updateCounts.length; i++) {
-                        if (updateCounts[i] == 0) {
-                            AggKey k = keys.get(i);
-                            log.info("GL Entry Not Found. Inserting New Record for: {}", k);
-                            insertBatchArgs.add(new Object[]{ k.b, k.c, k.g, aggregates.get(k) });
-                        }
-                    }
-
-                    if (!insertBatchArgs.isEmpty()) {
-                        jdbcTemplate.batchUpdate(insertSql, insertBatchArgs);
-                    }
-                    
-                    log.info("GL Balance Sync Completed: Updated {} existing rows, Inserted {} new rows.", updateBatchArgs.size() - insertBatchArgs.size(), insertBatchArgs.size());
-                } else {
-                    log.warn("No pending requests found to aggregate for approval.");
-                }
-
-            } catch (Exception e) {
-                log.error("GL Balance Batch Error", e);
-                throw new RuntimeException("Failed to sync GL Balances: " + e.getMessage());
-            }
-
-            // C. INSERT GL_TRANSACTIONS
+            // 3. Insert Audit Trail (GL_TRANSACTIONS)
             String insertTxnSql = """
                 INSERT INTO GL_TRANSACTIONS (
                     TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE, 
@@ -342,10 +296,9 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             txnArgs.addAll(args);
 
             jdbcTemplate.update(insertTxnSql, txnArgs.toArray());
-            log.info("Audit Trail (GL_TRANSACTIONS) updated successfully.");
         }
 
-        // 3. Update Status
+        // 4. Update Status in JOURNAL_REQUEST
         String updateSql = "UPDATE JOURNAL_REQUEST SET REQ_STATUS = ?, EXECUTOR_ID = ?, EXECUTOR_REMARKS = ?, EXECUTION_DATE = SYSDATE WHERE REQ_STATUS = 'P' AND CREATOR_ID != ? AND " + targetClause;
         List<Object> uArgs = new ArrayList<>();
         uArgs.add(dto.getStatus().getCode());
