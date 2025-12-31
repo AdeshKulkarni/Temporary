@@ -26,6 +26,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
@@ -152,6 +153,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                 ? batchDto.getCommonBatchRemarks()
                 : "Batch " + batchId;
 
+        // Grouping logic (kept for future extensibility)
         Map<String, List<BatchRequestDto.JournalRequestRow>> groupedRows = batchDto.getRows().stream()
                 .collect(Collectors.groupingBy(row -> row.getBranch() + ":" + row.getCurrency()));
 
@@ -160,7 +162,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         Iterator<String> prefixIterator = journalPrefixes.iterator();
         DateTimeFormatter dateFmt = DateTimeFormatter.ISO_DATE;
 
-        // FIXED SQL: Exactly 9 placeholders for 9 parameters
+        // FIXED SQL: 9 Question Marks
         String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, CHANGE_TYPE, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
         final int INSERT_BATCH_SIZE = 1000;
@@ -201,7 +203,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         return batchId;
     }
 
-    // --- 6. APPROVAL PROCESS & GL UPDATE (CURRENCY CONVERSION ADDED) ---
+    // --- 6. APPROVAL PROCESS & GL UPDATE (OPTIMIZED + CURRENCY CONVERSION + LOGGING) ---
     @Override
     @Transactional
     public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) {
@@ -227,14 +229,10 @@ public class JournalRequestServiceImpl implements JournalRequestService {
 
         // 2. Oracle Native MERGE with Currency Conversion
         if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
-            log.info("Approval Started. Processing Currency Conversion & DB Aggregation...");
+            log.info(">>> STARTING APPROVAL PROCESS (OPTIMIZED) <<<");
+            log.info("Target: {}", targetClause);
 
             // --- OPTIMIZED SQL: Uses JSON_TABLE + Join with CURRENCY_MASTER ---
-            // Logic: 
-            // 1. Extract JSON
-            // 2. Join with CURRENCY_MASTER on Currency Code
-            // 3. IF 'INR' -> Use Amount. IF NOT 'INR' -> Amount * Rate
-            // 4. Sum up converted amounts and Update/Insert GL_BALANCE
             String mergeSql = """
                 MERGE INTO GL_BALANCE B
                 USING (
@@ -276,14 +274,18 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             mergeArgs.add(executorId); 
             mergeArgs.addAll(args);
 
+            log.info("Executing Native MERGE with Currency Conversion...");
+            
             long start = System.currentTimeMillis();
             int affectedRows = jdbcTemplate.update(mergeSql, mergeArgs.toArray());
             long end = System.currentTimeMillis();
             
-            log.info("GL_BALANCE Sync Complete (With Currency Conversion). {} unique CGLs processed in {} ms.", affectedRows, (end - start));
+            log.info(">>> GL_BALANCE UPDATE COMPLETE <<<");
+            log.info("Logic: Amount * NVL(CURRENCY_RATE, 1)");
+            log.info("Time Taken: {} ms", (end - start));
+            log.info("Rows Affected (Inserted/Updated): {}", affectedRows);
 
             // 3. Insert Audit Trail (GL_TRANSACTIONS)
-            // Note: Transactions usually log the RAW amount (in original currency), so we keep this as is.
             String insertTxnSql = """
                 INSERT INTO GL_TRANSACTIONS (
                     TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE, 
@@ -326,7 +328,8 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             txnArgs.addAll(args);
 
             int txnRows = jdbcTemplate.update(insertTxnSql, txnArgs.toArray());
-            log.info("Audit Trail Created. {} transactions logged.", txnRows);
+            log.info(">>> AUDIT TRAIL COMPLETE <<<");
+            log.info("Transactions Logged: {}", txnRows);
         }
 
         // 4. Update Status in JOURNAL_REQUEST
