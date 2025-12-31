@@ -163,8 +163,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         Iterator<String> prefixIterator = journalPrefixes.iterator();
         DateTimeFormatter dateFmt = DateTimeFormatter.ISO_DATE;
 
-        // --- FIX IS HERE: Exactly 9 Question Marks ---
-        // Columns: REQ_STATUS(1), CHANGE_TYPE(2), REQ_DATE(3), CREATOR_ID(4), CREATOR_ROLE(5), BATCH_ID(6), JOURNAL_ID(7), COMMON_BATCH_REMARKS(8), PAYLOAD(9)
+        // Corrected SQL: Exactly 9 placeholders for 9 parameters
         String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, CHANGE_TYPE, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
         final int INSERT_BATCH_SIZE = 1000;
@@ -180,15 +179,15 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                 String payload = buildJsonPayloadFast(rowDto, postingDate, batchId, journalId, commonRemarks, journalSequence, dateFmt);
 
                 batchArgs.add(new Object[]{
-                        RequestStatus.PENDING.getCode(), // 1
-                        rowDto.getChangeType().name(),   // 2
-                        LocalDateTime.now(),             // 3
-                        creatorId,                       // 4
-                        creatorRole,                     // 5
-                        batchId,                         // 6
-                        journalId,                       // 7
-                        commonRemarks,                   // 8
-                        payload                          // 9
+                        RequestStatus.PENDING.getCode(),
+                        rowDto.getChangeType().name(),
+                        LocalDateTime.now(),
+                        creatorId,
+                        creatorRole,
+                        batchId,
+                        journalId,
+                        commonRemarks,
+                        payload
                 });
 
                 if (batchArgs.size() >= INSERT_BATCH_SIZE) {
@@ -205,7 +204,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         return batchId;
     }
 
-    // --- 6. APPROVAL PROCESS & GL UPDATE (OPTIMIZED) ---
+    // --- 6. APPROVAL PROCESS & GL UPDATE (WITH LOGGING) ---
     @Override
     @Transactional
     public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) {
@@ -229,8 +228,8 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             targetClause = "(" + String.join(" OR ", conds) + ")";
         }
 
-        // 2. Perform GL Logic (If Approved)
         if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            log.info("Starting Approval Process. Fetching pending requests...");
 
             String fetchSql = "SELECT PAYLOAD FROM JOURNAL_REQUEST WHERE REQ_STATUS = 'P' AND CREATOR_ID != ? AND " + targetClause;
             fetchArgs.add(executorId);
@@ -241,6 +240,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                 AggKey(String b, String c, String g) { this.b=b; this.c=c; this.g=g; }
                 @Override public boolean equals(Object o) { if(this==o)return true; if(o==null||getClass()!=o.getClass())return false; AggKey k=(AggKey)o; return b.equals(k.b)&&c.equals(k.c)&&g.equals(k.g); }
                 @Override public int hashCode() { return Objects.hash(b,c,g); }
+                @Override public String toString() { return "Branch:" + b + ", CGL:" + g + ", Curr:" + c; }
             }
 
             Map<AggKey, BigDecimal> aggregates = new HashMap<>();
@@ -255,6 +255,9 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                         String cgl = node.get("cgl").asText();
                         BigDecimal amt = new BigDecimal(node.get("amount").asText());
 
+                        // LOGGING: Show individual transaction data being processed
+                        log.info("Processing Request for GL: Branch={}, CGL={}, Amount={}", branch, cgl, amt);
+
                         AggKey key = new AggKey(branch, curr, cgl);
                         aggregates.merge(key, amt, BigDecimal::add);
                     } catch (Exception e) {
@@ -265,6 +268,12 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                 if (!aggregates.isEmpty()) {
                     List<AggKey> keys = new ArrayList<>(aggregates.keySet());
                     
+                    // LOGGING: Show aggregated totals before database update
+                    log.info("--- Aggregated GL Updates to perform: {} ---", keys.size());
+                    for(AggKey k : keys) {
+                        log.info("Will Update GL: {} with Net Amount: {}", k, aggregates.get(k));
+                    }
+
                     // 1. Batch Update (Balance ONLY)
                     String updateSql = "UPDATE GL_BALANCE SET BALANCE = BALANCE + ? WHERE BRANCH_CODE = ? AND CURRENCY = ? AND CGL = ?";
                     List<Object[]> updateBatchArgs = new ArrayList<>();
@@ -282,6 +291,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                     for (int i = 0; i < updateCounts.length; i++) {
                         if (updateCounts[i] == 0) {
                             AggKey k = keys.get(i);
+                            log.info("GL Entry Not Found. Inserting New Record for: {}", k);
                             insertBatchArgs.add(new Object[]{ k.b, k.c, k.g, aggregates.get(k) });
                         }
                     }
@@ -290,7 +300,9 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                         jdbcTemplate.batchUpdate(insertSql, insertBatchArgs);
                     }
                     
-                    log.info("GL Balance Sync: Updated {} rows, Inserted {} rows.", updateBatchArgs.size() - insertBatchArgs.size(), insertBatchArgs.size());
+                    log.info("GL Balance Sync Completed: Updated {} existing rows, Inserted {} new rows.", updateBatchArgs.size() - insertBatchArgs.size(), insertBatchArgs.size());
+                } else {
+                    log.warn("No pending requests found to aggregate for approval.");
                 }
 
             } catch (Exception e) {
@@ -330,6 +342,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             txnArgs.addAll(args);
 
             jdbcTemplate.update(insertTxnSql, txnArgs.toArray());
+            log.info("Audit Trail (GL_TRANSACTIONS) updated successfully.");
         }
 
         // 3. Update Status
