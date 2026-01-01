@@ -1,4 +1,116 @@
-01,02122025,2025,09,32121,USD,1208505003,1000,Dr,ewreew,12345678,B,C,D
-01,02122025,2025,09,32121,USD,1122505001,1000,Cr,Normal,12345679,B,C,D
+Yes, you must change one other place besides the query.
+Since the SQL query will now look for a field named "csvDate" inside the JSON, you must ensure your Java code actually writes that key into the JSON when creating the batch.
+Here are the two specific updates you need.
+1. Update buildJsonPayloadFast (Crucial)
+You must change the JSON key from "pDate": to "csvDate": in the string builder.
+    private String buildJsonPayloadFast(BatchRequestDto.JournalRequestRow row, LocalDate pDate, String batchId, String jId, String rem, int count, DateTimeFormatter fmt) {
+        StringBuilder sb = new StringBuilder(400);
+        sb.append("{")
+                .append("\"changeType\":\"").append(row.getChangeType()).append("\",")
+                .append("\"masterJournalId\":").append(row.getMasterJournalId()==null?"null":row.getMasterJournalId()).append(",")
+                // --- CHANGE HERE: Key is now "csvDate" ---
+                .append("\"csvDate\":\"").append(pDate.format(fmt)).append("\",")
+                .append("\"branch\":\"").append(row.getBranch()).append("\",")
+                .append("\"currency\":\"").append(row.getCurrency()).append("\",")
+                .append("\"cgl\":\"").append(row.getCgl()).append("\",")
+                .append("\"amount\":").append(row.getAmount()).append(",")
+                .append("\"productType\":").append(row.getProductType()==null?"null":"\""+row.getProductType()+"\"").append(",")
+                .append("\"remarks\":").append(row.getRemarks()==null?"null":"\""+escapeJson(row.getRemarks())+"\"").append(",")
+                .append("\"arFlag\":\"").append(row.getArFlag()==null?"A":row.getArFlag()).append("\",")
+                .append("\"acClassification\":\"").append(row.getAcClassification()==null?"A":row.getAcClassification()).append("\",")
+                .append("\"batchId\":\"").append(batchId).append("\",")
+                .append("\"journalId\":\"").append(jId).append("\",")
+                .append("\"commonBatchRemarks\":\"").append(escapeJson(rem)).append("\",")
+                .append("\"transactionCount\":").append(count)
+                .append("}");
+        return sb.toString();
+    }
 
-this is the csv file in which 02122025 this date to match in gl table date not the date which u are cheaking 
+2. The Updated SQL Query (In processBulkRequests)
+Here is the updated SQL. I have replaced pDate with csvDate in the extraction path, selection, and grouping.
+            // --- OPTIMIZED SQL ---
+            // 1. Group By: Now includes csvDate
+            // 2. ON Clause: Matches TRUNC(B.BALANCE_DATE) with the csvDate
+            String mergeSql = """
+                MERGE INTO GL_BALANCE B
+                USING (
+                    SELECT 
+                        jt.branch AS BRANCH_CODE, 
+                        jt.currency AS CURRENCY, 
+                        jt.cgl AS CGL,
+                        TO_DATE(jt.csvDate, 'YYYY-MM-DD') AS TXN_DATE, 
+                        SUM(
+                            CASE 
+                                WHEN jt.currency = 'INR' THEN jt.amount
+                                ELSE jt.amount * NVL(cm.CURRENCY_RATE, 1) 
+                            END
+                        ) AS NET_AMOUNT
+                    FROM JOURNAL_REQUEST jr
+                    CROSS JOIN JSON_TABLE(jr.PAYLOAD, '$' 
+                        COLUMNS (
+                            branch   VARCHAR2(50) PATH '$.branch',
+                            currency VARCHAR2(3)  PATH '$.currency',
+                            cgl      VARCHAR2(50) PATH '$.cgl',
+                            amount   NUMBER       PATH '$.amount',
+                            csvDate  VARCHAR2(10) PATH '$.csvDate'  -- CHANGED to csvDate
+                        )
+                    ) jt
+                    LEFT JOIN CURRENCY_MASTER cm ON jt.currency = cm.CURRENCY_CODE
+                    WHERE jr.REQ_STATUS = 'P' 
+                      AND jr.CREATOR_ID != ? 
+                      AND 
+            """ + " " + targetClause + " " + """
+                    GROUP BY jt.branch, jt.currency, jt.cgl, jt.csvDate
+                ) S
+                ON (
+                    B.BRANCH_CODE = S.BRANCH_CODE AND 
+                    B.CURRENCY = S.CURRENCY AND 
+                    B.CGL = S.CGL AND 
+                    TRUNC(B.BALANCE_DATE) = S.TXN_DATE 
+                )
+                WHEN MATCHED THEN
+                    UPDATE SET B.BALANCE = B.BALANCE + S.NET_AMOUNT
+                WHEN NOT MATCHED THEN
+                    INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE)
+                    VALUES (GL_BALANCE_SEQ.nextval, S.TXN_DATE, S.BRANCH_CODE, S.CURRENCY, S.CGL, S.NET_AMOUNT)
+            """;
+
+Also, update the Audit Trail Insert query in the same method:
+            // 3. Insert Audit Trail (GL_TRANSACTIONS)
+            String insertTxnSql = """
+                INSERT INTO GL_TRANSACTIONS (
+                    TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE, 
+                    BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, 
+                    TRANSACTION_COUNT, SOURCE_FLAG
+                )
+                SELECT 
+                    GL_TRANSACTIONS_SEQ.nextval, 
+                    jr.BATCH_ID, 
+                    jr.JOURNAL_ID, 
+                    TO_DATE(jt.csvDate, 'YYYY-MM-DD'), -- CHANGED to csvDate
+                    SYSTIMESTAMP, 
+                    jt.branch, 
+                    jt.currency, 
+                    jt.cgl, 
+                    jt.remarks,
+                    CASE WHEN jt.amount > 0 THEN jt.amount ELSE 0 END,
+                    CASE WHEN jt.amount < 0 THEN ABS(jt.amount) ELSE 0 END,
+                    jt.txn_count, 
+                    'J'
+                FROM JOURNAL_REQUEST jr,
+                     JSON_TABLE(jr.PAYLOAD, '$' 
+                        COLUMNS (
+                            csvDate   VARCHAR2(10) PATH '$.csvDate', -- CHANGED to csvDate
+                            branch    VARCHAR2(50) PATH '$.branch',
+                            currency  VARCHAR2(3)  PATH '$.currency',
+                            cgl       VARCHAR2(50) PATH '$.cgl',
+                            remarks   VARCHAR2(50) PATH '$.remarks',
+                            amount    NUMBER       PATH '$.amount',
+                            txn_count NUMBER       PATH '$.transactionCount'
+                        )
+                     ) jt
+                WHERE jr.REQ_STATUS = 'P' 
+                  AND jr.CREATOR_ID != ? 
+                  AND 
+            """ + " " + targetClause; 
+
