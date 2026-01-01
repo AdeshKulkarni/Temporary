@@ -1,40 +1,39 @@
-MERGE INTO datalakedb.gl_balance b
-USING (
-    SELECT
-        CONCAT(
-            jt.branch,
-            jt.currency,
-            jt.cgl
-        ) AS glcc,
-        SUM(
-            CASE
-                WHEN jt.currency = 'INR' THEN jt.amount
-                ELSE jt.amount * COALESCE(cm.currency_rate, 1)
-            END
-        ) AS net_amount
-    FROM journal_request jr
-    LATERAL VIEW JSON_TUPLE(
-        jr.payload,
-        'branch',
-        'currency',
-        'cgl',
-        'amount'
-    ) jt AS branch, currency, cgl, amount
-    LEFT JOIN currency_master cm
-        ON jt.currency = cm.currency_code
-    WHERE jr.req_status = 'P'
-      AND jr.creator_id <> ?
-      AND /* your targetClause here */
-    GROUP BY
-        jt.branch,
-        jt.currency,
-        jt.cgl
-) s
-ON b.glcc = s.glcc
-WHEN MATCHED THEN
-  UPDATE SET
-    b.amount = b.amount + s.net_amount,
-    b.balance_date = CURRENT_DATE()
-WHEN NOT MATCHED THEN
-  INSERT (glcc, amount, balance_date)
-  VALUES (s.glcc, s.net_amount, CURRENT_DATE());
+String mergeSql = """
+                MERGE INTO GL_BALANCE B
+                USING (
+                    SELECT 
+                        jt.branch AS BRANCH_CODE, 
+                        jt.currency AS CURRENCY, 
+                        jt.cgl AS CGL,
+                        MAX(jt.pDate) AS TXN_DATE, -- Extract the Posting Date
+                        SUM(
+                            CASE 
+                                WHEN jt.currency = 'INR' THEN jt.amount
+                                ELSE jt.amount * NVL(cm.CURRENCY_RATE, 1) 
+                            END
+                        ) AS NET_AMOUNT
+                    FROM JOURNAL_REQUEST jr
+                    CROSS JOIN JSON_TABLE(jr.PAYLOAD, '$' 
+                        COLUMNS (
+                            branch   VARCHAR2(50) PATH '$.branch',
+                            currency VARCHAR2(3)  PATH '$.currency',
+                            cgl      VARCHAR2(50) PATH '$.cgl',
+                            amount   NUMBER       PATH '$.amount',
+                            pDate    VARCHAR2(10) PATH '$.pDate'  -- Added Date extraction
+                        )
+                    ) jt
+                    LEFT JOIN CURRENCY_MASTER cm ON jt.currency = cm.CURRENCY_CODE
+                    WHERE jr.REQ_STATUS = 'P' 
+                      AND jr.CREATOR_ID != ? 
+                      AND 
+            """ + " " + targetClause + " " + """
+                    GROUP BY jt.branch, jt.currency, jt.cgl
+                ) S
+                ON (B.BRANCH_CODE = S.BRANCH_CODE AND B.CURRENCY = S.CURRENCY AND B.CGL = S.CGL)
+                WHEN MATCHED THEN
+                    UPDATE SET B.BALANCE = B.BALANCE + S.NET_AMOUNT
+                    -- Safety: Do not update BALANCE_DATE to avoid ORA-14402
+                WHEN NOT MATCHED THEN
+                    INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE)
+                    VALUES (GL_BALANCE_SEQ.nextval, TO_DATE(S.TXN_DATE, 'YYYY-MM-DD'), S.BRANCH_CODE, S.CURRENCY, S.CGL, S.NET_AMOUNT)
+            """;
