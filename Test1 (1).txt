@@ -1,68 +1,3 @@
-Here are the updated files.
-Changes Summary:
- * BatchRequestDto.java: Renamed the field from pDate to csvDate.
- * JournalRequestServiceImpl.java: Updated all getters/setters to use getCsvDate() / setCsvDate() instead of getPDate() / setPDate().
-1. BatchRequestDto.java
-Field renamed to csvDate
-package com.fincore.JournalService.Dto;
-
-import com.fincore.JournalService.Models.enums.ChangeType;
-import jakarta.validation.Valid;
-import jakarta.validation.constraints.NotNull;
-import jakarta.validation.constraints.Size;
-import java.math.BigDecimal;
-import java.time.LocalDate;
-import lombok.Data;
-import java.util.List;
-
-@Data
-public class BatchRequestDto {
-
-    @Data
-    public static class JournalRequestRow {
-        @NotNull
-        private ChangeType changeType = ChangeType.ADD;
-
-        private Long masterJournalId;
-
-        // --- RENAMED FIELD: pDate -> csvDate ---
-        private LocalDate csvDate;
-
-        @NotNull @Size(min = 1, max = 50)
-        private String branch;
-
-        @NotNull @Size(min = 3, max = 3)
-        private String currency;
-
-        @NotNull @Size(min = 1, max = 50)
-        private String cgl;
-
-        @NotNull
-        private BigDecimal amount;
-
-        @Size(max = 20)
-        private String productType;
-
-        @Size(max = 200)
-        private String remarks;
-
-        @Size(min = 1, max = 1)
-        private String arFlag = "A";
-
-        @Size(min = 1, max = 1)
-        private String acClassification;
-    }
-
-    @Size(max = 200)
-    private String commonBatchRemarks;
-
-    @Valid
-    @NotNull
-    private List<JournalRequestRow> rows;
-}
-
-2. JournalRequestServiceImpl.java
-Updated to use getCsvDate() and setCsvDate() everywhere.
 package com.fincore.JournalService.Service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -82,11 +17,13 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
+import org.springframework.jdbc.core.JdbcOperations;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
 import java.io.IOException;
+import java.sql.Timestamp;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -104,19 +41,27 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     private final NotificationWriterService notificationWriterService;
     private final PermissionConfigService permissionConfigService;
     private final JournalBulkValidationService journalBulkValidationService;
+//    private final JdbcTemplate hiveJdbcTemplate;
+
 
     @Autowired
     @Qualifier("oracleJdbcTemplate")
     private JdbcTemplate jdbcTemplate;
 
+    @Autowired
+    @Qualifier("hiveJdbcTemplate")
+    private JdbcTemplate hivejdbcTemplate1;
+
+    // Formatter to parse the CSV date "02122025" -> ddMMyyyy
     private static final DateTimeFormatter CSV_DATE_FMT = DateTimeFormatter.ofPattern("ddMMyyyy");
 
+    // --- 0. DATE FETCHING ---
     @Override
     public LocalDate getCurrentPostingDate() {
         try {
             String sql = "SELECT USERS_DATE FROM FINCORE_DATE FETCH FIRST 1 ROWS ONLY";
             return jdbcTemplate.queryForObject(sql, (rs, rowNum) -> {
-                java.sql.Timestamp ts = rs.getTimestamp("USERS_DATE");
+                Timestamp ts = rs.getTimestamp("USERS_DATE");
                 if (ts != null) return ts.toLocalDateTime().toLocalDate();
                 return LocalDate.now();
             });
@@ -126,6 +71,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         }
     }
 
+    // --- 1. SUMMARIES ---
     @Override
     public List<Map<String, Object>> getPendingBatchSummaries() {
         List<Object[]> rawData = journalRequestRepository.findPendingBatchSummariesNative();
@@ -165,11 +111,13 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         return result;
     }
 
+    // --- 2. PAGINATION ---
     @Override
     public Page<JournalRequest> getRequestsByBatchIdPaginated(String batchId, Pageable pageable) {
         return journalRequestRepository.findByBatchIdPaginated(batchId, pageable);
     }
 
+    // --- 3. BATCH CREATION (CACHE) ---
     @Override
     @Transactional
     public String createBatchFromCache(String requestId, String commonRemarks, String creatorId, Integer creatorRole) throws IOException {
@@ -182,16 +130,16 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         List<BatchRequestDto.JournalRequestRow> dtoRows = cachedRows.stream().map(r -> {
             BatchRequestDto.JournalRequestRow dto = new BatchRequestDto.JournalRequestRow();
             dto.setChangeType(ChangeType.ADD);
-            
-            // --- UPDATE: Use setCsvDate instead of setPDate ---
+
+            // --- LOGIC: Use date from CSV if System Format, otherwise use current date ---
             if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
                 try {
-                    dto.setCsvDate(LocalDate.parse(r.sysDate, CSV_DATE_FMT));
+                    dto.setPDate(LocalDate.parse(r.sysDate, CSV_DATE_FMT));
                 } catch (Exception e) {
-                    dto.setCsvDate(LocalDate.now()); 
+                    dto.setPDate(LocalDate.now());
                 }
             } else {
-                dto.setCsvDate(LocalDate.now());
+                dto.setPDate(LocalDate.now());
             }
 
             dto.setBranch(r.branch);
@@ -209,6 +157,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         return createBulkBatchRequest(batchDto, creatorId, creatorRole);
     }
 
+    // --- 4. MANUAL BATCH ---
     @Override
     @Transactional
     public List<JournalRequest> createBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
@@ -216,67 +165,81 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         return journalRequestRepository.findByBatchId(batchId);
     }
 
+    // --- 5. CORE INSERT LOGIC ---
     @Override
     @Transactional
     public String createBulkBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
         String batchId = sequenceService.getNextBatchId();
+
+        // Note: We ignore global posting date here and use per-row date if available
         LocalDate fallbackDate = getCurrentPostingDate();
 
         String commonRemarks = (batchDto.getCommonBatchRemarks() != null && !batchDto.getCommonBatchRemarks().isEmpty())
                 ? batchDto.getCommonBatchRemarks()
                 : "Batch " + batchId;
 
-        int totalJournals = batchDto.getRows().size();
+        Map<String, List<BatchRequestDto.JournalRequestRow>> groupedRows = batchDto.getRows().stream()
+                .collect(Collectors.groupingBy(row -> row.getBranch() + ":" + row.getCurrency()));
+
+        int totalJournals = groupedRows.size();
         List<String> journalPrefixes = fetchJournalSequences(totalJournals);
         Iterator<String> prefixIterator = journalPrefixes.iterator();
         DateTimeFormatter dateFmt = DateTimeFormatter.ISO_DATE;
 
+        // FIXED SQL: Exactly 9 placeholders for 9 parameters
         String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, CHANGE_TYPE, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        String createlaketable = " CREATE TABLE IF NOT EXISTS fincoredatalakedev.JOURNAL_REQUEST (REQ_ID NUMBER NOT NULL ,REQ_STATUS VARCHAR2(10CHAR) DEFAULT 'P' NOT NULL ENABLE, CHANGE_TYPE VARCHAR2(10 CHAR) NOT NULL ENABLE, REQ_DATE DATE DEFAULT SYSDATE NOT NULL ENABLE, CREATOR_ID VARCHAR2(12 CHAR) NOT NULL ENABLE, EXECUTOR_ID  VARCHAR2(12 CHAR), EXECUTION_DATE  DATE,EXECUTOR_REMARKS  VARCHAR2(50 CHAR), PAYLOAD  CLOB,  BATCH_ID  VARCHAR2(50 CHAR), JOURNAL_ID  VARCHAR2(50 CHAR), COMMON_BATCH_REMARKS VARCHAR2(50 CHAR), CREATOR_ROLE  NUMBER(10,0)) USING DELTA Location 'hdfs://10.177.103.199:8022/data-lake/30Dec-Data-Lake/JOURNAL_REQUEST';";
+        String datalakesql = "INSERT INTO fincoredatalakedev.JOURNAL_REQUEST (REQ_ID, REQ_STATUS, CHANGE_TYPE, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
         final int INSERT_BATCH_SIZE = 1000;
         List<Object[]> batchArgs = new ArrayList<>(INSERT_BATCH_SIZE);
         int processedCount = 0;
-
-        Map<String, List<BatchRequestDto.JournalRequestRow>> groupedRows = batchDto.getRows().stream()
-                .collect(Collectors.groupingBy(row -> row.getBranch() + ":" + row.getCurrency()));
 
         for (Map.Entry<String, List<BatchRequestDto.JournalRequestRow>> entry : groupedRows.entrySet()) {
             String journalIdPrefix = prefixIterator.next();
             int journalSequence = 1;
             for (BatchRequestDto.JournalRequestRow rowDto : entry.getValue()) {
                 String journalId = String.format("%s-%03d", journalIdPrefix, journalSequence);
-                
-                // --- UPDATE: Use getCsvDate() instead of getPDate() ---
-                LocalDate rowDate = (rowDto.getCsvDate() != null) ? rowDto.getCsvDate() : fallbackDate;
 
+                // --- KEY CHANGE: Use the specific row date ---
+                LocalDate rowDate = (rowDto.getPDate() != null) ? rowDto.getPDate() : fallbackDate;
+
+                // Build payload with "csvDate" key
                 String payload = buildJsonPayloadFast(rowDto, rowDate, batchId, journalId, commonRemarks, journalSequence, dateFmt);
 
                 batchArgs.add(new Object[]{
-                        RequestStatus.PENDING.getCode(), 
-                        rowDto.getChangeType().name(),   
-                        LocalDateTime.now(),             
-                        creatorId,                       
-                        creatorRole,                     
-                        batchId,                         
-                        journalId,                       
-                        commonRemarks,                   
-                        payload                          
+                        RequestStatus.PENDING.getCode(), // 1
+                        rowDto.getChangeType().name(),   // 2
+                        LocalDateTime.now(),             // 3
+                        creatorId,                       // 4
+                        creatorRole,                     // 5
+                        batchId,                         // 6
+                        journalId,                       // 7
+                        commonRemarks,                   // 8
+                        payload                          // 9
                 });
 
                 if (batchArgs.size() >= INSERT_BATCH_SIZE) {
                     jdbcTemplate.batchUpdate(sql, batchArgs);
+                    hivejdbcTemplate1.execute(createlaketable);
+                    hivejdbcTemplate1.batchUpdate(datalakesql, batchArgs);
                     batchArgs.clear();
                 }
                 journalSequence++;
                 processedCount++;
             }
         }
-        if (!batchArgs.isEmpty()) jdbcTemplate.batchUpdate(sql, batchArgs);
+        if (!batchArgs.isEmpty()){
+            jdbcTemplate.batchUpdate(sql, batchArgs);
+            hivejdbcTemplate1.execute(createlaketable);
+            hivejdbcTemplate1.batchUpdate(datalakesql, batchArgs);
+        }
 
         createNotification(batchId, creatorId, processedCount);
         return batchId;
     }
 
+    // --- 6. APPROVAL PROCESS & GL UPDATE (OPTIMIZED + DATE MATCH + CURRENCY) ---
     @Override
     @Transactional
     public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) {
@@ -300,10 +263,14 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         }
 
         if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
-            log.info(">>> STARTING APPROVAL (OPTIMIZED + TRIM + CURRENCY + CSVDATE) <<<");
-            
+            log.info(">>> STARTING APPROVAL PROCESS (OPTIMIZED WITH DATE MATCHING) <<<");
+
             // --- OPTIMIZED SQL ---
-            // 1. EXTRACT: Checks 'csvDate' AND 'pDate' (for backward compatibility)
+            // 1. Parses JSON using JSON_TABLE.
+            // 2. Extracts 'csvDate' and converts to DATE.
+            // 3. Joins with CURRENCY_MASTER for Rate conversion.
+            // 4. Aggregates by Branch + Currency + CGL + Date.
+            // 5. Merges: Updates if Date exists, Inserts if Date does not exist.
             String mergeSql = """
                 MERGE INTO GL_BALANCE B
                 USING (
@@ -311,11 +278,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                         jt.branch AS BRANCH_CODE, 
                         jt.currency AS CURRENCY, 
                         jt.cgl AS CGL,
-                        -- Tries csvDate -> pDate -> Current Date (Safety Net)
-                        NVL(
-                            TO_DATE(COALESCE(jt.csvDate, jt.pDate), 'YYYY-MM-DD'), 
-                            TRUNC(SYSDATE)
-                        ) AS TXN_DATE, 
+                        TO_DATE(jt.csvDate, 'YYYY-MM-DD') AS TXN_DATE, 
                         SUM(
                             CASE 
                                 WHEN jt.currency = 'INR' THEN jt.amount
@@ -329,8 +292,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                             currency VARCHAR2(3)  PATH '$.currency',
                             cgl      VARCHAR2(50) PATH '$.cgl',
                             amount   NUMBER       PATH '$.amount',
-                            csvDate  VARCHAR2(10) PATH '$.csvDate', -- Check new Key
-                            pDate    VARCHAR2(10) PATH '$.pDate'    -- Check old Key
+                            csvDate  VARCHAR2(10) PATH '$.csvDate' 
                         )
                     ) jt
                     LEFT JOIN CURRENCY_MASTER cm ON jt.currency = cm.CURRENCY_CODE
@@ -338,31 +300,84 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                       AND jr.CREATOR_ID != ? 
                       AND 
             """ + " " + targetClause + " " + """
-                    GROUP BY jt.branch, jt.currency, jt.cgl, COALESCE(jt.csvDate, jt.pDate)
+                    GROUP BY jt.branch, jt.currency, jt.cgl, jt.csvDate
                 ) S
                 ON (
-                    TRIM(B.BRANCH_CODE) = TRIM(S.BRANCH_CODE) AND 
-                    TRIM(B.CURRENCY) = TRIM(S.CURRENCY) AND 
-                    TRIM(B.CGL) = TRIM(S.CGL) AND 
+                    B.BRANCH_CODE = S.BRANCH_CODE AND 
+                    B.CURRENCY = S.CURRENCY AND 
+                    B.CGL = S.CGL AND 
                     TRUNC(B.BALANCE_DATE) = S.TXN_DATE 
                 )
                 WHEN MATCHED THEN
-                    UPDATE SET B.BALANCE = NVL(B.BALANCE, 0) + S.NET_AMOUNT
+                    UPDATE SET B.BALANCE = B.BALANCE + S.NET_AMOUNT
                 WHEN NOT MATCHED THEN
                     INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE)
                     VALUES (GL_BALANCE_SEQ.nextval, S.TXN_DATE, S.BRANCH_CODE, S.CURRENCY, S.CGL, S.NET_AMOUNT)
             """;
+            String mergedatalakeSql = """
+                MERGE INTO fincoredatalakedev.gl_balance B
+                        USING (
+                            SELECT
+                                jt.branch      AS BRANCH_CODE,
+                                jt.currency    AS CURRENCY,
+                                jt.cgl         AS CGL,
+                                TO_DATE(jt.csvDate, 'yyyy-MM-dd') AS TXN_DATE,
+                                SUM(jt.amount) AS NET_AMOUNT
+                            FROM fincoredatalakedev.journal_request jr
+                            LATERAL VIEW json_tuple(
+                                jr.payload,
+                                'branch',
+                                'currency',
+                                'cgl',
+                                'amount',
+                                'csvDate'
+                            ) jt AS branch, currency, cgl, amount, csvDate
+                            WHERE jr.req_status = 'P'
+                              AND jr.creator_id <> ?
+                              AND
+            """ + " " + targetClause + " " + """
+                    GROUP BY
+                                jt.branch,
+                                jt.currency,
+                                jt.cgl,
+                                jt.csvDate
+                        ) S
+                        ON (
+                            B.date = S.TXN_DATE
+                            AND B.glcc = CONCAT(S.BRANCH_CODE, S.CURRENCY, S.CGL)
+                        )
+                        WHEN MATCHED THEN
+                          UPDATE SET
+                            B.amount = B.amount + S.NET_AMOUNT
+                        WHEN NOT MATCHED THEN
+                          INSERT (date, glcc, amount)
+                          VALUES (
+                              S.TXN_DATE,
+                              CONCAT(S.BRANCH_CODE, S.CURRENCY, S.CGL),
+                              S.NET_AMOUNT
+                          );
+            """;
+
+
 
             List<Object> mergeArgs = new ArrayList<>();
-            mergeArgs.add(executorId); 
+            mergeArgs.add(executorId);
             mergeArgs.addAll(args);
 
             long start = System.currentTimeMillis();
             int affectedRows = jdbcTemplate.update(mergeSql, mergeArgs.toArray());
             long end = System.currentTimeMillis();
-            
-            log.info("GL_BALANCE Sync Complete. Affected Rows: {}. Time: {} ms", affectedRows, (end - start));
 
+            log.info("GL_BALANCE Sync Complete. Rows Affected: {}. Time: {} ms", affectedRows, (end - start));
+
+            long start1 = System.currentTimeMillis();
+            int affectedRowsDatalake = hivejdbcTemplate1.update(mergedatalakeSql, mergeArgs.toArray());
+            long end1 = System.currentTimeMillis();
+            log.info("GL_BALANCE Datalake  Sync Complete. Rows Affected: {}. Time: {} ms", affectedRowsDatalake, (end1 - start1));
+
+
+
+            // 3. Insert Audit Trail (GL_TRANSACTIONS)
             String insertTxnSql = """
                 INSERT INTO GL_TRANSACTIONS (
                     TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE, 
@@ -373,7 +388,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                     GL_TRANSACTIONS_SEQ.nextval, 
                     jr.BATCH_ID, 
                     jr.JOURNAL_ID, 
-                    NVL(TO_DATE(COALESCE(jt.csvDate, jt.pDate), 'YYYY-MM-DD'), TRUNC(SYSDATE)),
+                    TO_DATE(jt.csvDate, 'YYYY-MM-DD'), 
                     SYSTIMESTAMP, 
                     jt.branch, 
                     jt.currency, 
@@ -386,8 +401,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                 FROM JOURNAL_REQUEST jr,
                      JSON_TABLE(jr.PAYLOAD, '$' 
                         COLUMNS (
-                            csvDate   VARCHAR2(10) PATH '$.csvDate',
-                            pDate     VARCHAR2(10) PATH '$.pDate',
+                            csvDate   VARCHAR2(10) PATH '$.csvDate', 
                             branch    VARCHAR2(50) PATH '$.branch',
                             currency  VARCHAR2(3)  PATH '$.currency',
                             cgl       VARCHAR2(50) PATH '$.cgl',
@@ -399,7 +413,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                 WHERE jr.REQ_STATUS = 'P' 
                   AND jr.CREATOR_ID != ? 
                   AND 
-            """ + " " + targetClause; 
+            """ + " " + targetClause;
 
             List<Object> txnArgs = new ArrayList<>();
             txnArgs.add(executorId);
@@ -409,9 +423,10 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             log.info("Audit Trail Created. {} records.", txnRows);
         }
 
-        String updateTarget = targetClause.replace("jr.", ""); 
+        // 4. Update Status in JOURNAL_REQUEST
+        String updateTarget = targetClause.replace("jr.", "");
         String updateSql = "UPDATE JOURNAL_REQUEST SET REQ_STATUS = ?, EXECUTOR_ID = ?, EXECUTOR_REMARKS = ?, EXECUTION_DATE = SYSDATE WHERE REQ_STATUS = 'P' AND CREATOR_ID != ? AND " + updateTarget;
-        
+
         List<Object> uArgs = new ArrayList<>();
         uArgs.add(dto.getStatus().getCode());
         uArgs.add(executorId);
@@ -424,6 +439,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         return Collections.emptyList();
     }
 
+    // --- 7. CANCELLATION & HELPER METHODS (UNCHANGED) ---
     @Override @Transactional public void cancelMyRequest(Long id, String u) {
         JournalRequest r = journalRequestRepository.findById(id).orElseThrow(() -> new ResourceNotFoundException("Not found"));
         if(!u.equals(r.getCreatorId())) throw new IllegalStateException("Unauthorized");
@@ -438,19 +454,20 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     }
     @Override @Transactional public void cancelMyRequestsByJournalPrefixes(List<String> ps, String u) { journalRequestRepository.deleteJournalsNative(ps, u); }
 
+    // --- UTILS ---
     private List<String> fetchJournalSequences(int count) {
         if(count==0) return Collections.emptyList();
         List<Long> seqs = jdbcTemplate.queryForList("SELECT JRNL_SEQ.nextval FROM dual CONNECT BY LEVEL <= ?", Long.class, count);
         return seqs.stream().map(id -> String.format("%07d", id)).collect(Collectors.toList());
     }
 
-    // --- UPDATED JSON BUILDER: Writes "csvDate" Key ---
-    private String buildJsonPayloadFast(BatchRequestDto.JournalRequestRow row, LocalDate dateToUse, String batchId, String jId, String rem, int count, DateTimeFormatter fmt) {
+    // --- UPDATED JSON BUILDER: Writes "csvDate" instead of "pDate" ---
+    private String buildJsonPayloadFast(BatchRequestDto.JournalRequestRow row, LocalDate pDate, String batchId, String jId, String rem, int count, DateTimeFormatter fmt) {
         StringBuilder sb = new StringBuilder(400);
         sb.append("{")
                 .append("\"changeType\":\"").append(row.getChangeType()).append("\",")
                 .append("\"masterJournalId\":").append(row.getMasterJournalId()==null?"null":row.getMasterJournalId()).append(",")
-                .append("\"csvDate\":\"").append(dateToUse.format(fmt)).append("\",") // Using csvDate
+                .append("\"csvDate\":\"").append(pDate.format(fmt)).append("\",") // Using csvDate
                 .append("\"branch\":\"").append(row.getBranch()).append("\",")
                 .append("\"currency\":\"").append(row.getCurrency()).append("\",")
                 .append("\"cgl\":\"").append(row.getCgl()).append("\",")
@@ -489,3 +506,8 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     @Override public List<JournalRequestStatusDto> getJournalRequestStatusList() { return journalRequestRepository.findAll().stream().map(JournalRequestStatusDto::new).collect(Collectors.toList()); }
 }
 
+there is one change like in what ever balance u r converting after converting u are putting that into the balance now there is one change like theere is saprate column INR_BALANCE
+in that we need to put the converted amount in the balance u need to put without converting
+balance -> as it is amount balance whatever 
+INR_BALANCE (column )-> converted amount after u are compareing to currency master multipling and all put that in this column
+and dont give mi all code just give mi the code which i need to change for that step wise and file wise
