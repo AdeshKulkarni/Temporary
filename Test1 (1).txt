@@ -48,10 +48,10 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     @Qualifier("oracleJdbcTemplate")
     private JdbcTemplate jdbcTemplate;
 
-    // Data Lake Template (Commented out effectively by not using it)
-    @Autowired
-    @Qualifier("hiveJdbcTemplate")
-    private JdbcTemplate hivejdbcTemplate1;
+    // --- DATA LAKE (COMMENTED OUT TO PREVENT CONNECTION LAG) ---
+    // @Autowired
+    // @Qualifier("hiveJdbcTemplate")
+    // private JdbcTemplate hivejdbcTemplate1;
 
     private static final DateTimeFormatter CSV_DATE_FMT = DateTimeFormatter.ofPattern("ddMMyyyy");
 
@@ -59,6 +59,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     @Override
     public LocalDate getCurrentPostingDate() {
         try {
+            // Optimization: If DB is slow, consider using LocalDate.now() directly
             String sql = "SELECT USERS_DATE FROM FINCORE_DATE FETCH FIRST 1 ROWS ONLY";
             return jdbcTemplate.queryForObject(sql, (rs, rowNum) -> {
                 Timestamp ts = rs.getTimestamp("USERS_DATE");
@@ -131,6 +132,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             BatchRequestDto.JournalRequestRow dto = new BatchRequestDto.JournalRequestRow();
             dto.setChangeType(ChangeType.ADD);
             
+            // --- DATE PARSING LOGIC ---
             if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
                 try {
                     dto.setCsvDate(LocalDate.parse(r.sysDate, CSV_DATE_FMT));
@@ -169,7 +171,9 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     @Transactional
     public String createBulkBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
         String batchId = sequenceService.getNextBatchId();
-        LocalDate fallbackDate = getCurrentPostingDate();
+        
+        // Use local date fallback for speed, or DB date if strictly required
+        LocalDate fallbackDate = getCurrentPostingDate(); 
 
         String commonRemarks = (batchDto.getCommonBatchRemarks() != null && !batchDto.getCommonBatchRemarks().isEmpty())
                 ? batchDto.getCommonBatchRemarks()
@@ -185,10 +189,6 @@ public class JournalRequestServiceImpl implements JournalRequestService {
 
         String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, CHANGE_TYPE, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         
-        // --- DATA LAKE  ---
-        // String createlaketable = " CREATE TABLE IF NOT EXISTS fincoredatalakedev.JOURNAL_REQUEST ...";
-        // String datalakesql = "INSERT INTO fincoredatalakedev.JOURNAL_REQUEST ...";
-
         final int INSERT_BATCH_SIZE = 1000;
         List<Object[]> batchArgs = new ArrayList<>(INSERT_BATCH_SIZE);
         int processedCount = 0;
@@ -217,7 +217,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                 if (batchArgs.size() >= INSERT_BATCH_SIZE) {
                     jdbcTemplate.batchUpdate(sql, batchArgs);
                     
-                    /* // --- DATA LAKE INSERT  ---
+                    /* // --- DATA LAKE (COMMENTED OUT) ---
                     try {
                         hivejdbcTemplate1.execute(createlaketable);
                         hivejdbcTemplate1.batchUpdate(datalakesql, batchArgs);
@@ -232,20 +232,14 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         }
         if (!batchArgs.isEmpty()) {
             jdbcTemplate.batchUpdate(sql, batchArgs);
-            
-            /* // --- DATA LAKE INSERT  ---
-            try {
-                hivejdbcTemplate1.execute(createlaketable);
-                hivejdbcTemplate1.batchUpdate(datalakesql, batchArgs);
-            } catch (Exception e) { log.error("Data Lake Insert Failed", e); }
-            */
+            /* // --- DATA LAKE (COMMENTED OUT) --- */
         }
 
         createNotification(batchId, creatorId, processedCount);
         return batchId;
     }
 
-    // --- 6. APPROVAL PROCESS  ---
+    // --- 6. APPROVAL PROCESS (OPTIMISTIC BATCHING - MANUAL JAVA LOGIC) ---
     @Override
     @Transactional
     public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) {
@@ -269,9 +263,11 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         }
 
         if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
-            log.info(">>> STARTING APPROVAL (OPTIMISTIC BATCHING - JAVA LOGIC) <<<");
+            log.info(">>> STARTING APPROVAL (OPTIMISTIC BATCHING) <<<");
 
             // 1. FETCH AGGREGATED DATA
+            // - Calculates RAW_AMOUNT (Unconverted)
+            // - Calculates CONVERTED_AMOUNT (INR)
             String fetchSql = """
                 SELECT 
                     jt.branch AS BRANCH_CODE, 
@@ -279,10 +275,10 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                     jt.cgl AS CGL,
                     NVL(TO_DATE(COALESCE(jt.csvDate, jt.pDate), 'YYYY-MM-DD'), TRUNC(SYSDATE)) AS TXN_DATE, 
                     
-                    -- Raw Amount (For BALANCE)
+                    -- Raw Amount (Original Currency)
                     SUM(jt.amount) AS RAW_AMOUNT,
 
-                    -- Converted Amount (For INR_BALANCE)
+                    -- Converted Amount (INR)
                     SUM(
                         CASE 
                             WHEN jt.currency = 'INR' THEN jt.amount
@@ -313,6 +309,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
             fetchArgs.add(executorId); 
             fetchArgs.addAll(args);
 
+            // Fetch data into DTO
             List<GlAggregatedDataDto> dataList = jdbcTemplate.query(fetchSql, fetchArgs.toArray(), (rs, rowNum) -> new GlAggregatedDataDto(
                 rs.getString("BRANCH_CODE"),
                 rs.getString("CURRENCY"),
@@ -322,18 +319,20 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                 rs.getBigDecimal("CONVERTED_AMOUNT")
             ));
 
-            log.info("Fetched {} aggregated rows. Executing Optimistic Batch Update...", dataList.size());
+            log.info("Fetched {} aggregated rows. Executing Batch Update...", dataList.size());
 
             if (!dataList.isEmpty()) {
                 // 2. BATCH UPDATE
+                // Updates BALANCE (Raw) and INR_BALANCE (Converted)
+                // Uses TRIM() and TRUNC() for safety
                 String updateSql = "UPDATE GL_BALANCE SET BALANCE = NVL(BALANCE, 0) + ?, INR_BALANCE = NVL(INR_BALANCE, 0) + ? WHERE TRIM(BRANCH_CODE) = ? AND TRIM(CURRENCY) = ? AND TRIM(CGL) = ? AND TRUNC(BALANCE_DATE) = ?";
 
                 int[] updateCounts = jdbcTemplate.batchUpdate(updateSql, new BatchPreparedStatementSetter() {
                     @Override
                     public void setValues(PreparedStatement ps, int i) throws SQLException {
                         GlAggregatedDataDto row = dataList.get(i);
-                        ps.setBigDecimal(1, row.getRawAmount());       // Update Balance (Raw)
-                        ps.setBigDecimal(2, row.getConvertedAmount()); // Update INR_Balance (Converted)
+                        ps.setBigDecimal(1, row.getRawAmount());
+                        ps.setBigDecimal(2, row.getConvertedAmount());
                         ps.setString(3, row.getBranch().trim());
                         ps.setString(4, row.getCurrency().trim());
                         ps.setString(5, row.getCgl().trim());
@@ -366,8 +365,8 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                             ps.setString(2, row.getBranch().trim());
                             ps.setString(3, row.getCurrency().trim());
                             ps.setString(4, row.getCgl().trim());
-                            ps.setBigDecimal(5, row.getRawAmount());       // Insert Balance
-                            ps.setBigDecimal(6, row.getConvertedAmount()); // Insert INR_Balance
+                            ps.setBigDecimal(5, row.getRawAmount());
+                            ps.setBigDecimal(6, row.getConvertedAmount());
                         }
                         @Override
                         public int getBatchSize() {
@@ -377,7 +376,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
                 }
             }
 
-            /* // --- DATA LAKE UPDATE ---
+            /* // --- DATA LAKE (COMMENTED OUT) ---
             try {
                 // hivejdbcTemplate1.update(...);
             } catch (Exception e) { log.error("Data Lake Merge Failed", e); }
@@ -460,7 +459,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         journalRequestRepository.deleteAll(l);
     }
     @Override @Transactional public void cancelMyRequestsByJournalPrefixes(List<String> ps, String u) { journalRequestRepository.deleteJournalsNative(ps, u); }
-    
+
     private List<String> fetchJournalSequences(int count) {
         if(count==0) return Collections.emptyList();
         List<Long> seqs = jdbcTemplate.queryForList("SELECT JRNL_SEQ.nextval FROM dual CONNECT BY LEVEL <= ?", Long.class, count);
@@ -494,14 +493,18 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         return s.replace("\"", "\\\"").replace("\\", "\\\\");
     }
 
+    // --- OPTIMIZATION: ASYNC NOTIFICATION ---
+    // Runs in a background thread so the user doesn't wait
     private void createNotification(String batchId, String creatorId, int size) {
-        try {
-            NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
-            String message = String.format("Batch %s (%d rows) by %s pending.", batchId, size, creatorId);
-            notificationWriterService.createNotification(null, config.getTargetRoles(), message, config.getTargetUrl(), batchId, "JournalService");
-        } catch (Exception e) {
-            log.error("Notification failed", e);
-        }
+        new Thread(() -> {
+            try {
+                NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
+                String message = String.format("Batch %s (%d rows) by %s pending.", batchId, size, creatorId);
+                notificationWriterService.createNotification(null, config.getTargetRoles(), message, config.getTargetUrl(), batchId, "JournalService");
+            } catch (Exception e) {
+                log.error("Notification failed (Async)", e);
+            }
+        }).start();
     }
 
     @Override @Transactional public Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto d, String i, Integer r) { return Optional.empty(); }
