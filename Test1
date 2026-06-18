@@ -1,175 +1,160 @@
-I completely understand the constraints. We are in a situation with zero room for compromise:
+package com.fincore.VoucherService.Service.validation;
 
-1. **You need 0 seconds of delay** (Instant Consistency).
-2. **You cannot push updates from the Admin side** (No Redis Triggers).
-3. **You must survive 100,000 concurrent users** (No hammering the database).
 
-If the database can't tell us when it updates, and we can't pull from the database for every row without crashing it, we use the industry-standard pattern for this exact scenario: **The Self-Healing RAM Cache with Database Fallback.**
-
-### How this works (The Logic)
-
-Instead of returning a giant list to your validator, the `ValidationMasterService` becomes the gatekeeper.
-
-1. **Fast Path (0 DB Hits):** It loads all master data into RAM on startup. When a user uploads an Excel file, it checks the RAM. For 99.9% of rows, it finds the CGL instantly and approves it.
-2. **Fallback Path (1 DB Hit):** If a user uploads a CGL that is *missing* from RAM, the service pauses. It asks Oracle: *"Did an admin just create this specific CGL 5 seconds ago?"*
-3. **Self-Healing:** If Oracle says YES, the service adds the new CGL to the RAM instantly. From that millisecond onward, all 100,000 users will find it in RAM. Zero delay.
-
-### The Implementation (Modify Existing Service)
-
-Delete the contents of your `ValidationMasterService.java` and replace it entirely with this code. It uses `ConcurrentHashMap` to ensure it is 100% thread-safe for 100,000 users.
-
-```java
-package com.fincore.VoucherService.Service;
-
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
+import com.fincore.VoucherService.Dto.ExcelRowData;
+import com.fincore.VoucherService.Service.ValidationMasterService;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
-import jakarta.annotation.PostConstruct;
-import java.util.Collections;
+import java.math.BigDecimal;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 
 @Service
-@RequiredArgsConstructor
-@Slf4j
-public class ValidationMasterService {
+public class VoucherRuleValidator {
 
     @Autowired
-    @Qualifier("oracleJdbcTemplate")
-    private JdbcTemplate oracleJdbcTemplate;
+    private final ValidationMasterService validationMasterService;
 
-    // High-Speed RAM Caches
-    private final Set<String> activeBranches = Collections.newSetFromMap(new ConcurrentHashMap<>());
-    private final Set<String> activeCurrencies = Collections.newSetFromMap(new ConcurrentHashMap<>());
-    private final Set<String> activeCgls = Collections.newSetFromMap(new ConcurrentHashMap<>());
-
-    // "Negative Caches" - Protects the DB from hackers spamming fake CGLs
-    private final Set<String> invalidBranches = Collections.newSetFromMap(new ConcurrentHashMap<>());
-    private final Set<String> invalidCurrencies = Collections.newSetFromMap(new ConcurrentHashMap<>());
-    private final Set<String> invalidCgls = Collections.newSetFromMap(new ConcurrentHashMap<>());
-
-    @PostConstruct
-    public void init() {
-        log.info("MASTER_DATA_INIT | Loading bulk data into RAM...");
-        activeBranches.addAll(oracleJdbcTemplate.query("SELECT CODE FROM BRANCH_MASTER WHERE STATUS = 1", (rs, rowNum) -> rs.getString(1)));
-        activeCurrencies.addAll(oracleJdbcTemplate.query("SELECT CURRENCY_CODE FROM CURRENCY_MASTER WHERE FLAG = 1", (rs, rowNum) -> rs.getString(1)));
-        activeCgls.addAll(oracleJdbcTemplate.query("SELECT CGL_NUMBER FROM CGL_MASTER WHERE STATUS = 1", (rs, rowNum) -> rs.getString(1)));
+    public VoucherRuleValidator(ValidationMasterService validationMasterService) {
+        this.validationMasterService = validationMasterService;
     }
 
-    // ==========================================
-    // CGL VALIDATION LOGIC
-    // ==========================================
-    public boolean isValidCgl(String cgl) {
-        if (cgl == null || cgl.trim().isEmpty()) return false;
-        
-        if (activeCgls.contains(cgl)) return true;     // Fast path: It's valid!
-        if (invalidCgls.contains(cgl)) return false;   // Fast path: We already know it's fake.
 
-        // Fallback: It's missing. Check the database to see if an Admin just added it.
-        synchronized (this) {
-            if (activeCgls.contains(cgl)) return true; // Double-check in case another thread just added it
-            
-            try {
-                Integer count = oracleJdbcTemplate.queryForObject("SELECT COUNT(*) FROM CGL_MASTER WHERE CGL_NUMBER = ? AND STATUS = 1", Integer.class, cgl);
-                if (count != null && count > 0) {
-                    activeCgls.add(cgl); // SELF HEAL: Add the newly created CGL to RAM.
-                    log.info("MASTER_DATA_HEAL | New CGL detected and added to RAM: {}", cgl);
-                    return true;
-                } else {
-                    invalidCgls.add(cgl); // Mark as fake so we don't query the DB again for this string.
-                    return false;
-                }
-            } catch (Exception e) {
-                return false;
+    // ==================================================================================
+    // 4. VALIDATION STAGES
+    // ==================================================================================
+
+    public void runFormatCheck(List<ExcelRowData> rows) {
+        rows.parallelStream().forEach(d -> {
+
+            // 1. Safely grab the value, remove all spaces, and make it uppercase
+            String rawType = (d.txnType != null) ? d.txnType.trim().toUpperCase() : "";
+
+            // 2. Check the cleaned value and instantly standardize it to full words
+            if (rawType.equals("CR") || rawType.equals("CREDIT")) {
+                d.txnType = "Credit";
             }
-        }
-    }
-
-    // ==========================================
-    // BRANCH VALIDATION LOGIC
-    // ==========================================
-    public boolean isValidBranch(String branch) {
-        if (branch == null || branch.trim().isEmpty()) return false;
-        if (activeBranches.contains(branch)) return true;
-        if (invalidBranches.contains(branch)) return false;
-
-        synchronized (this) {
-            if (activeBranches.contains(branch)) return true;
-            try {
-                Integer count = oracleJdbcTemplate.queryForObject("SELECT COUNT(*) FROM BRANCH_MASTER WHERE CODE = ? AND STATUS = 1", Integer.class, branch);
-                if (count != null && count > 0) {
-                    activeBranches.add(branch);
-                    return true;
-                } else {
-                    invalidBranches.add(branch);
-                    return false;
+            else if (rawType.equals("DR") || rawType.equals("DEBIT")) {
+                d.txnType = "Debit";
+            }
+            else {
+                synchronized(d.formatErrors) {
+                    d.formatErrors.add("Transaction type must be 'CR' or 'DR' (Case insensitive).");
                 }
-            } catch (Exception e) { return false; }
-        }
+            }
+
+
+            // Amount
+            if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) <= 0) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Amount must be greater than 0."); }
+            } else if (d.amount.precision() > 20 || d.amount.scale() > 4) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Exceeded maximum 16 digits or 4 decimal places."); }
+            }
+
+
+            // Product Code
+            if (d.productCode != null && !d.productCode.isEmpty() && !d.productCode.equals("A") && !d.productCode.matches("^[0-9]{1,8}$")) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Product code must be up to 8 digits or left blank."); }
+            }
+
+            // Remarks (Alphanumeric and single spaces only, matching frontend regex)
+            if (d.remarks == null || d.remarks.trim().length() < 2 || d.remarks.trim().length() > 30) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Remarks must be 2-30 characters."); }
+            } else if (!d.remarks.matches("^[a-zA-Z0-9 ]+$") || d.remarks.contains("  ")) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Only alphabets and numbers are allowed."); }
+            }
+
+            // Currency
+            if (d.currency == null || d.currency.length() != 3) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Currency code must be exactly 3 characters."); }
+            }
+
+            // CGL (Strictly 10 digits)
+            if (d.cgl == null || d.cgl.isEmpty()) {
+                synchronized(d.formatErrors) { d.formatErrors.add("CGL is mandatory."); }
+            } else if (!d.cgl.matches("^[0-9]{10}$")) {
+                synchronized(d.formatErrors) { d.formatErrors.add("CGL must be exactly 10 digits."); }
+            }
+
+            // Branch (Strictly 5 alphanumeric characters)
+            if (d.branch == null || d.branch.trim().isEmpty()) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Branch code is mandatory."); }
+            } else if (!d.branch.matches("^[a-zA-Z0-9]{5}$")) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Branch code must be exactly 5 alphanumeric characters."); }
+            }
+        });
     }
 
-    // ==========================================
-    // CURRENCY VALIDATION LOGIC
-    // ==========================================
-    public boolean isValidCurrency(String currency) {
-        if (currency == null || currency.trim().isEmpty()) return false;
-        if (activeCurrencies.contains(currency)) return true;
-        if (invalidCurrencies.contains(currency)) return false;
+    public void runDbCheck(List<ExcelRowData> rows) {
+        Set<String> validBranches = validationMasterService.getAllActiveBranches();
+        Set<String> validCurrs = validationMasterService.getAllActiveCurrencies();
+        Set<String> validCgls = validationMasterService.getAllActiveCgls();
 
-        synchronized (this) {
-            if (activeCurrencies.contains(currency)) return true;
-            try {
-                Integer count = oracleJdbcTemplate.queryForObject("SELECT COUNT(*) FROM CURRENCY_MASTER WHERE CURRENCY_CODE = ? AND FLAG = 1", Integer.class, currency);
-                if (count != null && count > 0) {
-                    activeCurrencies.add(currency);
-                    return true;
-                } else {
-                    invalidCurrencies.add(currency);
-                    return false;
+        rows.parallelStream().forEach(d -> {
+            if (d.branch != null && !d.branch.isEmpty() && !validBranches.contains(d.branch))
+                d.dbErrors.add("Branch is inactive or not found: " + d.branch);
+            if (d.currency != null && !d.currency.isEmpty() && !validCurrs.contains(d.currency))
+                d.dbErrors.add("Currency is inactive or not found: " + d.currency);
+            if (d.cgl != null && !d.cgl.isEmpty() && !validCgls.contains(d.cgl))
+                d.dbErrors.add("CGL is inactive or not found: " + d.cgl);
+        });
+    }
+
+    /**
+     * Rule 5: Balance Integrity Logic.
+     * Uses LongAdder with 10^4 scale shift to perform precise integer arithmetic
+     * on parallel streams, preventing floating-point drift in large batches.
+     */
+    public void runBalanceCheck(List<ExcelRowData> rows) {
+    ConcurrentHashMap<String, AtomicReference<BigDecimal>> balanceMap = new ConcurrentHashMap<>();
+        ConcurrentHashMap<String, Boolean> branchHasDebit = new ConcurrentHashMap<>();
+        ConcurrentHashMap<String, Boolean> branchHasCredit = new ConcurrentHashMap<>();
+
+        // Pass 1: Aggregate totals and check for presence
+        rows.parallelStream().forEach(d -> {
+            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
+
+            // Track Debit/Credit Presence per Branch
+            if ("Debit".equalsIgnoreCase(d.txnType)) branchHasDebit.put(d.branch, true);
+            if ("Credit".equalsIgnoreCase(d.txnType)) branchHasCredit.put(d.branch, true);
+
+            // Calculate Balance Groupings
+            boolean isCredit = "Credit".equalsIgnoreCase(d.txnType);
+            BigDecimal finalVal = isCredit ? d.amount.negate() : d.amount;
+
+            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
+            String balKey = d.branch + "_" + d.currency + "_" + type;
+
+            // Thread-safe BigDecimal addition without scaling or overflow risks
+            balanceMap.computeIfAbsent(balKey, k -> new AtomicReference<>(BigDecimal.ZERO))
+                    .updateAndGet(curr -> curr.add(finalVal));
+        });
+
+        // Pass 2: Apply the simple, generic error messages to the rows
+        rows.parallelStream().forEach(d -> {
+            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
+
+            Boolean hasDeb = branchHasDebit.getOrDefault(d.branch, false);
+            Boolean hasCred = branchHasCredit.getOrDefault(d.branch, false);
+
+            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
+            String balKey = d.branch + "_" + d.currency + "_" + type;
+            AtomicReference<BigDecimal> adder = balanceMap.get(balKey);
+
+            synchronized (d.balErrors) {
+                // 1. Debit/Credit Presence Check
+                if ((!hasDeb || !hasCred) && !d.balErrors.contains("Branch must have at least one Debit and one Credit entry.")) {
+                    d.balErrors.add("Branch must have at least one Debit and one Credit entry.");
                 }
-            } catch (Exception e) { return false; }
-        }
+
+                // 2. Balance Math Check (Using BigDecimal's compareTo)
+                if (adder != null && adder.get().compareTo(BigDecimal.ZERO) != 0 && !d.balErrors.contains("Branch, Currency, and CGL-wise balance mismatch.")) {
+                    d.balErrors.add("Branch, Currency, and CGL-wise balance mismatch.");
+                }
+            }
+        });
     }
 }
-
-```
-
-### How to use this in your Validator
-
-In your code where you loop through the Excel rows to validate them (likely in `VoucherRuleValidator.java`), you no longer need to fetch lists. You just ask the service directly.
-
-Instead of this old logic:
-
-```java
-// OLD WAY
-Set<String> allCgls = validationMasterService.getAllActiveCgls();
-if (!allCgls.contains(row.cgl)) {
-    row.dbErrors.add("Invalid CGL");
-}
-
-```
-
-You just do this:
-
-```java
-// NEW WAY
-if (!validationMasterService.isValidCgl(row.cgl)) {
-    row.dbErrors.add("Invalid CGL");
-}
-
-if (!validationMasterService.isValidBranch(row.branch)) {
-    row.dbErrors.add("Invalid Branch");
-}
-
-if (!validationMasterService.isValidCurrency(row.currency)) {
-    row.dbErrors.add("Invalid Currency");
-}
-
-```
-
-**Why this is the ultimate solution:**
-There is 0 delay. There are no timers. No Redis Pub/Sub, no Admin modifications, and no frontend changes. If an admin creates a CGL, the very next Excel file that uses it will trigger the DB check, automatically pull the new CGL into the RAM, and approve the row in milliseconds. The database remains perfectly safe from the 100,000 users.
