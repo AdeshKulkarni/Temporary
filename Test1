@@ -1,5 +1,25 @@
+I know exactly why this happened. This is a notorious Spring Boot "gotcha."
+
+When we deleted the Oracle configuration but kept the `HiveDbConfig` (which creates a `DataSource`), Spring Boot's internal safety rules kicked in. **If Spring Boot detects even one manually created `DataSource` (like our Hive one), it completely disables all of its automatic database configurations.** Because of this, it completely ignored your Oracle properties and never created the `oracleJdbcTemplate`.
+
+When an application has multiple databases, you cannot mix "automatic" and "manual." You must manually define both, but you must do it using Spring's native `DataSourceProperties` so it correctly reads the URLs and the Hikari pool settings.
+
+Delete `JdbcTemplateConfig.java`. We are going to put the `oracleJdbcTemplate` exactly where it belongs, inside a fully bulletproof Oracle config file.
+
+Here is the final, complete code for your two configuration files.
+
+### 1. The Bulletproof Oracle Config
+
+Create (or replace) this file. This reads your `spring.datasource` properties, creates the Hikari pool, and exposes the exact `oracleJdbcTemplate` your services are looking for.
+
+**File:** `src/main/java/com/fincore/VoucherService/config/OracleDbConfig.java`
+
+```java
 package com.fincore.VoucherService.config;
 
+import com.zaxxer.hikari.HikariDataSource;
+import org.springframework.boot.autoconfigure.jdbc.DataSourceProperties;
+import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
@@ -7,15 +27,93 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import javax.sql.DataSource;
 
 @Configuration
-public class JdbcTemplateConfig {
+public class OracleDbConfig {
 
-    /**
-     * Takes the automatically configured Oracle DataSource and exposes it 
-     * as "oracleJdbcTemplate" to satisfy all your existing @Qualifier annotations.
-     */
+    // 1. Let Spring safely parse the standard URL and credentials
+    @Primary
+    @Bean
+    @ConfigurationProperties("spring.datasource")
+    public DataSourceProperties oracleDataSourceProperties() {
+        return new DataSourceProperties();
+    }
+
+    // 2. Feed those parsed properties into a strict Hikari Pool
+    @Primary
+    @Bean(name = "oracleDataSource")
+    @ConfigurationProperties("spring.datasource.hikari")
+    public HikariDataSource oracleDataSource(DataSourceProperties properties) {
+        return properties.initializeDataSourceBuilder().type(HikariDataSource.class).build();
+    }
+
+    // 3. Create the exact JdbcTemplate your services are asking for
     @Primary
     @Bean(name = "oracleJdbcTemplate")
-    public JdbcTemplate oracleJdbcTemplate(DataSource primaryDataSource) {
-        return new JdbcTemplate(primaryDataSource);
+    public JdbcTemplate oracleJdbcTemplate(DataSource oracleDataSource) {
+        return new JdbcTemplate(oracleDataSource);
     }
 }
+
+```
+
+### 2. The Bulletproof Hive Config
+
+Replace the contents of your `HiveDbConfig.java` with this. It does the exact same thing but for your secondary Data Lake.
+
+**File:** `src/main/java/com/fincore/VoucherService/config/HiveDbConfig.java`
+
+```java
+package com.fincore.VoucherService.config;
+
+import com.zaxxer.hikari.HikariDataSource;
+import org.springframework.boot.autoconfigure.jdbc.DataSourceProperties;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.jdbc.core.JdbcTemplate;
+import javax.sql.DataSource;
+
+@Configuration
+public class HiveDbConfig {
+
+    @Bean
+    @ConfigurationProperties("spring.hive.datasource")
+    public DataSourceProperties hiveDataSourceProperties() {
+        return new DataSourceProperties();
+    }
+
+    @Bean(name = "hiveDataSource")
+    @ConfigurationProperties("spring.hive.datasource.hikari")
+    public HikariDataSource hiveDataSource(DataSourceProperties properties) {
+        return properties.initializeDataSourceBuilder().type(HikariDataSource.class).build();
+    }
+    
+    // Optional: Expose a Hive JdbcTemplate just in case your HdfsSyncService needs it
+    @Bean(name = "hiveJdbcTemplate")
+    public JdbcTemplate hiveJdbcTemplate(DataSource hiveDataSource) {
+        return new JdbcTemplate(hiveDataSource);
+    }
+}
+
+```
+
+### 3. Verify Properties
+
+Because this Java code perfectly utilizes Spring's native parser, your `application.properties` must use the standard `.url` format (not `.jdbc-url`).
+
+Make sure your connection strings look exactly like this:
+
+```properties
+# --- ORACLE ---
+spring.datasource.url=jdbc:oracle:thin:@10.177.103.192:1523/fincorepdb1
+spring.datasource.username=thefd
+spring.datasource.password=sdfsf#sdf
+spring.datasource.driver-class-name=oracle.jdbc.OracleDriver
+
+# --- HIVE ---
+spring.hive.datasource.url=jdbc:hive2://localhost:10000/fincoredatalakejournal
+spring.hive.datasource.username=spark
+spring.hive.datasource.driver-class-name=org.apache.hive.jdbc.HiveDriver
+
+```
+
+Compile and run. The `UnsatisfiedDependencyException` will instantly disappear because the `oracleJdbcTemplate` is now properly generated and injected into your `VoucherWorkflowEngine` and `ValidationMasterService`.
