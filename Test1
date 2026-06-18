@@ -1,160 +1,46 @@
-package com.fincore.VoucherService.Service.validation;
+You need to update the `runDbCheck` method inside this file.
 
+Because we upgraded the `ValidationMasterService` to use the "Self-Healing RAM Cache" (which returns `true/false` instead of handing over massive lists), the old logic in `runDbCheck` will break.
 
-import com.fincore.VoucherService.Dto.ExcelRowData;
-import com.fincore.VoucherService.Service.ValidationMasterService;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Service;
+Here is exactly what to do in your `VoucherRuleValidator.java`.
 
-import java.math.BigDecimal;
-import java.util.List;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicReference;
+Find the `runDbCheck` method and **replace the entire method** with this updated version:
 
-@Service
-public class VoucherRuleValidator {
-
-    @Autowired
-    private final ValidationMasterService validationMasterService;
-
-    public VoucherRuleValidator(ValidationMasterService validationMasterService) {
-        this.validationMasterService = validationMasterService;
-    }
-
-
+```java
     // ==================================================================================
     // 4. VALIDATION STAGES
     // ==================================================================================
 
-    public void runFormatCheck(List<ExcelRowData> rows) {
-        rows.parallelStream().forEach(d -> {
-
-            // 1. Safely grab the value, remove all spaces, and make it uppercase
-            String rawType = (d.txnType != null) ? d.txnType.trim().toUpperCase() : "";
-
-            // 2. Check the cleaned value and instantly standardize it to full words
-            if (rawType.equals("CR") || rawType.equals("CREDIT")) {
-                d.txnType = "Credit";
-            }
-            else if (rawType.equals("DR") || rawType.equals("DEBIT")) {
-                d.txnType = "Debit";
-            }
-            else {
-                synchronized(d.formatErrors) {
-                    d.formatErrors.add("Transaction type must be 'CR' or 'DR' (Case insensitive).");
-                }
-            }
-
-
-            // Amount
-            if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) <= 0) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Amount must be greater than 0."); }
-            } else if (d.amount.precision() > 20 || d.amount.scale() > 4) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Exceeded maximum 16 digits or 4 decimal places."); }
-            }
-
-
-            // Product Code
-            if (d.productCode != null && !d.productCode.isEmpty() && !d.productCode.equals("A") && !d.productCode.matches("^[0-9]{1,8}$")) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Product code must be up to 8 digits or left blank."); }
-            }
-
-            // Remarks (Alphanumeric and single spaces only, matching frontend regex)
-            if (d.remarks == null || d.remarks.trim().length() < 2 || d.remarks.trim().length() > 30) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Remarks must be 2-30 characters."); }
-            } else if (!d.remarks.matches("^[a-zA-Z0-9 ]+$") || d.remarks.contains("  ")) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Only alphabets and numbers are allowed."); }
-            }
-
-            // Currency
-            if (d.currency == null || d.currency.length() != 3) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Currency code must be exactly 3 characters."); }
-            }
-
-            // CGL (Strictly 10 digits)
-            if (d.cgl == null || d.cgl.isEmpty()) {
-                synchronized(d.formatErrors) { d.formatErrors.add("CGL is mandatory."); }
-            } else if (!d.cgl.matches("^[0-9]{10}$")) {
-                synchronized(d.formatErrors) { d.formatErrors.add("CGL must be exactly 10 digits."); }
-            }
-
-            // Branch (Strictly 5 alphanumeric characters)
-            if (d.branch == null || d.branch.trim().isEmpty()) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Branch code is mandatory."); }
-            } else if (!d.branch.matches("^[a-zA-Z0-9]{5}$")) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Branch code must be exactly 5 alphanumeric characters."); }
-            }
-        });
-    }
+    // ... (Keep runFormatCheck exactly as it is) ...
 
     public void runDbCheck(List<ExcelRowData> rows) {
-        Set<String> validBranches = validationMasterService.getAllActiveBranches();
-        Set<String> validCurrs = validationMasterService.getAllActiveCurrencies();
-        Set<String> validCgls = validationMasterService.getAllActiveCgls();
-
+        // We no longer pull massive Sets into memory here.
+        // We ask the ValidationMasterService directly, which checks the RAM cache instantly.
+        
         rows.parallelStream().forEach(d -> {
-            if (d.branch != null && !d.branch.isEmpty() && !validBranches.contains(d.branch))
+            
+            if (d.branch != null && !d.branch.isEmpty() && !validationMasterService.isValidBranch(d.branch)) {
                 d.dbErrors.add("Branch is inactive or not found: " + d.branch);
-            if (d.currency != null && !d.currency.isEmpty() && !validCurrs.contains(d.currency))
-                d.dbErrors.add("Currency is inactive or not found: " + d.currency);
-            if (d.cgl != null && !d.cgl.isEmpty() && !validCgls.contains(d.cgl))
-                d.dbErrors.add("CGL is inactive or not found: " + d.cgl);
-        });
-    }
-
-    /**
-     * Rule 5: Balance Integrity Logic.
-     * Uses LongAdder with 10^4 scale shift to perform precise integer arithmetic
-     * on parallel streams, preventing floating-point drift in large batches.
-     */
-    public void runBalanceCheck(List<ExcelRowData> rows) {
-    ConcurrentHashMap<String, AtomicReference<BigDecimal>> balanceMap = new ConcurrentHashMap<>();
-        ConcurrentHashMap<String, Boolean> branchHasDebit = new ConcurrentHashMap<>();
-        ConcurrentHashMap<String, Boolean> branchHasCredit = new ConcurrentHashMap<>();
-
-        // Pass 1: Aggregate totals and check for presence
-        rows.parallelStream().forEach(d -> {
-            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
-
-            // Track Debit/Credit Presence per Branch
-            if ("Debit".equalsIgnoreCase(d.txnType)) branchHasDebit.put(d.branch, true);
-            if ("Credit".equalsIgnoreCase(d.txnType)) branchHasCredit.put(d.branch, true);
-
-            // Calculate Balance Groupings
-            boolean isCredit = "Credit".equalsIgnoreCase(d.txnType);
-            BigDecimal finalVal = isCredit ? d.amount.negate() : d.amount;
-
-            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
-            String balKey = d.branch + "_" + d.currency + "_" + type;
-
-            // Thread-safe BigDecimal addition without scaling or overflow risks
-            balanceMap.computeIfAbsent(balKey, k -> new AtomicReference<>(BigDecimal.ZERO))
-                    .updateAndGet(curr -> curr.add(finalVal));
-        });
-
-        // Pass 2: Apply the simple, generic error messages to the rows
-        rows.parallelStream().forEach(d -> {
-            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
-
-            Boolean hasDeb = branchHasDebit.getOrDefault(d.branch, false);
-            Boolean hasCred = branchHasCredit.getOrDefault(d.branch, false);
-
-            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
-            String balKey = d.branch + "_" + d.currency + "_" + type;
-            AtomicReference<BigDecimal> adder = balanceMap.get(balKey);
-
-            synchronized (d.balErrors) {
-                // 1. Debit/Credit Presence Check
-                if ((!hasDeb || !hasCred) && !d.balErrors.contains("Branch must have at least one Debit and one Credit entry.")) {
-                    d.balErrors.add("Branch must have at least one Debit and one Credit entry.");
-                }
-
-                // 2. Balance Math Check (Using BigDecimal's compareTo)
-                if (adder != null && adder.get().compareTo(BigDecimal.ZERO) != 0 && !d.balErrors.contains("Branch, Currency, and CGL-wise balance mismatch.")) {
-                    d.balErrors.add("Branch, Currency, and CGL-wise balance mismatch.");
-                }
             }
+            
+            if (d.currency != null && !d.currency.isEmpty() && !validationMasterService.isValidCurrency(d.currency)) {
+                d.dbErrors.add("Currency is inactive or not found: " + d.currency);
+            }
+            
+            if (d.cgl != null && !d.cgl.isEmpty() && !validationMasterService.isValidCgl(d.cgl)) {
+                d.dbErrors.add("CGL is inactive or not found: " + d.cgl);
+            }
+            
         });
     }
-}
+
+    // ... (Keep runBalanceCheck exactly as it is) ...
+
+```
+
+### Why this connects the whole system:
+
+By making this simple change, your parallel stream now shoots individual checks (`isValidCgl`, `isValidBranch`) to the `ValidationMasterService`.
+
+* It hits the RAM cache for the valid ones instantly.
+* If a brand new one was added by an admin seconds ago, the service falls back to the database, pulls it into RAM, and approves it right here without skipping a beat.
