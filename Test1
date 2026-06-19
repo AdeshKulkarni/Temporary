@@ -1,10 +1,7 @@
-That is a highly effective way to handle it. Switching from "Total Time Since Creation" to "Time Since Last Action" gives you a much more accurate picture of where the bottleneck is in your approval pipeline.
-Since you already have the VoucherWorkflow table tracking every step, you can easily pull the most recent record for a specific BATCH_ID and compare its LAST_ACTION_AT timestamp to the current time.
-Here is the cleanest way to implement this in your Spring Boot application using your existing architecture.
-### Step 1: Update Your Repository
-Right now, your VoucherWorkflowRepository has a method that pulls *all* actions and sorts them ascending. Pulling the whole list just to check the last item wastes memory.
-Add a new method that asks the database to sort descending and return **only the single most recent row**.
+Here is the exact, end-to-end roadmap of every file you need to change across your backend and frontend to replace the "Total Time" with the new "Time Since Last Action" calculation.
+### 1. Backend: The Repository
 **File:** src/main/java/com/fincore/VoucherService/Repository/VoucherWorkflowRepository.java
+Add the specialized query method to fetch only the most recent action.
 ```java
 package com.fincore.VoucherService.Repository;
 
@@ -18,49 +15,112 @@ import java.util.Optional;
 @Repository
 public interface VoucherWorkflowRepository extends JpaRepository<VoucherWorkflow, Long> {
     
-    // Your existing method
     List<VoucherWorkflow> findByBatchIdFkOrderByLastActionAtAsc(String batchIdFk);
 
-    // NEW: Fetches only the single most recent workflow action instantly
+    // ADD THIS EXACT LINE
     Optional<VoucherWorkflow> findTopByBatchIdFkOrderByLastActionAtDesc(String batchIdFk);
 }
 
 ```
-### Step 2: Calculate the Pending Time in Your Service
-Wherever you are building your response for the frontend (likely in a Service class that builds your pending list), use Java's Duration class to calculate the exact time difference.
+### 2. Backend: The Data Transfer Object (DTO)
+**File:** Wherever your response DTO for the pending list is stored (e.g., PendingBatchDTO.java or VoucherSummaryResponse.java).
+You need to add a new String field to hold the calculated time so it can be sent to the frontend.
+```java
+// Inside your DTO class
+private String timeSinceLastAction; // Add this field
+
+// Add getter and setter
+public String getTimeSinceLastAction() {
+    return timeSinceLastAction;
+}
+
+public void setTimeSinceLastAction(String timeSinceLastAction) {
+    this.timeSinceLastAction = timeSinceLastAction;
+}
+
+```
+### 3. Backend: The Service Layer (The API Logic)
+**File:** The Service class that fetches the pending list (e.g., VoucherQueryService.java or VoucherWorkflowService.java).
+This is where you calculate the time and attach it to the DTO before sending it to the frontend.
 ```java
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.Optional;
 
-// ... inside your Service class ...
+// ... inside your service class ...
 
-public String getPendingTimeSinceLastAction(String batchId) {
-    // 1. Fetch the most recent action for this batch
-    Optional<VoucherWorkflow> latestActionOpt = 
-        voucherWorkflowRepository.findTopByBatchIdFkOrderByLastActionAtDesc(batchId);
+@Autowired
+private VoucherWorkflowRepository workflowRepository;
 
-    // 2. If no actions exist yet, the pending time is 0 (or you can fallback to batch creation time)
-    if (latestActionOpt.isEmpty() || latestActionOpt.get().getLastActionAt() == null) {
-        return "0h 0m"; 
+// 1. Add this private helper method to do the math
+private String calculateTimeSinceLastAction(String batchId) {
+    Optional<VoucherWorkflow> latestAction = 
+        workflowRepository.findTopByBatchIdFkOrderByLastActionAtDesc(batchId);
+
+    if (latestAction.isEmpty() || latestAction.get().getLastActionAt() == null) {
+        return "0h 0m";
     }
 
-    // 3. Get the timestamps
-    LocalDateTime lastActionTime = latestActionOpt.get().getLastActionAt();
-    LocalDateTime currentTime = LocalDateTime.now();
+    Duration duration = Duration.between(latestAction.get().getLastActionAt(), LocalDateTime.now());
+    return duration.toHours() + "h " + duration.toMinutesPart() + "m";
+}
 
-    // 4. Calculate the duration between the last action and right now
-    Duration duration = Duration.between(lastActionTime, currentTime);
+// 2. Update your existing API method that gets the pending list
+public List<PendingBatchDTO> getPendingBatchesForUser(Long roleId) {
+    // ... your existing code that fetches the batches ...
+    List<PendingBatchDTO> responseList = new ArrayList<>();
 
-    // 5. Format the output cleanly (e.g., "2h 15m")
-    long hours = duration.toHours();
-    long minutes = duration.toMinutesPart(); // Gets the remaining minutes after hours are extracted
-
-    return hours + "h " + minutes + "m";
+    for (Batch batch : pendingBatches) {
+        PendingBatchDTO dto = new PendingBatchDTO();
+        // ... set other properties (id, amount, creator, etc.) ...
+        
+        // ADD THIS LINE: Call the helper method and set the value
+        dto.setTimeSinceLastAction(calculateTimeSinceLastAction(batch.getBatchId()));
+        
+        responseList.add(dto);
+    }
+    
+    return responseList;
 }
 
 ```
-### Why this approach is optimal:
- * **Database Efficiency:** The findTopBy...Desc naming convention translates to a highly optimized FETCH FIRST 1 ROW ONLY SQL query in Oracle. It doesn't load a massive list of history into your server's RAM.
- * **Precision:** By using java.time.Duration, you avoid the nightmare of doing manual milliseconds-to-minutes math.
- * **Accurate SLA Tracking:** If a batch was created 3 days ago, but the Level 1 approver just approved it 10 minutes ago, the Level 2 approver will correctly see "Pending since: 10m" instead of "Pending since: 3 days."
+### 4. Frontend: The React Component
+**File:** Your React file that displays the Pending Data Table (e.g., PendingApprovals.jsx or VoucherInbox.jsx).
+Update the table column that currently shows the old "Total Time" to map to the new timeSinceLastAction key coming from the JSON response.
+**If using standard MUI <Table>:**
+```javascript
+{/* Inside your TableHead */}
+<TableCell sx={{ fontWeight: 'bold' }}>Pending Time (Since Last Action)</TableCell>
+
+{/* Inside your TableBody mapping over the rows */}
+<TableCell>
+    <Chip 
+        label={row.timeSinceLastAction || "0h 0m"} 
+        color="warning" 
+        size="small" 
+        variant="outlined" 
+    />
+</TableCell>
+
+```
+**If using MUI <DataGrid>:**
+Update the columns definition array to point to the new field.
+```javascript
+const columns = [
+  // ... other columns ...
+  {
+    field: 'timeSinceLastAction', // Must exactly match the Java DTO variable name
+    headerName: 'Pending Time',
+    width: 150,
+    renderCell: (params) => (
+      <Chip 
+        label={params.value || "0h 0m"} 
+        color="warning" 
+        size="small" 
+        variant="outlined" 
+      />
+    )
+  }
+];
+
+```
