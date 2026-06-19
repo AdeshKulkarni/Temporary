@@ -1,16 +1,66 @@
-Voucher workflow 
+That is a highly effective way to handle it. Switching from "Total Time Since Creation" to "Time Since Last Action" gives you a much more accurate picture of where the bottleneck is in your approval pipeline.
+Since you already have the VoucherWorkflow table tracking every step, you can easily pull the most recent record for a specific BATCH_ID and compare its LAST_ACTION_AT timestamp to the current time.
+Here is the cleanest way to implement this in your Spring Boot application using your existing architecture.
+### Step 1: Update Your Repository
+Right now, your VoucherWorkflowRepository has a method that pulls *all* actions and sorts them ascending. Pulling the whole list just to check the last item wastes memory.
+Add a new method that asks the database to sort descending and return **only the single most recent row**.
+**File:** src/main/java/com/fincore/VoucherService/Repository/VoucherWorkflowRepository.java
+```java
+package com.fincore.VoucherService.Repository;
 
-WORKFLOW_ID	NUMBER	No	"FINCORE"."ISEQ$$_81239".nextval	1	
-BATCH_ID_FK	VARCHAR2(50 BYTE)	No		2	
-VID_FK	VARCHAR2(20 BYTE)	No		3	
-LAST_ACTION	VARCHAR2(30 BYTE)	Yes		4	
-LAST_ACTION_BY	VARCHAR2(100 BYTE)	Yes		5	
-LAST_ACTION_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	6	
-REMARKS	VARCHAR2(500 BYTE)	Yes		7	
-SCHEDULED_TIME	TIMESTAMP(6)	Yes		8	
+import com.fincore.VoucherService.Models.VoucherWorkflow;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
 
-ok there is issue like 
-pending Sense it is like 
-we are able to see the pending at that stage i am able to see the pending at time total from batch start
-i want like from that last approval time - current time 
-for that we can use this table in that LAST_ACTION_AT using that batch id 
+import java.util.List;
+import java.util.Optional;
+
+@Repository
+public interface VoucherWorkflowRepository extends JpaRepository<VoucherWorkflow, Long> {
+    
+    // Your existing method
+    List<VoucherWorkflow> findByBatchIdFkOrderByLastActionAtAsc(String batchIdFk);
+
+    // NEW: Fetches only the single most recent workflow action instantly
+    Optional<VoucherWorkflow> findTopByBatchIdFkOrderByLastActionAtDesc(String batchIdFk);
+}
+
+```
+### Step 2: Calculate the Pending Time in Your Service
+Wherever you are building your response for the frontend (likely in a Service class that builds your pending list), use Java's Duration class to calculate the exact time difference.
+```java
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.util.Optional;
+
+// ... inside your Service class ...
+
+public String getPendingTimeSinceLastAction(String batchId) {
+    // 1. Fetch the most recent action for this batch
+    Optional<VoucherWorkflow> latestActionOpt = 
+        voucherWorkflowRepository.findTopByBatchIdFkOrderByLastActionAtDesc(batchId);
+
+    // 2. If no actions exist yet, the pending time is 0 (or you can fallback to batch creation time)
+    if (latestActionOpt.isEmpty() || latestActionOpt.get().getLastActionAt() == null) {
+        return "0h 0m"; 
+    }
+
+    // 3. Get the timestamps
+    LocalDateTime lastActionTime = latestActionOpt.get().getLastActionAt();
+    LocalDateTime currentTime = LocalDateTime.now();
+
+    // 4. Calculate the duration between the last action and right now
+    Duration duration = Duration.between(lastActionTime, currentTime);
+
+    // 5. Format the output cleanly (e.g., "2h 15m")
+    long hours = duration.toHours();
+    long minutes = duration.toMinutesPart(); // Gets the remaining minutes after hours are extracted
+
+    return hours + "h " + minutes + "m";
+}
+
+```
+### Why this approach is optimal:
+ * **Database Efficiency:** The findTopBy...Desc naming convention translates to a highly optimized FETCH FIRST 1 ROW ONLY SQL query in Oracle. It doesn't load a massive list of history into your server's RAM.
+ * **Precision:** By using java.time.Duration, you avoid the nightmare of doing manual milliseconds-to-minutes math.
+ * **Accurate SLA Tracking:** If a batch was created 3 days ago, but the Level 1 approver just approved it 10 minutes ago, the Level 2 approver will correctly see "Pending since: 10m" instead of "Pending since: 3 days."
