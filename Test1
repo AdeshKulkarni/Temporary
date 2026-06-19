@@ -1,77 +1,119 @@
+You are looking at **SequenceService.java**. That is a completely different file!
+SequenceService.java is only responsible for generating your 7-digit Batch IDs and Journal IDs. It should **not** have the refreshMasterData method. Leave that file exactly as it is; it looks perfectly fine.
+The file we have been upgrading to handle the 1 Lakh users and the parallel loading is **ValidationMasterService.java**.
+You need to find or create ValidationMasterService.java in the exact same folder (com.fincore.VoucherService.Service).
+Here is the complete, final code for **ValidationMasterService.java** including the lightning-fast parallel loading we just discussed. Copy and paste this into ValidationMasterService.java:
+```java
 package com.fincore.VoucherService.Service;
 
-import com.fincore.VoucherService.Exception.CustomExceptions;
-import jakarta.persistence.EntityManager;
-import jakarta.persistence.PersistenceContext;
-import jakarta.persistence.PersistenceException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
-import jakarta.transaction.Transactional;
 
-/**
- * Provides unique, zero-padded identifiers for batches and journals.
- * Interacts directly with Oracle Sequences via native queries for maximum reliability.
- */
+import jakarta.annotation.PostConstruct;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+
 @Service
 @RequiredArgsConstructor
 @Slf4j
-public class SequenceService {
+public class ValidationMasterService {
 
-    @PersistenceContext
-    private EntityManager entityManager;
+    @Autowired
+    @Qualifier("oracleJdbcTemplate")
+    private JdbcTemplate oracleJdbcTemplate;
 
-    /**
-     * Pads the given number with leading zeros to a total length of 7.
-     * Logic preserved exactly as defined.
-     */
-    private String padToSevenDigits(Long id) {
-        if (id == null) {
-            log.error("SEQUENCE_PADDING_FAIL | Status: DATABASE_SEQUENCE_EXHAUSTED_OR_NULL");
+    // Volatile ensures instant zero-delay updates for all users during the pointer swap
+    private volatile Set<String> activeBranches = new HashSet<>();
+    private volatile Set<String> activeCurrencies = new HashSet<>();
+    private volatile Set<String> activeCgls = new HashSet<>();
 
-            throw new CustomExceptions.DatabaseOperationException("Critical failure: Oracle Sequence returned null. Check Sequence limits.");
-        }
-        return String.format("%07d", id);
+    // 1. Load data instantly when the server starts up
+    @PostConstruct
+    public void init() {
+        refreshMasterData();
     }
 
-    /**
-     * Gets the next BATCH_ID from the BATCH_SEQ sequence.
-     * Wrapped in specific error handling for database persistence issues.
-     */
-    @Transactional
-    public String getNextBatchId() {
+    // 2. The Background Worker: Runs every 60 seconds.
+    // Zero downtime. Users keep validating against RAM while this runs.
+    @Scheduled(fixedRate = 60000)
+    public void refreshMasterData() {
+        log.info("MASTER_DATA_SYNC | Starting PARALLEL fetch from Oracle...");
+        long startTime = System.currentTimeMillis();
+
         try {
-            Number nextId = (Number) entityManager
-                    .createNativeQuery("select BATCH_SEQ.nextval from dual")
-                    .getSingleResult();
+            // Fire all three queries at the exact same time on background threads
+            // Increased fetchSize to 10000 for massive speed improvements
+            CompletableFuture<List<String>> branchFuture = CompletableFuture.supplyAsync(() -> 
+                oracleJdbcTemplate.query(
+                    con -> {
+                        var ps = con.prepareStatement("SELECT CODE FROM BRANCH_MASTER WHERE STATUS = 1");
+                        ps.setFetchSize(10000); 
+                        return ps;
+                    }, 
+                    (rs, rowNum) -> rs.getString(1)
+                )
+            );
 
-            String paddedId = padToSevenDigits(nextId.longValue());
-            log.info("SEQUENCE_GENERATED | Type: BATCH_ID | Value: {}", paddedId);
-            return paddedId;
+            CompletableFuture<List<String>> currencyFuture = CompletableFuture.supplyAsync(() -> 
+                oracleJdbcTemplate.query(
+                    con -> {
+                        var ps = con.prepareStatement("SELECT CURRENCY_CODE FROM CURRENCY_MASTER WHERE FLAG = 1");
+                        ps.setFetchSize(10000);
+                        return ps;
+                    }, 
+                    (rs, rowNum) -> rs.getString(1)
+                )
+            );
 
-        } catch (PersistenceException e) {
-            log.error("SEQUENCE_FETCH_FAIL | Type: BATCH_ID | Status: Oracle sequence error");
-            throw new CustomExceptions.DatabaseOperationException("Critical failure: Batch sequence unavailable", e);
+            CompletableFuture<List<String>> cglFuture = CompletableFuture.supplyAsync(() -> 
+                oracleJdbcTemplate.query(
+                    con -> {
+                        var ps = con.prepareStatement("SELECT CGL_NUMBER FROM CGL_MASTER WHERE STATUS = 1");
+                        ps.setFetchSize(10000);
+                        return ps;
+                    }, 
+                    (rs, rowNum) -> rs.getString(1)
+                )
+            );
+
+            // Wait for the longest query to finish, then proceed
+            CompletableFuture.allOf(branchFuture, currencyFuture, cglFuture).join();
+
+            // THE NANOSECOND POINTER SWAP
+            this.activeBranches = new HashSet<>(branchFuture.get());
+            this.activeCurrencies = new HashSet<>(currencyFuture.get());
+            this.activeCgls = new HashSet<>(cglFuture.get());
+
+            long duration = System.currentTimeMillis() - startTime;
+            log.info("MASTER_DATA_SYNC_SUCCESS | Loaded in {} ms. CGLs: {} | Branches: {} | Currencies: {}", 
+                    duration, this.activeCgls.size(), this.activeBranches.size(), this.activeCurrencies.size());
+
+        } catch (Exception e) {
+            log.error("MASTER_DATA_SYNC_FAIL | Retaining old RAM cache to prevent validation failure. Error: {}", e.getMessage());
         }
     }
 
-    /**
-     * Gets the next JOURNAL_ID prefix from the JRNL_SEQ sequence.
-     */
-    @Transactional
-    public String getNextJournalIdPrefix() {
-        try {
-            Number nextId = (Number) entityManager
-                    .createNativeQuery("select JRNL_SEQ.nextval from dual")
-                    .getSingleResult();
+    // ====================================================================
+    // User Validation Methods: These read purely from RAM (Zero DB Hits)
+    // ====================================================================
+    public boolean isValidBranch(String branch) {
+        return branch != null && this.activeBranches.contains(branch);
+    }
 
-            String paddedId = padToSevenDigits(nextId.longValue());
-            log.info("SEQUENCE_GENERATED | Type: JRNL_ID | Value: {}", paddedId);
-            return paddedId;
+    public boolean isValidCurrency(String currency) {
+        return currency != null && this.activeCurrencies.contains(currency);
+    }
 
-        } catch (PersistenceException e) {
-            log.error("SEQUENCE_FETCH_FAIL | Type: JRNL_ID | Reason: Oracle JRNL_SEQ unavailable: {}", e.getMessage());
-            throw new CustomExceptions.DatabaseOperationException("Critical failure: Could not generate Journal ID sequence", e);
-        }
+    public boolean isValidCgl(String cgl) {
+        return cgl != null && this.activeCgls.contains(cgl);
     }
 }
+
+```
