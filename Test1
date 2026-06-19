@@ -1,63 +1,77 @@
-Yes, we can drastically reduce the loading time.
-Right now, your application is fetching the data **sequentially**. It waits for Branches to finish downloading, then starts downloading Currencies, and then starts downloading CGLs.
-If CGL takes 5 seconds, Branch takes 2 seconds, and Currency takes 1 second, your total load time is **8 seconds**.
-To make this lightning fast, we can use Java's CompletableFuture to run all three database queries **in parallel** on separate CPU threads. This means the total load time will drop to just the time of the longest query (5 seconds instead of 8).
-Here is the exact code to implement parallel loading in your ValidationMasterService.
-### 1. The Parallel Loading Code
-Update your refreshMasterData() method to look like this:
-```java
-    import java.util.concurrent.CompletableFuture;
+package com.fincore.VoucherService.Service;
 
-    public void refreshMasterData() {
-        log.info("MASTER_DATA_SYNC | Starting PARALLEL fetch from Oracle...");
-        long startTime = System.currentTimeMillis();
+import com.fincore.VoucherService.Exception.CustomExceptions;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
+import jakarta.persistence.PersistenceException;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import jakarta.transaction.Transactional;
 
+/**
+ * Provides unique, zero-padded identifiers for batches and journals.
+ * Interacts directly with Oracle Sequences via native queries for maximum reliability.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class SequenceService {
+
+    @PersistenceContext
+    private EntityManager entityManager;
+
+    /**
+     * Pads the given number with leading zeros to a total length of 7.
+     * Logic preserved exactly as defined.
+     */
+    private String padToSevenDigits(Long id) {
+        if (id == null) {
+            log.error("SEQUENCE_PADDING_FAIL | Status: DATABASE_SEQUENCE_EXHAUSTED_OR_NULL");
+
+            throw new CustomExceptions.DatabaseOperationException("Critical failure: Oracle Sequence returned null. Check Sequence limits.");
+        }
+        return String.format("%07d", id);
+    }
+
+    /**
+     * Gets the next BATCH_ID from the BATCH_SEQ sequence.
+     * Wrapped in specific error handling for database persistence issues.
+     */
+    @Transactional
+    public String getNextBatchId() {
         try {
-            // 1. Fire all three queries at the exact same time on background threads
-            CompletableFuture<List<String>> branchFuture = CompletableFuture.supplyAsync(() -> 
-                oracleJdbcTemplate.query("SELECT CODE FROM BRANCH_MASTER WHERE STATUS = 1", 
-                (rs, rowNum) -> rs.getString(1))
-            );
+            Number nextId = (Number) entityManager
+                    .createNativeQuery("select BATCH_SEQ.nextval from dual")
+                    .getSingleResult();
 
-            CompletableFuture<List<String>> currencyFuture = CompletableFuture.supplyAsync(() -> 
-                oracleJdbcTemplate.query("SELECT CURRENCY_CODE FROM CURRENCY_MASTER WHERE FLAG = 1", 
-                (rs, rowNum) -> rs.getString(1))
-            );
+            String paddedId = padToSevenDigits(nextId.longValue());
+            log.info("SEQUENCE_GENERATED | Type: BATCH_ID | Value: {}", paddedId);
+            return paddedId;
 
-            CompletableFuture<List<String>> cglFuture = CompletableFuture.supplyAsync(() -> 
-                oracleJdbcTemplate.query("SELECT CGL_NUMBER FROM CGL_MASTER WHERE STATUS = 1", 
-                (rs, rowNum) -> rs.getString(1))
-            );
-
-            // 2. Wait for all of them to finish
-            CompletableFuture.allOf(branchFuture, currencyFuture, cglFuture).join();
-
-            // 3. Extract the data and perform the atomic nanosecond pointer swap
-            this.activeBranches = new HashSet<>(branchFuture.get());
-            this.activeCurrencies = new HashSet<>(currencyFuture.get());
-            this.activeCgls = new HashSet<>(cglFuture.get());
-
-            long duration = System.currentTimeMillis() - startTime;
-            log.info("MASTER_DATA_SYNC_SUCCESS | Loaded in {} ms. CGLs: {} | Branches: {} | Currencies: {}", 
-                    duration, this.activeCgls.size(), this.activeBranches.size(), this.activeCurrencies.size());
-
-        } catch (Exception e) {
-            log.error("MASTER_DATA_SYNC_FAIL | Retaining old RAM cache. Error: {}", e.getMessage());
+        } catch (PersistenceException e) {
+            log.error("SEQUENCE_FETCH_FAIL | Type: BATCH_ID | Status: Oracle sequence error");
+            throw new CustomExceptions.DatabaseOperationException("Critical failure: Batch sequence unavailable", e);
         }
     }
 
-```
-### 2. Database Level (Covering Indexes)
-To make the actual Oracle execution instant, you must ensure you have **Covering Indexes** on those tables. If you only have a standard index, Oracle still has to read the table data. A covering index puts the specific data you requested directly into the index tree, meaning Oracle never even touches the actual table.
-If you have access to run SQL on your Oracle database, ask your DBA to apply these exact indexes. It will force Oracle to use an "Index Fast Full Scan," which takes milliseconds.
-```sql
--- Creates covering indexes so Oracle only reads the B-Tree, bypassing the table completely
-CREATE INDEX IDX_BRANCH_STATUS_CODE ON BRANCH_MASTER (STATUS, CODE);
-CREATE INDEX IDX_CURRENCY_FLAG_CODE ON CURRENCY_MASTER (FLAG, CURRENCY_CODE);
-CREATE INDEX IDX_CGL_STATUS_NUMBER ON CGL_MASTER (STATUS, CGL_NUMBER);
+    /**
+     * Gets the next JOURNAL_ID prefix from the JRNL_SEQ sequence.
+     */
+    @Transactional
+    public String getNextJournalIdPrefix() {
+        try {
+            Number nextId = (Number) entityManager
+                    .createNativeQuery("select JRNL_SEQ.nextval from dual")
+                    .getSingleResult();
 
-```
-### 3. Increase Fetch Size
-In your provided code, you were using ps.setFetchSize(2000). If you are pulling over 50,000 CGLs, that is still 25 network round trips.
-Because we are only fetching a single String column (which takes almost zero memory), you can safely increase the fetch size for this specific query to **10,000**. This will pull 10,000 rows in a single network packet, drastically cutting down the network latency between your server and Oracle.
-Combine these three techniques (Parallel Threads + Covering Indexes + Larger Fetch Size), and your master data will reload in the blink of an eye.
+            String paddedId = padToSevenDigits(nextId.longValue());
+            log.info("SEQUENCE_GENERATED | Type: JRNL_ID | Value: {}", paddedId);
+            return paddedId;
+
+        } catch (PersistenceException e) {
+            log.error("SEQUENCE_FETCH_FAIL | Type: JRNL_ID | Reason: Oracle JRNL_SEQ unavailable: {}", e.getMessage());
+            throw new CustomExceptions.DatabaseOperationException("Critical failure: Could not generate Journal ID sequence", e);
+        }
+    }
+}
