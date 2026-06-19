@@ -1,277 +1,56 @@
-package com.fincore.VoucherService.Service.validation;
+It makes complete sense to stick with the original structure if that is what fits your current architecture and deployment limits best.
+Since you reverted to the original ValidationMasterService, you already have the exact database logic needed for your new API. Your getAllActiveCurrencies() method is already designed to pull strictly the CURRENCY_CODE where FLAG = 1.
+To expose this as your own custom API for the frontend (or other services) to consume, you simply need to create a new REST Controller that calls this existing method.
+Here is the exact file to create to build your own Currency API.
+### 1. Create the Master Data Controller
+Create a new controller file. This will expose an endpoint (e.g., /api/v1/master/currencies) that returns just the list of active 3-letter currency codes as JSON.
+**File:** src/main/java/com/fincore/VoucherService/Controllers/MasterDataController.java
+```java
+package com.fincore.VoucherService.Controllers;
 
-
-import com.fincore.VoucherService.Dto.ExcelRowData;
 import com.fincore.VoucherService.Service.ValidationMasterService;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Service;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
 
-import java.math.BigDecimal;
-import java.util.List;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicReference;
 
-@Service
-public class VoucherRuleValidator {
+@RestController
+@RequestMapping("/api/v1/master")
+@RequiredArgsConstructor
+public class MasterDataController {
 
-    @Autowired
     private final ValidationMasterService validationMasterService;
 
-    public VoucherRuleValidator(ValidationMasterService validationMasterService) {
-        this.validationMasterService = validationMasterService;
-    }
-
-
-    // ==================================================================================
-    // 4. VALIDATION STAGES
-    // ==================================================================================
-
-    public void runFormatCheck(List<ExcelRowData> rows) {
-        rows.parallelStream().forEach(d -> {
-
-            // 1. Safely grab the value, remove all spaces, and make it uppercase
-            String rawType = (d.txnType != null) ? d.txnType.trim().toUpperCase() : "";
-
-            // 2. Check the cleaned value and instantly standardize it to full words
-            if (rawType.equals("CR") || rawType.equals("CREDIT")) {
-                d.txnType = "Credit";
-            }
-            else if (rawType.equals("DR") || rawType.equals("DEBIT")) {
-                d.txnType = "Debit";
-            }
-            else {
-                synchronized(d.formatErrors) {
-                    d.formatErrors.add("Transaction type must be 'CR' or 'DR' (Case insensitive).");
-                }
-            }
-
-
-            // Amount
-            if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) <= 0) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Amount must be greater than 0."); }
-            } else if (d.amount.precision() > 20 || d.amount.scale() > 4) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Exceeded maximum 16 digits or 4 decimal places."); }
-            }
-
-
-            // Product Code
-            if (d.productCode != null && !d.productCode.isEmpty() && !d.productCode.equals("A") && !d.productCode.matches("^[0-9]{1,8}$")) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Product code must be up to 8 digits or left blank."); }
-            }
-
-            // Remarks (Alphanumeric and single spaces only, matching frontend regex)
-            if (d.remarks == null || d.remarks.trim().length() < 2 || d.remarks.trim().length() > 30) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Remarks must be 2-30 characters."); }
-            } else if (!d.remarks.matches("^[a-zA-Z0-9 ]+$") || d.remarks.contains("  ")) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Only alphabets and numbers are allowed."); }
-            }
-
-            // Currency
-            if (d.currency == null || d.currency.length() != 3) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Currency code must be exactly 3 characters."); }
-            }
-
-            // CGL (Strictly 10 digits)
-            if (d.cgl == null || d.cgl.isEmpty()) {
-                synchronized(d.formatErrors) { d.formatErrors.add("CGL is mandatory."); }
-            } else if (!d.cgl.matches("^[0-9]{10}$")) {
-                synchronized(d.formatErrors) { d.formatErrors.add("CGL must be exactly 10 digits."); }
-            }
-
-            // Branch (Strictly 5 alphanumeric characters)
-            if (d.branch == null || d.branch.trim().isEmpty()) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Branch code is mandatory."); }
-            } else if (!d.branch.matches("^[a-zA-Z0-9]{5}$")) {
-                synchronized(d.formatErrors) { d.formatErrors.add("Branch code must be exactly 5 alphanumeric characters."); }
-            }
-        });
-    }
-
-    public void runDbCheck(List<ExcelRowData> rows) {
-        Set<String> validBranches = validationMasterService.getAllActiveBranches();
-        Set<String> validCurrs = validationMasterService.getAllActiveCurrencies();
-        Set<String> validCgls = validationMasterService.getAllActiveCgls();
-
-        rows.parallelStream().forEach(d -> {
-            if (d.branch != null && !d.branch.isEmpty() && !validBranches.contains(d.branch))
-                d.dbErrors.add("Branch is inactive or not found: " + d.branch);
-            if (d.currency != null && !d.currency.isEmpty() && !validCurrs.contains(d.currency))
-                d.dbErrors.add("Currency is inactive or not found: " + d.currency);
-            if (d.cgl != null && !d.cgl.isEmpty() && !validCgls.contains(d.cgl))
-                d.dbErrors.add("CGL is inactive or not found: " + d.cgl);
-        });
-    }
-
-
     /**
-     * Rule 5: Balance Integrity Logic.
-     * Uses LongAdder with 10^4 scale shift to perform precise integer arithmetic
-     * on parallel streams, preventing floating-point drift in large batches.
+     * API Endpoint: GET /api/v1/master/currencies
+     * Purpose: Returns a list of only the active CURRENCY_CODEs.
      */
-    public void runBalanceCheck(List<ExcelRowData> rows) {
-    ConcurrentHashMap<String, AtomicReference<BigDecimal>> balanceMap = new ConcurrentHashMap<>();
-        ConcurrentHashMap<String, Boolean> branchHasDebit = new ConcurrentHashMap<>();
-        ConcurrentHashMap<String, Boolean> branchHasCredit = new ConcurrentHashMap<>();
-
-        // Pass 1: Aggregate totals and check for presence
-        rows.parallelStream().forEach(d -> {
-            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
-
-            // Track Debit/Credit Presence per Branch
-            if ("Debit".equalsIgnoreCase(d.txnType)) branchHasDebit.put(d.branch, true);
-            if ("Credit".equalsIgnoreCase(d.txnType)) branchHasCredit.put(d.branch, true);
-
-            // Calculate Balance Groupings
-            boolean isCredit = "Credit".equalsIgnoreCase(d.txnType);
-            BigDecimal finalVal = isCredit ? d.amount.negate() : d.amount;
-
-            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
-            String balKey = d.branch + "_" + d.currency + "_" + type;
-
-            // Thread-safe BigDecimal addition without scaling or overflow risks
-            balanceMap.computeIfAbsent(balKey, k -> new AtomicReference<>(BigDecimal.ZERO))
-                    .updateAndGet(curr -> curr.add(finalVal));
-        });
-
-        // Pass 2: Apply the simple, generic error messages to the rows
-        rows.parallelStream().forEach(d -> {
-            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
-
-            Boolean hasDeb = branchHasDebit.getOrDefault(d.branch, false);
-            Boolean hasCred = branchHasCredit.getOrDefault(d.branch, false);
-
-            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
-            String balKey = d.branch + "_" + d.currency + "_" + type;
-            AtomicReference<BigDecimal> adder = balanceMap.get(balKey);
-
-            synchronized (d.balErrors) {
-                // 1. Debit/Credit Presence Check
-                if ((!hasDeb || !hasCred) && !d.balErrors.contains("Branch must have at least one Debit and one Credit entry.")) {
-                    d.balErrors.add("Branch must have at least one Debit and one Credit entry.");
-                }
-
-                // 2. Balance Math Check (Using BigDecimal's compareTo)
-                if (adder != null && adder.get().compareTo(BigDecimal.ZERO) != 0 && !d.balErrors.contains("Branch, Currency, and CGL-wise balance mismatch.")) {
-                    d.balErrors.add("Branch, Currency, and CGL-wise balance mismatch.");
-                }
-            }
-        });
+    @GetMapping("/currencies")
+    public ResponseEntity<Set<String>> getActiveCurrencies() {
+        // Reuses your existing high-performance JDBC method
+        Set<String> currencies = validationMasterService.getAllActiveCurrencies();
+        
+        return ResponseEntity.ok(currencies);
     }
 }
 
+```
+### How this works:
+ 1. When your frontend hits GET /api/v1/master/currencies, this controller catches the request.
+ 2. It triggers your exact original getAllActiveCurrencies() method.
+ 3. The method uses the jdbcTemplate with your fetchSize(1000) to pull just the CURRENCY_CODE from Oracle.
+ 4. It wraps it in a standard HTTP 200 OK response.
+The JSON output will look exactly like this, giving the frontend exactly what it needs without exposing the rest of the table's data:
+```json
+[
+  "USD",
+  "INR",
+  "EUR",
+  "GBP"
+]
 
-
-package com.fincore.VoucherService.Service;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.dao.DataAccessException;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.stereotype.Service;
-
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-
-/**
- * Loads active master records into memory-efficient HashSets for O(1) validation lookups.
- * Utilizes optimized JDBC fetch sizes to handle high-volume data transfers from Oracle.
- */
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class ValidationMasterService {
-
-    @Autowired
-    @Qualifier("oracleJdbcTemplate")
-    private JdbcTemplate jdbcTemplate;
-
-    /**
-     * Fetches all active branch codes.
-     * Uses a fetchSize of 5000 to minimize network round-trips for large branch networks.
-     */
-    public Set<String> getAllActiveBranches() {
-        long start = System.currentTimeMillis();
-        String sql = "SELECT CODE FROM BRANCH_MASTER WHERE STATUS = 1";
-
-        try {
-            List<String> list = jdbcTemplate.query(con -> {
-                var ps = con.prepareStatement(sql);
-                ps.setFetchSize(5000);
-                return ps;
-            }, (rs, rowNum) -> rs.getString(1));
-
-            log.info("MASTER_DATA_LOADED | Type: BRANCHES | Count: {} | Duration: {}ms", list.size(), System.currentTimeMillis() - start);
-            return new HashSet<>(list);
-
-        } catch (DataAccessException e) {
-            log.error("MASTER_DATA_FETCH_FAIL | Type: BRANCHES | Reason: {}", e.getMessage());
-            return new HashSet<>(); // Returning empty set to trigger validation failure safely
-        }
-    }
-
-    /**
-     * Fetches all active currency codes.
-     * Uses a fetchSize of 1000 for standard currency volume.
-     */
-    public Set<String> getAllActiveCurrencies() {
-        long start = System.currentTimeMillis();
-        String sql = "SELECT CURRENCY_CODE FROM CURRENCY_MASTER WHERE FLAG = 1";
-
-        try {
-            List<String> list = jdbcTemplate.query(con -> {
-                var ps = con.prepareStatement(sql);
-                ps.setFetchSize(1000);
-                return ps;
-            }, (rs, rowNum) -> rs.getString(1));
-
-            log.info("MASTER_DATA_LOADED | Type: CURRENCIES | Count: {} | Duration: {}ms", list.size(), System.currentTimeMillis() - start);
-            return new HashSet<>(list);
-
-        } catch (DataAccessException e) {
-            log.error("MASTER_DATA_FETCH_FAIL | Type: CURRENCIES | Reason: {}", e.getMessage());
-            return new HashSet<>();
-        }
-    }
-
-    /**
-     * Fetches all active CGL numbers.
-     * Uses a fetchSize of 2000 to balance memory and speed for ledger data.
-     */
-    public Set<String> getAllActiveCgls() {
-        long start = System.currentTimeMillis();
-        String sql = "SELECT CGL_NUMBER FROM CGL_MASTER WHERE STATUS = 1";
-
-        try {
-            List<String> list = jdbcTemplate.query(con -> {
-                var ps = con.prepareStatement(sql);
-                ps.setFetchSize(2000);
-                return ps;
-            }, (rs, rowNum) -> rs.getString(1));
-
-            log.info("MASTER_DATA_LOADED | Type: CGLS | Count: {} | Duration: {}ms", list.size(), System.currentTimeMillis() - start);
-            return new HashSet<>(list);
-
-        } catch (DataAccessException e) {
-            log.error("MASTER_DATA_FETCH_FAIL | Type: CGLS | Reason: {}", e.getMessage());
-            return new HashSet<>();
-        }
-    }
-}
-
- i  convert it back to my original code and one more thing is can my current api is there for the currency is depends on the currency master i want to create my own
-this is my table
-currency master
-
-CURRENCY_CODE	VARCHAR2(3 BYTE)	No		1	Currency Code of Currency
-CURRENCY_NAME	VARCHAR2(50 BYTE)	No		2	Name of Currency
-FLAG	NUMBER(1,0)	No	0	3	Currency Active or Inactive
-CURRENCY_RATE	NUMBER(12,6)	Yes		4	Current Rate of Currency
-RATE_DATE	DATE	Yes		5	Rate change date 
-CREATED_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	6	Currency created date
-UPDATED_AT	TIMESTAMP(6)	Yes	"CURRENT_TIMESTAMP
-   "	7	Currency updated date
-
-table in which i just need CURRENCY_CODE only we will create our own api for currency
+```
+You can use this exact same controller pattern to create /api/v1/master/branches or /api/v1/master/cgls later on if you want to expose those specific codes to the frontend as well!
