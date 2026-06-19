@@ -1,48 +1,44 @@
-You are absolutely right. I used a generic name (PendingBatchDTO) because every project names that file a little differently, but it is very common in Spring Boot applications to simply return the database Entity directly instead of using a DTO at all.
-If you cannot find a DTO file, you are likely passing the main database Entity (probably RequestVoucher or whatever entity represents your batch/journal) straight to the frontend.
-Here is the foolproof way to find exactly where to put this code, and how to do it without breaking your Oracle database.
-### Step 1: Find the right file (The @Transient trick)
-Go into your React frontend code and look at the API URL you call to get the pending list (for example, /JS/voucher/pending).
-Search your Java project for that URL to find the **Controller**, and look at what type of list it returns.
-If it returns something like List<RequestVoucher> or List<JournalBatch>, open that Entity class. You can add the new field directly to the Entity, but you **must** use the @Transient annotation.
-**File:** src/main/java/com/fincore/VoucherService/Models/RequestVoucher.java (or whichever entity you found)
-```java
-import jakarta.persistence.Transient;
+package com.fincore.VoucherService.Service.core;
+import com.fincore.VoucherService.Exception.CustomExceptions;
+import com.fincore.VoucherService.Models.JournalRequest;
+import com.fincore.VoucherService.Models.VoucherWorkflow;
+import com.fincore.VoucherService.Repository.JournalRequestRepository;
+import com.fincore.VoucherService.Repository.VoucherWorkflowRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.dao.EmptyResultDataAccessException;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
 
-// ... inside your Entity class ...
-
-    // @Transient tells Hibernate: "Do NOT look for this column in the Oracle database. 
-    // Just hold this data in memory so I can send it to the React frontend."
-    @Transient
-    private String timeSinceLastAction;
-
-    public String getTimeSinceLastAction() {
-        return timeSinceLastAction;
-    }
-
-    public void setTimeSinceLastAction(String timeSinceLastAction) {
-        this.timeSinceLastAction = timeSinceLastAction;
-    }
-
-```
-### Step 2: Inject the math into your Service
-Now, find the Service method that gets called by that Controller (e.g., getPendingVouchers()).
-Since you are returning a list of entities, you just loop through them, run the calculation, and use that new setter before returning the list to the Controller.
-**File:** Your Service class (e.g., VoucherQueryService.java)
-```java
+import java.math.BigDecimal;
+import java.sql.Timestamp;
 import java.time.Duration;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.util.Optional;
+import java.util.*;
 
-// ... inside your Service class ...
+@Service
+public class VoucherQueryService {
 
     @Autowired
-    private VoucherWorkflowRepository workflowRepository;
+    @Qualifier("oracleJdbcTemplate")
+    private JdbcTemplate jdbcTemplate;
 
-    // 1. The helper method
+    private final JournalRequestRepository journalRequestRepository;
+
+    private final VoucherWorkflowRepository workflowRepository;
+
+
+    public VoucherQueryService(JournalRequestRepository journalRequestRepository, VoucherWorkflowRepository workflowRepository) {
+        this.journalRequestRepository = journalRequestRepository;
+        this.workflowRepository = workflowRepository;
+    }
+
     private String calculateTimeSinceLastAction(String batchId) {
-        Optional<VoucherWorkflow> latestAction = 
-            workflowRepository.findTopByBatchIdFkOrderByLastActionAtDesc(batchId);
+        Optional<VoucherWorkflow> latestAction =
+                workflowRepository.findTopByBatchIdFkOrderByLastActionAtDesc(batchId);
 
         if (latestAction.isEmpty() || latestAction.get().getLastActionAt() == null) {
             return "0h 0m";
@@ -52,20 +48,291 @@ import java.util.Optional;
         return duration.toHours() + "h " + duration.toMinutesPart() + "m";
     }
 
-    // 2. Inside your existing method that gets the pending list:
-    public List<RequestVoucher> getPendingList(Long roleId) {
-        // ... your existing code that fetches 'pendingList' from the database ...
-        
-        // Loop through the list and attach the calculated time
-        for (RequestVoucher req : pendingList) {
-            String time = calculateTimeSinceLastAction(req.getBatchId());
-            req.setTimeSinceLastAction(time); 
-        }
-        
-        return pendingList;
+
+    public List<Map<String, Object>> getPendingBatchesForChecker(Integer userRole, String userId) {
+        String sql = """
+            SELECT 
+                p.BATCH_ID, 
+                p.VID_FK AS VID, 
+                p.CREATED_BY AS CREATOR_ID, 
+                p.CREATED_AT AS REQ_DATE, 
+                p.COMMON_BATCH_REMARKS AS BATCH_REMARKS, -- ✨ PERF BOOST: Direct column read
+                p.RECORDS_COUNT AS TOTAL_ROWS, 
+                p.SCHEDULED_TIME,
+                w.WORKFLOW_STAGE, 
+                w.WORKFLOW_CODE, 
+                w.ESCALATION_TIME, 
+                w.WORKFLOW_ORDER, 
+                w.IS_FINAL_APPROVAL,
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME
+            FROM VOUCHER_POSTING p
+            INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+            LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
+            WHERE w.ALLOWED_ROLE_ID = ? AND p.BATCH_STATUS = 'P'
+            AND NOT EXISTS (
+                SELECT 1 FROM VOUCHER_WORKFLOW vw 
+                WHERE vw.BATCH_ID_FK = p.BATCH_ID AND vw.LAST_ACTION_BY = ?
+            )
+            ORDER BY p.CREATED_AT DESC
+        """;
+
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("vid", rs.getString("VID"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("creatorName", rs.getString("CREATOR_NAME"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
+            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+            map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
+            map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
+            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
+            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
+            map.put("isFinalApproval", rs.getString("IS_FINAL_APPROVAL"));
+            return map;
+        }, userRole, userId);
     }
 
-```
-### Step 3: The React Frontend
-Because you used @Transient and the setter in the Service, Spring Boot will automatically include "timeSinceLastAction": "2h 15m" in the JSON it sends to your React app.
-You just need to update your table column to read row.timeSinceLastAction exactly as shown in the previous frontend snippet!
+
+    public List<Map<String, Object>> getAllRequestsSummary(String userId) {
+        String sql = """
+            SELECT 
+                p.BATCH_ID, 
+                p.VID_FK,
+                p.CREATED_BY AS CREATOR_ID, 
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME,
+                p.CREATED_AT AS REQ_DATE, 
+                p.RECORDS_COUNT AS TOTAL_ROWS, 
+                p.BATCH_STATUS, 
+                w.WORKFLOW_STAGE, 
+                w.WORKFLOW_CODE,
+                w.WORKFLOW_ORDER
+            FROM VOUCHER_POSTING p
+            LEFT JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+            LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
+            WHERE UPPER(TRIM(p.CREATED_BY)) = UPPER(TRIM(?)) -- SECURITY FIX: Only fetch batches owned by the logged-in user
+            ORDER BY p.CREATED_AT DESC
+        """;
+
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("vid", rs.getString("VID_FK"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("creatorName", rs.getString("CREATOR_NAME"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
+            map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
+            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
+
+            String bStatus = rs.getString("BATCH_STATUS");
+            map.put("batchStatus", bStatus); // UI FIX: Explicitly send this flag so the frontend triggers the Red Cross
+
+            if ("R".equals(bStatus)) map.put("currentStatus", "REJECTED");
+            else if ("A".equals(bStatus) || "C".equals(bStatus)) map.put("currentStatus", "POSTED");
+            else map.put("currentStatus", rs.getString("WORKFLOW_STAGE") != null ? rs.getString("WORKFLOW_STAGE") : "PENDING");
+
+            return map;
+        }, userId); // Pass the user ID into the SQL query
+    }
+
+
+    public Map<String, Object> getBatchSummaryDetails(String batchId) {
+        String sql = """
+            SELECT 
+                vp.VID_FK AS VID,
+                vp.CREATED_BY AS BATCH_CREATOR_ID,
+                COALESCE(bu.FIRST_NAME || ' ' || bu.LAST_NAME, vp.CREATED_BY) AS BATCH_CREATED_BY_NAME,
+                vp.CREATED_AT AS BATCH_CREATED_AT,
+                vp.CREATOR_ROLE AS CREATORS_ROLE,
+                vp.SCHEDULED_TIME,
+                vp.EXECUTED_AT,
+                vc.CATEGORY_NAME,
+                
+                -- NEW: Fetch and comma-separate all mapped Issue Categories
+                (
+                    SELECT LISTAGG(ic.ISSUE_CATEGORY_NAME, ', ') WITHIN GROUP (ORDER BY ic.ISSUE_CATEGORY_NAME)
+                    FROM REQUEST_VOUCHER_ISSUE_CATEGORY rvic
+                    JOIN ISSUE_CATEGORY ic ON rvic.ISSUE_CATEGORY_ID = ic.ID
+                    WHERE rvic.REQUEST_VOUCHER_ID = rv.ID
+                ) AS ISSUE_CATEGORIES,
+                
+                rv.CREATED_BY AS VID_CREATOR_ID,
+                COALESCE(vu.FIRST_NAME || ' ' || vu.LAST_NAME, rv.CREATED_BY) AS VID_CREATED_BY_NAME,
+                rv.CREATED_AT AS VID_CREATED_AT,
+                rv.DESCRIPTION
+            FROM VOUCHER_POSTING vp
+            LEFT JOIN REQUEST_VOUCHER rv ON vp.VID_FK = rv.VID
+            LEFT JOIN VOUCHER_CATEGORY vc ON rv.CATEGORY_ID = vc.ID
+            LEFT JOIN USERS bu ON vp.CREATED_BY = bu.USER_ID
+            LEFT JOIN USERS vu ON rv.CREATED_BY = vu.USER_ID
+            WHERE vp.BATCH_ID = ?
+        """;
+
+        try {
+            return jdbcTemplate.queryForMap(sql, batchId);
+        } catch (EmptyResultDataAccessException e) {
+            return new HashMap<>();
+        }
+    }
+
+
+    public List<Map<String, Object>> getWorkflowHistory(String batchId) {
+        String sql = """
+            SELECT 
+                w.LAST_ACTION_BY, 
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, w.LAST_ACTION_BY) AS ACTION_USER_NAME, 
+                w.LAST_ACTION, 
+                w.LAST_ACTION_AT, 
+                w.REMARKS,
+                w.SCHEDULED_TIME
+            FROM VOUCHER_WORKFLOW w 
+            LEFT JOIN USERS u ON w.LAST_ACTION_BY = u.USER_ID
+            WHERE w.BATCH_ID_FK = ? 
+            ORDER BY w.LAST_ACTION_AT ASC
+        """;
+
+        return jdbcTemplate.queryForList(sql, batchId);
+    }
+
+    public long getRequestCountByBatchId(String batchId) {
+        try { return jdbcTemplate.queryForObject("SELECT NVL(RECORDS_COUNT, 0) FROM VOUCHER_POSTING WHERE BATCH_ID = ?", Long.class, batchId); }
+        catch (Exception e) { return 0L; }
+    }
+
+    public Page<JournalRequest> getRequestsByBatchIdPaginated(String b, Pageable p) { return journalRequestRepository.findByBatchIdPaginated(b, p); }
+    public List<JournalRequest> getRequestsByBatchId(String b) { return journalRequestRepository.findByBatchId(b); }
+    public List<JournalRequest> getPendingRequests(String userId, Integer roleId) { return journalRequestRepository.findByRequestStatus(com.fincore.VoucherService.Models.enums.RequestStatus.PENDING); }
+
+    public LocalDate getCurrentPostingDate() {
+        try {
+            return jdbcTemplate.queryForObject("SELECT USERS_DATE FROM FINCORE_DATE FETCH FIRST 1 ROWS ONLY", (rs, rowNum) -> {
+                Timestamp ts = rs.getTimestamp("USERS_DATE"); return ts != null ? ts.toLocalDateTime().toLocalDate() : LocalDate.now();
+            });
+        } catch (Exception e) { return LocalDate.now(); }
+    }
+
+    public List<Map<String, Object>> getWorkflowSteps(String workflowCode) {
+        return jdbcTemplate.query("SELECT w.WORKFLOW_STAGE AS state, w.WORKFLOW_STAGE AS designation, w.ALLOWED_ROLE_ID AS role_id, r.ROLE_NAME FROM WORKFLOW_TRANSITIONS w LEFT JOIN ROLES r ON w.ALLOWED_ROLE_ID = r.ROLE_ID WHERE w.WORKFLOW_CODE = ? ORDER BY w.WORKFLOW_ORDER ASC", (rs, rowNum) -> {
+            Map<String, Object> step = new HashMap<>(); step.put("state", rs.getString("state")); step.put("designation", rs.getString("designation"));
+            step.put("role", rs.getString("ROLE_NAME") != null ? rs.getString("ROLE_NAME") : "System"); return step;
+        }, workflowCode);
+    }
+
+    public Map<String, String> getActiveRoles() {
+        return jdbcTemplate.query("SELECT ROLE_ID, ROLE_NAME FROM ROLES WHERE ROLE_STATUS = 'ACTIVE'", rs -> {
+            Map<String, String> roleMap = new HashMap<>();
+            while (rs.next()) { roleMap.put(String.valueOf(rs.getLong("ROLE_ID")), rs.getString("ROLE_NAME")); } return roleMap;
+        });
+    }
+
+    public Map<String, Object> getVidDetails(String vid) {
+        try { return jdbcTemplate.queryForMap("SELECT r.VID, r.DESCRIPTION, r.CREATED_BY, r.CREATED_AT, r.REMARKS, c.CATEGORY_NAME FROM REQUEST_VOUCHER r LEFT JOIN VOUCHER_CATEGORY c ON r.CATEGORY_ID = c.ID WHERE r.VID = ?", vid); }
+        catch (EmptyResultDataAccessException e) { return new HashMap<>(); }
+    }
+
+    public List<Map<String, Object>> getAvailableVouchersVid(Long roleId) {
+        // Step 1: Fetch the core voucher data (No inline subquery to avoid Oracle null stripping)
+        String sql = """
+            SELECT 
+                rv.ID,
+                rv.VID,
+                rv.DESCRIPTION,
+                c.CATEGORY_NAME,
+                rv.CREATED_BY AS CREATOR_ID,
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, rv.CREATED_BY) AS CREATOR_NAME,
+                rv.CREATED_AT
+            FROM REQUEST_VOUCHER rv
+            LEFT JOIN VOUCHER_CATEGORY c ON rv.CATEGORY_ID = c.ID
+            LEFT JOIN USERS u ON rv.CREATED_BY = u.USER_ID
+            WHERE rv.ALLOWED_ROLE = ? AND rv.STATUS = 'ACTIVE'
+            ORDER BY rv.CREATED_AT DESC
+        """;
+
+        List<Map<String, Object>> vouchers = jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("id", rs.getLong("ID"));
+            map.put("vid", rs.getString("VID"));
+            map.put("description", rs.getString("DESCRIPTION"));
+            map.put("categoryName", rs.getString("CATEGORY_NAME"));
+            map.put("createdBy", rs.getString("CREATOR_ID"));
+            map.put("createdByName", rs.getString("CREATOR_NAME"));
+
+            java.sql.Timestamp ts = rs.getTimestamp("CREATED_AT");
+            map.put("createdAt", ts != null ? ts.toInstant().toString() : null);
+            return map;
+        }, roleId);
+
+        if (vouchers.isEmpty()) {
+            return vouchers;
+        }
+
+        // Step 2: Fetch the Issue Categories for these specific Vouchers
+        List<Long> voucherIds = vouchers.stream()
+                .map(v -> (Long) v.get("id"))
+                .toList();
+
+        // Dynamically build the IN clause (?,?,?)
+        String inClause = String.join(",", Collections.nCopies(voucherIds.size(), "?"));
+
+        String issueSql = String.format("""
+            SELECT 
+                rvic.REQUEST_VOUCHER_ID, 
+                LISTAGG(ic.ISSUE_CATEGORY_NAME, ', ') WITHIN GROUP (ORDER BY ic.ISSUE_CATEGORY_NAME) AS CATEGORIES
+            FROM REQUEST_VOUCHER_ISSUE_CATEGORY rvic
+            JOIN ISSUE_CATEGORY ic ON rvic.ISSUE_CATEGORY_ID = ic.ID
+            WHERE rvic.REQUEST_VOUCHER_ID IN (%s)
+            GROUP BY rvic.REQUEST_VOUCHER_ID
+        """, inClause);
+
+        Map<Long, String> issueCategoryMap = new HashMap<>();
+        jdbcTemplate.query(issueSql, rs -> {
+            issueCategoryMap.put(rs.getLong("REQUEST_VOUCHER_ID"), rs.getString("CATEGORIES"));
+        }, voucherIds.toArray());
+
+        // Step 3: Map the categories back to the vouchers (Defaults to "N/A" so Jackson never drops the key)
+        for (Map<String, Object> voucher : vouchers) {
+            Long vId = (Long) voucher.get("id");
+            voucher.put("issueCategories", issueCategoryMap.getOrDefault(vId, "N/A"));
+        }
+
+        return vouchers;
+    }
+
+    public boolean isUserAuthorizedForBatch(String batchId, String userId, Integer roleId) {
+        Integer isCreator = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM VOUCHER_POSTING WHERE BATCH_ID = ? AND CREATED_BY = ?", Integer.class, batchId, userId);
+        if (isCreator != null && isCreator > 0) return true;
+        Integer isAuthorized = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM VOUCHER_POSTING vp JOIN WORKFLOW_TRANSITIONS wt ON vp.PENDING_AT = wt.WORKFLOW_ID WHERE vp.BATCH_ID = ? AND wt.ALLOWED_ROLE_ID = ?", Integer.class, batchId, roleId);
+        return isAuthorized != null && isAuthorized > 0;
+    }
+
+    public byte[] generateBatchExcel(String batchId) {
+        List<JournalRequest> requests = journalRequestRepository.findByBatchId(batchId);
+        if (requests == null || requests.isEmpty()) throw new CustomExceptions.InvalidDataException("No records found for batch.");
+
+        try (org.apache.poi.xssf.usermodel.XSSFWorkbook workbook = new org.apache.poi.xssf.usermodel.XSSFWorkbook();
+             java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream()) {
+            org.apache.poi.ss.usermodel.Sheet sheet = workbook.createSheet("Batch Details");
+            org.apache.poi.ss.usermodel.Row headerRow = sheet.createRow(0);
+            String[] headers = {"Branch", "Currency", "CGL", "Amount", "Type", "Remarks", "Product Code"};
+            for (int i = 0; i < headers.length; i++) headerRow.createCell(i).setCellValue(headers[i]);
+
+            int rowIdx = 1;
+            for (JournalRequest req : requests) {
+                org.apache.poi.ss.usermodel.Row row = sheet.createRow(rowIdx++);
+                row.createCell(0).setCellValue(req.getBranchCode() != null ? req.getBranchCode() : "");
+                row.createCell(1).setCellValue(req.getCurrency() != null ? req.getCurrency() : "");
+                row.createCell(2).setCellValue(req.getCgl() != null ? req.getCgl() : "");
+                if (req.getAmount() != null) {
+                    row.createCell(3).setCellValue(req.getAmount().abs().stripTrailingZeros().toPlainString());
+                    row.createCell(4).setCellValue(req.getAmount().compareTo(BigDecimal.ZERO) < 0 ? "Credit" : "Debit");
+                }
+                row.createCell(5).setCellValue(req.getNarration() != null ? req.getNarration() : ""); // Moved Remarks (Narration) to Index 5
+                row.createCell(6).setCellValue(req.getProductCode() != null ? req.getProductCode() : ""); // Moved Product Code to Index 6
+            }
+            workbook.write(out); return out.toByteArray();
+        } catch (java.io.IOException e) { throw new CustomExceptions.DatabaseOperationException("Failed to generate Excel file", e); }
+    }
+}
