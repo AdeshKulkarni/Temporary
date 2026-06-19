@@ -1,118 +1,3488 @@
-package com.fincore.VoucherService.Service;
-import jakarta.annotation.PostConstruct;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.dao.DataAccessException;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.scheduling.annotation.Scheduled;
-import org.springframework.stereotype.Service;
+import React, { useState, useEffect, useCallback, useRef } from "react";
+import {
+  Box,
+  Typography,
+  Grid,
+  TextField,
+  Button,
+  Paper,
+  IconButton,
+  MenuItem,
+  CircularProgress,
+  Autocomplete,
+  Tooltip,
+  Checkbox,
+  FormControlLabel,
+  Chip,
+  FormHelperText,
+  Divider,
+  Card,
+  CardActionArea,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  TablePagination,
+  Collapse,
+  Radio,
+  Stack,
+  Stepper
+} from "@mui/material";
+import { useNavigate } from "react-router-dom";
+import AddIcon from "@mui/icons-material/Add";
+import TaskAltIcon from '@mui/icons-material/TaskAlt';
+import DeleteIcon from "@mui/icons-material/Delete";
+import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
+import KeyboardArrowUpIcon from '@mui/icons-material/KeyboardArrowUp';
+import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown';
+import ScheduleIcon from "@mui/icons-material/Schedule";
+import ArrowBackIcon from "@mui/icons-material/ArrowBack";
+import ArrowForwardIcon from "@mui/icons-material/ArrowForward";
+import DateRangeTwoToneIcon from '@mui/icons-material/DateRangeTwoTone';
+import EditNoteIcon from '@mui/icons-material/EditNote';
+import UploadFileIcon from '@mui/icons-material/UploadFile';
+import TableChartIcon from '@mui/icons-material/TableChart';
+import { debounce } from "lodash";
+import useApi from "../../hooks/useApi";
+import JournalBulkUpload from "./VoucherBulkUpload";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
+import dayjs from "dayjs";
+import { LocalizationProvider } from "@mui/x-date-pickers/LocalizationProvider";
+import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
+import { TimePicker } from "@mui/x-date-pickers/TimePicker";
+import { jpStyles } from "./VoucherStyle";
+const createNewRow = () => ({
+  id: crypto.randomUUID ? crypto.randomUUID() : Date.now() + Math.random(),
+  branch: null,
+  currency: "",
+  cgl: null,
+  amount: "",
+  txnType: "",
+  remarks: "",
+  productCode: "",
+});
 
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * Loads active master records into memory-efficient HashSets for O(1) validation lookups.
- * Utilizes optimized JDBC fetch sizes to handle high-volume data transfers from Oracle.
- */
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class ValidationMasterService {
+const formatBigIntForDisplay = (val) => {
+  if (typeof val !== "bigint") {
+    val = BigInt(val || 0);
+  }
+  const str = val.toString().padStart(5, "0");
+  const integer = str.slice(0, -4);
+  const fractional = str.slice(-4);
+  return `${integer || "0"}.${fractional}`;
+};
+export default function VoucherPosting() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+  const navigate = useNavigate();
+  // --- INTERNAL WIZARD STATE ---
+  const [activeStep, setActiveStep] = useState(0);
+  const [entryMethod, setEntryMethod] = useState("MANUAL");
+
+  const [submittedBatchId, setSubmittedBatchId] = useState(null);
+  const [showSchedulePicker, setShowSchedulePicker] = useState(false);
+  const [isApplyingSchedule, setIsApplyingSchedule] = useState(false);
 
 
-    @Autowired
-    @Qualifier("oracleJdbcTemplate")
-    private JdbcTemplate oracleJdbcTemplate;
 
-    // Volatile ensures instant zero-delay updates for all users during the pointer swap
-    private volatile Set<String> activeBranches = new HashSet<>();
-    private volatile Set<String> activeCurrencies = new HashSet<>();
-    private volatile Set<String> activeCgls = new HashSet<>();
+  // --- VOUCHER TABLE STATE ---
+  const [voucherList, setVoucherList] = useState([]);
+  const [selectedVoucher, setSelectedVoucher] = useState(null);
+  const [expandedRow, setExpandedRow] = useState(null); // Tracks which row is clicked open
+  const [page, setPage] = useState(0);
+  const [rowsPerPage, setRowsPerPage] = useState(5);
 
-    // 1. Load data instantly when the server starts up
-    @PostConstruct
-    public void init() {
-        refreshMasterData();
-    }
+  const isMounted = useRef(true);
+  const [currentUserId, setCurrentUserId] = useState(null);
+  // --- STEPPER & WIZARD STATE ---
+  const steps = ['Select Voucher', 'Entry Method', 'Data Entry'];
 
-    // 2. The Background Worker: Runs every 60 seconds.
-    // Zero downtime. Users keep validating against RAM while this runs.
-    @Scheduled(fixedRate = 60000)
-    public void refreshMasterData() {
-        log.info("MASTER_DATA_SYNC | Starting PARALLEL fetch from Oracle...");
-        long startTime = System.currentTimeMillis();
+  const [groupedVouchers, setGroupedVouchers] = useState({});
+  const [scheduledTime, setScheduledTime] = useState(() =>
+    dayjs().add(32, 'minute').second(0).millisecond(0) // Initialize to min allowed time
+  );
 
-        try {
-            // Fire all three queries at the exact same time on background threads
-            // Increased fetchSize to 10000 for massive speed improvements
-            CompletableFuture<List<String>> branchFuture = CompletableFuture.supplyAsync(() ->
-                    oracleJdbcTemplate.query(
-                            con -> {
-                                var ps = con.prepareStatement("SELECT CODE FROM BRANCH_MASTER WHERE STATUS = 1");
-                                ps.setFetchSize(10000);
-                                return ps;
-                            },
-                            (rs, rowNum) -> rs.getString(1)
-                    )
-            );
+  const [rows, setRows] = useState([createNewRow()]);
 
-            CompletableFuture<List<String>> currencyFuture = CompletableFuture.supplyAsync(() ->
-                    oracleJdbcTemplate.query(
-                            con -> {
-                                var ps = con.prepareStatement("SELECT CURRENCY_CODE FROM CURRENCY_MASTER WHERE FLAG = 1");
-                                ps.setFetchSize(10000);
-                                return ps;
-                            },
-                            (rs, rowNum) -> rs.getString(1)
-                    )
-            );
+  const [currencyOptions, setCurrencyOptions] = useState([]);
 
-            CompletableFuture<List<String>> cglFuture = CompletableFuture.supplyAsync(() ->
-                    oracleJdbcTemplate.query(
-                            con -> {
-                                var ps = con.prepareStatement("SELECT CGL_NUMBER FROM CGL_MASTER WHERE STATUS = 1");
-                                ps.setFetchSize(10000);
-                                return ps;
-                            },
-                            (rs, rowNum) -> rs.getString(1)
-                    )
-            );
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
-            // Wait for the longest query to finish, then proceed
-            CompletableFuture.allOf(branchFuture, currencyFuture, cglFuture).join();
+  const [commonBatchRemarks, setCommonBatchRemarks] = useState("");
+  const [postingDate, setPostingDate] = useState("");
 
-            // THE NANOSECOND POINTER SWAP
-            this.activeBranches = new HashSet<>(branchFuture.get());
-            this.activeCurrencies = new HashSet<>(currencyFuture.get());
-            this.activeCgls = new HashSet<>(cglFuture.get());
+  const [checked, setChecked] = useState(false);
 
-            long duration = System.currentTimeMillis() - startTime;
-            log.info("MASTER_DATA_SYNC_SUCCESS | Loaded in {} ms. CGLs: {} | Branches: {} | Currencies: {}",
-                    duration, this.activeCgls.size(), this.activeBranches.size(), this.activeCurrencies.size());
+  const [isPageLoading, setIsPageLoading] = useState(true);
+  const [isEodRunning, setIsEodRunning] = useState(false);
 
-        } catch (Exception e) {
-            log.error("MASTER_DATA_SYNC_FAIL | Retaining old RAM cache to prevent validation failure. Error: {}", e.getMessage());
+  // Replaces anything that is NOT an alphabet, number, or space
+  const REMARKS_REPLACE_REGEX = /[^a-zA-Z0-9 _\-]/g;
+
+  // Replaces anything that is NOT a digit (CGL is strictly digits)
+  const CGL_REPLACE_REGEX = /[^0-9]/g;
+
+  // Replaces anything that is NOT alphanumeric (Branch is strictly alphanumeric)
+  const BRANCH_REPLACE_REGEX = /[^0-9]/g;
+
+
+  const [currentRoleId, setCurrentRoleId] = useState(null);
+
+
+  // Track input values to prevent empty dropdown tray on focus
+  const [branchInputValues, setBranchInputValues] = useState({});
+  const [cglInputValues, setCglInputValues] = useState({});
+
+  const [branchSearch, setBranchSearch] = useState({
+    loadingId: null,
+    options: [],
+  });
+  const [cglSearch, setCglSearch] = useState({
+    loadingId: null,
+    options: []
+  });
+
+  useEffect(() => {
+    isMounted.current = true;
+    try {
+      const auth = sessionStorage.getItem("persist:auth") || localStorage.getItem("persist:auth");
+      if (auth) {
+        const user = JSON.parse(JSON.parse(auth).user);
+        if (user?.userId) setCurrentUserId(String(user.userId));
+        // Assuming your auth object holds the role ID. Adjust the property name if needed.
+        if (user?.roleId) setCurrentRoleId(user.roleId);
+      }
+    } catch (e) { }
+    return () => { isMounted.current = false; };
+  }, []);
+  useEffect(() => {
+    const fetchInitialData = async () => {
+      try {
+        setIsPageLoading(true);
+
+        // CRITICAL FIX: Synchronously extract the role directly from storage. 
+        // Do not rely on 'currentRoleId' state here, as it will be 'null' on the first render.
+        let actualRoleId = null;
+        const auth = sessionStorage.getItem("persist:auth") || localStorage.getItem("persist:auth");
+        if (auth) {
+          const user = JSON.parse(JSON.parse(auth).user);
+          // Checks multiple common property names just to be safe
+          actualRoleId = user?.roleId || user?.role || user?.ROLE_ID;
         }
+
+        if (!actualRoleId) {
+          showSnackBar("Security Error: User Role ID not found. Cannot fetch VIDs.", "error");
+          setIsPageLoading(false);
+          return; // Aborts the call if no role is found
+        }
+
+        // Passes the guaranteed correct role ID to the backend
+        const vouchersResponse = await callApi(`/JS/voucher/active?roleId=${actualRoleId}`, null, "GET");
+
+        // Defensively extract the array whether your callApi unwraps the { data: [...] } or not
+        if (vouchersResponse && Array.isArray(vouchersResponse.data)) {
+          setVoucherList(vouchersResponse.data);
+        } else if (Array.isArray(vouchersResponse)) {
+          setVoucherList(vouchersResponse);
+        } else {
+          setVoucherList([]); // Safe fallback
+        }
+
+        // 1. FIRST: Check the EOD Status from your new API
+        const eodResponse = await callApi("/JS/voucher/eod_status", null, "GET");
+
+        // The API returns an array: [{ "eodStatus": 0 }]
+        if (eodResponse && Array.isArray(eodResponse) && eodResponse.length > 0) {
+          if (eodResponse[0].eodStatus === 1) {
+            setIsEodRunning(true);
+            setIsPageLoading(false);
+            return; // STOP loading everything else, block the screen
+          }
+        }
+
+        // 2. IF EOD IS NOT RUNNING: Continue loading the normal page data
+        const dateResponse = await callApi("/JS/voucher/current-posting-date", null, "GET");
+
+        if (dateResponse) {
+          try {
+            const [year, month, day] = dateResponse.split("-");
+            const formattedDate = `${day}-${month}-${year}`;
+            setPostingDate(formattedDate);
+          } catch (e) {
+            console.error("Could not parse date:", dateResponse, e);
+            setPostingDate(dateResponse);
+          }
+        } else {
+          showSnackBar("Failed to load official posting date.", "error");
+          setPostingDate("Error");
+        }
+
+        const currencyResponse = await callApi("/CM/common-master/currency", null, "GET");
+        if (currencyResponse?.success && Array.isArray(currencyResponse.data)) {
+          let uniqueCurrencies = [...new Set(currencyResponse.data)];
+
+          // Sort the array so "INR" is always at index 0, and the rest are alphabetical
+          uniqueCurrencies.sort((a, b) => {
+            if (a === "INR") return -1;
+            if (b === "INR") return 1;
+            return a.localeCompare(b);
+          });
+
+          setCurrencyOptions(uniqueCurrencies);
+        } else {
+          showSnackBar("Failed to load currencies.", "error");
+        }
+
+      } catch (error) {
+        console.error("Error fetching initial data:", error);
+        showSnackBar("An error occurred while loading page data.", "error");
+      } finally {
+        setIsPageLoading(false);
+      }
+    };
+
+    fetchInitialData();
+  }, [callApi, showSnackBar]);
+
+  const handleNext = () => {
+    if (activeStep === 0 && !selectedVoucher) {
+      showSnackBar("Please select a voucher from the list first.", "warning");
+      return;
+    }
+    setActiveStep((prevStep) => prevStep + 1);
+  };
+
+  const handleMethodSelection = (method) => {
+    setEntryMethod(method);
+    handleNext();
+  };
+
+  const handleResetWizard = () => {
+    setSelectedVoucher(null);
+    setEntryMethod("MANUAL");
+    setRows([createNewRow()]);
+    setCommonBatchRemarks("");
+    setScheduledTime(null);
+    setChecked(false);
+    setSubmittedBatchId(null);
+    setShowSchedulePicker(false);
+    navigate("/voucher-posting-status");
+  };
+
+  const handleApplySchedule = async () => {
+    if (!scheduledTime || !scheduledTime.isValid()) {
+      showSnackBar("Please select a valid time.", "warning");
+      return;
     }
 
-    // ====================================================================
-    // User Validation Methods: These read purely from RAM (Zero DB Hits)
-    // ====================================================================
-    public boolean isValidBranch(String branch) {
-        return branch != null && this.activeBranches.contains(branch);
+    // Force the date to strictly be TODAY, merging it with the selected time
+    const today = dayjs();
+    const finalSchedule = scheduledTime
+      .year(today.year())
+      .month(today.month())
+      .date(today.date());
+
+    const minAllowed = dayjs().add(30, 'minute'); // 2 min network buffer
+    const maxAllowed = dayjs().endOf('day'); // 11:59:59 PM today
+
+    if (finalSchedule.isBefore(minAllowed)) {
+      showSnackBar("Schedule time must be at least 30 minutes from now.", "warning");
+      return;
     }
 
-    public boolean isValidCurrency(String currency) {
-        return currency != null && this.activeCurrencies.contains(currency);
+    if (finalSchedule.isAfter(maxAllowed)) {
+      showSnackBar("Schedule time cannot exceed today's end of day (11:59 PM).", "warning");
+      return;
     }
 
-    public boolean isValidCgl(String cgl) {
-        return cgl != null && this.activeCgls.contains(cgl);
+    setIsApplyingSchedule(true);
+    try {
+      // Formats it cleanly for the Oracle Backend
+      const formattedSchedule = finalSchedule.format('YYYY-MM-DD HH:mm:ss');
+
+      await callApi("/JS/voucher/update-schedule", {
+        batchId: submittedBatchId,
+        scheduledTime: formattedSchedule
+      }, "POST");
+
+      showSnackBar("Schedule applied successfully!", "success");
+      handleResetWizard();
+    } catch (e) {
+      showSnackBar(e.message, "error");
+    } finally {
+      setIsApplyingSchedule(false);
     }
+  };
+
+  const handleChangePage = (event, newPage) => {
+    setPage(newPage);
+  };
+
+  const handleChangeRowsPerPage = (event) => {
+    setRowsPerPage(parseInt(event.target.value, 10));
+    setPage(0);
+  };
+
+  const handleRowExpand = (id) => {
+    setExpandedRow(expandedRow === id ? null : id);
+  };
+  const handleBack = () => {
+    setActiveStep((prevStep) => prevStep - 1);
+  };
+
+  const filterRemarks = (val) => {
+    let filtered = val.replace(/[^a-zA-Z0-9 ]/g, ""); // Allow only alphanumeric and spaces
+    filtered = filtered.replace(/^\s+/, ""); // Remove leading spaces
+    filtered = filtered.replace(/\s{2,}/g, " "); // Replace multiple consecutive spaces with a single space
+    return filtered;
+  };
+
+
+  // 1. Common remarks can be empty. If filled, must be 2-30.
+  const isCommonRemarksValid = (val) => val.trim().length === 0 || (val.trim().length >= 2 && val.trim().length <= 30);
+
+  // 2. Row remarks are STRICTLY compulsory (2-30 chars).
+  const isRowRemarksValid = (val) => val.trim().length >= 2 && val.trim().length <= 30;
+  const filterAndWarn = (val, type) => {
+    let filtered = val;
+    let hasError = false;
+    let msg = "Only alphabets and numbers are allowed.";
+
+    if (type === "alphanumeric_space") {
+      // 1. Strip any character using the centralized regex
+      filtered = val.replace(REMARKS_REPLACE_REGEX, "");
+
+      if (filtered !== val) {
+        hasError = true;
+      }
+
+      // 2. Strip leading space and collapse double spaces
+      const beforeSpaceTrim = filtered;
+      filtered = filtered.replace(/^\s+/, "").replace(/\s{2,}/g, " ");
+      if (beforeSpaceTrim !== filtered && !hasError) {
+        hasError = true;
+        msg = "Remark should not start with space or contain consecutive spaces.";
+      }
+    }
+
+    if (hasError) {
+      showSnackBar(msg, "warning");
+    }
+    return filtered;
+  };
+
+  // Both Common Batch Remarks and Row Remarks are now strictly compulsory (2-30 chars)
+  const isRemarksValid = (val) => val.trim().length >= 2 && val.trim().length <= 30;
+  const handleAddRow = () => {
+    const lastRow = rows[rows.length - 1];
+
+    if (
+      !lastRow.branch ||
+      !lastRow.currency ||
+      !lastRow.cgl ||
+      !lastRow.amount ||
+      !lastRow.txnType ||
+      !isRowRemarksValid(lastRow.remarks)
+    ) {
+      showSnackBar(
+        "Please fill all required fields (*) in the current row before adding a new one.",
+        "warning"
+      );
+      return;
+    }
+
+    const newRow = {
+      ...createNewRow(),
+      remarks: checked ? commonBatchRemarks : "",
+    };
+
+    setRows([...rows, newRow]);
+  };
+
+  const handleRemarksSync = (event) => {
+    const isChecked = event.target.checked;
+    setChecked(isChecked);
+
+    if (isChecked) {
+      const newRows = rows.map((row) => ({
+        ...row,
+        remarks: commonBatchRemarks,
+      }));
+      setRows(newRows);
+    } else {
+      const newRows = rows.map((row) => ({
+        ...row,
+        remarks: "",
+      }));
+      setRows(newRows);
+    }
+  };
+
+  const handleDeleteRow = (id) => {
+    if (rows.length > 1) {
+      setRows(rows.filter((row) => row.id !== id));
+      // Cleanup input tracking
+      const newBranchInputs = { ...branchInputValues };
+      delete newBranchInputs[id];
+      setBranchInputValues(newBranchInputs);
+      const newCglInputs = { ...cglInputValues };
+      delete newCglInputs[id];
+      setCglInputValues(newCglInputs);
+    } else {
+      showSnackBar("Cannot delete the first row.", "warning");
+    }
+  };
+
+  const handleRowChange = (id, field, value) => {
+    setRows((prevRows) =>
+      prevRows.map((row) => {
+        if (row.id === id) {
+          return { ...row, [field]: value };
+        }
+        return row;
+      })
+    );
+  };
+
+  const searchBranches = useCallback(
+    debounce(async (query, rowId) => {
+      if (!query || query.trim().length < 3) {
+        setBranchSearch({ loadingId: null, options: [] });
+        return;
+      }
+      setBranchSearch((prev) => ({ ...prev, loadingId: rowId }));
+      try {
+        const response = await callApi(
+          `/JS/branches-journal/search?query=${encodeURIComponent(query)}`,
+          null,
+          "GET"
+        );
+
+        setBranchSearch({ loadingId: null, options: response || [] });
+      } catch (error) {
+        showSnackBar("Branch search failed.", "error");
+        setBranchSearch({ loadingId: null, options: [] });
+      }
+    }, 300),
+    [callApi, showSnackBar]
+  );
+
+  const searchCgls = useCallback(
+    debounce(async (query, rowId) => {
+      // Changed from === 0 to < 3 to enforce the minimum character limit
+      if (!query || query.trim().length < 3) {
+        setCglSearch({ loadingId: null, options: [] });
+        return;
+      }
+      setCglSearch((prev) => ({ ...prev, loadingId: rowId }));
+
+      try {
+        const response = await callApi(
+          `/JS/cgl-journal/search?query=${encodeURIComponent(query)}`,
+          null,
+          "GET"
+        );
+
+        setCglSearch({ loadingId: null, options: response || [] });
+      } catch (error) {
+        showSnackBar("CGL search failed.", "error");
+        setCglSearch({ loadingId: null, options: [] });
+      }
+    }, 300),
+    [callApi, showSnackBar]
+  );
+
+  const handleSubmit = async () => {
+    if (!isCommonRemarksValid(commonBatchRemarks)) {
+      showSnackBar("Common Batch Remarks must be 2-30 characters if provided.", "error");
+      return;
+    }
+
+
+    setIsSubmitting(true);
+
+    const [day, month, year] = postingDate.split("-");
+    const formattedBackendDate = `${year}-${month}-${day}`;
+
+
+    const branchCurrencyTotals = new Map();
+    const branchEntryCheck = new Map();
+    const rowPayloads = [];
+
+    for (const [index, row] of rows.entries()) {
+      if (
+        !row.branch ||
+        !row.currency ||
+        !row.cgl ||
+        !row.amount ||
+        parseFloat(row.amount) === 0 ||
+        !row.txnType ||
+        !isRowRemarksValid(row.remarks)
+      ) {
+        showSnackBar(
+          `Row ${index + 1} is incomplete or has a zero amount. Amount must be greater than 0, and remarks must be 2-30 characters.`,
+          "error"
+        );
+        setIsSubmitting(false);
+        return;
+      }
+
+
+      const branchCode = row.branch.code;
+      const branchName = row.branch.name;
+      const currency = row.currency;
+
+      const cglNumber = String(row.cgl.cglNumber);
+      const isMemo = cglNumber.startsWith("5");
+      const type = isMemo ? "MEMO" : "NORMAL";
+
+      const [integerPart = "0", fractionalPart = "0"] = (
+        row.amount || "0"
+      ).split(".");
+      const fractionalPadded = fractionalPart.substring(0, 4).padEnd(4, "0");
+      const amountAsBigInt = BigInt(integerPart + fractionalPadded);
+
+      const compositeKey = `${branchCode}-${currency}-${type}`;
+
+      if (!branchCurrencyTotals.has(compositeKey)) {
+        branchCurrencyTotals.set(compositeKey, {
+          totalDebit: 0n,
+          totalCredit: 0n,
+          branchName: branchName,
+          branchCode: branchCode,
+          currency: currency,
+          type: type,
+        });
+      }
+      const currencyTotals = branchCurrencyTotals.get(compositeKey);
+
+      if (row.txnType === "Debit") {
+        currencyTotals.totalDebit += amountAsBigInt;
+      } else if (row.txnType === "Credit") {
+        currencyTotals.totalCredit += amountAsBigInt;
+      }
+
+      if (!branchEntryCheck.has(branchCode)) {
+        branchEntryCheck.set(branchCode, {
+          hasDebit: false,
+          hasCredit: false,
+          branchName: branchName,
+        });
+      }
+      const branchCheck = branchEntryCheck.get(branchCode);
+
+      if (row.txnType === "Debit" && amountAsBigInt > 0n) {
+        branchCheck.hasDebit = true;
+      } else if (row.txnType === "Credit" && amountAsBigInt > 0n) {
+        branchCheck.hasCredit = true;
+      }
+
+      const finalAmount =
+        row.txnType === "Credit" ? "-" + row.amount : row.amount;
+
+      rowPayloads.push({
+        branch: row.branch.code,
+        currency: row.currency,
+        cgl: row.cgl.cglNumber,
+        amount: finalAmount,
+        productType: row.productCode,
+        remarks: row.remarks,
+        arFlag: "A",
+        postingDate: formattedBackendDate
+      });
+    }
+
+    for (const [branchCode, totals] of branchEntryCheck.entries()) {
+      const { hasDebit, hasCredit } = totals;
+      if (!hasDebit || !hasCredit) {
+        showSnackBar("Branch must have at least one Debit and one Credit entry.", "error");
+        setIsSubmitting(false);
+        return;
+      }
+    }
+
+
+    for (const [compositeKey, totals] of branchCurrencyTotals.entries()) {
+      const { totalDebit, totalCredit } = totals;
+
+      if (totalDebit !== totalCredit) {
+        showSnackBar("Branch and Currency Debit/Credit Mismatch for Real/Memo CGL.", "error");
+        setIsSubmitting(false);
+        return;
+      }
+    }
+
+    let formattedSchedule = null;
+    if (scheduledTime) {
+      const dateObj = new Date(scheduledTime);
+      formattedSchedule = dateObj.toISOString().slice(0, 19).replace('T', ' ');
+    }
+
+    const finalPayload = {
+      vid: selectedVoucher?.vid,
+      scheduledTime: null, // Handled in Step 3 now
+      // commonBatchRemarks: commonBatchRemarks.trim(),
+        commonBatchRemarks: "Voucher created successfully", 
+      rows: rowPayloads,
+    };
+    try {
+      const response = await callApi(
+        "/JS/voucher/create-batch",
+        finalPayload,
+        "POST"
+      );
+
+      // Extract the Batch ID created by the backend
+      const newBatchId = response?.[0]?.batchId || response?.batchId || "N/A";
+      setSubmittedBatchId(newBatchId);
+
+      setRows([createNewRow()]);
+      setCommonBatchRemarks("");
+      setChecked(false);
+      setBranchInputValues({});
+      setCglInputValues({});
+      setActiveStep(3);
+    } catch (error) {
+      // If it fails instantly (e.g. server down, bad network), show an error snackbar
+      const errMsg = error?.response?.data?.message || error.message || "System error occurred.";
+      showSnackBar(`Failed to initiate request: ${errMsg}`, "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const isFormReadyToSubmit = rows.length >= 2 && rows.every(
+    (row) =>
+      row.branch &&
+      row.currency &&
+      row.cgl &&
+      row.amount &&
+      parseFloat(row.amount) > 0 &&
+      row.txnType &&
+      isRowRemarksValid(row.remarks)
+  );
+
+  const SelectedVoucherCard = () => {
+    if (!selectedVoucher) return null;
+
+    return (
+      <Paper elevation={0} sx={jpStyles.svPaper}>
+        <Box sx={jpStyles.svHeaderBox}>
+          <Typography variant="subtitle1" fontWeight="bold" color="text.primary">
+            Selected Voucher Details
+          </Typography>
+        </Box>
+
+        <Grid container spacing={2}>
+          <Grid item size={12} sx={{ mb: 2 }}>
+            <Stack direction="row" spacing={8}>
+              <Box>
+                <Typography variant="caption" color="text.secondary" display="block" gutterBottom>VID</Typography>
+                <Typography variant="body1" fontWeight="bold" color="primary">{selectedVoucher.vid}</Typography>
+              </Box>
+              <Box>
+                <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Category</Typography>
+                <Typography variant="body1" fontWeight="500">{selectedVoucher.categoryName || "General"}</Typography>
+              </Box>
+              <Box>
+                <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Issue Categories</Typography>
+                <Box>
+                  {selectedVoucher.issueCategories ? selectedVoucher.issueCategories.split(",").map((cat, index) => (
+                    <Chip key={index} label={cat.trim()} size="small" sx={{ mr: 0.5 }} />
+                  )) : <Typography variant="body2" color="text.secondary">N/A</Typography>}
+                </Box>
+              </Box>
+            </Stack>
+          </Grid>
+          <Grid item size={12}>
+            <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Description</Typography>
+            <Typography variant="body2" sx={{ whiteSpace: "pre-wrap", lineHeight: 1.6, fontWeight: 300 }}>
+              {selectedVoucher.description || "No description provided."}
+            </Typography>
+          </Grid>
+        </Grid>
+      </Paper>
+    );
+  };
+
+  if (isPageLoading) {
+    return (
+      <Box sx={jpStyles.loadingBox}>
+        <CircularProgress size={60} />
+      </Box>
+    );
+  }
+  if (isEodRunning) {
+    return (
+      <Box sx={jpStyles.eodBox}>
+        <Paper elevation={4} sx={jpStyles.eodPaper}>
+          <Typography variant="h4" color="error" fontWeight="bold" gutterBottom>EOD is Currently Running</Typography>
+          <Typography variant="h6" color="text.secondary" sx={{ mt: 2 }}>Voucher Posting is temporarily disabled.</Typography>
+          <Typography variant="body1" color="text.secondary" sx={{ mt: 1 }}>Please wait until the End of Day process completes to post new transactions.</Typography>
+        </Paper>
+      </Box>
+    );
+  }
+
+
+
+
+  return (
+    <Paper sx={jpStyles.mainPaper}>
+
+      {/* INTERNAL STEP 0: VOUCHER SELECTION TABLE */}
+      {activeStep === 0 && (
+        <Box>
+          <Typography variant="h6" fontWeight="bold" gutterBottom color="primary.main" sx={jpStyles.stepHeader}>
+            Select Voucher Id (VID)
+          </Typography>
+
+
+          <Paper elevation={2} sx={jpStyles.tablePaper}>
+            <TableContainer sx={jpStyles.tableContainer}>
+              <Table size="medium" sx={jpStyles.table}>
+                <TableHead sx={jpStyles.tableHead}>
+                  <TableRow>
+                    <TableCell padding="checkbox" sx={{ width: '5%' }}></TableCell>
+                    <TableCell sx={{ fontWeight: 'bold', width: '20%' }}>VID</TableCell>
+                    <TableCell sx={{ fontWeight: 'bold', width: '25%' }}>Category</TableCell>
+                    <TableCell sx={{ fontWeight: 'bold', width: '25%' }}>Created By</TableCell>
+                    <TableCell sx={{ fontWeight: 'bold', width: '25%' }}>Created At</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {voucherList
+                    .slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage)
+                    .map((row) => {
+                      // FIX: Using clean camelCase keys exactly as mapped by the backend RowMapper
+                      const rowId = row.id;
+                      const rowVid = row.vid;
+                      const rowCategory = row.categoryName || "General";
+                      const rowCreatorName = row.createdByName || "System";
+                      const rowCreatorId = row.createdBy || "N/A";
+                      const rowCreatedAt = row.createdAt;
+                      const rowDescription = row.description || "No description provided for this voucher configuration.";
+                      const rowIssueCategories = row.issueCategories;
+
+                      const isSelected = selectedVoucher?.id === rowId;
+                      const isExpanded = expandedRow === rowId;
+                      return (
+                        <React.Fragment key={row.id}>
+                          {/* MAIN ROW */}
+                          <TableRow
+                            hover
+                            onClick={() => {
+                              setSelectedVoucher(row);
+                              handleRowExpand(row.id);
+                            }}
+                            sx={{
+                              cursor: 'pointer',
+                              backgroundColor: isSelected ? "action.selected" : "inherit",
+                              '& > *': { borderBottom: isExpanded ? 'none' : '1px solid rgba(224, 224, 224, 1)' }
+                            }}
+                          >
+                            <TableCell padding="checkbox">
+                              <Radio checked={isSelected} color="primary" />
+                            </TableCell>
+                            <TableCell sx={jpStyles.ellipsisCell}>
+                              {row.vid}
+                            </TableCell>
+                            <TableCell sx={jpStyles.ellipsisCell}>
+                              {row.categoryName || "General"}
+                            </TableCell>
+                            <TableCell sx={jpStyles.ellipsisCell}>
+                              {row.createdByName} <Typography component="span" variant="caption" color="text.secondary">({row.createdBy})</Typography>
+                            </TableCell>
+                            <TableCell sx={jpStyles.ellipsisCell}>
+                              {row.createdAt ? (
+                                new Date(row.createdAt).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })
+                                + ", " +
+                                new Date(row.createdAt).toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit", hour12: true }).toLowerCase()
+                              ) : "N/A"}
+                            </TableCell>
+                          </TableRow>
+
+                          <TableRow sx={{ backgroundColor: "background.default" }}>
+                            {/* colSpan is now 5 to match the new column count */}
+                            <TableCell style={{ paddingBottom: 0, paddingTop: 0, borderBottom: isExpanded ? '1px solid rgba(224, 224, 224, 1)' : 'none' }} colSpan={5}>
+                              <Collapse in={isExpanded} timeout="auto" unmountOnExit>
+                                <Grid container sx={jpStyles.collapseGrid}>
+                                  <Grid item size={{ lg: 1.3, md: 1.5 }}>
+                                    <Typography variant="body2" color="text.secondary">
+                                      <strong>Description:</strong>
+                                    </Typography>
+                                  </Grid>
+                                  <Grid item size={{ lg: 10.7, md: 10.5 }}>
+                                    <Typography variant="body2" color="text.secondary">
+                                      {row.description || "No description provided for this voucher configuration."}
+                                    </Typography>
+                                  </Grid>
+                                  <Grid item size={{ lg: 1.3, md: 1.5 }}>
+                                    <Typography variant="body2" color="text.secondary">
+                                      <strong> Issue Categories: </strong>
+                                    </Typography>
+                                  </Grid>
+                                  <Grid item size={{ lg: 10.7, md: 10.5 }}>
+                                    <Box>
+                                      {row.issueCategories?.split(",")
+                                        .map((cat) => (
+                                          <Chip label={cat.trim()} sx={jpStyles.issueCategoryChip} />
+                                        ))}
+                                    </Box>
+                                  </Grid>
+                                  {/* </Box> */}
+                                </Grid>
+                              </Collapse>
+                            </TableCell>
+                          </TableRow>
+                        </React.Fragment>
+                      );
+                    })}
+                  {voucherList.length === 0 && (
+                    <TableRow>
+                      <TableCell colSpan={4} align="center" sx={{ py: 3 }}>
+                        No configurations found.
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </TableContainer>
+            <TablePagination
+              rowsPerPageOptions={[5, 10, 25]}
+              component="div"
+              count={voucherList.length}
+              rowsPerPage={rowsPerPage}
+              page={page}
+              onPageChange={handleChangePage}
+              onRowsPerPageChange={handleChangeRowsPerPage}
+            />
+          </Paper>
+
+          <Box sx={jpStyles.buttonRightAlign}>
+            <Button variant="contained" onClick={handleNext} disabled={!selectedVoucher} endIcon={<ArrowForwardIcon />} sx={{ px: 4 }}>
+              Next
+            </Button>
+          </Box>
+        </Box>
+      )
+      }
+
+      {/* INTERNAL STEP 1: CHOOSE ENTRY METHOD */}
+      {
+        activeStep === 1 && (
+          <Box sx={jpStyles.methodContainer}>
+
+            <Typography variant="h5" align="center" fontWeight="bold" gutterBottom sx={{ mt: 2 }}>
+              How would you like to input the data?
+            </Typography>
+            <Typography variant="body1" align="center" color="text.secondary" sx={{ mb: 6 }}>
+              Selected VID : <b>{selectedVoucher?.vid}</b>
+            </Typography>
+            {/* Using Flexbox with fixed widths instead of dynamic Grids for perfect symmetry */}
+            <Box sx={jpStyles.cardsWrapper}>
+
+              {/* MANUAL ENTRY CARD */}
+              <Card elevation={2} sx={jpStyles.methodCard}>
+                <CardActionArea onClick={() => handleMethodSelection("MANUAL")} sx={jpStyles.methodCardArea}>
+                  <EditNoteIcon color="primary" sx={jpStyles.manualIcon} />
+                  <Typography variant="h6" fontWeight="bold" gutterBottom>Manual Entry</Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    Manual Voucher Posting
+                  </Typography>
+                </CardActionArea>
+              </Card>
+
+              {/* EXCEL UPLOAD CARD */}
+              <Card elevation={2} sx={jpStyles.methodCard}>
+                <CardActionArea onClick={() => handleMethodSelection("BULK")} sx={jpStyles.methodCardArea}>
+                  {/* Standard Excel Green Hex Code */}
+                  <TableChartIcon sx={jpStyles.excelIcon} />
+                  <Typography variant="h6" fontWeight="bold" gutterBottom>Excel Upload</Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    Upload an Excel file (.xlsx or .xls) to process hundreds of voucher entries instantly.
+                  </Typography>
+                </CardActionArea>
+              </Card>
+
+            </Box>
+
+            <Box sx={jpStyles.backButtonBox}>
+              <Button variant="outlined" onClick={handleBack} startIcon={<ArrowBackIcon />}>
+                Previous
+              </Button>
+            </Box>
+          </Box>
+        )
+      }
+
+      {/* INTERNAL STEP 2: DATA ENTRY GRID */}
+      {
+        activeStep === 2 && entryMethod === "MANUAL" && (
+          <Box>
+            {/* Replaces the old basic header with the professional detailed card */}
+            <SelectedVoucherCard onBackClick={handleBack} showBackButton={true} />
+
+            <Box component={Paper} elevation={3} sx={jpStyles.dataEntryPaper}>
+              {/* ... EXISTING GRID START ... */}
+              <Grid item xs={12} md={12} sx={jpStyles.gridContainer}>
+                <Tooltip title="Enter batch-level remarks applied to multiple rows" placement="top-start">
+                  <TextField
+                    label="Common Batch Remarks"
+                    value={commonBatchRemarks}
+                    onChange={(e) => {
+                      const newValue = filterAndWarn(e.target.value, "alphanumeric_space");
+                      if (newValue.length <= 30) {
+                        setCommonBatchRemarks(newValue);
+                        if (checked) {
+                          setRows(rows.map((row) => ({ ...row, remarks: newValue })));
+                        }
+                      }
+                    }}
+                    fullWidth required multiline rows={1} inputProps={{ maxLength: 30 }}
+                    error={commonBatchRemarks.length > 0 && !isCommonRemarksValid(commonBatchRemarks)}
+                  />
+                </Tooltip>
+
+                <FormHelperText sx={jpStyles.commonRemarksHelper}>
+                  Allowed 2-30 chars (alphabets, numbers)
+                </FormHelperText>
+                <Box sx={jpStyles.checkboxBox}>
+                  <FormControlLabel
+                    control={<Checkbox checked={checked} onChange={handleRemarksSync} color="primary" disabled={commonBatchRemarks.length > 0 && !isRemarksValid(commonBatchRemarks)} />}
+                    label="Apply this remark to all below transactions"
+                  />
+                </Box>
+              </Grid>
+
+              <Box sx={{ mt: 2 }}>
+                {rows.map((row, index) => {
+                  // Universal Regex: Up to 16 digits, up to 4 decimal places
+                  const amountRegex = /^\d{0,16}(\.\d{0,4})?$/;
+
+                  return (
+                    <React.Fragment key={row.id}>
+                      <Grid container spacing={2} alignItems="flex-start">
+
+                        {/* Branch */}
+                        <Grid item size={{ xl: 1.5, lg: 2 }}>
+                          <Autocomplete
+                            autoHighlight
+                            // autoSelect REMOVED to prevent selection on click-away
+                            popupIcon={null}
+                            options={
+                              row.branch && !branchSearch.options.some((o) => o.code === row.branch.code)
+                                ? [row.branch, ...branchSearch.options]
+                                : branchSearch.options
+                            }
+                            getOptionLabel={(option) => option && option.code ? `${option.code} - ${option.name}` : ""}
+                            slotProps={{
+                              popper: {
+                                placement: 'bottom-start',
+                                modifiers: [{ name: 'flip', enabled: false }, { name: 'preventOverflow', enabled: false }],
+                              },
+                            }}
+                            value={row.branch || null}
+                            onChange={(event, newValue) => handleRowChange(row.id, "branch", newValue)}
+                            inputValue={branchInputValues[row.id] || ""}
+                            onInputChange={(event, newInputValue, reason) => {
+                              if (reason === 'input') {
+                                const cleanInput = newInputValue.replace(BRANCH_REPLACE_REGEX, "").substring(0, 5);
+                                setBranchInputValues(prev => ({ ...prev, [row.id]: cleanInput }));
+
+                                let queryForSearch = cleanInput;
+                                // APPEND ZEROS: If they enter 1 or 2 digits, pad it to 5 digits for the search
+                                if (cleanInput.length > 0 && cleanInput.length <= 2) {
+                                  queryForSearch = cleanInput.padStart(5, '0');
+                                }
+
+                                searchBranches(queryForSearch, row.id);
+                              } else {
+                                setBranchInputValues(prev => ({ ...prev, [row.id]: newInputValue }));
+                              }
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Tab' && !row.branch && branchSearch.options?.length > 0) {
+                                handleRowChange(row.id, "branch", branchSearch.options[0]);
+                              }
+                            }}
+                            loading={branchSearch.loadingId === row.id}
+                            filterOptions={(x) => x}
+                            isOptionEqualToValue={(option, value) => option?.code === value?.code}
+                            noOptionsText=""
+                            renderInput={(params) => (
+                              <Tooltip title="Search by Branch Code" placement="top-start">
+                                <TextField
+                                  {...params}
+                                  label="Branch *"
+                                  placeholder="Branch"
+                                  InputLabelProps={{ shrink: true }}
+                                  inputProps={{ ...params.inputProps, style: { textOverflow: 'ellipsis', whiteSpace: 'nowrap', overflow: 'hidden' } }}
+                                  InputProps={{
+                                    ...params.InputProps,
+                                    endAdornment: (
+                                      <Box>
+                                        {branchSearch.loadingId === row.id ? (<CircularProgress color="inherit" size={20} />) : null}
+                                        {params.InputProps.endAdornment}
+                                      </Box>
+                                    )
+                                  }}
+                                />
+                              </Tooltip>
+                            )}
+                          />
+                          <Typography variant="caption" sx={jpStyles.captionText}>
+                            Min 3 Digits Required Search
+                          </Typography>
+                        </Grid>
+
+
+
+                        {/* Currency */}
+                        <Grid item size={{ xl: 1.5, lg: 2 }}>
+                          <Tooltip title="Search by Currency" placement="top-start">
+                            <Autocomplete
+                              disableClearable
+                              autoHighlight
+                              popupIcon={null} // Req 1: Removes dropdown icon
+                              options={currencyOptions}
+                              value={row.currency || null}
+                              onChange={(event, newValue) => {
+                                handleRowChange(row.id, "currency", newValue || "");
+                                handleRowChange(row.id, "amount", "");
+                              }}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Tab' && !row.currency) {
+                                  const inputVal = e.target.value;
+                                  if (inputVal && inputVal.trim() !== "") {
+                                    const match = currencyOptions.find(c => c.toLowerCase().includes(inputVal.trim().toLowerCase()));
+                                    if (match) {
+                                      handleRowChange(row.id, "currency", match);
+                                      handleRowChange(row.id, "amount", "");
+                                    }
+                                  }
+                                }
+                              }}
+                              filterOptions={(options, params) => {
+                                const { inputValue } = params;
+                                if (inputValue.trim().length === 0) return [];
+                                return options.filter((option) =>
+                                  option.toLowerCase().includes(inputValue.toLowerCase())
+                                );
+                              }}
+                              noOptionsText=""
+                              slotProps={{
+                                popper: {
+                                  placement: 'bottom-start', // Req 2: Always opens at bottom
+                                  modifiers: [{ name: 'flip', enabled: false }, { name: 'preventOverflow', enabled: false }]
+                                }
+                              }}
+                              renderInput={(params) => (
+                                <TextField
+                                  {...params}
+                                  label="Currency *"
+                                  placeholder={!row.currency ? "Currency" : ""}
+                                  InputLabelProps={{ shrink: true }}
+                                  onInput={(e) => {
+                                    // Req 3: Disable numbers instantly on keystroke
+                                    e.target.value = e.target.value.replace(/[^A-Za-z]/g, '');
+                                  }}
+                                  inputProps={{
+                                    ...params.inputProps,
+                                    maxLength: 3,
+                                  }}
+                                />
+                              )}
+                            />
+                          </Tooltip>
+                        </Grid>
+
+
+                        {/* CGL */}
+                        <Grid item size={{ xl: 2, lg: 2.8 }} >
+                          <Autocomplete
+                            autoHighlight
+                            // autoSelect REMOVED
+                            popupIcon={null}
+                            options={
+                              row.cgl && !cglSearch.options.some((o) => o.cglNumber === row.cgl.cglNumber)
+                                ? [row.cgl, ...cglSearch.options]
+                                : cglSearch.options
+                            }
+                            slotProps={{
+                              popper: {
+                                placement: 'bottom-start',
+                                modifiers: [
+                                  { name: 'flip', enabled: false },
+                                  { name: 'preventOverflow', enabled: false }
+                                ],
+                              },
+                            }}
+                            getOptionLabel={(option) => option && option.cglNumber ? `${option.cglNumber} - ${option.description}` : ""}
+                            value={row.cgl || null}
+                            onChange={(event, newValue) => handleRowChange(row.id, "cgl", newValue)}
+                            inputValue={cglInputValues[row.id] || ""}
+                            onInputChange={(event, newInputValue, reason) => {
+                              if (reason === 'input') {
+                                const cleanInput = newInputValue.replace(CGL_REPLACE_REGEX, "").substring(0, 10);
+                                setCglInputValues(prev => ({ ...prev, [row.id]: cleanInput }));
+                                searchCgls(cleanInput, row.id);
+                              } else {
+                                setCglInputValues(prev => ({ ...prev, [row.id]: newInputValue }));
+                              }
+                            }}
+                            // --- ADDED INTERCEPTOR FOR TAB KEY ---
+                            onKeyDown={(e) => {
+                              if (e.key === 'Tab' && !row.cgl && cglSearch.options?.length > 0) {
+                                // Automatically set the first suggestion when Tab is pressed
+                                handleRowChange(row.id, "cgl", cglSearch.options[0]);
+                              }
+                            }}
+                            loading={cglSearch.loadingId === row.id}
+                            filterOptions={(x) => x}
+                            isOptionEqualToValue={(option, value) => option?.cglNumber === value?.cglNumber}
+                            noOptionsText={(cglInputValues[row.id] || "").length < 3 ? "" : "CGL not found"}
+                            renderInput={(params) => (
+                              <Tooltip title="Search by CGL Number" placement="top-start">
+                                <TextField
+                                  {...params}
+                                  label="CGL *"
+                                  placeholder="CGL"
+                                  InputLabelProps={{ shrink: true }}
+                                  InputProps={{
+                                    ...params.InputProps,
+                                    endAdornment: (
+                                      <Box sx={jpStyles.memoChipBox}>
+                                        {row.cgl && String(row.cgl.cglNumber).startsWith("5") && (<Chip label="MEMO" size="small" color="warning" sx={jpStyles.memoChip} />)}
+                                        {cglSearch.loadingId === row.id ? <CircularProgress color="inherit" size={20} /> : null}
+                                        {params.InputProps.endAdornment}
+                                      </Box>
+                                    )
+                                  }}
+                                />
+                              </Tooltip>
+                            )}
+                          />
+                          <Typography variant="caption" sx={jpStyles.captionText}>
+                            Min 3 digits Required Search
+                          </Typography>
+                        </Grid>
+
+
+                        {/* Amount */}
+                        <Grid item size={{ xl: 2, lg: 2.8 }}>
+                           <Tooltip title="Enter Amount " placement="top-start">
+                          <TextField
+                            label="Amount *"
+                            type="text"
+                            value={row.amount}
+                            InputLabelProps={{ shrink: true }}
+                            fullWidth
+                            placeholder="0.0000"
+                            inputProps={{ style: { textAlign: "right" } }}
+                            // Checks if input is not empty AND equals zero numerically
+                            error={row.amount !== "" && parseFloat(row.amount) === 0}
+                            onChange={(e) => {
+                              const rawVal = e.target.value;
+                              if (/[^0-9.]/.test(rawVal)) {
+                                showSnackBar("Only numbers and decimal point are allowed.", "warning"); return;
+                              }
+                              if (rawVal === "" || /^\d{0,16}(\.\d{0,4})?$/.test(rawVal)) {
+                                handleRowChange(row.id, "amount", rawVal);
+                              }
+                              else {
+                                showSnackBar("Exceeded maximum digits or decimal places.", "warning");
+                              }
+                            }}
+                          />
+                          </Tooltip>
+                          <Typography
+                            variant="caption"
+                            // Turns the caption red if the error state is triggered
+                            sx={{ ...jpStyles.captionText, color: (row.amount !== "" && parseFloat(row.amount) === 0) ? 'error.main' : 'text.secondary' }}
+                          >
+                            {(row.amount !== "" && parseFloat(row.amount) === 0) ? "Amount cannot be zero" : "Max 16 digits, 4 decimals"}
+                          </Typography>
+                        </Grid>
+
+
+                        {/* Txn Type */}
+                        <Grid item size={{ xl: 1, lg: 1.5 }}>
+                           <Tooltip title="Type D for Debit / C for Credit" placement="top-start">
+                          <TextField
+                            select
+                            label="Type *"
+                            value={row.txnType}
+                            fullWidth
+                            InputLabelProps={{ shrink: true }}
+                            onChange={(e) => handleRowChange(row.id, "txnType", e.target.value)}
+                            onKeyDown={(e) => {
+                              // Intercept keystrokes to auto-select
+                              const key = e.key.toLowerCase();
+                              if (key === 'd') {
+                                e.preventDefault(); // Prevents standard browser behavior
+                                handleRowChange(row.id, "txnType", "Debit");
+                              } else if (key === 'c') {
+                                e.preventDefault();
+                                handleRowChange(row.id, "txnType", "Credit");
+                              }
+                            }}
+                            SelectProps={{
+                              displayEmpty: true,
+                              renderValue: (selected) => !selected ? <span style={{ color: 'gray', opacity: 0.8 }}>Type</span> : selected
+                            }}
+                          >
+                            
+                            <MenuItem value="Debit">Debit</MenuItem>
+                            <MenuItem value="Credit">Credit</MenuItem>
+                          </TextField>
+                          </Tooltip>
+                        </Grid>
+
+
+                     
+                        {/* Remarks (Individual) */}
+                        <Grid item
+                          size={{ xl: 2.5, lg: 3.5 }}
+                        //  sx={{ flexGrow: 2 }}
+                        >
+                            <Tooltip title="Enter remarks" placement="top-start">
+                          <TextField label="Remarks *" value={row.remarks} InputLabelProps={{ shrink: true }} placeholder="Enter remarks..." fullWidth inputProps={{ maxLength: 30 }} disabled={checked} error={row.remarks.length > 0 && !isRowRemarksValid(row.remarks)} onChange={(e) => { const val = filterAndWarn(e.target.value, "alphanumeric_space"); if (val.length <= 30) { handleRowChange(row.id, "remarks", val); } }} />
+                          </Tooltip>
+                          <Typography variant="caption" sx={jpStyles.captionText}>Allowed 2-30 chars (alphabets, numbers)</Typography>
+                        </Grid>
+                        {/* Product Code */}
+                        <Grid item
+                          // xs={12} md={2}
+                          size={{ xl: 1.2, lg: 1.5 }} >
+                             <Tooltip title="Enter Product Code" placement="top-start">
+                          <TextField label="Product Code" value={row.productCode} InputLabelProps={{ shrink: true }} placeholder="Product Code.." fullWidth inputProps={{ maxLength: 8 }} onChange={(e) => { const rawVal = e.target.value; const cleanVal = rawVal.replace(/[^0-9]/g, ""); if (rawVal !== cleanVal) { showSnackBar("Only digits are allowed.", "warning"); } if (cleanVal.length <= 8) { handleRowChange(row.id, "productCode", cleanVal); } }} />
+                          </Tooltip>
+                          <Typography variant="caption" sx={jpStyles.captionText}>Max 8 digits</Typography>
+                        </Grid>
+
+                        {/* Delete Action */}
+                        <Grid item size={{ xl: 0.5, lg: 0.8 }} sx={{ textAlign: "center" }}>
+                          {rows.length > 1 && (
+                            <Tooltip title="Delete row" arrow>
+                              <IconButton
+                                onClick={() => handleDeleteRow(row.id)}
+                                aria-label="delete row"
+                                sx={jpStyles.deleteIconButton}
+                              >
+                                <DeleteIcon />
+                              </IconButton>
+                            </Tooltip>
+                          )}
+                        </Grid>
+                      </Grid>
+
+                      {index < rows.length - 1 && (<Box sx={jpStyles.rowDivider} />)}
+                    </React.Fragment>
+                  );
+                })}
+
+                {/* ACTION BUTTONS */}
+                <Box sx={jpStyles.actionButtonsWrapper}>
+
+                  <Button variant="outlined" startIcon={<ArrowBackIcon />} onClick={handleBack}>
+                    Previous
+                  </Button>
+                  <Box sx={{ display: "flex", gap: 2 }}>
+                    <Button variant="contained" startIcon={<AddIcon />} onClick={handleAddRow}>
+                      Add Row
+                    </Button>
+                    <Tooltip title={rows.length < 2 ? "Minimum 2 rows required to submit" : "Submit batch"} placement="top">
+                      <span> {/* Span wrapper required for Tooltip when button is disabled */}
+                        <Button
+                          variant="contained"
+                          color="success"
+                          onClick={handleSubmit}
+                          disabled={isSubmitting || !isCommonRemarksValid(commonBatchRemarks) || !isFormReadyToSubmit}
+                        >
+                          {isSubmitting ? <CircularProgress size={24} color="inherit" /> : "Submit Request"}
+                        </Button>
+                      </span>
+                    </Tooltip>
+                  </Box>
+                </Box>
+              </Box>
+            </Box>
+          </Box>
+        )
+      }
+
+      {/* EXTERNAL STEP 2: BULK UPLOAD EXCEL COMPONENT */}
+      {
+        activeStep === 2 && entryMethod === "BULK" && (
+          <JournalBulkUpload
+            selectedVoucher={selectedVoucher}
+            onBack={handleBack}
+            onReset={handleResetWizard}
+            // Triggered automatically when Bulk Excel completes
+            onSuccessSubmit={(batchId) => {
+              setSubmittedBatchId(batchId);
+              setActiveStep(3);
+            }}
+          />
+        )
+      }
+
+      {/* NEW STEP 3: POST-SUBMISSION SUCCESS & SCHEDULING SCREEN */}
+      {
+        activeStep === 3 && (
+          <Box sx={jpStyles.successBox}>
+            <Paper elevation={3} sx={jpStyles.successPaper}>
+
+              <TaskAltIcon sx={jpStyles.successIconProps} />
+
+              <Typography variant="h5" fontWeight="bold" gutterBottom>
+                Your request has been submitted!
+              </Typography>
+              <Typography variant="body1" color="text.secondary" sx={{ mb: 4 }}>
+                Batch ID <b>{submittedBatchId}</b> is now pending for approvals.
+              </Typography>
+
+              <Divider sx={{ my: 3 }} />
+
+              <Typography variant="h6" fontWeight="bold" color="primary.main" gutterBottom>
+                Do you want to schedule this execution?
+              </Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 4 }}>
+                By default, this batch will post immediately after the final approval. You can choose to delay the posting to a specific future date and time.
+              </Typography>
+
+              {!showSchedulePicker ? (
+                <Box sx={{ display: 'flex', gap: 3, justifyContent: 'center' }}>
+                  <Button variant="outlined" size="large" onClick={handleResetWizard} sx={jpStyles.largeBtn}>
+                    Execute Immediately
+                  </Button>
+                  <Button
+                    variant="contained"
+                    size="large"
+                    startIcon={<ScheduleIcon />}
+                    onClick={() => {
+                      // FIX: Generate a fresh, valid time (+35 mins) exactly when they click the button
+                      setScheduledTime(dayjs().add(35, 'minute').second(0).millisecond(0));
+                      setShowSchedulePicker(true);
+                    }}
+                    sx={jpStyles.largeBtn}
+                  >
+                    Schedule Execution
+                  </Button>
+                </Box>
+              ) : (
+                <Box sx={jpStyles.scheduleContainer}>
+                  <Typography variant="subtitle2" gutterBottom>Select Future Date & Time</Typography>
+
+                  <LocalizationProvider dateAdapter={AdapterDayjs}>
+
+                    <TimePicker
+                      label="Select Execution Time (Today)"
+                      value={scheduledTime}
+                      onChange={(newValue) => setScheduledTime(newValue)}
+                      minTime={dayjs().add(30, 'minute')}
+                      maxTime={dayjs().endOf('day')}
+                      timeSteps={{ minutes: 1 }}
+                      slotProps={{
+                        textField: {
+                          size: 'small',
+                          fullWidth: true,
+                          sx: { mb: 3, caretColor: 'transparent' },
+                          helperText: "Execution must be scheduled at least 30 mins from now, and before 11:59 PM today.",
+                          onKeyDown: (e) => e.preventDefault(),
+                          onPaste: (e) => e.preventDefault(),
+                          inputProps: { readOnly: true }
+                        }
+                      }}
+                    />
+
+
+                  </LocalizationProvider> <Box sx={jpStyles.LocalizationProvider}>
+                    <Button onClick={() => setShowSchedulePicker(false)} color="inherit" disabled={isApplyingSchedule}>
+                      Cancel
+                    </Button>
+                    <Button
+                      variant="contained"
+                      color="primary"
+                      onClick={handleApplySchedule}
+                      disabled={!scheduledTime || isApplyingSchedule}
+                    >
+                      {isApplyingSchedule ? <CircularProgress size={24} color="inherit" /> : "Confirm Schedule"}
+                    </Button>
+                  </Box>
+                </Box>
+              )}
+
+            </Paper>
+          </Box>
+        )
+      }
+
+    </Paper >
+
+  );
 }
+
+
+
+import React, { useState, useEffect, useCallback, useRef } from "react";
+import {
+  Box,
+  Typography,
+  Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  TextField,
+  Button,
+  CircularProgress,
+  Tooltip,
+  IconButton,
+  Stack,
+  Grid,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Paper,
+  Checkbox,
+  TablePagination,
+  Alert,
+  FormHelperText,
+  Stepper,
+  Step,
+  StepLabel,
+  StepConnector,
+  stepConnectorClasses,
+  styled,
+  Avatar,
+  Accordion,
+  AccordionSummary,
+  AccordionDetails,
+  ToggleButton,
+  ToggleButtonGroup,
+} from "@mui/material";
+
+import { DataGrid } from "@mui/x-data-grid";
+import {
+  Check as CheckIcon,
+  Clear as ClearIcon,
+  Visibility as VisibilityIcon,
+  FileDownload as FileDownloadIcon,
+  Close as CloseIcon,
+  Add as AddIcon,
+  Remove as RemoveIcon,
+} from "@mui/icons-material";
+import AccountCircleIcon from "@mui/icons-material/AccountCircle";
+import InfoIcon from "@mui/icons-material/Info";
+import { alpha } from "@mui/material/styles";
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
+import { jaStyles } from "./VoucherStyle";
+import { TimePicker } from "@mui/x-date-pickers/TimePicker";
+import { DateTimePicker } from "@mui/x-date-pickers/DateTimePicker";
+import dayjs from "dayjs";
+import { LocalizationProvider } from "@mui/x-date-pickers/LocalizationProvider";
+import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
+const styles = {
+  mainContainer: {
+    padding: 3,
+    height: "100%",
+    width: "100%",
+  },
+  dataGridContainer: {
+    height: 600,
+    width: "100%",
+    backgroundColor: "background.paper",
+    boxShadow: 2,
+    borderRadius: 2,
+    border: 1,
+    borderColor: "divider",
+    "& .MuiDataGrid-columnHeaders": {
+      backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.08),
+      fontWeight: "bold",
+      fontSize: "0.95rem",
+    },
+    "& .MuiDataGrid-row:hover": {
+      backgroundColor: (theme) => alpha(theme.palette.primary.main, 0.04),
+    },
+  },
+  tableContainer: {
+    maxHeight: 450,
+    overflowY: "auto",
+    border: 1,
+    borderColor: "divider",
+    mt: 1,
+  },
+  fixedContentBox: {
+    minHeight: 400,
+    display: "flex",
+    flexDirection: "column",
+    justifyContent: "space-between",
+  },
+  tableHeaderCell: {
+    fontWeight: "bold",
+    backgroundColor: "#f5f6f8",
+    color: "text.primary",
+    whiteSpace: "nowrap",
+    zIndex: 10,
+  },
+  stickyHeaderColumn: (leftOffset) => ({
+    position: "sticky",
+    left: leftOffset,
+    top: 0,
+    zIndex: 20,
+    backgroundColor: "background.paper",
+    borderBottom: 1,
+    borderRight: 1,
+    borderColor: "divider",
+    fontWeight: "bold",
+  }),
+  stickyBodyColumn: (leftOffset) => ({
+    position: "sticky",
+    left: leftOffset,
+    zIndex: 5,
+    backgroundColor: "background.paper",
+    borderRight: 1,
+    borderColor: "divider",
+  }),
+  dialogTitle: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    pb: 1,
+  },
+  dialogActions: { p: 2, borderTop: 1, borderColor: "divider" },
+  loadingContainer: {
+    height: "100%",
+    display: "flex",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  helperText: {
+    fontSize: "0.75rem",
+    color: "text.secondary",
+    marginTop: "4px",
+  },
+};
+
+const formatCurrency = (val) => {
+  if (val === null || val === undefined || val === "") return "0.0000";
+
+  // Ensure it's a string without using Number()
+  const strVal = String(val).trim();
+
+  // Split into integer and decimal parts
+  const parts = strVal.split(".");
+  let intPart = parts[0];
+  let decPart = parts[1] || "";
+
+  // Pad or truncate to exactly 4 decimal places
+  decPart = decPart.padEnd(4, "0").substring(0, 4);
+
+  // Safely add commas to the integer part (e.g. 1000000 -> 1,000,000)
+  intPart = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+
+  return `${intPart}.${decPart}`;
+};
+
+const getTxnTypeColor = (txnType) =>
+  txnType === "Credit" ? "error" : "success";
+
+const CustomConnector = styled(StepConnector)(({ theme }) => ({
+  [`&.${stepConnectorClasses.alternativeLabel}`]: {
+    top: 12, // Exactly half of the 24px icon height
+    left: "calc(-50% + 12px)",
+    right: "calc(50% + 12px)",
+  },
+  [`&.${stepConnectorClasses.active}`]: {
+    [`& .${stepConnectorClasses.line}`]: {
+      borderColor: theme.palette.success.main,
+    },
+  },
+  [`&.${stepConnectorClasses.completed}`]: {
+    [`& .${stepConnectorClasses.line}`]: {
+      borderColor: theme.palette.success.main,
+    },
+  },
+  [`& .${stepConnectorClasses.line}`]: {
+    borderColor: theme.palette.divider,
+    borderTopWidth: 2,
+    borderRadius: 1,
+  },
+}));
+
+const BigConnector = styled(StepConnector)(({ theme }) => ({
+  [`&.${stepConnectorClasses.alternativeLabel}`]: {
+    top: 20, // Center of the 40px tall pill
+    left: "calc(-50% + 80px)", // Offset by half the width of the 160px pill
+    right: "calc(50% + 80px)",
+  },
+  [`&.${stepConnectorClasses.active}`]: {
+    [`& .${stepConnectorClasses.line}`]: {
+      borderColor: theme.palette.success.main,
+    },
+  },
+  [`&.${stepConnectorClasses.completed}`]: {
+    [`& .${stepConnectorClasses.line}`]: {
+      borderColor: theme.palette.success.main,
+    },
+  },
+  [`& .${stepConnectorClasses.line}`]: {
+    borderColor: theme.palette.divider,
+    borderTopWidth: 3,
+    borderRadius: 1,
+  },
+}));
+
+const BigWorkflowIcon = (props) => {
+  const { statusFlag, label } = props;
+
+  const baseStyle = {
+    height: 40,
+    minWidth: 160,
+    borderRadius: 20, // Pill shape
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 1,
+    px: 2,
+    position: "relative",
+    zIndex: 2,
+    backgroundColor: "white",
+  };
+
+  // Info/Escalation Badge (Top Right)
+  const InfoBadge = () => (
+    <Box sx={jaStyles.infoBadge}>!</Box>
+  );
+
+  if (statusFlag === "COMPLETED") {
+    return (
+      <Box sx={jaStyles.bwfCompleted(baseStyle)}>
+        <CheckIcon sx={{ fontSize: 18 }} />
+        <Typography variant="body2" fontWeight="bold">{label}</Typography>
+      </Box>
+    );
+  }
+  if (statusFlag === "REJECTED") {
+    return (
+      <Box sx={jaStyles.bwfRejected(baseStyle)}>
+        <CloseIcon sx={{ fontSize: 18 }} />
+        <Typography variant="body2" fontWeight="bold">{label}</Typography>
+      </Box>
+    );
+  }
+  if (statusFlag === "ESCALATED" || statusFlag === "ACTIVE") {
+    return (
+      <Box sx={jaStyles.bwfEscalated(baseStyle)}>
+        <Typography variant="body2" fontWeight="bold">{label}</Typography>
+        <InfoBadge />
+      </Box>
+    );
+  }
+
+  // PENDING / FUTURE STEPS (Gray outline)
+  return (
+    <Box sx={jaStyles.bwfPending(baseStyle)}>
+      <Typography variant="body2" fontWeight="bold">{label}</Typography>
+    </Box>
+  );
+};
+
+function CustomNoRowsOverlay() {
+  return (
+    <Stack sx={jaStyles.noRowsStack}>
+      <InfoIcon sx={jaStyles.noRowsIcon} />
+      <Typography variant="h6">No Pending Requests</Typography>
+    </Stack>
+  );
+}
+
+export default function VoucherAuthorization() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+  const isMounted = useRef(true);
+  const [currentUserId, setCurrentUserId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState([]);
+  const [workflowStepsMap, setWorkflowStepsMap] = useState({});
+  const [detailTotalCount, setDetailTotalCount] = useState(0);
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submittingAction, setSubmittingAction] = useState(null);
+  const [selectedBatch, setSelectedBatch] = useState(null);
+  const [modalMode, setModalMode] = useState("ACCEPTED");
+  const [executorRemarks, setExecutorRemarks] = useState("");
+  const [isViewModalOpen, setIsViewModalOpen] = useState(false);
+  const [batchDetails, setBatchDetails] = useState([]);
+  const [viewingBatch, setViewingBatch] = useState(null);
+  const [actionSelection, setActionSelection] = useState(null); // SINGLE DECLARATION, DEFAULT NULL
+  const [isScheduleLapseModalOpen, setIsScheduleLapseModalOpen] = useState(false);
+  const [newScheduleTime, setNewScheduleTime] = useState("");
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [viewingBatchId, setViewingBatchId] = useState(null);
+  const [viewingBatchCreatorId, setViewingBatchCreatorId] = useState(null);
+  const [viewingBatchState, setViewingBatchState] = useState("");
+  const [dynamicSteps, setDynamicSteps] = useState([]);
+  const [dbRoleMap, setDbRoleMap] = useState({});
+  const [isFetchingSteps, setIsFetchingSteps] = useState(false);
+  const [vidDetails, setVidDetails] = useState(null);
+  const [isFetchingVid, setIsFetchingVid] = useState(false);
+  const [workflowHistory, setWorkflowHistory] = useState([]);
+  const [isDescExpanded, setIsDescExpanded] = useState(false);
+  const [viewingBatchOrder, setViewingBatchOrder] = useState(1);
+
+  const [isActionMode, setIsActionMode] = useState(false); // Universal action screen state
+  const [scheduleOverrideType, setScheduleOverrideType] = useState("KEEP");
+
+  const [finalScheduleTime, setFinalScheduleTime] = useState("");
+  const handleDownloadExcel = async () => {
+    if (!viewingBatchId) {
+      showSnackBar("Error: Batch ID is missing!", "error");
+      return;
+    }
+
+    try {
+      showSnackBar("Downloading Excel...", "info");
+
+      const response = await callApi(
+        `/JS/voucher/download-batch/${viewingBatchId}`,
+        null,
+        "GET",
+        "blob",
+        null,
+        {},
+        false
+      );
+
+      const blobData = response.data || response;
+      if (!blobData) {
+        throw new Error("No data received from backend");
+      }
+
+      const blob = new Blob([blobData], {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      });
+      const url = window.URL.createObjectURL(blob);
+
+      const link = document.createElement("a");
+      link.href = url;
+      link.setAttribute("download", `Batch_${viewingBatchId}.xlsx`);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+      showSnackBar("Download complete.", "success");
+    } catch (e) {
+      console.error("Download failed:", e);
+      let errorMsg = "Failed to download Excel file.";
+      if (e.response && e.status === 404) {
+        errorMsg = "API endpoint not found (404).";
+      }
+      showSnackBar(errorMsg, "error");
+    }
+  };
+
+  const CustomWorkflowIcon = (props) => {
+    const { statusFlag, iconLetter, label, isMini } = props;
+    const showTextInside = isMini && (statusFlag === "ACTIVE" || statusFlag === "ESCALATED");
+
+    const baseStyle = {
+      height: 24, // Reduced size
+      borderRadius: 12,
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      zIndex: 2,
+      position: "relative",
+      fontWeight: "bold",
+      fontSize: "0.7rem",
+      px: showTextInside ? 1.5 : 0,
+      minWidth: showTextInside ? "auto" : 24,
+      width: showTextInside ? "max-content" : 24,
+      whiteSpace: "nowrap",
+      boxSizing: "border-box", // Prevents borders from making circles larger
+    };
+
+    if (statusFlag === "COMPLETED") {
+      return (
+        <Box sx={{ ...baseStyle, backgroundColor: "success.main", color: "#fff" }}>
+          <CheckIcon sx={{ fontSize: 16 }} />
+        </Box>
+      );
+    }
+    if (statusFlag === "REJECTED") {
+      return (
+        <Box sx={{ ...baseStyle, backgroundColor: "error.main", color: "#fff" }}>
+          <CloseIcon sx={{ fontSize: 16 }} />
+        </Box>
+      );
+    }
+    if (statusFlag === "ESCALATED") {
+      return (
+        <Tooltip title="Escalation Time Breached - Attention Required" arrow>
+          <Box sx={{ ...baseStyle, backgroundColor: "white", border: "2px solid", borderColor: "warning.main", color: "warning.main" }}>
+            {showTextInside ? `${label} ??` : "!"}
+          </Box>
+        </Tooltip>
+      );
+    }
+    if (statusFlag === "ACTIVE") {
+      return (
+        <Box sx={{ ...baseStyle, backgroundColor: "white", border: "2px solid", borderColor: "warning.main", color: "warning.main" }}>
+          {showTextInside ? label : iconLetter}
+        </Box>
+      );
+    }
+
+    // PENDING / FUTURE STEPS (Now white with grey border to match the big stepper)
+    return (
+      <Box sx={{ ...baseStyle, backgroundColor: "white", border: "2px solid #e2e8f0", color: "text.disabled" }}>
+        {iconLetter}
+      </Box>
+    );
+  };
+
+  useEffect(() => {
+    isMounted.current = true;
+    try {
+      const auth =
+        sessionStorage.getItem("persist:auth") ||
+        localStorage.getItem("persist:auth");
+      if (auth) {
+        const user = JSON.parse(JSON.parse(auth).user);
+        if (user?.userId) setCurrentUserId(String(user.userId));
+      }
+    } catch (e) { }
+    return () => {
+      isMounted.current = false;
+    };
+  }, []);
+
+  const filterAndWarn = (val, type) => {
+    let filtered = val;
+    let hasError = false;
+    let msg = "Only alphanumeric and / & ( ) , . - are allowed.";
+
+    if (type === "alphanumeric_space") {
+      // 1. Strip any character that is NOT alphanumeric or in the allowed special chars list
+      filtered = val.replace(/[^a-zA-Z0-9 ]/g, "");
+      if (filtered !== val) {
+        hasError = true;
+      }
+
+      // 2. Strip leading space and collapse double spaces (enforces the (?!.* {2}) regex rule)
+      const beforeSpaceTrim = filtered;
+      filtered = filtered.replace(/^\s+/, "").replace(/\s{2,}/g, " ");
+      if (beforeSpaceTrim !== filtered && !hasError) {
+        hasError = true;
+        msg =
+          "Remark should not start with space or contain consecutive spaces.";
+      }
+    }
+
+    if (hasError) {
+      showSnackBar(msg, "warning");
+    }
+    return filtered;
+  };
+  const handleRemarksChange = (e, setter) => {
+    const val = filterAndWarn(e.target.value, "alphanumeric_space");
+    if (val.length <= 30) {
+      setter(val);
+    }
+  };
+
+  // Validation logic: Remarks are strictly compulsory (min 2, max 30)
+  const isRemarksValid = (val) =>
+    val.trim().length >= 2 && val.trim().length <= 30;
+
+  const isViewingSelfCreated =
+    currentUserId &&
+    viewingBatchCreatorId &&
+    String(currentUserId).trim().toUpperCase() ===
+    String(viewingBatchCreatorId).trim().toUpperCase();
+
+  const isLargeBatch = detailTotalCount > 2000;
+  const fetchPendingBatches = useCallback(async () => {
+    setLoading(true);
+    try {
+      // 1. Fetch only pending approvals for THIS user's role
+      const response = await callApi(
+        "/JS/voucher/checker/pending-approvals",
+        null,
+        "GET"
+      );
+
+      // CRITICAL FIX: Defensively extract the array whether it's wrapped in a DTO or not
+      let fetchedRows = [];
+      if (Array.isArray(response)) {
+        fetchedRows = response;
+      } else if (response && Array.isArray(response.data)) {
+        fetchedRows = response.data;
+      } else if (response && Array.isArray(response.content)) {
+        fetchedRows = response.content;
+      }
+
+      // 2. Extract unique workflow codes
+      const uniqueWorkflows = [
+        ...new Set(
+          fetchedRows.map((row) => row.approvalWorkflow).filter(Boolean)
+        ),
+      ];
+
+      // 3. Dynamically fetch the step configurations for each workflow
+      const stepsMap = {};
+      await Promise.all(
+        uniqueWorkflows.map(async (wfCode) => {
+          try {
+            const stepsResponse = await callApi(
+              `/JS/voucher/workflow/steps/${wfCode}`,
+              null,
+              "GET"
+            );
+            // Defensively unwrap steps
+            const steps = Array.isArray(stepsResponse) ? stepsResponse : (stepsResponse?.data || []);
+
+            // CRITICAL FIX: Store the raw object so both steppers can read it safely
+            stepsMap[wfCode] = steps;
+          } catch (e) {
+            stepsMap[wfCode] = [
+              { state: "P", designation: "Creator" },
+              { state: "APPROVED", designation: "Approver" }
+            ]; // Fallback
+          }
+        })
+      );
+
+      // 4. Update states
+      if (isMounted.current) {
+        setWorkflowStepsMap(stepsMap);
+        setRows(fetchedRows);
+      }
+    } catch (err) {
+      if (isMounted.current && err.name !== "CanceledError")
+        showSnackBar("Failed to load requests", "error");
+    } finally {
+      if (isMounted.current) setLoading(false);
+    }
+  }, [callApi, showSnackBar]);
+
+  useEffect(() => {
+    const fetchRoles = async () => {
+      try {
+        // Fetch the { "9001": "TCSGLIF" } map from our new API
+        const rolesData = await callApi(
+          "/JS/voucher/active-roles",
+          null,
+          "GET"
+        );
+        if (rolesData && isMounted.current) {
+          setDbRoleMap(rolesData);
+        }
+      } catch (err) {
+        console.error("Failed to fetch roles mapping", err);
+      }
+    };
+    fetchRoles();
+  }, [callApi]);
+
+  useEffect(() => {
+    fetchPendingBatches();
+  }, [fetchPendingBatches]);
+
+  const fetchBatchDetailsPaginated = async (batchId, page, size) => {
+    setDetailLoading(true);
+    try {
+      const res = await callApi(
+        `/JS/voucher/by-batch-paginated/${batchId}?page=${page}&size=${size}`,
+        null,
+        "GET"
+      );
+
+      const contentArray = res?.content || (Array.isArray(res) ? res : []);
+
+      if (contentArray && isMounted.current) {
+        setDetailTotalCount(res?.totalElements || contentArray.length || 0);
+        const journalGroups = new Map();
+
+        contentArray.forEach((req, index) => {
+          try {
+            console.log("Backend Row Data in Authorization:", req);
+
+            const jId = req.journalId || req.id || `UNKNOWN-${index}`;
+            const prefix = String(jId).split("-")[0];
+
+            const amountVal = parseFloat(req.amount || req.reqAmount) || 0;
+
+            const row = {
+              ...req,
+              journalPrefix: prefix, // Save the distinct prefix
+              amount: Math.abs(amountVal),
+              transactionType: amountVal < 0 ? "Credit" : "Debit",
+              branch: req.branchCode || req.reqBranchCode || "-",
+              currency: req.currency || req.reqCurrency || "-",
+              cgl: req.cgl || req.reqCgl || "-",
+              remarks: req.narration || req.reqNarration || "-",
+              product: req.productCode || req.reqProduct || "-",
+            };
+
+            // FIX: Group explicitly by Branch!
+            if (!journalGroups.has(prefix)) journalGroups.set(prefix, []);
+            journalGroups.get(prefix).push(row);
+          } catch (e) {
+            console.error("Failed to map row details:", req, e);
+          }
+        });
+
+        setBatchDetails(Array.from(journalGroups.values()));
+      }
+    } catch (e) {
+      if (isMounted.current) showSnackBar("Failed to load details", "error");
+    } finally {
+      if (isMounted.current) setDetailLoading(false);
+    }
+  };
+  const handleOpenViewModal = async (row) => {
+    setViewingBatch(row);
+    setViewingBatchId(row.batchId);
+    setViewingBatchCreatorId(String(row.creatorId));
+    setViewingBatchState(row.workflowState || "");
+    setViewingBatchOrder(row.currentOrder || 1);
+
+    setIsViewModalOpen(true);
+    setIsFetchingSteps(true);
+    setIsFetchingVid(true);
+
+    try {
+      const workflowCode = row.approvalWorkflow || "Workflow_3";
+
+      const [stepsData, summaryData, historyData] = await Promise.all([
+        callApi(`/JS/voucher/workflow/steps/${workflowCode}`, null, "GET"),
+        callApi(`/JS/voucher/batch-summary/${row.batchId}`, null, "GET"),
+        callApi(`/JS/voucher/workflow-history/${row.batchId}`, null, "GET"),
+      ]);
+
+      // CRITICAL FIX: Defensively extract `.data` if wrapped in ApiResponseDto
+      setDynamicSteps(Array.isArray(stepsData) ? stepsData : (stepsData?.data || []));
+      setVidDetails(summaryData?.data || summaryData);
+      setWorkflowHistory(Array.isArray(historyData) ? historyData : (historyData?.data || []));
+
+    } catch (err) {
+      showSnackBar("Failed to load batch details.", "error");
+    } finally {
+      setIsFetchingSteps(false);
+      setIsFetchingVid(false);
+    }
+  };
+
+  const handleDetailRowsPerPageChange = (event) => {
+    const newSize = parseInt(event.target.value, 10);
+    setDetailRowsPerPage(newSize);
+    setDetailPage(0);
+    fetchBatchDetailsPaginated(viewingBatchId, 0, newSize);
+  };
+
+  const getRoleDisplayName = (roleValue) => {
+    if (!roleValue || roleValue === "null" || roleValue === "System")
+      return "System";
+
+    // Now it looks inside the dynamic DB map instead of a hardcoded one!
+    return dbRoleMap[String(roleValue)] || roleValue;
+  };
+  const calculateTimeElapsed = (startDateString) => {
+    if (!startDateString) return "N/A";
+    const start = new Date(startDateString);
+    const now = new Date();
+
+    const diffMs = Math.abs(now - start);
+    const diffMins = Math.floor(diffMs / 60000);
+
+    if (diffMins === 0) return "Just now";
+    if (diffMins < 60) return `${diffMins} min`;
+
+    const hours = Math.floor(diffMins / 60);
+    const mins = diffMins % 60;
+    return mins > 0 ? `${hours} hr ${mins} min` : `${hours} hr`;
+  };
+  const handleCloseViewModal = () => {
+    setIsViewModalOpen(false);
+    setBatchDetails([]);
+    setViewingBatchId(null);
+    setViewingBatchCreatorId(null);
+    setIsDescExpanded(false);
+
+    // Reset Action UI states
+    setIsActionMode(false);
+    setActionSelection(null); // CHANGED: Reset to null so it forces user selection next time
+    setExecutorRemarks("");
+    setScheduleOverrideType("KEEP");
+    setFinalScheduleTime("");
+    fetchPendingBatches();
+  };
+  const handleProceed = () => {
+    setIsActionMode(true); // Open the universal action screen
+
+    // Only pre-fill time if it's the final approval
+    if (viewingBatch?.isFinalApproval === "Y") {
+      if (vidDetails?.SCHEDULED_TIME) {
+        const dateObj = new Date(vidDetails.SCHEDULED_TIME);
+        dateObj.setMinutes(dateObj.getMinutes() - dateObj.getTimezoneOffset());
+        setFinalScheduleTime(dateObj.toISOString().slice(0, 16));
+      } else {
+        setFinalScheduleTime("");
+      }
+    }
+  };
+
+  const handleOpenModal = (batch, mode) => {
+    setSelectedBatch(batch);
+    setModalMode(mode);
+    setExecutorRemarks("");
+    setIsModalOpen(true);
+  };
+
+  const handleCloseModal = () => {
+    if (isSubmitting) return;
+    setIsModalOpen(false);
+    setSelectedBatch(null);
+  };
+
+  const handleInitiateAccept = () => {
+    // Check if the current user is the final approver from our updated API
+    if (viewingBatch?.isFinalApproval === "Y") {
+      setIsSchedulingMode(true);
+
+      if (vidDetails?.SCHEDULED_TIME) {
+        const dateObj = new Date(vidDetails.SCHEDULED_TIME);
+        dateObj.setMinutes(dateObj.getMinutes() - dateObj.getTimezoneOffset());
+        setFinalScheduleTime(dateObj.toISOString().slice(0, 16));
+      } else {
+        setFinalScheduleTime("");
+      }
+    } else {
+      // Normal checker, skip the scheduling screen and just submit
+      handleSubmitAction("ACCEPTED");
+    }
+  };
+
+  const handleSubmitAction = async (actionStatus, overrideLapse = false) => {
+    // If it's a lapse override, we use the saved modalMode, otherwise use the fresh button click
+    const statusToSubmit =
+      typeof actionStatus === "string" ? actionStatus : modalMode;
+
+    if (!isRemarksValid(executorRemarks)) {
+      showSnackBar("Remarks are compulsory (2-30 chars).", "warning");
+      return;
+    }
+    setSubmittingAction(statusToSubmit);
+    setIsSubmitting(true);
+    setModalMode(statusToSubmit); // Save for edge cases like schedule lapse
+
+    let formattedNewSchedule = null;
+    const targetTime = isActionMode ? finalScheduleTime : newScheduleTime;
+
+    if (overrideLapse && targetTime) {
+      const today = dayjs();
+      const scheduledDayjs = dayjs(targetTime);
+
+      // Force the date to strictly be TODAY, merging it with the selected time
+      const finalSchedule = scheduledDayjs
+        .year(today.year())
+        .month(today.month())
+        .date(today.date());
+
+      const minAllowed = dayjs().add(28, 'minute'); // 2 min buffer
+      const maxAllowed = dayjs().endOf('day'); // 11:59:59 PM today
+
+      if (finalSchedule.isBefore(minAllowed)) {
+        showSnackBar("Schedule time must be at least 30 minutes from now.", "warning");
+        setIsSubmitting(false);
+        return;
+      }
+      if (finalSchedule.isAfter(maxAllowed)) {
+        showSnackBar("Schedule time cannot exceed today's end of day (11:59 PM).", "warning");
+        setIsSubmitting(false);
+        return;
+      }
+
+      // Format safely for Oracle
+      formattedNewSchedule = finalSchedule.format("YYYY-MM-DD HH:mm:ss");
+    }
+
+    try {
+      const response = await callApi(
+        "/JS/voucher/workflow/action",
+        {
+          batchId: viewingBatchId,
+          status: statusToSubmit,
+          remarks: executorRemarks.trim(),
+          overrideScheduleLapse: overrideLapse,
+          newScheduledTime: formattedNewSchedule,
+        },
+        "POST"
+      );
+
+      showSnackBar(
+        response?.message || "Workflow action processed successfully.",
+        "success"
+      );
+
+      setIsScheduleLapseModalOpen(false);
+      setIsViewModalOpen(false);
+      setNewScheduleTime("");
+      setExecutorRemarks("");
+      fetchPendingBatches();
+    } catch (e) {
+      if (e.response && e.response.status === 409) {
+        setIsScheduleLapseModalOpen(true);
+        setIsSubmitting(false);
+        return;
+      }
+
+      let errorMsg = "Failed to process request.";
+      if (e.response?.data?.message) {
+        errorMsg = e.response.data.message;
+      } else if (e.message) {
+        errorMsg = e.message;
+      }
+      showSnackBar(errorMsg, "error");
+    } finally {
+      setIsSubmitting(false);
+      setSubmittingAction(null);
+    }
+  };
+
+  const columns = [
+    {
+      field: "batchId",
+      headerName: "Batch ID",
+      width: 110,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+    },
+    {
+      field: "vid",
+      headerName: "VID",
+      width: 170,
+      align: "center", // Handles horizontal alignment of the cell content
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) => (
+        <Typography
+          variant="body2"
+          fontWeight="bold"
+          sx={{
+            width: "100%",
+            height: "100%",
+            display: "flex",
+            alignItems: "center", // Vertically centers text
+            justifyContent: "center", // Horizontally centers text (redundant if align: "center" works, but safe)
+          }}
+        >
+          {p.value || "N/A"}
+        </Typography>
+      ),
+    },
+    {
+      field: "workflowState",
+      headerName: "Workflow Progress",
+      width: 360,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (params) => {
+        const state = params.value || "";
+        const workflow = params.row.approvalWorkflow;
+        const isRejected = state === "REJECTED" || params.row.batchStatus === "R";
+
+        // CRITICAL FIX: Read the array of objects
+        const steps = workflowStepsMap[workflow] || [];
+
+        let activeStep = params.row.currentOrder ? params.row.currentOrder - 1 : 0;
+
+        if (state === "POSTED" || state === "SCHEDULED" || state === "C" || state === "S") {
+          activeStep = steps.length;
+        }
+        if (activeStep === -1) activeStep = 0;
+
+        const escalationHours = params.row.escalationTime || 24;
+        const hoursPending = Math.abs(new Date() - new Date(params.row.requestDate)) / 36e5;
+        const isEscalated = !isRejected && activeStep < steps.length && hoursPending > escalationHours;
+
+        return (
+          <Box sx={jaStyles.miniStepperBox}>
+            <Stepper activeStep={activeStep} alternativeLabel connector={<CustomConnector />} sx={jaStyles.miniStepper}>
+              {steps.map((step, index) => {
+                const isCompleted = index < activeStep;
+                const isCurrent = index === activeStep;
+
+                let statusFlag = "PENDING";
+                if (isCompleted) statusFlag = "COMPLETED";
+                if (isCurrent && isRejected) statusFlag = "REJECTED";
+                else if (isCurrent && isEscalated) statusFlag = "ESCALATED";
+                else if (isCurrent) statusFlag = "ACTIVE";
+
+                // CRITICAL FIX: Extract the label safely from the object
+                const label = step?.designation || step?.state || "Unknown";
+
+                return (
+                  <Tooltip title={label} key={`${label}-${index}`} arrow>
+                    <Step completed={isCompleted} active={isCurrent} sx={jaStyles.miniStep(isRejected, index, activeStep)}>
+                      <StepLabel
+                        StepIconComponent={() => (
+                          <CustomWorkflowIcon
+                            statusFlag={statusFlag}
+                            iconLetter={label.charAt(0).toUpperCase()}
+                            label={label}
+                            isMini={true}
+                          />
+                        )}
+                        sx={jaStyles.miniStepLabel}
+                      />
+                    </Step>
+                  </Tooltip>
+                );
+              })}
+            </Stepper>
+          </Box>
+        );
+      },
+    },
+    {
+      field: "creatorName",
+      headerName: "Creator",
+      width: 320,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) => {
+        const name = p.row.creatorName || p.row.creatorId;
+        const id = p.row.creatorId;
+        return (
+          <Chip
+            icon={<AccountCircleIcon />}
+            label={`${name} (${id})`}
+            size="small"
+            variant="outlined"
+          />
+        );
+      },
+    },
+    {
+      field: "requestDate",
+      headerName: "Submitted On",
+      width: 230,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (p) =>
+        new Date(p.value).toLocaleString("en-IN", {
+          dateStyle: "medium",
+          timeStyle: "short",
+        }),
+    },
+
+    {
+      field: "requestCount",
+      headerName: "No. of Entries",
+      width: 220,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+    },
+
+    {
+      field: "actions",
+      headerName: "Action",
+      width: 130,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (params) => {
+        return (
+          <Button
+            variant="contained"
+            size="small"
+            onClick={() => handleOpenViewModal(params.row)}
+            sx={{ textTransform: "none", borderRadius: 2, boxShadow: 0 }}
+          >
+            View & Action
+          </Button>
+        );
+      },
+    },
+  ];
+
+  return (
+    <Paper elevation={0} sx={jaStyles.mainPaper}>
+      <Box sx={styles.mainContainer}>
+        <DataGrid
+          rows={rows}
+          columns={columns}
+          loading={loading}
+          getRowId={(row) => row.batchId}
+          disableRowSelectionOnClick
+          pageSizeOptions={[5, 10, 25]}
+          disableColumnResize
+          rowHeight={52}
+          initialState={{
+            pagination: { paginationModel: { page: 0, pageSize: 10 } },
+          }}
+          slots={{ noRowsOverlay: CustomNoRowsOverlay }}
+          sx={styles.dataGridContainer}
+        />
+
+        {/* --- Main Grid Approve/Reject Dialog --- */}
+
+        <Dialog
+          open={isModalOpen}
+          onClose={handleCloseModal}
+          fullWidth
+          maxWidth="sm"
+        >
+          <DialogTitle>
+            {modalMode === "ACCEPTED" ? "Accept" : "Reject"} Batch ID
+          </DialogTitle>
+          <DialogContent>
+            <DialogContentText>
+              Please provide the remarks to{" "}
+              {modalMode === "ACCEPTED" ? "Accept" : "Reject"} Batch ID{" "}
+              <strong>{selectedBatch?.batchId}</strong>
+            </DialogContentText>
+            <TextField
+              autoFocus
+              required
+              margin="dense"
+              label="Remarks"
+              fullWidth
+              variant="standard"
+              value={executorRemarks}
+              onChange={(e) => handleRemarksChange(e, setExecutorRemarks)}
+              disabled={isSubmitting}
+              inputProps={{ maxLength: 30 }}
+              error={
+                executorRemarks.length > 0 && !isRemarksValid(executorRemarks)
+              }
+            />
+            <Typography sx={styles.helperText}>
+              Allowed 2-30 chars (alphabets, numbers)
+            </Typography>
+          </DialogContent>
+          <DialogActions sx={styles.dialogActions}>
+            <Button onClick={handleCloseModal} disabled={isSubmitting}>
+              Cancel
+            </Button>
+            <Button
+              onClick={() => handleSubmitAction(false)}
+              variant="contained"
+              color={modalMode === "ACCEPTED" ? "success" : "error"}
+              disabled={isSubmitting || !isRemarksValid(executorRemarks)}
+            >
+              {isSubmitting ? (
+                <CircularProgress size={24} />
+              ) : modalMode === "ACCEPTED" ? (
+                "Accept"
+              ) : (
+                "Reject"
+              )}
+            </Button>
+          </DialogActions>
+        </Dialog>
+
+        {/* --- Schedule Lapsed Edge Case Modal --- */}
+        <Dialog
+          open={isScheduleLapseModalOpen}
+          onClose={() => setIsScheduleLapseModalOpen(false)}
+          maxWidth="sm"
+          fullWidth
+        >
+          <DialogTitle sx={jaStyles.lapseTitle}>
+            {" "}
+            Schedule Lapsed{" "}
+          </DialogTitle>
+          <DialogContent>
+            <Alert severity="warning" sx={jaStyles.lapseAlert}>
+              The originally scheduled execution time{" "}
+              <strong>
+                {vidDetails?.SCHEDULED_TIME
+                  ? new Date(vidDetails.SCHEDULED_TIME).toLocaleString()
+                  : "N/A"}
+              </strong>{" "}
+              for Batch ID <strong>{viewingBatchId}</strong> (Created by{" "}
+              <strong>
+                {viewingBatch?.creatorName || viewingBatchCreatorId}
+              </strong>
+              ) has already passed.
+            </Alert>
+            <Typography variant="body1" gutterBottom>
+              Would you like to reschedule this batch for a future time, or
+              would you prefer to post it immediately?
+            </Typography>
+
+            <Paper elevation={0} sx={jaStyles.lapsePaper}>
+              <Typography variant="subtitle2" gutterBottom>
+                Optional: Set New Schedule
+              </Typography>
+              <LocalizationProvider dateAdapter={AdapterDayjs}>
+                <TimePicker
+                  label="New Execution Time (Today)"
+                  value={newScheduleTime ? dayjs(newScheduleTime) : null} // FIX: Bound to newScheduleTime
+                  onChange={(newValue) => {
+                    setNewScheduleTime(newValue ? newValue.format("YYYY-MM-DDTHH:mm") : "");
+                  }}
+                  disablePast
+                  minTime={dayjs().add(30, 'minute')}
+                  maxTime={dayjs().endOf('day')}
+                  timeSteps={{ minutes: 1 }}
+                  slotProps={{
+                    // CRITICAL: Forces the clock popup to open UPWARDS
+                    popper: {
+                      placement: "top",
+                    },
+                    textField: {
+                      size: 'small',
+                      fullWidth: true,
+                      required: true,
+                      sx: {
+                        caretColor: 'transparent',
+                        '& .MuiFormHelperText-root': {
+                          whiteSpace: 'normal',
+                          wordBreak: 'break-word',
+                          marginInline: 0,
+                          mt: 1
+                        }
+                      },
+                      helperText: "Execution must be scheduled at least 30 mins from now, and before 11:59 PM today.",
+                      onKeyDown: (e) => e.preventDefault(),
+                      onPaste: (e) => e.preventDefault(),
+                      inputProps: { readOnly: true }
+                    }
+                  }}
+                />
+              </LocalizationProvider>
+              <FormHelperText>
+                Leave blank to post immediately upon acceptance.
+              </FormHelperText>
+            </Paper>
+          </DialogContent>
+          <DialogActions sx={jaStyles.lapseActions}>
+            <Button
+              onClick={() => setIsScheduleLapseModalOpen(false)}
+              color="inherit"
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={() => handleSubmitAction(true)}
+              variant="contained"
+              color="primary"
+              disabled={isSubmitting}
+            >
+              {isSubmitting ? (
+                <CircularProgress size={20} color="inherit" />
+              ) : (
+                "Confirm & Proceed"
+              )}
+            </Button>
+          </DialogActions>
+        </Dialog>
+
+        {/* --- View Details Modal --- */}
+        <Dialog
+          open={isViewModalOpen}
+          onClose={handleCloseViewModal}
+          fullWidth
+          maxWidth="lg"
+        >
+          <DialogTitle sx={styles.dialogTitle}>
+            <Typography variant="h6" fontWeight="bold">
+              Batch Details: {viewingBatchId}
+            </Typography>
+            <IconButton onClick={handleCloseViewModal}>
+              <CloseIcon />
+            </IconButton>
+          </DialogTitle>
+          {/* ADDED: height: '75vh' explicitly locks the modal size so it NEVER jumps */}
+          <DialogContent dividers sx={jaStyles.viewModalContent}>
+            {/* --- STATE 1: STANDARD DETAILS (Hidden if Final Approver is scheduling) --- */}
+            <Box sx={jaStyles.viewModalScrollBox(isActionMode)}>
+              {/* ---  HEADER CARDS --- */}
+              <Box
+                sx={{
+                  p: 4,
+                  backgroundColor: "white",
+                  borderBottom: "1px solid",
+                  borderColor: "divider",
+                }}
+              >
+                {/* --- DYNAMIC DETAILS GRIDS --- */}
+                {isFetchingVid ? (
+                  <Box sx={jaStyles.centerProgress}>
+                    <CircularProgress size={24} />
+                  </Box>
+                ) : vidDetails && vidDetails.VID ? (
+                  <Stack spacing={3} sx={jaStyles.stackFullWidth}>
+                    {/* SECTION 1: VOUCHER DETAILS + EMBEDDED DESCRIPTION */}
+                    <Paper
+                      elevation={0}
+                      sx={{
+                        p: 3,
+                        borderRadius: 2,
+                        width: "100%",
+                        border: "1px solid",
+                        borderColor: "divider",
+                        display: "flex",
+                        flexDirection: "column",
+                      }}
+                    >
+                      <Typography
+                        variant="subtitle1"
+                        fontWeight="bold"
+                        color="text.primary"
+                        gutterBottom
+                        sx={{
+                          borderBottom: "1px solid",
+                          borderColor: "divider",
+                          pb: 1,
+                          mb: 2,
+                        }}
+                      >
+                        Voucher Request ID : {vidDetails.VID}
+                      </Typography>
+
+                      <Typography
+                        variant="caption"
+                        color="text.secondary"
+                        display="block"
+                        gutterBottom
+                      >
+                        Voucher Description
+                      </Typography>
+
+
+                      <Box
+                        sx={{
+                          maxHeight: 90,
+                          mb: "24px",
+                          overflowY: "auto",
+                          pr: 1,
+                        }}
+                      >
+                        <Typography
+                          variant="body2"
+                          color="text.primary"
+                          sx={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}
+                        >
+                          {vidDetails.DESCRIPTION || "No description provided."}
+                        </Typography>
+                      </Box>
+                      {/* NEW: Issue Categories Column */}
+                      <Grid item xs={12} sm={3} sx={{ mb: "24px" }}>
+                        <Typography variant="caption" color="text.secondary" display="block" gutterBottom>
+                          Issue Categories
+                        </Typography>
+                        <Typography variant="body1" fontWeight="600" color="primary.main">
+                          {vidDetails.ISSUE_CATEGORIES || "N/A"}
+                        </Typography>
+                      </Grid>
+
+                      <Grid container spacing={3}>
+                        <Grid item xs={12} sm={3}>
+                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>
+                            Category
+                          </Typography>
+                          <Typography variant="body1" fontWeight="500">
+                            {vidDetails.CATEGORY_NAME || "N/A"}
+                          </Typography>
+                        </Grid>
+
+
+                        <Grid item xs={12} sm={3}>
+                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>
+                            Created By
+                          </Typography>
+                          <Stack direction="row" spacing={1} alignItems="center">
+                            <AccountCircleIcon sx={{ fontSize: 20, color: "text.secondary" }} />
+                            <Typography variant="body1" fontWeight="500">
+                              {vidDetails.VID_CREATED_BY_NAME}{" "}
+                              <Typography component="span" variant="caption" color="text.secondary">
+                                ({vidDetails.VID_CREATOR_ID})
+                              </Typography>
+                            </Typography>
+                          </Stack>
+                        </Grid>
+
+                        <Grid item xs={12} sm={3}>
+                          <Typography variant="caption" color="text.secondary" display="block" gutterBottom>
+                            Created At
+                          </Typography>
+                          <Typography variant="body1" fontWeight="500">
+                            {vidDetails.VID_CREATED_AT
+                              ? new Date(vidDetails.VID_CREATED_AT).toLocaleString("en-IN", {
+                                dateStyle: "short",
+                                timeStyle: "short",
+                              })
+                              : "N/A"}
+                          </Typography>
+                        </Grid>
+                      </Grid>
+                    </Paper>
+
+                    {/* SECTION 2: BATCH EXECUTION DETAILS + DOWNLOAD BUTTON */}
+                    <Paper
+                      elevation={0}
+                      sx={{
+                        p: 3,
+                        borderRadius: 2,
+                        width: "100%",
+                        border: "1px solid",
+                        borderColor: "divider",
+                        display: "flex",
+                        flexDirection: "column",
+                      }}
+                    >
+                      <Typography
+                        variant="subtitle1"
+                        fontWeight="bold"
+                        color="text.primary"
+                        gutterBottom
+                        sx={{
+                          borderBottom: "1px solid",
+                          borderColor: "divider",
+                          pb: 1,
+                          mb: 2,
+                        }}
+                      >
+                        Voucher Details
+                      </Typography>
+
+                      <Grid container spacing={3} alignItems="center">
+                        <Grid item xs={12} sm={3}>
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                            display="block"
+                            gutterBottom
+                          >
+                            Created By
+                          </Typography>
+                          <Stack
+                            direction="row"
+                            spacing={1}
+                            alignItems="center"
+                          >
+                            <AccountCircleIcon
+                              sx={{ fontSize: 20, color: "text.secondary" }}
+                            />
+                            <Typography variant="body1" fontWeight="500">
+                              {vidDetails.BATCH_CREATED_BY_NAME}{" "}
+                              <Typography
+                                component="span"
+                                variant="caption"
+                                color="text.secondary"
+                              >
+                                ({vidDetails.BATCH_CREATOR_ID})
+                              </Typography>
+                            </Typography>
+                          </Stack>
+                        </Grid>
+
+                        <Grid item xs={12} sm={2}>
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                            display="block"
+                            gutterBottom
+                          >
+                            Created At
+                          </Typography>
+                          <Typography variant="body1" fontWeight="500">
+                            {vidDetails.BATCH_CREATED_AT
+                              ? new Date(
+                                vidDetails.BATCH_CREATED_AT
+                              ).toLocaleString("en-IN", {
+                                dateStyle: "short",
+                                timeStyle: "short",
+                              })
+                              : "N/A"}
+                          </Typography>
+                        </Grid>
+
+                        <Grid item xs={12} sm={2}>
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                            display="block"
+                            gutterBottom
+                          >
+                            No. of Entries
+                          </Typography>
+                          <Typography
+                            variant="body1"
+                            fontWeight="600"
+                            color="primary.main"
+                          >
+                            {viewingBatch?.requestCount || 0}
+                          </Typography>
+                        </Grid>
+
+                        <Grid item xs={12} sm={3}>
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                            display="block"
+                            gutterBottom
+                          >
+                            Is Execution Scheduled?
+                          </Typography>
+                          <Typography
+                            variant="body1"
+                            fontWeight="500"
+                            color={
+                              vidDetails.SCHEDULED_TIME
+                                ? "info.main"
+                                : "text.primary"
+                            }
+                          >
+                            {vidDetails.SCHEDULED_TIME
+                              ? `Yes (${new Date(
+                                vidDetails.SCHEDULED_TIME
+                              ).toLocaleString("en-IN", {
+                                dateStyle: "short",
+                                timeStyle: "short",
+                              })})`
+                              : "No"}
+                          </Typography>
+                        </Grid>
+
+                        <Grid item xs={12} sm={2}>
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                            display="block"
+                            gutterBottom
+                          >
+                            Download Voucher Batch
+                          </Typography>
+                          <Button variant="outlined" size="small" startIcon={<FileDownloadIcon />} onClick={handleDownloadExcel} disabled={!viewingBatchId} sx={jaStyles.downloadBtn}>
+
+                            Download Batch
+                          </Button>
+                        </Grid>
+                      </Grid>
+                    </Paper>
+                  </Stack>
+                ) : null}
+              </Box>
+
+              {/* --- HORIZONTAL TIMELINE --- */}
+              <Box sx={jaStyles.timelineWrapper}>
+                <Typography variant="subtitle1" fontWeight="bold" color="text.primary" sx={jaStyles.timelineHeader}>
+                  Workflow Progress
+                </Typography>
+                {viewingBatchState === "REJECTED" ? (
+                  <Alert severity="error" variant="filled" sx={jaStyles.timelineErrorAlert}>
+                    This batch was REJECTED and the workflow has been
+                    terminated.
+                  </Alert>
+                ) : isFetchingSteps ? (
+                  <Box sx={jaStyles.timelineProgressBox}>
+                    <CircularProgress />
+                  </Box>
+                ) : dynamicSteps.length > 0 ? (
+                  <Stepper
+                    activeStep={
+                      viewingBatchState === "POSTED" ||
+                        viewingBatchState === "SCHEDULED" ||
+                        viewingBatchState === "APPROVED" ||
+                        viewingBatchState === "C" ||
+                        viewingBatchState === "S"
+                        ? dynamicSteps.length
+                        : viewingBatchOrder - 1
+                    }
+                    alternativeLabel
+                    connector={<BigConnector />}
+                  >
+                    {dynamicSteps.map((step, index) => {
+                      const isFullyDone =
+                        viewingBatchState === "POSTED" ||
+                        viewingBatchState === "SCHEDULED" ||
+                        viewingBatchState === "APPROVED" ||
+                        viewingBatchState === "C" ||
+                        viewingBatchState === "S";
+                      const activeStepIndex = isFullyDone
+                        ? dynamicSteps.length
+                        : viewingBatchOrder - 1;
+                      const isCompleted = index < activeStepIndex;
+                      const isCurrent = index === activeStepIndex;
+
+                      const escalationHours =
+                        viewingBatch?.escalationTime || 24;
+                      const hoursPending = viewingBatch
+                        ? Math.abs(
+                          new Date() - new Date(viewingBatch.requestDate)
+                        ) / 36e5
+                        : 0;
+                      const isEscalated =
+                        viewingBatchState !== "REJECTED" &&
+                        activeStepIndex < dynamicSteps.length &&
+                        hoursPending > escalationHours;
+
+                      let statusFlag = "PENDING";
+                      if (isCompleted) statusFlag = "COMPLETED";
+                      if (isCurrent && viewingBatchState === "REJECTED")
+                        statusFlag = "REJECTED";
+                      else if (isCurrent && isEscalated)
+                        statusFlag = "ESCALATED";
+                      else if (isCurrent) statusFlag = "ACTIVE";
+
+                      // Grab the matching history item to identify who performed this step
+                      const historyItem = workflowHistory[index];
+                      const executorStr = historyItem ? `${historyItem.ACTION_USER_NAME} (${historyItem.LAST_ACTION_BY})` : null;
+
+
+
+                      return (
+                        <Step key={step.state} completed={isCompleted} active={isCurrent} sx={jaStyles.miniStep(viewingBatchState === "REJECTED", index, activeStepIndex)}>
+
+                          <StepLabel
+                            StepIconComponent={() => (
+                              <BigWorkflowIcon
+                                statusFlag={statusFlag}
+                                label={step.designation}
+                              />
+                            )}
+                          >
+                            <Chip label={getRoleDisplayName(step.role)} size="small" variant={isCurrent ? "filled" : "outlined"} color={isCurrent ? "primary" : "default"} sx={jaStyles.timelineChip} />
+                            {/* NEW: Show the user who completed the step */}
+                            {(isCompleted || (isCurrent && viewingBatchState === "REJECTED")) && historyItem && (
+                              <Stack direction="row" alignItems="center" justifyContent="center" spacing={0.5} sx={{ mt: 0.5 }}>
+                                {statusFlag === 'REJECTED' && <CloseIcon sx={{ fontSize: 14, color: "error.main" }} />}
+                                <Typography variant="caption" display="block" color={statusFlag === 'REJECTED' ? "error.main" : "success.main"} sx={{ fontWeight: "bold" }}>
+                                  {executorStr}
+                                </Typography>
+                              </Stack>
+                            )}
+
+                            {isCurrent && viewingBatchState !== "REJECTED" && (
+                              <Typography variant="caption" display="block" color={isEscalated ? "warning.main" : "text.secondary"} fontWeight="bold" sx={jaStyles.timelinePendingText}>
+
+                                Pending:{" "}
+                                {calculateTimeElapsed(
+                                  viewingBatch?.requestDate
+                                )}
+                              </Typography>
+                            )}
+                          </StepLabel>
+                        </Step>
+                      );
+                    })}
+                  </Stepper>
+                ) : (
+                  <Alert severity="info" sx={jaStyles.timelineInfoAlert}>
+                    Workflow configuration not found.
+                  </Alert>
+                )}
+              </Box>
+
+              {/* --- WORKFLOW HISTORY --- */}
+              <Box
+                sx={{ p: 4, borderTop: "1px solid", borderColor: "divider" }}
+              >
+                {isFetchingSteps ? (
+                  <Box sx={jaStyles.historyProgressBox}>
+                    <CircularProgress size={24} />
+                  </Box>
+                ) : (
+                  <>
+                    <Typography variant="subtitle1" fontWeight="bold" color="text.primary" sx={jaStyles.timelineHeader}>
+                      Workflow History ({workflowHistory.length})
+                    </Typography>
+
+                    <Stack spacing={2.5}>
+                      {workflowHistory.map((history, idx) => {
+                        const isSystem = history.LAST_ACTION_BY === "SYSTEM";
+                        const userName = history.ACTION_USER_NAME || "User";
+                        const initial = userName.charAt(0).toUpperCase();
+                        const isOverrideAction =
+                          history.LAST_ACTION?.toUpperCase().includes(
+                            "OVERRIDE"
+                          );
+                        const isExecutionFail = history.LAST_ACTION?.toUpperCase().includes("FAILED");
+
+                        return (
+                          <Box key={idx} sx={jaStyles.historyRowBox}>
+                            <Box>
+                              <Avatar sx={jaStyles.historyAvatar}>
+                                {initial}
+                              </Avatar>
+                            </Box>
+                            <Box sx={jaStyles.historyCard}>
+                              <Box sx={jaStyles.historyHeaderBox}>
+                                <Typography variant="subtitle2" fontWeight="bold" color="text.primary">
+                                  {/* Shows System or User (ID) */}
+                                  {userName} {isSystem ? "" : `(${history.LAST_ACTION_BY})`}
+                                </Typography>
+                                <Typography variant="caption" color="text.secondary">
+                                  • {new Date(history.LAST_ACTION_AT).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}
+                                </Typography>
+                              </Box>
+
+                              <Stack direction="row" spacing={1} alignItems="center" sx={jaStyles.historyActionStack}>
+                                {/* Extracted just the first word using .split(" ")[0] */}
+                                <Chip label={(history.LAST_ACTION || "System Action").split(" ")[0]} size="small" sx={jaStyles.historyActionChip(history.LAST_ACTION?.includes("Reject"))} />
+
+
+                                {history.SCHEDULED_TIME && (
+                                  <Chip
+                                    label={
+                                      isOverrideAction
+                                        ? `Schedule Overridden to: ${new Date(
+                                          history.SCHEDULED_TIME
+                                        ).toLocaleString("en-IN", {
+                                          dateStyle: "short",
+                                          timeStyle: "short",
+                                        })}`
+                                        : `Scheduled for: ${new Date(
+                                          history.SCHEDULED_TIME
+                                        ).toLocaleString("en-IN", {
+                                          dateStyle: "short",
+                                          timeStyle: "short",
+                                        })}`
+                                    }
+                                    size="small"
+                                    color={
+                                      isOverrideAction ? "warning" : "info"
+                                    }
+                                    variant="outlined"
+                                    sx={jaStyles.historySchedChip}
+                                  />
+                                )}
+                              </Stack>
+
+                              <Typography
+                                variant="body2"
+                                color="text.primary"
+                                sx={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}
+                              >
+                                {history.REMARKS || "Voucher Batch Created."}
+                              </Typography>
+                            </Box>
+                          </Box>
+                        );
+                      })}
+                    </Stack>
+                  </>
+                )}
+              </Box>
+            </Box>
+
+            {/* --- STATE 2: UNIVERSAL ACTION SCREEN --- */}
+            {/* ADDED: flexGrow: 1 and overflowY: auto so it fills the 75vh box perfectly */}
+            {isActionMode && (
+              <Box sx={jaStyles.actionScreenBox}>
+                <Typography variant="h5" fontWeight="bold" gutterBottom>
+                  Process Workflow Action
+                </Typography>
+                <Typography
+                  variant="body1"
+                  color="text.secondary"
+                  textAlign="center"
+                  sx={jaStyles.actionSubtitle}
+                >
+                  You are reviewing Batch <strong>{viewingBatchId}</strong>.
+                  Please select your decision and provide remarks below.
+                </Typography>
+
+                {/* ADDED: minHeight: 480 prevents the card from collapsing when "Reject" hides the scheduling inputs */}
+                <Paper elevation={0} sx={jaStyles.actionCard}>
+                  {/* 1. DECISION TOGGLE */}
+                  <Typography variant="subtitle2" fontWeight="bold" color="text.primary" gutterBottom>
+                    Decision <Typography component="span" color="error">*</Typography>
+                  </Typography>
+
+                  <Grid container spacing={2} sx={{ mb: 3 }}>
+                    <Grid item size={{ lg: 6, md: 6 }}>
+                      <Box
+                        onClick={() => setActionSelection("ACCEPTED")}
+                        sx={{
+                          p: 2, border: "2px solid", borderRadius: 2, cursor: "pointer", transition: "all 0.2s",
+                          borderColor: actionSelection === "ACCEPTED" ? "success.main" : "divider",
+                          backgroundColor: actionSelection === "ACCEPTED" ? "success.50" : "transparent",
+                          display: "flex", alignItems: "center", gap: 1.5,
+                          "&:hover": { borderColor: actionSelection !== "ACCEPTED" ? "success.light" : "success.main" }
+                        }}
+                      >
+                        <CheckIcon color={actionSelection === "ACCEPTED" ? "success" : "action"} />
+                        <Box>
+                          <Typography fontWeight="bold" color={actionSelection === "ACCEPTED" ? "success.main" : "text.primary"}>
+                            Approve Request
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary">Move to next stage</Typography>
+                        </Box>
+                      </Box>
+                    </Grid>
+                    <Grid item size={{ lg: 6, md: 6 }}>
+                      <Box
+                        onClick={() => setActionSelection("REJECTED")}
+                        sx={{
+                          p: 2, border: "2px solid", borderRadius: 2, cursor: "pointer", transition: "all 0.2s",
+                          borderColor: actionSelection === "REJECTED" ? "error.main" : "divider",
+                          backgroundColor: actionSelection === "REJECTED" ? "error.50" : "transparent",
+                          display: "flex", alignItems: "center", gap: 1.5,
+                          "&:hover": { borderColor: actionSelection !== "REJECTED" ? "error.light" : "error.main" }
+                        }}
+                      >
+                        <CloseIcon color={actionSelection === "REJECTED" ? "error" : "action"} />
+                        <Box>
+                          <Typography fontWeight="bold" color={actionSelection === "REJECTED" ? "error.main" : "text.primary"}>
+                            Reject Request
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary">Terminate workflow</Typography>
+                        </Box>
+                      </Box>
+                    </Grid>
+                  </Grid>
+
+                  {/* 2. REMARKS INPUT */}
+                  <Typography
+                    variant="subtitle2"
+                    fontWeight="bold"
+                    color="text.primary"
+                    gutterBottom
+                  >
+                    Action Remarks{" "}
+                    <Typography component="span" color="error">
+                      *
+                    </Typography>
+                  </Typography>
+                  <TextField
+                    fullWidth
+                    multiline
+                    rows={1}
+                    placeholder="Enter compulsory remarks here (2-30 chars)..."
+                    value={executorRemarks}
+                    onChange={(e) => handleRemarksChange(e, setExecutorRemarks)}
+                    disabled={isSubmitting}
+                    error={
+                      executorRemarks.length > 0 &&
+                      !isRemarksValid(executorRemarks)
+                    }
+                    helperText={
+                      executorRemarks.length > 0 &&
+                        !isRemarksValid(executorRemarks)
+                        ? "Remarks must be 2-30 alphanumeric characters."
+                        : " "
+                    }
+                    sx={jaStyles.actionTextField}
+                  />
+
+                  {/* 3. CONDITIONAL SCHEDULING (FINAL APPROVAL ONLY) */}
+                  {viewingBatch?.isFinalApproval === "Y" && (
+                    <Box sx={jaStyles.routingBoxWrapper}>
+                      <Typography
+                        variant="subtitle2"
+                        fontWeight="bold"
+                        color="text.primary"
+                        gutterBottom
+                        sx={{ pt: "3px" }}
+                      >
+                        Final Execution Routing
+                      </Typography>
+
+                      {vidDetails?.SCHEDULED_TIME && new Date(vidDetails.SCHEDULED_TIME) < new Date() && actionSelection !== "REJECTED" && (
+                        <Alert
+                          variant="filled"
+                          severity="warning"
+                          sx={{
+                            mb: 4,
+                            fontSize: '1rem',
+                          }}
+                        >
+                         The original scheduled execution time has been passed. You can schedule it again otherwise voucher posting will be executed immediately on Submit/Approval.
+                        </Alert>
+                      )}
+
+                      {actionSelection === "REJECTED" ? (
+                        <Alert severity="info" sx={jaStyles.routingAlert}>
+                          Execution scheduling is not applicable for Rejected
+                          batches.
+                        </Alert>
+                      ) : (
+                        <Box sx={jaStyles.routingInnerBox}>
+                          <Box
+                            sx={{
+                              p: 2,
+                              mb: 3,
+                              backgroundColor: "#f8fafc",
+                              borderRadius: 2,
+                              borderLeft: "4px solid",
+                              borderColor: "primary.main",
+                            }}
+                          >
+                            <Typography
+                              variant="caption"
+                              color="text.secondary"
+                              fontWeight="bold"
+                              display="block"
+                            >
+                              REQUESTED BY CREATOR (
+                              {vidDetails?.BATCH_CREATED_BY_NAME})
+                            </Typography>
+                            <Typography
+                              variant="body2"
+                              fontWeight="bold"
+                              color={
+                                vidDetails?.SCHEDULED_TIME
+                                  ? "primary.main"
+                                  : "text.primary"
+                              }
+                            >
+                              {vidDetails?.SCHEDULED_TIME
+                                ? `Scheduled for: ${new Date(
+                                  vidDetails.SCHEDULED_TIME
+                                ).toLocaleString("en-IN", {
+                                  dateStyle: "long",
+                                  timeStyle: "short",
+                                })}`
+                                : "Immediate Execution"}
+                            </Typography>
+                          </Box>
+                          <Grid container spacing={2} sx={{ width: '100%', mt: 0.5, mx: 0 }}>
+                            <Grid item xs={12} md={6} sx={{ p: 0 }}>
+                              <Box
+                                onClick={() => setScheduleOverrideType("KEEP")}
+                                sx={jaStyles.overrideOption(scheduleOverrideType === "KEEP", false)}
+                              >
+                                <Box sx={jaStyles.overrideRadioBtn(scheduleOverrideType === "KEEP", false)} />
+                                <Box sx={{ minWidth: 0, flex: 1 }}>
+                                  <Typography
+                                    variant="subtitle2"
+                                    fontWeight="bold"
+                                    sx={{ whiteSpace: 'normal', wordBreak: 'break-word' }}
+                                    color={scheduleOverrideType === "KEEP" ? "success.dark" : "text.primary"}
+                                  >
+                                    Keep Original Routing
+                                  </Typography>
+                                  <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
+                                    Execute as scheduled by creator
+                                  </Typography>
+                                </Box>
+                              </Box>
+                            </Grid>
+
+                            <Grid item xs={12} md={6} sx={{ p: 0 }}>
+                              <Box
+                                onClick={() => setScheduleOverrideType("OVERRIDE")}
+                                sx={jaStyles.overrideOption(scheduleOverrideType === "OVERRIDE", true)}
+                              >
+                                <Box sx={jaStyles.overrideRadioBtn(scheduleOverrideType === "OVERRIDE", true)} />
+                                <Box sx={{ minWidth: 0, flex: 1 }}>
+                                  <Typography
+                                    variant="subtitle2"
+                                    fontWeight="bold"
+                                    sx={{ whiteSpace: 'normal', wordBreak: 'break-word' }}
+                                    color={scheduleOverrideType === "OVERRIDE" ? "warning.dark" : "text.primary"}
+                                  >
+                                    Override Schedule
+                                  </Typography>
+                                  <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
+                                    Set a new execution date & time
+                                  </Typography>
+                                </Box>
+                              </Box>
+                            </Grid>
+                          </Grid>
+                          {scheduleOverrideType === "OVERRIDE" && (
+                            <LocalizationProvider dateAdapter={AdapterDayjs}>
+                              <Box
+                                sx={{
+                                  mt: 2,
+                                  mb: 2,
+                                  p: { xs: 2, sm: 3 }, // Responsive padding to fit nicely on smaller screens
+                                  borderRadius: 2,
+                                  border: "1px solid",
+                                  borderColor: "divider",
+                                  animation: "fadeIn 0.2s ease-in-out",
+                                  backgroundColor: "white",
+                                  width: "100%",
+                                  boxSizing: "border-box", // CRITICAL: Ensures padding is calculated inside the 100% width
+                                }}
+                              >
+                                <TimePicker
+                                  label="New Execution Time (Today)"
+                                  value={finalScheduleTime ? dayjs(finalScheduleTime) : null}
+                                  onChange={(newValue) => {
+                                    setFinalScheduleTime(newValue ? newValue.format("YYYY-MM-DDTHH:mm") : "");
+                                  }}
+                                  disablePast // Visually disables all past times
+                                  minTime={dayjs().add(30, 'minute')}
+                                  maxTime={dayjs().endOf('day')}
+                                  timeSteps={{ minutes: 1 }}
+                                  slotProps={{
+                                    // CRITICAL: Forces the clock popup to open UPWARDS
+                                    popper: {
+                                      placement: "top",
+                                    },
+                                    textField: {
+                                      size: 'small',
+                                      fullWidth: true,
+                                      required: true,
+                                      sx: {
+                                        caretColor: 'transparent',
+                                        '& .MuiFormHelperText-root': {
+                                          whiteSpace: 'normal',
+                                          wordBreak: 'break-word',
+                                          marginInline: 0,
+                                          mt: 1
+                                        }
+                                      },
+                                      helperText: "Execution must be scheduled at least 30 mins from now, and before 11:59 PM today.",
+                                      onKeyDown: (e) => e.preventDefault(),
+                                      onPaste: (e) => e.preventDefault(),
+                                      inputProps: { readOnly: true }
+                                    }
+                                  }}
+                                />
+                              </Box>
+                            </LocalizationProvider>
+                          )}
+
+                        </Box>
+                      )}
+                    </Box>
+                  )}
+                </Paper>
+              </Box>
+            )}
+          </DialogContent>
+          {/* --- STICKY BOTTOM ACTION BAR --- */}
+          <DialogActions sx={jaStyles.stickyBottomBar}>
+            {(() => {
+              const isWorkflowFinished =
+                viewingBatchState === "POSTED" ||
+                viewingBatchState === "SCHEDULED" ||
+                viewingBatchState === "APPROVED" ||
+                viewingBatchState === "REJECTED";
+              const isActionDisabled =
+                isViewingSelfCreated || isWorkflowFinished;
+
+              return (
+                <>
+                  <Box sx={jaStyles.flexGrowBox}>
+                    {isViewingSelfCreated && !isWorkflowFinished && (
+                      <Typography
+                        variant="body2"
+                        color="error.main"
+                        fontWeight="bold"
+                      >
+                        * Security Violation: You cannot approve or reject your
+                        own request.
+                      </Typography>
+                    )}
+                    {isWorkflowFinished && (
+                      <Typography
+                        variant="body2"
+                        color="text.secondary"
+                        fontWeight="bold"
+                      >
+                        * Workflow processing is complete for this batch.
+                      </Typography>
+                    )}
+                  </Box>
+
+                  <Stack direction="row" spacing={2} alignItems="center">
+                    {!isActionMode ? (
+                      <Button
+                        variant="contained"
+                        color="primary"
+                        disabled={isActionDisabled}
+                        onClick={handleProceed}
+                        sx={jaStyles.proceedBtn}
+                      >
+                        Proceed to Action
+                      </Button>
+                    ) : (
+                      <>
+                        <Button onClick={() => setIsActionMode(false)} sx={jaStyles.backBtn} disabled={isSubmitting}>
+
+                          Back to Details
+                        </Button>
+                        <Button
+                          variant="contained"
+                          color={
+                            actionSelection === "ACCEPTED" ? "success" : "error"
+                          }
+                          disabled={
+                            !actionSelection ||
+                            !isRemarksValid(executorRemarks) ||
+                            isSubmitting ||
+                            (actionSelection === "ACCEPTED" &&
+                              viewingBatch?.isFinalApproval === "Y" &&
+                              scheduleOverrideType === "OVERRIDE" &&
+                              !finalScheduleTime)
+                          }
+                          onClick={() => {
+                            const isOverriding =
+                              actionSelection === "ACCEPTED" &&
+                              viewingBatch?.isFinalApproval === "Y" &&
+                              scheduleOverrideType === "OVERRIDE";
+                            handleSubmitAction(actionSelection, isOverriding);
+                          }}
+                          sx={jaStyles.proceedBtn}
+                        >
+                          {isSubmitting ? (
+                            <CircularProgress size={20} color="inherit" />
+                          ) : (
+                            "Confirm & Submit"
+                          )}
+                        </Button>
+                      </>
+                    )}
+                  </Stack>
+                </>
+              );
+            })()}
+          </DialogActions>
+        </Dialog>
+      </Box>
+    </Paper>
+  );
+}
+
+
+
+
+1) in this what ever Selected Voucher Details are there we are showing Description in that it is around 500 char we need to show that on click
+
+2)
+and one more thing is for branch and cgl 
+
+ noOptionsText="Min 3 Digits Required Search" i added this in that but now the problem is 
+ when i search and then click on that it show the histroy type last data but i want that it should that only -> noOptionsText="Min 3 Digits Required Search"
+ for cgl , and branch
+ 
+ 3) the dates or time which we are showing 
+ for Is Execution Scheduled?
+ Created At
+Scheduled for
+ 
+ that all should be same format -> like this  19 Jun 2026, 12:58 pm this is how we are showing in the submitted on
