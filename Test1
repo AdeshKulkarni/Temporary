@@ -1,119 +1,63 @@
-I know exactly why this happened. This is a notorious Spring Boot "gotcha."
-
-When we deleted the Oracle configuration but kept the `HiveDbConfig` (which creates a `DataSource`), Spring Boot's internal safety rules kicked in. **If Spring Boot detects even one manually created `DataSource` (like our Hive one), it completely disables all of its automatic database configurations.** Because of this, it completely ignored your Oracle properties and never created the `oracleJdbcTemplate`.
-
-When an application has multiple databases, you cannot mix "automatic" and "manual." You must manually define both, but you must do it using Spring's native `DataSourceProperties` so it correctly reads the URLs and the Hikari pool settings.
-
-Delete `JdbcTemplateConfig.java`. We are going to put the `oracleJdbcTemplate` exactly where it belongs, inside a fully bulletproof Oracle config file.
-
-Here is the final, complete code for your two configuration files.
-
-### 1. The Bulletproof Oracle Config
-
-Create (or replace) this file. This reads your `spring.datasource` properties, creates the Hikari pool, and exposes the exact `oracleJdbcTemplate` your services are looking for.
-
-**File:** `src/main/java/com/fincore/VoucherService/config/OracleDbConfig.java`
-
+Yes, we can drastically reduce the loading time.
+Right now, your application is fetching the data **sequentially**. It waits for Branches to finish downloading, then starts downloading Currencies, and then starts downloading CGLs.
+If CGL takes 5 seconds, Branch takes 2 seconds, and Currency takes 1 second, your total load time is **8 seconds**.
+To make this lightning fast, we can use Java's CompletableFuture to run all three database queries **in parallel** on separate CPU threads. This means the total load time will drop to just the time of the longest query (5 seconds instead of 8).
+Here is the exact code to implement parallel loading in your ValidationMasterService.
+### 1. The Parallel Loading Code
+Update your refreshMasterData() method to look like this:
 ```java
-package com.fincore.VoucherService.config;
+    import java.util.concurrent.CompletableFuture;
 
-import com.zaxxer.hikari.HikariDataSource;
-import org.springframework.boot.autoconfigure.jdbc.DataSourceProperties;
-import org.springframework.boot.context.properties.ConfigurationProperties;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.context.annotation.Primary;
-import org.springframework.jdbc.core.JdbcTemplate;
-import javax.sql.DataSource;
+    public void refreshMasterData() {
+        log.info("MASTER_DATA_SYNC | Starting PARALLEL fetch from Oracle...");
+        long startTime = System.currentTimeMillis();
 
-@Configuration
-public class OracleDbConfig {
+        try {
+            // 1. Fire all three queries at the exact same time on background threads
+            CompletableFuture<List<String>> branchFuture = CompletableFuture.supplyAsync(() -> 
+                oracleJdbcTemplate.query("SELECT CODE FROM BRANCH_MASTER WHERE STATUS = 1", 
+                (rs, rowNum) -> rs.getString(1))
+            );
 
-    // 1. Let Spring safely parse the standard URL and credentials
-    @Primary
-    @Bean
-    @ConfigurationProperties("spring.datasource")
-    public DataSourceProperties oracleDataSourceProperties() {
-        return new DataSourceProperties();
+            CompletableFuture<List<String>> currencyFuture = CompletableFuture.supplyAsync(() -> 
+                oracleJdbcTemplate.query("SELECT CURRENCY_CODE FROM CURRENCY_MASTER WHERE FLAG = 1", 
+                (rs, rowNum) -> rs.getString(1))
+            );
+
+            CompletableFuture<List<String>> cglFuture = CompletableFuture.supplyAsync(() -> 
+                oracleJdbcTemplate.query("SELECT CGL_NUMBER FROM CGL_MASTER WHERE STATUS = 1", 
+                (rs, rowNum) -> rs.getString(1))
+            );
+
+            // 2. Wait for all of them to finish
+            CompletableFuture.allOf(branchFuture, currencyFuture, cglFuture).join();
+
+            // 3. Extract the data and perform the atomic nanosecond pointer swap
+            this.activeBranches = new HashSet<>(branchFuture.get());
+            this.activeCurrencies = new HashSet<>(currencyFuture.get());
+            this.activeCgls = new HashSet<>(cglFuture.get());
+
+            long duration = System.currentTimeMillis() - startTime;
+            log.info("MASTER_DATA_SYNC_SUCCESS | Loaded in {} ms. CGLs: {} | Branches: {} | Currencies: {}", 
+                    duration, this.activeCgls.size(), this.activeBranches.size(), this.activeCurrencies.size());
+
+        } catch (Exception e) {
+            log.error("MASTER_DATA_SYNC_FAIL | Retaining old RAM cache. Error: {}", e.getMessage());
+        }
     }
-
-    // 2. Feed those parsed properties into a strict Hikari Pool
-    @Primary
-    @Bean(name = "oracleDataSource")
-    @ConfigurationProperties("spring.datasource.hikari")
-    public HikariDataSource oracleDataSource(DataSourceProperties properties) {
-        return properties.initializeDataSourceBuilder().type(HikariDataSource.class).build();
-    }
-
-    // 3. Create the exact JdbcTemplate your services are asking for
-    @Primary
-    @Bean(name = "oracleJdbcTemplate")
-    public JdbcTemplate oracleJdbcTemplate(DataSource oracleDataSource) {
-        return new JdbcTemplate(oracleDataSource);
-    }
-}
 
 ```
-
-### 2. The Bulletproof Hive Config
-
-Replace the contents of your `HiveDbConfig.java` with this. It does the exact same thing but for your secondary Data Lake.
-
-**File:** `src/main/java/com/fincore/VoucherService/config/HiveDbConfig.java`
-
-```java
-package com.fincore.VoucherService.config;
-
-import com.zaxxer.hikari.HikariDataSource;
-import org.springframework.boot.autoconfigure.jdbc.DataSourceProperties;
-import org.springframework.boot.context.properties.ConfigurationProperties;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.jdbc.core.JdbcTemplate;
-import javax.sql.DataSource;
-
-@Configuration
-public class HiveDbConfig {
-
-    @Bean
-    @ConfigurationProperties("spring.hive.datasource")
-    public DataSourceProperties hiveDataSourceProperties() {
-        return new DataSourceProperties();
-    }
-
-    @Bean(name = "hiveDataSource")
-    @ConfigurationProperties("spring.hive.datasource.hikari")
-    public HikariDataSource hiveDataSource(DataSourceProperties properties) {
-        return properties.initializeDataSourceBuilder().type(HikariDataSource.class).build();
-    }
-    
-    // Optional: Expose a Hive JdbcTemplate just in case your HdfsSyncService needs it
-    @Bean(name = "hiveJdbcTemplate")
-    public JdbcTemplate hiveJdbcTemplate(DataSource hiveDataSource) {
-        return new JdbcTemplate(hiveDataSource);
-    }
-}
+### 2. Database Level (Covering Indexes)
+To make the actual Oracle execution instant, you must ensure you have **Covering Indexes** on those tables. If you only have a standard index, Oracle still has to read the table data. A covering index puts the specific data you requested directly into the index tree, meaning Oracle never even touches the actual table.
+If you have access to run SQL on your Oracle database, ask your DBA to apply these exact indexes. It will force Oracle to use an "Index Fast Full Scan," which takes milliseconds.
+```sql
+-- Creates covering indexes so Oracle only reads the B-Tree, bypassing the table completely
+CREATE INDEX IDX_BRANCH_STATUS_CODE ON BRANCH_MASTER (STATUS, CODE);
+CREATE INDEX IDX_CURRENCY_FLAG_CODE ON CURRENCY_MASTER (FLAG, CURRENCY_CODE);
+CREATE INDEX IDX_CGL_STATUS_NUMBER ON CGL_MASTER (STATUS, CGL_NUMBER);
 
 ```
-
-### 3. Verify Properties
-
-Because this Java code perfectly utilizes Spring's native parser, your `application.properties` must use the standard `.url` format (not `.jdbc-url`).
-
-Make sure your connection strings look exactly like this:
-
-```properties
-# --- ORACLE ---
-spring.datasource.url=jdbc:oracle:thin:@10.177.103.192:1523/fincorepdb1
-spring.datasource.username=thefd
-spring.datasource.password=sdfsf#sdf
-spring.datasource.driver-class-name=oracle.jdbc.OracleDriver
-
-# --- HIVE ---
-spring.hive.datasource.url=jdbc:hive2://localhost:10000/fincoredatalakejournal
-spring.hive.datasource.username=spark
-spring.hive.datasource.driver-class-name=org.apache.hive.jdbc.HiveDriver
-
-```
-
-Compile and run. The `UnsatisfiedDependencyException` will instantly disappear because the `oracleJdbcTemplate` is now properly generated and injected into your `VoucherWorkflowEngine` and `ValidationMasterService`.
+### 3. Increase Fetch Size
+In your provided code, you were using ps.setFetchSize(2000). If you are pulling over 50,000 CGLs, that is still 25 network round trips.
+Because we are only fetching a single String column (which takes almost zero memory), you can safely increase the fetch size for this specific query to **10,000**. This will pull 10,000 rows in a single network packet, drastically cutting down the network latency between your server and Oracle.
+Combine these three techniques (Parallel Threads + Covering Indexes + Larger Fetch Size), and your master data will reload in the blink of an eye.
