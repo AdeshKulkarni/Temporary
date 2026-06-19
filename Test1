@@ -1,149 +1,71 @@
-Here is the exact, end-to-end roadmap of every file you need to change across your backend and frontend to replace the "Total Time" with the new "Time Since Last Action" calculation.
-### 1. Backend: The Repository
-**File:** src/main/java/com/fincore/VoucherService/Repository/VoucherWorkflowRepository.java
-Add the specialized query method to fetch only the most recent action.
+You are absolutely right. I used a generic name (PendingBatchDTO) because every project names that file a little differently, but it is very common in Spring Boot applications to simply return the database Entity directly instead of using a DTO at all.
+If you cannot find a DTO file, you are likely passing the main database Entity (probably RequestVoucher or whatever entity represents your batch/journal) straight to the frontend.
+Here is the foolproof way to find exactly where to put this code, and how to do it without breaking your Oracle database.
+### Step 1: Find the right file (The @Transient trick)
+Go into your React frontend code and look at the API URL you call to get the pending list (for example, /JS/voucher/pending).
+Search your Java project for that URL to find the **Controller**, and look at what type of list it returns.
+If it returns something like List<RequestVoucher> or List<JournalBatch>, open that Entity class. You can add the new field directly to the Entity, but you **must** use the @Transient annotation.
+**File:** src/main/java/com/fincore/VoucherService/Models/RequestVoucher.java (or whichever entity you found)
 ```java
-package com.fincore.VoucherService.Repository;
+import jakarta.persistence.Transient;
 
-import com.fincore.VoucherService.Models.VoucherWorkflow;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.stereotype.Repository;
+// ... inside your Entity class ...
 
-import java.util.List;
-import java.util.Optional;
+    // @Transient tells Hibernate: "Do NOT look for this column in the Oracle database. 
+    // Just hold this data in memory so I can send it to the React frontend."
+    @Transient
+    private String timeSinceLastAction;
 
-@Repository
-public interface VoucherWorkflowRepository extends JpaRepository<VoucherWorkflow, Long> {
-    
-    List<VoucherWorkflow> findByBatchIdFkOrderByLastActionAtAsc(String batchIdFk);
+    public String getTimeSinceLastAction() {
+        return timeSinceLastAction;
+    }
 
-    // ADD THIS EXACT LINE
-    Optional<VoucherWorkflow> findTopByBatchIdFkOrderByLastActionAtDesc(String batchIdFk);
-}
+    public void setTimeSinceLastAction(String timeSinceLastAction) {
+        this.timeSinceLastAction = timeSinceLastAction;
+    }
 
 ```
-### 2. Backend: The Data Transfer Object (DTO)
-**File:** Wherever your response DTO for the pending list is stored (e.g., PendingBatchDTO.java or VoucherSummaryResponse.java).
-You need to add a new String field to hold the calculated time so it can be sent to the frontend.
-```java
-// Inside your DTO class
-private String timeSinceLastAction; // Add this field
-
-// Add getter and setter
-public String getTimeSinceLastAction() {
-    return timeSinceLastAction;
-}
-
-public void setTimeSinceLastAction(String timeSinceLastAction) {
-    this.timeSinceLastAction = timeSinceLastAction;
-}
-
-```
-### 3. Backend: The Service Layer (The API Logic)
-**File:** The Service class that fetches the pending list (e.g., VoucherQueryService.java or VoucherWorkflowService.java).
-This is where you calculate the time and attach it to the DTO before sending it to the frontend.
+### Step 2: Inject the math into your Service
+Now, find the Service method that gets called by that Controller (e.g., getPendingVouchers()).
+Since you are returning a list of entities, you just loop through them, run the calculation, and use that new setter before returning the list to the Controller.
+**File:** Your Service class (e.g., VoucherQueryService.java)
 ```java
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.Optional;
 
-// ... inside your service class ...
+// ... inside your Service class ...
 
-@Autowired
-private VoucherWorkflowRepository workflowRepository;
+    @Autowired
+    private VoucherWorkflowRepository workflowRepository;
 
-// 1. Add this private helper method to do the math
-private String calculateTimeSinceLastAction(String batchId) {
-    Optional<VoucherWorkflow> latestAction = 
-        workflowRepository.findTopByBatchIdFkOrderByLastActionAtDesc(batchId);
+    // 1. The helper method
+    private String calculateTimeSinceLastAction(String batchId) {
+        Optional<VoucherWorkflow> latestAction = 
+            workflowRepository.findTopByBatchIdFkOrderByLastActionAtDesc(batchId);
 
-    if (latestAction.isEmpty() || latestAction.get().getLastActionAt() == null) {
-        return "0h 0m";
+        if (latestAction.isEmpty() || latestAction.get().getLastActionAt() == null) {
+            return "0h 0m";
+        }
+
+        Duration duration = Duration.between(latestAction.get().getLastActionAt(), LocalDateTime.now());
+        return duration.toHours() + "h " + duration.toMinutesPart() + "m";
     }
 
-    Duration duration = Duration.between(latestAction.get().getLastActionAt(), LocalDateTime.now());
-    return duration.toHours() + "h " + duration.toMinutesPart() + "m";
-}
-
-// 2. Update your existing API method that gets the pending list
-public List<PendingBatchDTO> getPendingBatchesForUser(Long roleId) {
-    // ... your existing code that fetches the batches ...
-    List<PendingBatchDTO> responseList = new ArrayList<>();
-
-    for (Batch batch : pendingBatches) {
-        PendingBatchDTO dto = new PendingBatchDTO();
-        // ... set other properties (id, amount, creator, etc.) ...
+    // 2. Inside your existing method that gets the pending list:
+    public List<RequestVoucher> getPendingList(Long roleId) {
+        // ... your existing code that fetches 'pendingList' from the database ...
         
-        // ADD THIS LINE: Call the helper method and set the value
-        dto.setTimeSinceLastAction(calculateTimeSinceLastAction(batch.getBatchId()));
+        // Loop through the list and attach the calculated time
+        for (RequestVoucher req : pendingList) {
+            String time = calculateTimeSinceLastAction(req.getBatchId());
+            req.setTimeSinceLastAction(time); 
+        }
         
-        responseList.add(dto);
-    }
-    
-    return responseList;
-}
-public String getPendingTimeSinceLastAction(String batchId) {
-    // 1. Fetch the most recent action for this batch
-    Optional<VoucherWorkflow> latestActionOpt = 
-        voucherWorkflowRepository.findTopByBatchIdFkOrderByLastActionAtDesc(batchId);
-
-    // 2. If no actions exist yet, the pending time is 0 (or you can fallback to batch creation time)
-    if (latestActionOpt.isEmpty() || latestActionOpt.get().getLastActionAt() == null) {
-        return "0h 0m"; 
+        return pendingList;
     }
 
-    // 3. Get the timestamps
-    LocalDateTime lastActionTime = latestActionOpt.get().getLastActionAt();
-    LocalDateTime currentTime = LocalDateTime.now();
-
-    // 4. Calculate the duration between the last action and right now
-    Duration duration = Duration.between(lastActionTime, currentTime);
-
-    // 5. Format the output cleanly (e.g., "2h 15m")
-    long hours = duration.toHours();
-    long minutes = duration.toMinutesPart(); // Gets the remaining minutes after hours are extracted
-
-    return hours + "h " + minutes + "m";
-}
-
 ```
-### 4. Frontend: The React Component
-**File:** Your React file that displays the Pending Data Table (e.g., PendingApprovals.jsx or VoucherInbox.jsx).
-Update the table column that currently shows the old "Total Time" to map to the new timeSinceLastAction key coming from the JSON response.
-**If using standard MUI <Table>:**
-```javascript
-{/* Inside your TableHead */}
-<TableCell sx={{ fontWeight: 'bold' }}>Pending Time (Since Last Action)</TableCell>
-
-{/* Inside your TableBody mapping over the rows */}
-<TableCell>
-    <Chip 
-        label={row.timeSinceLastAction || "0h 0m"} 
-        color="warning" 
-        size="small" 
-        variant="outlined" 
-    />
-</TableCell>
-
-```
-**If using MUI <DataGrid>:**
-Update the columns definition array to point to the new field.
-```javascript
-const columns = [
-  // ... other columns ...
-  {
-    field: 'timeSinceLastAction', // Must exactly match the Java DTO variable name
-    headerName: 'Pending Time',
-    width: 150,
-    renderCell: (params) => (
-      <Chip 
-        label={params.value || "0h 0m"} 
-        color="warning" 
-        size="small" 
-        variant="outlined" 
-      />
-    )
-  }
-];
-
-```
+### Step 3: The React Frontend
+Because you used @Transient and the setter in the Service, Spring Boot will automatically include "timeSinceLastAction": "2h 15m" in the JSON it sends to your React app.
+You just need to update your table column to read row.timeSinceLastAction exactly as shown in the previous frontend snippet!
