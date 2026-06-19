@@ -1,185 +1,277 @@
-Here are the exact code replacements to bring your **Status Screen** perfectly in sync with the Authorization screen.
-### 1. Add dayjs Import & the Date Helper Function
-At the very top of your file, add the dayjs import:
-```javascript
-import dayjs from "dayjs";
+package com.fincore.VoucherService.Service.validation;
 
-```
-Then, right below your calculateTimeElapsed function (around line 224), add the helper function:
-```javascript
-const formatDateTime = (dateVal) => {
-  if (!dateVal) return "N/A";
-  return dayjs(dateVal).format("DD MMM YYYY, hh:mm a").toLowerCase();
-};
 
-```
-### 2. Update Date Formats in the Table Columns
-**Find this block (inside your columns array for "Submitted On"):**
-```javascript
-    {
-      field: "requestDate",
-      headerName: "Submitted On",
-      width: 200,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: true,
-      sortable: false,
-      renderCell: (p) =>
-        new Date(p.value).toLocaleString("en-IN", {
-          dateStyle: "medium",
-          timeStyle: "short",
-        }),
-    },
+import com.fincore.VoucherService.Dto.ExcelRowData;
+import com.fincore.VoucherService.Service.ValidationMasterService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
 
-```
-**Replace it with:**
-```javascript
-    {
-      field: "requestDate",
-      headerName: "Submitted On",
-      width: 200,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: true,
-      sortable: false,
-      renderCell: (p) => formatDateTime(p.value),
-    },
+import java.math.BigDecimal;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 
-```
-### 3. Update Date Formats in the Header Cards
-**Find these three specific lines in your SECTION 1 & 2 blocks (inside the View Modal):**
-**A. VID Created At**
-```javascript
-// Replace this:
-{vidDetails.VID_CREATED_AT ? new Date(vidDetails.VID_CREATED_AT).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" }) : "N/A"}
+@Service
+public class VoucherRuleValidator {
 
-// With this:
-{formatDateTime(vidDetails.VID_CREATED_AT)}
+    @Autowired
+    private final ValidationMasterService validationMasterService;
 
-```
-**B. Batch Created At**
-```javascript
-// Replace this:
-{vidDetails.BATCH_CREATED_AT ? new Date(vidDetails.BATCH_CREATED_AT).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" }) : "N/A"}
+    public VoucherRuleValidator(ValidationMasterService validationMasterService) {
+        this.validationMasterService = validationMasterService;
+    }
 
-// With this:
-{formatDateTime(vidDetails.BATCH_CREATED_AT)}
 
-```
-**C. Scheduled Execution**
-```javascript
-// Replace this:
-{vidDetails.SCHEDULED_TIME ? `Yes (${new Date(vidDetails.SCHEDULED_TIME).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" })})` : "No"}
+    // ==================================================================================
+    // 4. VALIDATION STAGES
+    // ==================================================================================
 
-// With this:
-{vidDetails.SCHEDULED_TIME ? `Yes (${formatDateTime(vidDetails.SCHEDULED_TIME)})` : "No"}
+    public void runFormatCheck(List<ExcelRowData> rows) {
+        rows.parallelStream().forEach(d -> {
 
-```
-### 4. Update the Stepper: Add "Pending" Text & Fix the Chip Border
-**Find this exact block inside your <Stepper> mapping in the View Modal:**
-```javascript
-                        <StepLabel StepIconComponent={() => <BigWorkflowIcon statusFlag={statusFlag} label={step.designation} />}>
+            // 1. Safely grab the value, remove all spaces, and make it uppercase
+            String rawType = (d.txnType != null) ? d.txnType.trim().toUpperCase() : "";
 
-                          <Chip
-                            label={getRoleDisplayName(step.role)}
-                            size="small"
-                            // FIX 1: If it is rejected, force it to be "outlined" so it keeps the standard grey border
-                            variant={isCurrent && statusFlag !== 'REJECTED' ? "filled" : "outlined"}
-                            color={isCurrent && statusFlag !== 'REJECTED' ? "primary" : "default"}
-                            sx={{ mt: 1, height: 22, fontSize: "0.65rem", fontWeight: "bold" }}
-                          />
+            // 2. Check the cleaned value and instantly standardize it to full words
+            if (rawType.equals("CR") || rawType.equals("CREDIT")) {
+                d.txnType = "Credit";
+            }
+            else if (rawType.equals("DR") || rawType.equals("DEBIT")) {
+                d.txnType = "Debit";
+            }
+            else {
+                synchronized(d.formatErrors) {
+                    d.formatErrors.add("Transaction type must be 'CR' or 'DR' (Case insensitive).");
+                }
+            }
 
-                          {/* FIX 2: Removed the small Cross icon and "By:" prefix for a cleaner look */}
-                          {(isCompleted || (isCurrent && viewingBatchState === "REJECTED")) && historyItem && (
-                            <Typography
-                              variant="caption"
-                              display="block"
-                              color={statusFlag === 'REJECTED' ? "error.main" : "success.main"}
-                              sx={{ mt: 0.5, fontWeight: "bold" }}
-                            >
-                              {executorStr}
-                            </Typography>
-                          )}
 
-                        </StepLabel>
+            // Amount
+            if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) <= 0) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Amount must be greater than 0."); }
+            } else if (d.amount.precision() > 20 || d.amount.scale() > 4) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Exceeded maximum 16 digits or 4 decimal places."); }
+            }
 
-```
-**Replace it entirely with this:**
-```javascript
-                        <StepLabel StepIconComponent={() => <BigWorkflowIcon statusFlag={statusFlag} label={step.designation} />}>
 
-                          <Chip
-                            label={getRoleDisplayName(step.role)}
-                            size="small"
-                            variant="outlined" 
-                            color={isCurrent && statusFlag !== 'REJECTED' ? "primary" : "default"}
-                            sx={{ mt: 1, height: 22, fontSize: "0.65rem", fontWeight: "bold" }}
-                          />
+            // Product Code
+            if (d.productCode != null && !d.productCode.isEmpty() && !d.productCode.equals("A") && !d.productCode.matches("^[0-9]{1,8}$")) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Product code must be up to 8 digits or left blank."); }
+            }
 
-                          {(isCompleted || (isCurrent && viewingBatchState === "REJECTED")) && historyItem && (
-                            <Typography
-                              variant="caption"
-                              display="block"
-                              color={statusFlag === 'REJECTED' ? "error.main" : "success.main"}
-                              sx={{ mt: 0.5, fontWeight: "bold" }}
-                            >
-                              {executorStr}
-                            </Typography>
-                          )}
+            // Remarks (Alphanumeric and single spaces only, matching frontend regex)
+            if (d.remarks == null || d.remarks.trim().length() < 2 || d.remarks.trim().length() > 30) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Remarks must be 2-30 characters."); }
+            } else if (!d.remarks.matches("^[a-zA-Z0-9 ]+$") || d.remarks.contains("  ")) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Only alphabets and numbers are allowed."); }
+            }
 
-                          {isCurrent && viewingBatchState !== "REJECTED" && (
-                            <Typography 
-                              variant="caption" 
-                              display="block" 
-                              color={statusFlag === 'ESCALATED' ? "warning.main" : "text.secondary"} 
-                              fontWeight="bold" 
-                              sx={{ mt: 0.5 }}
-                            >
-                              Pending: {calculateTimeElapsed(viewingBatchRequestDate)}
-                            </Typography>
-                          )}
+            // Currency
+            if (d.currency == null || d.currency.length() != 3) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Currency code must be exactly 3 characters."); }
+            }
 
-                        </StepLabel>
+            // CGL (Strictly 10 digits)
+            if (d.cgl == null || d.cgl.isEmpty()) {
+                synchronized(d.formatErrors) { d.formatErrors.add("CGL is mandatory."); }
+            } else if (!d.cgl.matches("^[0-9]{10}$")) {
+                synchronized(d.formatErrors) { d.formatErrors.add("CGL must be exactly 10 digits."); }
+            }
 
-```
-### 5. Update Date Formats in the Workflow History Section
-**Find this block (inside the workflowHistory.map):**
-```javascript
-                              <Typography variant="subtitle2" fontWeight="bold" color="text.primary">
-                                {userName} {isSystem ? "" : `(${history.LAST_ACTION_BY})`}
-                              </Typography>
-                              <Typography variant="caption" color="text.secondary">• {new Date(history.LAST_ACTION_AT).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</Typography>
+            // Branch (Strictly 5 alphanumeric characters)
+            if (d.branch == null || d.branch.trim().isEmpty()) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Branch code is mandatory."); }
+            } else if (!d.branch.matches("^[a-zA-Z0-9]{5}$")) {
+                synchronized(d.formatErrors) { d.formatErrors.add("Branch code must be exactly 5 alphanumeric characters."); }
+            }
+        });
+    }
 
-```
-**Replace it with:**
-```javascript
-                              <Typography variant="subtitle2" fontWeight="bold" color="text.primary">
-                                {userName} {isSystem ? "" : `(${history.LAST_ACTION_BY})`}
-                              </Typography>
-                              <Typography variant="caption" color="text.secondary">• {formatDateTime(history.LAST_ACTION_AT)}</Typography>
+    public void runDbCheck(List<ExcelRowData> rows) {
+        Set<String> validBranches = validationMasterService.getAllActiveBranches();
+        Set<String> validCurrs = validationMasterService.getAllActiveCurrencies();
+        Set<String> validCgls = validationMasterService.getAllActiveCgls();
 
-```
-**Finally, find this block (also in the history map, for Scheduled time chips):**
-```javascript
-                              {history.SCHEDULED_TIME ? (
-                                <Chip
-                                  label={isOverrideAction ? `Schedule Overridden to: ${new Date(history.SCHEDULED_TIME).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" })}` : `Scheduled for: ${new Date(history.SCHEDULED_TIME).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" })}`}
-                                  size="small"
-                                  color={isOverrideAction ? "warning" : "info"}
-                                  variant="outlined"
-                                  sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold" }}
-                                />
+        rows.parallelStream().forEach(d -> {
+            if (d.branch != null && !d.branch.isEmpty() && !validBranches.contains(d.branch))
+                d.dbErrors.add("Branch is inactive or not found: " + d.branch);
+            if (d.currency != null && !d.currency.isEmpty() && !validCurrs.contains(d.currency))
+                d.dbErrors.add("Currency is inactive or not found: " + d.currency);
+            if (d.cgl != null && !d.cgl.isEmpty() && !validCgls.contains(d.cgl))
+                d.dbErrors.add("CGL is inactive or not found: " + d.cgl);
+        });
+    }
 
-```
-**Replace it with:**
-```javascript
-                              {history.SCHEDULED_TIME ? (
-                                <Chip
-                                  label={isOverrideAction ? `Schedule Overridden to: ${formatDateTime(history.SCHEDULED_TIME)}` : `Scheduled for: ${formatDateTime(history.SCHEDULED_TIME)}`}
-                                  size="small"
-                                  color={isOverrideAction ? "warning" : "info"}
-                                  variant="outlined"
-                                  sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold" }}
-                                />
 
-```
+    /**
+     * Rule 5: Balance Integrity Logic.
+     * Uses LongAdder with 10^4 scale shift to perform precise integer arithmetic
+     * on parallel streams, preventing floating-point drift in large batches.
+     */
+    public void runBalanceCheck(List<ExcelRowData> rows) {
+    ConcurrentHashMap<String, AtomicReference<BigDecimal>> balanceMap = new ConcurrentHashMap<>();
+        ConcurrentHashMap<String, Boolean> branchHasDebit = new ConcurrentHashMap<>();
+        ConcurrentHashMap<String, Boolean> branchHasCredit = new ConcurrentHashMap<>();
+
+        // Pass 1: Aggregate totals and check for presence
+        rows.parallelStream().forEach(d -> {
+            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
+
+            // Track Debit/Credit Presence per Branch
+            if ("Debit".equalsIgnoreCase(d.txnType)) branchHasDebit.put(d.branch, true);
+            if ("Credit".equalsIgnoreCase(d.txnType)) branchHasCredit.put(d.branch, true);
+
+            // Calculate Balance Groupings
+            boolean isCredit = "Credit".equalsIgnoreCase(d.txnType);
+            BigDecimal finalVal = isCredit ? d.amount.negate() : d.amount;
+
+            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
+            String balKey = d.branch + "_" + d.currency + "_" + type;
+
+            // Thread-safe BigDecimal addition without scaling or overflow risks
+            balanceMap.computeIfAbsent(balKey, k -> new AtomicReference<>(BigDecimal.ZERO))
+                    .updateAndGet(curr -> curr.add(finalVal));
+        });
+
+        // Pass 2: Apply the simple, generic error messages to the rows
+        rows.parallelStream().forEach(d -> {
+            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
+
+            Boolean hasDeb = branchHasDebit.getOrDefault(d.branch, false);
+            Boolean hasCred = branchHasCredit.getOrDefault(d.branch, false);
+
+            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
+            String balKey = d.branch + "_" + d.currency + "_" + type;
+            AtomicReference<BigDecimal> adder = balanceMap.get(balKey);
+
+            synchronized (d.balErrors) {
+                // 1. Debit/Credit Presence Check
+                if ((!hasDeb || !hasCred) && !d.balErrors.contains("Branch must have at least one Debit and one Credit entry.")) {
+                    d.balErrors.add("Branch must have at least one Debit and one Credit entry.");
+                }
+
+                // 2. Balance Math Check (Using BigDecimal's compareTo)
+                if (adder != null && adder.get().compareTo(BigDecimal.ZERO) != 0 && !d.balErrors.contains("Branch, Currency, and CGL-wise balance mismatch.")) {
+                    d.balErrors.add("Branch, Currency, and CGL-wise balance mismatch.");
+                }
+            }
+        });
+    }
+}
+
+
+
+package com.fincore.VoucherService.Service;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.dao.DataAccessException;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+/**
+ * Loads active master records into memory-efficient HashSets for O(1) validation lookups.
+ * Utilizes optimized JDBC fetch sizes to handle high-volume data transfers from Oracle.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class ValidationMasterService {
+
+    @Autowired
+    @Qualifier("oracleJdbcTemplate")
+    private JdbcTemplate jdbcTemplate;
+
+    /**
+     * Fetches all active branch codes.
+     * Uses a fetchSize of 5000 to minimize network round-trips for large branch networks.
+     */
+    public Set<String> getAllActiveBranches() {
+        long start = System.currentTimeMillis();
+        String sql = "SELECT CODE FROM BRANCH_MASTER WHERE STATUS = 1";
+
+        try {
+            List<String> list = jdbcTemplate.query(con -> {
+                var ps = con.prepareStatement(sql);
+                ps.setFetchSize(5000);
+                return ps;
+            }, (rs, rowNum) -> rs.getString(1));
+
+            log.info("MASTER_DATA_LOADED | Type: BRANCHES | Count: {} | Duration: {}ms", list.size(), System.currentTimeMillis() - start);
+            return new HashSet<>(list);
+
+        } catch (DataAccessException e) {
+            log.error("MASTER_DATA_FETCH_FAIL | Type: BRANCHES | Reason: {}", e.getMessage());
+            return new HashSet<>(); // Returning empty set to trigger validation failure safely
+        }
+    }
+
+    /**
+     * Fetches all active currency codes.
+     * Uses a fetchSize of 1000 for standard currency volume.
+     */
+    public Set<String> getAllActiveCurrencies() {
+        long start = System.currentTimeMillis();
+        String sql = "SELECT CURRENCY_CODE FROM CURRENCY_MASTER WHERE FLAG = 1";
+
+        try {
+            List<String> list = jdbcTemplate.query(con -> {
+                var ps = con.prepareStatement(sql);
+                ps.setFetchSize(1000);
+                return ps;
+            }, (rs, rowNum) -> rs.getString(1));
+
+            log.info("MASTER_DATA_LOADED | Type: CURRENCIES | Count: {} | Duration: {}ms", list.size(), System.currentTimeMillis() - start);
+            return new HashSet<>(list);
+
+        } catch (DataAccessException e) {
+            log.error("MASTER_DATA_FETCH_FAIL | Type: CURRENCIES | Reason: {}", e.getMessage());
+            return new HashSet<>();
+        }
+    }
+
+    /**
+     * Fetches all active CGL numbers.
+     * Uses a fetchSize of 2000 to balance memory and speed for ledger data.
+     */
+    public Set<String> getAllActiveCgls() {
+        long start = System.currentTimeMillis();
+        String sql = "SELECT CGL_NUMBER FROM CGL_MASTER WHERE STATUS = 1";
+
+        try {
+            List<String> list = jdbcTemplate.query(con -> {
+                var ps = con.prepareStatement(sql);
+                ps.setFetchSize(2000);
+                return ps;
+            }, (rs, rowNum) -> rs.getString(1));
+
+            log.info("MASTER_DATA_LOADED | Type: CGLS | Count: {} | Duration: {}ms", list.size(), System.currentTimeMillis() - start);
+            return new HashSet<>(list);
+
+        } catch (DataAccessException e) {
+            log.error("MASTER_DATA_FETCH_FAIL | Type: CGLS | Reason: {}", e.getMessage());
+            return new HashSet<>();
+        }
+    }
+}
+
+ i  convert it back to my original code and one more thing is can my current api is there for the currency is depends on the currency master i want to create my own
+this is my table
+currency master
+
+CURRENCY_CODE	VARCHAR2(3 BYTE)	No		1	Currency Code of Currency
+CURRENCY_NAME	VARCHAR2(50 BYTE)	No		2	Name of Currency
+FLAG	NUMBER(1,0)	No	0	3	Currency Active or Inactive
+CURRENCY_RATE	NUMBER(12,6)	Yes		4	Current Rate of Currency
+RATE_DATE	DATE	Yes		5	Rate change date 
+CREATED_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	6	Currency created date
+UPDATED_AT	TIMESTAMP(6)	Yes	"CURRENT_TIMESTAMP
+   "	7	Currency updated date
+
+table in which i just need CURRENCY_CODE only we will create our own api for currency
