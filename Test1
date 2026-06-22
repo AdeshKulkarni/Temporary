@@ -1,114 +1,76 @@
-You have come up with the **industry-standard enterprise solution**! Using a "Draft" ('S' for Saved) state that transitions to "Pending" ('P') only after the user confirms their scheduling choice is exactly how major financial systems handle this.
-You have a very valid concern about performance, but I have great news: **It will not take any extra time, and it will work perfectly with your Redis architecture.**
-Here is why your idea is completely safe, followed by the exact code changes you need to make it work.
-### Why it takes ZERO extra time
-You are worried that changing the status from 'S' to 'P' on an Excel upload with 50,000 rows will force the database to update 50,000 rows.
-**This is a misconception!** In your architecture, the 50,000 individual transactions are inserted into the VOUCHER_POSTING_DATA table, but the BATCH_STATUS column only exists on the **single master record** in the VOUCHER_POSTING table.
-Changing the status from 'S' to 'P' is a single, instant SQL update:
-UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?
-This takes approximately **1 millisecond**, regardless of whether your batch has 2 rows or 200,000 rows!
-### The Hidden Danger with Async Excel Uploads
-While your idea is perfect, there is one critical edge case we must handle for the Excel uploads.
- 1. User uploads 50,000 rows.
- 2. Master record is created as 'S' (Draft).
- 3. The VoucherAsyncWorker starts inserting the 50,000 rows in the background (which might take 2 minutes).
- 4. The user instantly clicks "Execute Immediately" on the UI after just 5 seconds.
- 5. The Master record changes to 'P'.
-**The Problem:** Because the Master is now 'P', the Level 1 Checkers will immediately see it in their inbox. If they open it, they will only see the first 5,000 rows because the background worker hasn't finished inserting the rest yet!
-### The Perfect Solution ("The Double Lock")
-To fix this, we update your updateBatchSchedule API. When the user clicks "Execute Immediately" or "Schedule", the backend will check if the Async Worker is still running.
- * If the worker is finished, it changes the status to 'P'.
- * If the worker is *still inserting data*, it saves the schedule but leaves the status as 'S'. The Async Worker will then automatically flip it to 'P' the moment it finishes inserting the final row!
-### The Exact Code Changes
-#### 1. Create batches as 'S' (Draft)
-Open VoucherCommandService.java. We need to change the initial creation status for both Manual and Excel uploads.
-**Find this in createBatchFromCacheAsync (Excel Upload, around line 149):**
-```java
-            posting.setWorkflowCode(workflowCode);
-            posting.setPendingAt(firstApproverWorkflowId);
-            posting.setBatchStatus("P"); // CHANGE THIS
+Because we updated the backend to create every batch in an **'S' (Saved/Draft)** state, we now have a slight trap on the frontend!
+Currently, if the Maker clicks the **"Execute Immediately"** button on the final success screen, your React code just resets the page (handleResetWizard). It never tells the backend that the user is done! As a result, the batch will stay trapped in the 'S' state forever, and Checkers will never see it.
+We need to create a function that explicitly calls the /JS/voucher/update-schedule API with a blank time, triggering our new "Double-Lock" backend logic to flip the switch to 'P'.
+Here are the three quick changes you need to make in **VoucherPosting.jsx**.
+### 1. Add the Loading State
+Find your wizard states near the top of the file (around line 90) and add a loading state for the immediate execution button:
+**FIND THIS:**
+```javascript
+  const [showSchedulePicker, setShowSchedulePicker] = useState(false);
+  const [isApplyingSchedule, setIsApplyingSchedule] = useState(false);
 
 ```
-**Replace with:**
-```java
-            posting.setWorkflowCode(workflowCode);
-            posting.setPendingAt(firstApproverWorkflowId);
-            posting.setBatchStatus("S"); // Created as Saved/Draft
+**ADD THIS RIGHT BELOW IT:**
+```javascript
+  const [isExecutingImmediately, setIsExecutingImmediately] = useState(false);
 
 ```
-**Find this in createBatchRequest (Manual Upload, around line 186):**
-```java
-        posting.setCreatedBy(creatorId);
-        posting.setPendingAt(firstApproverWorkflowId);
-        posting.setBatchStatus("P"); // CHANGE THIS
+### 2. Add the handleExecuteImmediately Function
+Find your existing handleApplySchedule function (around line 210). Right **below** that entire function, paste this new one:
+```javascript
+  const handleExecuteImmediately = async () => {
+    setIsExecutingImmediately(true);
+    try {
+      // Sending a null/empty scheduledTime tells the backend to just run the status flip logic
+      await callApi("/JS/voucher/update-schedule", {
+        batchId: submittedBatchId,
+        scheduledTime: null 
+      }, "POST");
 
-```
-**Replace with:**
-```java
-        posting.setCreatedBy(creatorId);
-        posting.setPendingAt(firstApproverWorkflowId);
-        posting.setBatchStatus("S"); // Created as Saved/Draft
-
-```
-#### 2. Update the Scheduling API to flip to 'P' safely
-Still in VoucherCommandService.java, find your updateBatchSchedule method (around line 208) and replace the entire method with this smart version:
-```java
-    @Transactional
-    public void updateBatchSchedule(String batchId, String scheduledTime) {
-        Integer exists = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM VOUCHER_POSTING WHERE BATCH_ID = ?", Integer.class, batchId);
-        if (exists == null || exists == 0) {
-            throw new CustomExceptions.InvalidDataException("The batch is still being initialized. Please wait a few seconds.");
-        }
-
-        if (scheduledTime != null && !scheduledTime.isEmpty()) {
-            LocalDateTime parsedTime = LocalDateTime.parse(scheduledTime, java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
-            workflowEngine.validateScheduledTime(parsedTime);
-            
-            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS'), IS_SCHEDULE_OVERRIDE = 'NO', IS_EXECUTION_SCHEDULED = 'YES' WHERE BATCH_ID = ?", scheduledTime, batchId);
-            jdbcTemplate.update("UPDATE VOUCHER_WORKFLOW SET SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS') WHERE BATCH_ID_FK = ? AND LAST_ACTION = 'Submitted'", scheduledTime, batchId);
-        }
-
-        // SMART DOUBLE-LOCK LOGIC:
-        // Check if the AsyncWorker is still writing data. (If actual rows match requested rows, it's done!)
-        String checkDataLoadedSql = """
-            SELECT CASE WHEN p.RECORDS_COUNT = (SELECT COUNT(*) FROM VOUCHER_POSTING_DATA d WHERE d.BATCH_ID = p.BATCH_ID) 
-            THEN 1 ELSE 0 END FROM VOUCHER_POSTING p WHERE p.BATCH_ID = ?
-        """;
-        
-        Integer isDataLoaded = jdbcTemplate.queryForObject(checkDataLoadedSql, Integer.class, batchId);
-
-        if (isDataLoaded != null && isDataLoaded == 1) {
-            // Data is fully loaded. Safe to show to checkers!
-            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
-        } else {
-            // Data is still inserting. Leave it as 'S'. The Async Worker will flip it to 'P' when it finishes.
-            log.info("Schedule saved for Batch {}, but data is still loading. Status remains 'S'.", batchId);
-        }
+      showSnackBar("Request submitted for immediate execution!", "success");
+      handleResetWizard();
+    } catch (e) {
+      showSnackBar(e.message || "Failed to finalize batch execution.", "error");
+    } finally {
+      setIsExecutingImmediately(false);
     }
+  };
 
 ```
-#### 3. Let the AsyncWorker flip the final switch
-Open VoucherAsyncWorker.java and find the end of the executeAsyncBatchCreation method (around line 30). This is where the background thread finishes inserting all the Excel data.
-**Find this block:**
-```java
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(45, TimeUnit.MINUTES);
-            progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
+### 3. Wire Up the "Execute Immediately" Button
+Scroll all the way down to Step 3 (around line 690) where the two large buttons are rendered. We need to swap out the onClick handler and add the loading spinner.
+**FIND THIS:**
+```javascript
+              {!showSchedulePicker ? (
+                <Box sx={{ display: 'flex', gap: 3, justifyContent: 'center' }}>
+                  <Button variant="outlined" size="large" onClick={handleResetWizard} sx={jpStyles.largeBtn}>
+                    Execute Immediately
+                  </Button>
+                  <Button
+                    variant="contained"
+                    size="large"
+                    startIcon={<ScheduleIcon />}
+                    // ... onClick logic
 
 ```
-**Add this right below it:**
-```java
-            // If the user already finished the UI scheduling step, flip the status to 'P' so Checkers can see it!
-            jdbcTemplate.update("""
-                UPDATE VOUCHER_POSTING 
-                SET BATCH_STATUS = 'P' 
-                WHERE BATCH_ID = ? 
-                AND (IS_EXECUTION_SCHEDULED = 'YES' OR IS_EXECUTION_SCHEDULED = 'NO')
-                AND BATCH_STATUS = 'S'
-            """, batchId);
+**REPLACE IT WITH THIS:**
+```javascript
+              {!showSchedulePicker ? (
+                <Box sx={{ display: 'flex', gap: 3, justifyContent: 'center' }}>
+                  <Button 
+                    variant="outlined" 
+                    size="large" 
+                    onClick={handleExecuteImmediately} 
+                    disabled={isExecutingImmediately || isApplyingSchedule}
+                    sx={jpStyles.largeBtn}
+                  >
+                    {isExecutingImmediately ? <CircularProgress size={24} color="inherit" /> : "Execute Immediately"}
+                  </Button>
+                  <Button
+                    variant="contained"
+                    size="large"
+                    startIcon={<ScheduleIcon />}
+                    // ... onClick logic remains the same
 
 ```
-### Summary of how this flows now:
- * **Manual Post:** Maker submits -> Status S. Maker immediately clicks "Execute" -> Status flips to P instantly.
- * **Small Excel Post:** Maker uploads -> Async finishes in 2 seconds. Maker clicks "Execute" at 10 seconds -> Status flips to P instantly.
- * **Massive 50,000 Excel Post:** Maker uploads -> Async takes 2 minutes. Maker clicks "Execute" at 10 seconds -> Status stays S. At 2 minutes, Async thread finishes and flips it to P.
-No checkers will ever see broken data, and the Maker is never rushed by a timer again!
+Now, whether the Maker sets a future schedule or clicks "Execute Immediately", the frontend explicitly contacts the backend, triggering your new, highly secure double-lock logic!
