@@ -1,50 +1,684 @@
-You are actually in a really great spot! Because VoucherBulkUpload.jsx handles the file upload but hands the baton back to VoucherPosting.jsx for **Step 3 (The Scheduling Screen)**, your Excel uploads automatically inherit all the awesome fixes we just made (like the "Execute Immediately" button and the Double-Lock logic).
-So, no new UI files need to be changed for Bulk Upload!
-However, looking at the code you just pasted and the ApiResponse (11).txt file you uploaded, I caught **two critical bugs** you need to fix before you deploy this.
-### 1. You accidentally hardcoded the Remarks (Frontend)
-In the VoucherPosting.jsx code you just pasted, you went through all the effort to build that beautiful filterAndWarn regex for the commonBatchRemarks input field... but you commented out the actual variable in your API payload!
-Right now, no matter what the user types, the database will save *"Voucher created successfully"*.
-**Find this in VoucherPosting.jsx (around line 669 inside handleSubmit):**
-```javascript
-    const finalPayload = {
-      vid: selectedVoucher?.vid,
-      scheduledTime: null, // Handled in Step 3 now
-      // commonBatchRemarks: commonBatchRemarks.trim(),
-      commonBatchRemarks: "Voucher created successfully",
-      rows: rowPayloads,
+import React, { useState, useRef, useEffect } from "react";
+import dayjs from "dayjs";
+import {
+  Box,
+  Typography,
+  Paper,
+  TextField,
+  Button,
+  CircularProgress,
+  Chip,
+  Alert,
+  Stack,
+  Stepper,
+  Step,
+  StepLabel,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  TablePagination,
+  IconButton,
+  Tooltip,
+  Collapse ,
+  Grid
+} from "@mui/material";
+import {
+  CloudUpload as CloudUploadIcon,
+  RestartAlt as RestartAltIcon,
+  Description as DescriptionIcon,
+  Send as SendIcon,
+  FileDownload as FileDownloadIcon,
+  ArrowBack as ArrowBackIcon,
+  Close as CloseIcon,
+  TaskAlt as TaskAltIcon,
+  KeyboardArrowUp,
+  KeyboardArrowDown 
+} from "@mui/icons-material";
+import { alpha } from "@mui/material/styles";
+
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
+import { LocalizationProvider } from "@mui/x-date-pickers/LocalizationProvider";
+import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
+import { DatePicker } from "@mui/x-date-pickers/DatePicker";
+
+import { jbuStyles } from "./VoucherBulkStyle";
+
+// --- STYLES ---
+const mainContainerStyle = { padding: 3, height: "100%", width: "100%" };
+const ALLOWED_FILE_TYPES = [".xlsx"];
+
+const mainSteps = ["Upload & Validate", "Preview & Submit"];
+const validationSteps = [
+  "Format Validation",
+  "Database Validation",
+  "Balance Validation",
+];
+
+const VoucherBulkUpload = ({ selectedVoucher, onBack, onReset, onSuccessSubmit }) => {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+
+  const [activeStep, setActiveStep] = useState(0);
+  const [selectedDate, setSelectedDate] = useState(null);
+  const [file, setFile] = useState(null);
+  const fileInputRef = useRef(null);
+  const [requestId, setRequestId] = useState(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [isDebouncing, setIsDebouncing] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+
+  const [validationStage, setValidationStage] = useState(0);
+  const [resultStatus, setResultStatus] = useState(null);
+  const [resultMsg, setResultMsg] = useState("");
+  const [autoDlTriggered, setAutoDlTriggered] = useState(false);
+  const [downloadMsg, setDownloadMsg] = useState("Downloading error report...");
+  const [isErrorDownloaded, setIsErrorDownloaded] = useState(false);
+  const [previewRows, setPreviewRows] = useState([]);
+  const [totalRows, setTotalRows] = useState(0);
+
+  const [page, setPage] = useState(0);
+  const [rowsPerPage, setRowsPerPage] = useState(50);
+  const [isCreatingBatch, setIsCreatingBatch] = useState(false);
+  const [batchCreated, setBatchCreated] = useState(false);
+    const [isDescExpanded, setIsDescExpanded] = useState(false);
+  const [isPageLoading, setIsPageLoading] = useState(true);
+  const [isEodRunning, setIsEodRunning] = useState(false);
+  useEffect(() => {
+    const fetchInitialData = async () => {
+      try {
+        setIsPageLoading(true);
+
+        // 1. Check EOD Status First
+        const eodResponse = await callApi("/JS/voucher/eod_status", null, "GET");
+        if (eodResponse && Array.isArray(eodResponse) && eodResponse.length > 0) {
+          if (eodResponse[0].eodStatus === 1) {
+            setIsEodRunning(true);
+            return; // Stop loading anything else, block the screen
+          }
+        }
+
+        // 2. Fetch the Official Posting Date
+        const dateResponse = await callApi("/JS/voucher/current-posting-date", null, "GET");
+        if (dateResponse) {
+          // Parse the YYYY-MM-DD date perfectly into DayJS for the calendar
+          const parsedDate = dayjs(dateResponse, "YYYY-MM-DD");
+          if (parsedDate.isValid()) {
+            setSelectedDate(parsedDate);
+          } else {
+            showSnackBar("Failed to parse official posting date.", "error");
+          }
+        } else {
+          showSnackBar("Failed to load official posting date.", "error");
+        }
+
+      } catch (error) {
+        console.error("Failed to fetch initial data:", error);
+      } finally {
+        setIsPageLoading(false);
+      }
     };
 
-```
-**Replace it with this to use the actual validated input:**
-```javascript
-    const finalPayload = {
-      vid: selectedVoucher?.vid,
-      scheduledTime: null, 
-      commonBatchRemarks: commonBatchRemarks ? commonBatchRemarks.trim() : "Voucher created successfully",
-      rows: rowPayloads,
+    fetchInitialData();
+  }, [callApi, showSnackBar]);
+
+
+  useEffect(() => {
+    const checkEodStatus = async () => {
+      try {
+        setIsPageLoading(true);
+        const eodResponse = await callApi("/JS/voucher/eod_status", null, "GET");
+
+        // The API returns an array: [{ "eodStatus": 0 }]
+        if (eodResponse && Array.isArray(eodResponse) && eodResponse.length > 0) {
+          if (eodResponse[0].eodStatus === 1) {
+            setIsEodRunning(true);
+          }
+        }
+      } catch (error) {
+        console.error("Failed to check EOD status:", error);
+      } finally {
+        setIsPageLoading(false);
+      }
     };
 
-```
-*(This uses the user's text if they typed it, and safely falls back to a default if they left it blank).*
-### 2. Your Backend .txt file is missing the 'S' (Draft) changes
-I checked the ApiResponse (11).txt file you uploaded. In your VoucherCommandService.java, the code is **still** setting BATCH_STATUS = "P" instead of "S"! If you run this backend code, the Checker race condition will still happen.
-Please double-check your Java code and ensure you applied the changes we discussed previously.
-**In VoucherCommandService.java -> createBatchFromCacheAsync() (around line 149 in the txt):**
-```java
-// CHANGE THIS:
-posting.setBatchStatus("P");
+    checkEodStatus();
+  }, [callApi]);
 
-// TO THIS:
-posting.setBatchStatus("S");
+  const triggerDebounce = () => {
+    setIsDebouncing(true);
+    setTimeout(() => {
+      setIsDebouncing(false);
+    }, 3000);
+  };
 
-```
-**In VoucherCommandService.java -> createBatchRequest() (around line 186 in the txt):**
-```java
-// CHANGE THIS:
-posting.setBatchStatus("P");
+  const validateAndSetFile = (selected) => {
+    if (!selected) return;
+    const fileName = selected.name.toLowerCase();
+    const fileSize = selected.size;
 
-// TO THIS:
-posting.setBatchStatus("S");
+    const isValidExt = ALLOWED_FILE_TYPES.some((ext) => fileName.endsWith(ext));
 
-```
-As long as you fix that commented-out variable in React and ensure your Java file actually has the "S" saved, your entire manual and bulk workflow is perfectly synchronized and ready to go!
+    if (!isValidExt) {
+      showSnackBar(`Invalid file type! Only ${ALLOWED_FILE_TYPES.join(", ")} files are supported.`, "error");
+      clearInput();
+      return;
+    }
+
+    const MAX_SIZE_MB = 50;
+    if (fileSize > MAX_SIZE_MB * 1024 * 1024) {
+      showSnackBar(`File too large! Maximum allowed size is ${MAX_SIZE_MB}MB.`, "error");
+      clearInput();
+      return;
+    }
+
+    if (fileSize === 0) {
+      showSnackBar("The selected file is empty. Please upload a valid file.", "error");
+      clearInput();
+      return;
+    }
+
+
+
+    setFile(selected);
+    setResultStatus(null);
+    setResultMsg("");
+    setValidationStage(0);
+    setPreviewRows([]);
+    setTotalRows(0);
+    setRequestId(null);
+    setAutoDlTriggered(false);
+    setIsProcessing(false);
+    setIsErrorDownloaded(false);
+    setDownloadMsg("Downloading error report...");
+  };
+
+  const handleFileSelect = (e) => {
+    if (e.target.files[0]) {
+      validateAndSetFile(e.target.files[0]);
+    }
+  };
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      validateAndSetFile(e.dataTransfer.files[0]);
+      e.dataTransfer.clearData();
+    }
+  };
+
+  const clearInput = () => {
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const handleClearFile = (e) => {
+    if (e) e.stopPropagation();
+    setFile(null);
+    clearInput();
+    setResultStatus(null);
+    setResultMsg("");
+    setValidationStage(0);
+    setIsProcessing(false);
+    setIsErrorDownloaded(false);
+    setBatchCreated(false);
+  };
+  const resetAll = () => {
+    setRequestId(null);
+    setResultStatus(null);
+    setValidationStage(0);
+    setResultMsg("");
+    setPreviewRows([]);
+    setTotalRows(0);
+    setIsProcessing(false);
+    setAutoDlTriggered(false);
+    setIsErrorDownloaded(false);
+    setBatchCreated(false);
+    setFile(null);
+    setPage(0);
+    setDownloadMsg("Downloading error report...");
+    clearInput();
+    if (onReset) onReset(); // Tells JournalPosting.jsx to go back to Step 0
+  };
+  const handleBackNavigation = () => {
+    if (onBack) onBack(); // Tells JournalPosting.jsx to go back to Step 1
+  };
+
+  const handleBack = () => {
+    setActiveStep(0);
+    setResultStatus(null);
+    setValidationStage(0);
+    setResultMsg("");
+    setIsProcessing(false);
+    setAutoDlTriggered(false);
+    setDownloadMsg("Downloading error report...");
+  };
+
+  const downloadFileHelper = async (url, filename) => {
+    try {
+      const response = await callApi(url, null, "GET", "blob", null, {}, false);
+      const blobData = response.data || response;
+      if (!blobData) throw new Error("Empty response data");
+
+      const blob = new Blob([blobData], {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      });
+
+      const link = document.createElement("a");
+      const objectUrl = window.URL.createObjectURL(blob);
+      link.href = objectUrl;
+      link.setAttribute("download", filename);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(objectUrl);
+      return true;
+    } catch (e) {
+      showSnackBar("File download failed.", "error");
+      return false;
+    }
+  };
+
+  const handleDownloadTemplate = (e) => {
+    if (e) e.stopPropagation();
+    downloadFileHelper("/JS/voucher/download-template", "Voucher_Upload_Template.xlsx");
+  };
+
+  const handleDownloadFile = async (type, reqId = requestId) => {
+    if (type === "ERROR") showSnackBar("Downloading error report...", "info");
+    const success = await downloadFileHelper(
+      `/JS/voucher/download-bulk-file/${reqId}?type=${type}`,
+      type === "ERROR" ? "Error_Report.xlsx" : ""
+    );
+    if (success && type === "SUCCESS") showSnackBar("Downloaded successfully.", "success");
+    if (success && type === "ERROR") {
+      setDownloadMsg("Error report downloaded.");
+      setIsErrorDownloaded(true);
+    }
+  };
+
+  const handleStartValidation = async () => {
+    if (!selectedDate || !selectedDate.isValid() || !file) {
+      showSnackBar("Please select a valid date and file.", "warning");
+      return;
+    }
+    triggerDebounce();
+    setResultStatus(null);
+    setResultMsg("");
+    setValidationStage(0);
+    setRequestId(null);     // FIX: Prevent the useEffect from polling the old ID
+    setIsProcessing(true);
+    setAutoDlTriggered(false);
+    setDownloadMsg("");
+
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("postingDate", selectedDate.format("DD/MM/YYYY"));
+
+
+    // Automatically appends the globally selected VID to your upload request payload context
+    if (selectedVoucher) {
+      formData.append("vid", selectedVoucher.VID || selectedVoucher.vid);
+    }
+
+    try {
+      const data = await callApi("/JS/voucher/bulk-validate-init", formData, "POST", "json", "multipart/form-data");
+      if (data && data.requestId) {
+        setRequestId(data.requestId);
+      } else {
+        throw new Error("Invalid response from server.");
+      }
+    } catch (err) {
+      setIsProcessing(false);
+      setResultStatus("ERROR");
+
+      // FIX: Extract the specific exception message from the backend response
+      let errorMsg = err.message;
+      if (err.response && err.response.data && err.response.data.message) {
+        errorMsg = err.response.data.message;
+      }
+
+      setResultMsg("Initialization failed: " + errorMsg);
+    }
+  };
+
+
+  const autoSubmitBatch = async (reqId) => {
+    setIsCreatingBatch(true);
+    try {
+      // Safely capture the VID from the prop
+      const currentVid = selectedVoucher?.VID || selectedVoucher?.vid;
+
+      const payload = {
+        requestId: reqId,
+        postingDate: selectedDate.format("DD/MM/YYYY"),
+        vid: currentVid,
+        VID: currentVid,
+        vidFk: currentVid,
+        commonBatchRemarks: "Voucher created successfully",
+      };
+
+      const response = await callApi("/JS/voucher/create-batch-from-cache", payload, "POST");
+
+      if (response && (response.status === "SUCCESS" || response.batchId)) {
+        const newBatchId = response.batchId || "N/A";
+
+        // Push the user to the brand new Schedule Screen (Step 3)!
+        if (onSuccessSubmit) {
+          onSuccessSubmit(newBatchId);
+        } else {
+          setBatchCreated(true);
+        }
+      } else {
+        throw new Error(response.message || "Failed.");
+      }
+    } catch (e) {
+      let msg = e.message || "Unknown error";
+      if (e.response && e.response.data && e.response.data.message) {
+        msg = e.response.data.message;
+      }
+      showSnackBar("Failed to submit batch: " + msg, "error");
+    } finally {
+
+      setIsCreatingBatch(false);
+
+    }
+  };
+
+
+  useEffect(() => {
+    let interval;
+    if (isProcessing && requestId) {
+      interval = setInterval(async () => {
+        try {
+          const res = await callApi(`/JS/voucher/bulk-status/${requestId}`, null, "GET");
+          if (!res) return;
+          if (res.totalRows) setTotalRows(res.totalRows);
+          if (res.status === "ERROR") {
+            setIsProcessing(false);
+            setResultStatus("ERROR");
+            setResultMsg(res.message);
+            setValidationStage(res.currentStage || 1);
+            clearInterval(interval);
+            showSnackBar(res.message, "error", 5000);
+            if (res.hasErrorFile && !autoDlTriggered) {
+              setAutoDlTriggered(true);
+              handleDownloadFile("ERROR", res.requestId);
+            }
+          } else if (res.status === "SUCCESS") {
+            setResultStatus("SUCCESS");
+            setValidationStage(4);
+            setTotalRows(res.totalRows);
+            clearInterval(interval);
+            setIsProcessing(false);
+
+            // Instantly trigger submission without an extra snackbar message
+            autoSubmitBatch(res.requestId);
+          } else {
+            setValidationStage(res.currentStage);
+          }
+        } catch (e) { }
+      }, 800);
+    }
+    return () => clearInterval(interval);
+  }, [isProcessing, requestId, autoDlTriggered, callApi, showSnackBar]);
+
+  const handleChangePage = (event, newPage) => setPage(newPage);
+  const handleChangeRowsPerPage = (event) => {
+    setRowsPerPage(parseInt(event.target.value, 10));
+    setPage(0);
+  };
+
+  const visibleRows = previewRows.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage);
+  const isValidationStepFailed = (index) => {
+    return resultStatus === "ERROR" && index === validationStage - 1;
+  };
+  if (isPageLoading) {
+    return (
+      <Box sx={jbuStyles.loadingBox}>
+        <CircularProgress size={60} />
+      </Box>
+    );
+  }
+  const desc = selectedVoucher?.DESCRIPTION || selectedVoucher?.description || "No description provided.";
+  const isLongDesc = desc.length > 100 || desc.split(/\r?\n/).length > 2;
+
+
+
+  if (isEodRunning) {
+    return (
+      <Box sx={jbuStyles.eodBox}>
+        <Paper elevation={4} sx={jbuStyles.eodPaper}>
+          <Typography variant="h4" color="error" fontWeight="bold" gutterBottom>
+            EOD is Currently Running
+          </Typography>
+          <Typography variant="h6" color="text.secondary" sx={jbuStyles.eodSubtitle}>
+            Bulk Upload is temporarily disabled.
+          </Typography>
+          <Typography variant="body1" color="text.secondary" sx={jbuStyles.eodText}>
+            Please wait until the End of Day process completes to upload new transactions.
+          </Typography>
+        </Paper>
+      </Box>
+    );
+  }
+
+  // --- ORIGINAL UI RENDER (Cleaned up without activeSteps) ---
+  return (
+    <Box sx={mainContainerStyle}>
+      {/* --- STANDARDIZED HORIZONTAL SELECTION HEADER --- */}
+      {selectedVoucher && (
+        <Paper elevation={0} sx={jbuStyles.svPaper}>
+          <Box sx={jbuStyles.svHeaderBox}>
+            <Typography variant="subtitle1" fontWeight="bold" color="text.primary">
+              Voucher Request Details
+            </Typography>
+          </Box>
+
+          <Grid container>
+            <Grid item sx={jbuStyles.svGridItem} size={12}>
+              <Stack direction="row" spacing={10}>
+                <Box>
+                  <Typography variant="caption" color="text.secondary" display="block" gutterBottom>VID</Typography>
+                  <Typography variant="body1" fontWeight="bold" color="primary">{selectedVoucher.VID || selectedVoucher.vid}</Typography>
+                </Box>
+                <Box>
+                  <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Category</Typography>
+                  <Typography variant="body1" fontWeight="500">{selectedVoucher.CATEGORY_NAME || selectedVoucher.category || "General"}</Typography>
+                </Box>
+                <Box>
+                  <Typography variant="caption" color="text.secondary" display="block" gutterBottom>Issue Categories</Typography>
+                  <Box>
+                    {selectedVoucher.issueCategories ? selectedVoucher.issueCategories.split(",").map((cat, index) => (
+                      <Chip key={index} label={cat.trim()} size="small" sx={jbuStyles.issueCategoryChip} />
+                    )) : <Typography variant="body2" color="text.secondary">N/A</Typography>}
+                  </Box>
+                </Box>
+              </Stack>
+            </Grid>
+             <Grid item xs={12}>
+              <Typography variant="caption" color="text.secondary" display="block" gutterBottom>
+                Description
+              </Typography>
+              
+              <Box sx={{ position: "relative" }}>
+                {/* collapsedSize={44} perfectly frames about 2 lines of body2 text */}
+                <Collapse in={!isLongDesc || isDescExpanded} collapsedSize={20}>
+                  <Typography variant="body2" sx={{ whiteSpace: "pre-wrap", lineHeight: 1.6, fontWeight: 400, color: "text.primary" }}>
+                    {desc}
+                  </Typography>
+                </Collapse>
+                
+                {isLongDesc && (
+                  <Box sx={{ display: "flex", justifyContent: "flex-start", mt: 0.5 }}>
+                    <Button
+                      size="small"
+                      disableRipple
+                      onClick={() => setIsDescExpanded(!isDescExpanded)}
+                      endIcon={isDescExpanded ? <KeyboardArrowUp /> : <KeyboardArrowDown />}
+                      sx={{
+                        p: 0,
+                        minWidth: "auto",
+                        textTransform: "none",
+                        fontWeight: 600,
+                        color: "primary.main",
+                        "&:hover": { background: "transparent", textDecoration: "underline" }
+                      }}
+                    >
+                      {isDescExpanded ? "Read Less" : "Read More"}
+                    </Button>
+                  </Box>
+                )}
+              </Box>
+            </Grid>
+          </Grid>
+        </Paper>
+      )}
+
+      <Paper elevation={1} sx={jbuStyles.controlPanel}>
+        <Box sx={jbuStyles.dynamicWrapper(resultStatus === "ERROR", isProcessing || isCreatingBatch)}>
+          <Box sx={jbuStyles.uploadBox(isDragging, resultStatus === "ERROR")} onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}>
+            <Box sx={jbuStyles.templateSection} onClick={(e) => e.stopPropagation()}>
+              <Typography variant="caption" sx={jbuStyles.templateCaption}>
+                Need assistance? Download the template (.xlsx)
+              </Typography>
+              <Button variant="outlined" size="small" startIcon={<FileDownloadIcon />} onClick={handleDownloadTemplate} sx={jbuStyles.templateBtn}>
+                Download Template
+              </Button>
+            </Box>
+            <Box sx={jbuStyles.boxCenter}>
+              <Box sx={{ position: "relative", textAlign: "center" }}>
+                <CloudUploadIcon sx={jbuStyles.uploadIcon} />
+                <Typography sx={jbuStyles.headerText}>
+                  {file ? file.name : (isDragging ? "Drop file now" : "Drag or Browse the File")}
+                </Typography>
+                {!file && (
+                  <Typography sx={jbuStyles.subText}>
+                    Supported file formats: {ALLOWED_FILE_TYPES.join(", ")} (Maximum Size: 50MB)
+                  </Typography>
+                )}
+
+                {/* 1. RESTORED: The "Remove File" (X) button is back! */}
+                {file && (
+                  <Tooltip title="Remove File">
+                    <IconButton size="small" onClick={handleClearFile} sx={jbuStyles.clearFileBtn}>
+                      <CloseIcon fontSize="small" />
+                    </IconButton>
+                  </Tooltip>
+                )}
+              </Box>
+            </Box>
+
+
+            <Box sx={jbuStyles.browseBtnWrapper} onClick={(e) => e.stopPropagation()}>
+
+              {/* Browse File Button Column */}
+
+              {!file && (
+                <Box>
+                  <input
+                    type="file"
+                    hidden
+                    ref={fileInputRef}
+                    onChange={handleFileSelect}
+                    onClick={(e) => (e.target.value = null)}
+                    accept={ALLOWED_FILE_TYPES.join(",")}
+                  />
+                  <Button sx={jbuStyles.customBtn} variant="contained" onClick={() => fileInputRef.current.click()} disabled={isProcessing || isCreatingBatch}>
+                    Browse File
+                  </Button>
+                </Box>
+              )}
+            </Box>
+
+          </Box>
+
+          {(isProcessing || resultStatus) && (
+            <Box sx={jbuStyles.stepperBox}>
+              <Stepper activeStep={validationStage - 1} alternativeLabel>
+                {validationSteps.map((label, index) => {
+                  const labelProps = {};
+                  if (isValidationStepFailed(index)) {
+                    labelProps.optional = <Typography variant="caption" color="error">Failed</Typography>;
+                    labelProps.error = true;
+                  }
+                  return (
+                    <Step key={label}>
+                      <StepLabel {...labelProps}>{label}</StepLabel>
+                    </Step>
+                  );
+                })}
+              </Stepper>
+            </Box>
+          )}
+
+          {resultStatus === "ERROR" && (
+            <Alert severity="error" sx={jbuStyles.errorAlert}>
+              <Typography variant="body1" fontWeight="500">
+                {resultMsg} {downloadMsg ? `— ${downloadMsg}` : ""}
+              </Typography>
+            </Alert>
+          )}
+
+          {batchCreated && (
+            <Alert severity="success" sx={jbuStyles.successAlert}>
+              <Typography variant="body1" fontWeight="bold">Batch Successfully Validated and Submitted!</Typography>
+              <Typography variant="body2">Total valid records processed: <strong>{totalRows.toLocaleString()}</strong>.</Typography>
+            </Alert>
+          )}
+
+          <Grid container sx={jbuStyles.bottomGrid}>
+            <Grid item size={2}>
+              <Button startIcon={<ArrowBackIcon />} onClick={handleBackNavigation} variant="outlined" size="small">
+                Previous
+              </Button>
+            </Grid>
+            {/* <Stack direction="row" sx={{ ...actionButtonsContainer, alignItems: "center" }}> */}
+            <Grid item sx={jbuStyles.bottomBtnBox} size={8}>
+
+
+              {!batchCreated && (
+                <Button
+                  variant="contained"
+                  size="large"
+                  onClick={handleStartValidation}
+                  disabled={!file || !selectedDate || isDebouncing || isProcessing || isCreatingBatch || isErrorDownloaded}
+                  startIcon={(isProcessing || isCreatingBatch) ? <CircularProgress size={20} color="inherit" /> : <SendIcon />}
+                >
+                  {isProcessing ? "Validating..." : isCreatingBatch ? "Submitting..." : "Validate & Submit"}
+                </Button>
+              )}
+
+              {batchCreated && (
+                <Tooltip title="Clear and Upload New File" placement="top">
+                  <IconButton onClick={resetAll} color="primary" size="large" sx={jbuStyles.restartBtn}>
+                    <RestartAltIcon />
+                  </IconButton>
+                </Tooltip>
+              )}
+              {/* </Stack> */}
+            </Grid>
+          </Grid>
+        </Box>
+      </Paper>
+    </Box>
+  );
+};
+
+export default VoucherBulkUpload;
