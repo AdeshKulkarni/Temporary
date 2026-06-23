@@ -1,0 +1,2752 @@
+config-----------------------------------------
+
+
+package com.fincore.VoucherService.config;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+
+/**
+ * Configures global beans such as the Jackson ObjectMapper for consistent JSON processing.
+ * Ensures that Java 8 Date/Time types are serialized in ISO-8601 format across the service.
+ */
+@Configuration
+@Slf4j
+public class AppConfig {
+
+    /**
+     * Configures the primary ObjectMapper used by Spring Boot for REST request/response bodies.
+     * Enforces human-readable date formats and JSR-310 compatibility.
+     */
+    @Bean
+    @Primary
+    public ObjectMapper objectMapper() {
+        log.info("APP_CONFIG_INIT | Configuring Primary Jackson ObjectMapper");
+
+        ObjectMapper mapper = new ObjectMapper();
+
+        // Registers support for Java 8 Date and Time API (LocalDate, LocalDateTime)
+        mapper.registerModule(new JavaTimeModule());
+
+        // Disables numeric timestamp formatting (e.g., [2026,3,25]) in favor of ISO strings ("2026-03-25")
+        mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+
+        log.info("APP_CONFIG_SUCCESS | ObjectMapper configured with JavaTimeModule; ISO Date format enabled");
+
+        return mapper;
+    }
+}
+
+
+package com.fincore.VoucherService.config;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.aop.interceptor.AsyncUncaughtExceptionHandler;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.AsyncConfigurer;
+import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+
+import java.util.concurrent.Executor;
+
+/**
+ * Configures dedicated thread pools for high-volume row processing and chunking.
+ * Implements global error handling for fire-and-forget async tasks.
+ */
+@Configuration
+@EnableAsync
+@EnableScheduling
+@Slf4j
+public class AsyncConfig implements AsyncConfigurer {
+
+
+    @Bean(name = "progressExecutor")
+    public Executor progressExecutor() {
+        log.info("ASYNC_CONFIG_INIT | Initializing Dedicated Progress Thread Pool");
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(5);
+        executor.setMaxPoolSize(10);
+        executor.setQueueCapacity(2000);
+        executor.setThreadNamePrefix("Progress-");
+        executor.initialize();
+        return executor;
+    }
+
+    /**
+     * Dedicated executor for high-volume journal operations (Coordinator pool).
+     * Logic for pool sizing and queue capacity is preserved exactly as established.
+     */
+    @Bean(name = "bulkExecutor")
+    public Executor bulkExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(20);
+        executor.setQueueCapacity(100);
+        executor.setThreadNamePrefix("BulkCoord-");
+        executor.initialize();
+        return executor;
+    }
+    /**
+     * Dedicated worker pool specifically for processing inner batch chunks.
+     * Prevents deadlock by separating chunk processing from the main coordinator threads.
+     */
+    @Bean(name = "chunkWorkerExecutor")
+    public Executor chunkWorkerExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(25);
+        executor.setMaxPoolSize(50);
+        executor.setQueueCapacity(500);
+        executor.setThreadNamePrefix("BulkWriter-");
+        executor.setRejectedExecutionHandler(new java.util.concurrent.ThreadPoolExecutor.CallerRunsPolicy());
+        executor.initialize();
+        return executor;
+    }
+
+    /**
+     * Global handler for uncaught exceptions in @Async methods that return void.
+     * Replaces generic catching with structured, descriptive logging.
+     */
+    @Override
+    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+        return (ex, method, params) -> {
+            log.error("ASYNC_TASK_EXCEPTION | Method: {} | Exception: {}",
+                    method.getName(), ex.getClass().getSimpleName());
+
+            if (ex instanceof org.springframework.dao.DataAccessException) {
+                log.error("ASYNC_DATA_FAILURE | Status: Database connectivity lost in background thread");
+            } else if (ex instanceof NullPointerException) {
+                log.error("ASYNC_LOGIC_FAILURE | Status: Null pointer encountered in async task");
+            }
+            else {
+                log.error("ASYNC_TECHNICAL_FAULT | Status: Unexpected background error");
+            }
+        };
+    }
+}
+package com.fincore.VoucherService.config;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+@EnableCaching
+@Slf4j
+public class CacheConfig {
+
+    @Bean
+    public org.springframework.cache.CacheManager cacheManager(
+            org.springframework.data.redis.connection.RedisConnectionFactory connectionFactory) {
+
+        log.info("CACHE_CONFIG_INIT | Using Redis-backed CacheManager for K8s compatibility");
+
+        org.springframework.data.redis.cache.RedisCacheConfiguration config =
+                org.springframework.data.redis.cache.RedisCacheConfiguration.defaultCacheConfig()
+                        .entryTtl(java.time.Duration.ofMinutes(30))
+                        .disableCachingNullValues()
+                        .serializeValuesWith(
+                                org.springframework.data.redis.serializer.RedisSerializationContext.SerializationPair
+                                        .fromSerializer(new org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer()));
+
+        return org.springframework.data.redis.cache.RedisCacheManager.builder(connectionFactory)
+                .cacheDefaults(config)
+                .withCacheConfiguration("notification_configs",
+                        config.entryTtl(java.time.Duration.ofHours(1)))
+                .build();
+    }
+}
+
+
+package com.fincore.VoucherService.config;
+
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.jdbc.DataSourceBuilder;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.jdbc.core.JdbcTemplate;
+import lombok.extern.slf4j.Slf4j;
+
+import javax.sql.DataSource;
+
+/**
+ * Configures the connection to the Data Lake (Delta Lake).
+ * Uses JdbcTemplate for direct SQL execution, suitable for high-volume analytics.
+ */
+@Configuration
+@Slf4j
+public class HiveDbConfig {
+
+    /**
+     * Configures the Hive/Thrift DataSource for Data Lake synchronization.
+     * Connection properties are externalized with the prefix 'spring.datasource.hive'.
+     */
+    @Bean(name = "hiveDataSource")
+    @ConfigurationProperties(prefix = "spring.datasource.hive")
+    public DataSource hiveDataSource() {
+        log.info("HIVE_DB_INIT | Initializing Secondary Hive/Thrift DataSource for Data Lake");
+        return DataSourceBuilder.create().build();
+    }
+
+    /**
+     * Provides a dedicated JdbcTemplate for interacting with the Hive Data Lake.
+     * The @Qualifier ensures the correct secondary datasource is injected.
+     */
+    @Bean(name = "hiveJdbcTemplate")
+    public JdbcTemplate hiveJdbcTemplate(@Qualifier("hiveDataSource") DataSource dataSource) {
+        log.info("HIVE_JDBC_TEMPLATE_INIT | Providing dedicated Hive JdbcTemplate bean");
+        return new JdbcTemplate(dataSource);
+    }
+}
+
+
+
+package com.fincore.VoucherService.config;
+
+import jakarta.persistence.EntityManagerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.jdbc.DataSourceBuilder;
+import org.springframework.boot.orm.jpa.EntityManagerFactoryBuilder;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.orm.jpa.JpaTransactionManager;
+import org.springframework.orm.jpa.LocalContainerEntityManagerFactoryBean;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.annotation.EnableTransactionManagement;
+import lombok.extern.slf4j.Slf4j;
+
+import javax.sql.DataSource;
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Ensures that all existing JPA Repositories and Entities are correctly mapped to the Oracle database.
+ * Marking beans as @Primary ensures this datasource is the default for injection into existing services.
+ */
+@Configuration
+@EnableTransactionManagement
+@EnableJpaRepositories(
+        basePackages = "com.fincore.VoucherService.Repository",
+        entityManagerFactoryRef = "oracleEntityManagerFactory",
+        transactionManagerRef = "oracleTransactionManager"
+)
+@Slf4j
+public class OracleDbConfig {
+
+    /**
+     * Configures the primary Oracle DataSource.
+     * Connection properties are externalized with the prefix 'spring.datasource.oracle'.
+     */
+    @Primary
+    @Bean(name = "oracleDataSource")
+    @ConfigurationProperties(prefix = "spring.datasource.oracle")
+    public DataSource oracleDataSource() {
+        log.info("ORACLE_DB_INIT | Initializing Primary Oracle DataSource");
+        return DataSourceBuilder.create().build();
+    }
+
+    /**
+     * Configures the EntityManagerFactory for Oracle using Hibernate as the JPA provider.
+     * Preserves original dialect and ddl-auto properties.
+     */
+    @Primary
+    @Bean(name = "oracleEntityManagerFactory")
+    public LocalContainerEntityManagerFactoryBean oracleEntityManagerFactory(
+            EntityManagerFactoryBuilder builder,
+            @Qualifier("oracleDataSource") DataSource dataSource) {
+
+        log.info("ORACLE_EMF_INIT | Building EntityManagerFactory for com.fincore.VoucherService.Models");
+
+        Map<String, Object> properties = new HashMap<>();
+        properties.put("hibernate.dialect", "org.hibernate.dialect.OracleDialect");
+        properties.put("hibernate.hbm2ddl.auto", "validate");
+
+        return builder
+                .dataSource(dataSource)
+                .packages("com.fincore.VoucherService.Models")
+                .persistenceUnit("oracle")
+                .properties(properties)
+                .build();
+    }
+
+    /**
+     * Configures the Transaction Manager for the primary Oracle database.
+     */
+    @Primary
+    @Bean(name = "oracleTransactionManager")
+    public PlatformTransactionManager oracleTransactionManager(
+            @Qualifier("oracleEntityManagerFactory") EntityManagerFactory entityManagerFactory) {
+        log.info("ORACLE_TX_MANAGER_INIT | Initializing JpaTransactionManager for Oracle");
+        return new JpaTransactionManager(entityManagerFactory);
+    }
+
+    /**
+     * Provides a primary JdbcTemplate for direct SQL operations against Oracle.
+     */
+    @Primary
+    @Bean(name = "oracleJdbcTemplate")
+    public JdbcTemplate oracleJdbcTemplate(@Qualifier("oracleDataSource") DataSource dataSource) {
+        log.info("ORACLE_JDBC_TEMPLATE_INIT | Providing primary JdbcTemplate bean");
+        return new JdbcTemplate(dataSource);
+    }
+}
+
+package com.fincore.VoucherService.config;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
+
+/**
+ * Configures templates to handle compressed binary data (GZIP).
+ * This strategy prevents Out-Of-Memory (OOM) errors by offloading large
+ * validation datasets to Redis rather than keeping them in the application heap.
+ */
+@Configuration
+@Slf4j
+public class RedisConfig {
+
+    /**
+     * Configures a RedisTemplate specifically for byte array values.
+     * Uses String serialization for keys to ensure they are readable in the Redis CLI,
+     * while keeping values as raw bytes to avoid the overhead of standard Java serialization.
+     */
+    @Bean(name = "byteArrayRedisTemplate")
+    public RedisTemplate<String, byte[]> byteArrayRedisTemplate(RedisConnectionFactory connectionFactory) {
+        log.info("REDIS_CONFIG_INIT | Initializing ByteArrayRedisTemplate for binary data storage");
+
+        RedisTemplate<String, byte[]> template = new RedisTemplate<>();
+        template.setConnectionFactory(connectionFactory);
+
+        // Keys are Strings (e.g., "DATA_UUID") for easy debugging and TTL management
+        template.setKeySerializer(new StringRedisSerializer());
+
+        // Values are kept as raw Byte Arrays (GZIP Compressed) to maximize performance
+        template.setEnableDefaultSerializer(false);
+
+        log.info("REDIS_CONFIG_SUCCESS | ByteArrayRedisTemplate configured with StringKeySerializer and disabled value serialization");
+
+        return template;
+    }
+
+}
+package com.fincore.VoucherService.config;
+
+import jakarta.persistence.AttributeConverter;
+import jakarta.persistence.Converter;
+import com.fincore.VoucherService.Models.enums.RequestStatus;
+import lombok.extern.slf4j.Slf4j;
+import java.util.stream.Stream;
+
+/**
+ * Automatically maps the RequestStatus enum to its corresponding database code ("P", "A", "R").
+ * This ensures that the database remains decoupled from Java enum naming conventions.
+ */
+@Converter(autoApply = true)
+@Slf4j
+public class RequestStatusConverter implements AttributeConverter<RequestStatus, String> {
+
+    /**
+     * Converts the enum value to its data representation for storage.
+     * Logic preserved: Returns the specific character code (e.g., 'P' for PENDING).
+     */
+    @Override
+    public String convertToDatabaseColumn(RequestStatus status) {
+        if (status == null) {
+            return null;
+        }
+        return status.getCode();
+    }
+
+    /**
+     * Reconstructs the enum value from the database character code.
+     * Logic preserved: Uses a stream to find the matching enum constant.
+     * @throws IllegalArgumentException if an unrecognized code is encountered in the database.
+     */
+    @Override
+    public RequestStatus convertToEntityAttribute(String code) {
+        if (code == null) {
+            return null;
+        }
+
+        return Stream.of(RequestStatus.values())
+                .filter(status -> status.getCode().equals(code))
+                .findFirst()
+                .orElseThrow(() -> {
+                    log.error("DB_INTEGRITY_ERROR | Status: UNKNOWN_CODE_ENCOUNTERED | Value: {}", code);
+                    return new IllegalArgumentException("Unknown status code found in database: " + code);
+                });
+    }
+}
+
+
+package com.fincore.VoucherService.config;
+
+import com.fincore.commonutilities.config.CommonSecurityConfig;
+import com.fincore.commonutilities.config.RedisConfig;
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.fincore.commonutilities.security.ContextRbacFilter;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+
+/**
+ * Common Security Configuration.
+ * * Aligned with the "Distributed Gateway" architecture.
+ * It uses the ContextRbacFilter from Common Utilities to enforce:
+ * 1. Token Validity
+ * 2. Single Session (Redis check)
+ * 3. RBAC Permissions
+ */
+@Configuration
+@EnableWebSecurity
+@Import({RedisConfig.class, JwtUtil.class, CommonSecurityConfig.class }) // Import logic from JAR
+public class SecurityConfig {
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+
+    @Autowired
+    private JwtUtil jwtUtil;
+
+    @Autowired
+    private CommonSecurityConfig commonSecurityConfig; // Wire in the CORS config
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+                .csrf(AbstractHttpConfigurer::disable)
+                .cors(cors -> cors.configurationSource(commonSecurityConfig.corsConfigurationSource()))
+                .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .authorizeHttpRequests(authz -> authz
+                        .requestMatchers("/actuator/**", "/api/auth/**", "/error", "/swagger-ui.html", "/v3/api-docs/**").permitAll()
+                        .anyRequest().permitAll ()
+                );
+        // Add Filters using the BEAN references (methods above)
+//                .addFilterBefore(mdcLoggingFilter(), UsernamePasswordAuthenticationFilter.class)
+//                .addFilterAfter(contextRbacFilter(), MdcLoggingFilter.class);
+        return http.build();
+    }
+}
+
+
+
+
+Controllers-------------------------------------------
+
+
+
+package com.fincore.VoucherService.Controllers;
+
+import com.fincore.VoucherService.Dto.BranchDto;
+import com.fincore.VoucherService.Service.BranchService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Exposes endpoints for branch master data retrieval and search.
+ * Rule: Implements "Starts With" search logic to optimize Oracle Index Range Scans.
+ */
+@RestController
+@RequestMapping("/api/branches-journal")
+@RequiredArgsConstructor
+@Slf4j
+public class BranchController {
+
+    private final BranchService branchService;
+
+    /**
+     * Endpoint to retrieve a complete map of branch codes to branch names.
+     */
+    @GetMapping("/map")
+    public ResponseEntity<Map<String, String>> getBranchMap() {
+        log.info("BRANCH_CONTROLLER_MAP_REQUEST | Action: Fetching all active branch mappings");
+        Map<String, String> branchMap = branchService.getBranchCodeAndNameMap();
+        return ResponseEntity.ok(branchMap);
+    }
+
+    /**
+     * Endpoint to perform a PREFIX search for branches.
+     * Logic: Returns results starting with the query string (e.g., '321' matches '32121').
+     */
+    @GetMapping("/search")
+    public ResponseEntity<List<BranchDto>> searchBranches(@RequestParam String query) {
+        // Log the prefix search initialization
+        log.info("BRANCH_CONTROLLER_PREFIX_SEARCH | Query: {}", query);
+
+        if (query == null || query.trim().isEmpty()) {
+            // Preservation of empty list logic for blank inputs
+            return ResponseEntity.ok(Collections.emptyList());
+        }
+
+        // Service layer now handles the "StartingWith" repository call
+        List<BranchDto> results = branchService.searchBranches(query.trim());
+        return ResponseEntity.ok(results);
+    }
+}
+
+
+package com.fincore.VoucherService.Controllers;
+
+import com.fincore.VoucherService.Dto.CglDto;
+import com.fincore.VoucherService.Service.CglService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.util.Collections;
+import java.util.List;
+
+/**
+ * Exposes endpoints for searching Common General Ledger (CGL) master data.
+ * Updated to use "Starts With" logic for professional financial filtering.
+ */
+@RestController
+@RequestMapping("/api/cgl-journal")
+@RequiredArgsConstructor
+@Slf4j
+public class CglController {
+
+    private final CglService cglService;
+
+    /**
+     * Endpoint to search for CGLs by prefix.
+     * Logic: Implements prefix matching (REQ_CGL LIKE 'query%') for high performance.
+     */
+    @GetMapping("/search")
+    public ResponseEntity<List<CglDto>> searchCgl(
+            @RequestParam(value = "query", required = false, defaultValue = "") String query) {
+
+        if (query == null || query.trim().isEmpty()) {
+            return ResponseEntity.ok(Collections.emptyList());
+        }
+
+        log.info("CGL_CONTROLLER_PREFIX_SEARCH | Action: Filtering CGLs starting with: {}", query);
+
+        // Service layer uses the repository's findBy...StartingWith logic
+        List<CglDto> results = cglService.searchCgls(query.trim());
+        return ResponseEntity.ok(results);
+    }
+}
+package com.fincore.VoucherService.Controllers;
+
+
+import com.fincore.VoucherService.Service.ValidationMasterService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.util.Set;
+
+@RestController
+@RequestMapping("/api/voucher")
+@RequiredArgsConstructor
+public class CurrencyController {
+
+    private final ValidationMasterService validationMasterService;
+
+    /**
+     * Purpose: Returns a list of only the active CURRENCY_CODEs.
+     */
+    @GetMapping("/currencies")
+    public ResponseEntity<Set<String>> getActiveCurrencies() {
+        // Reuses your existing high-performance JDBC method
+        Set<String> currencies = validationMasterService.getAllActiveCurrencies();
+
+        return ResponseEntity.ok(currencies);
+    }
+}
+
+
+package com.fincore.VoucherService.Controllers;
+
+
+import com.fincore.VoucherService.Exception.CustomExceptions;
+import com.fincore.VoucherService.Models.JournalRequest;
+import com.fincore.VoucherService.Service.core.VoucherCommandService;
+import com.fincore.VoucherService.Service.core.VoucherWorkflowEngine;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import com.fincore.VoucherService.Dto.*;
+import com.fincore.commonutilities.jwt.JwtUtil;
+import jakarta.validation.Valid;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+@RestController
+@RequestMapping("/api/voucher")
+@RequiredArgsConstructor
+@Slf4j
+public class VoucherActionController {
+
+
+    private final VoucherCommandService commandService;
+    private final VoucherWorkflowEngine workflowEngine;
+    private final JwtUtil jwtUtil;
+
+
+    /**
+     * Triggers the async approval/rejection process using Oracle Parallel execution.
+     */
+    @PostMapping("/process-bulk")
+    public ResponseEntity<Map<String, Object>> processBulkRequests(
+            @RequestHeader("Authorization") String token,
+            @Valid @RequestBody BulkProcessVoucherPostingDto dto) {
+
+        String userId = jwtUtil.getUserIdFromToken(token);
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+        log.info("BULK_PROCESS_START | User: {} | Batch: {} | Action: {}", userId, dto.getBatchId(), dto.getStatus());
+
+        commandService.processBulkRequestsAsync(dto, userId, userRole);
+
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
+                "status", "PROCESSING", "message", "Approval process started. Notifications will be sent upon completion."));
+    }
+
+
+    @PostMapping("/workflow/action")
+    public ResponseEntity<Map<String, String>> processCheckerAction(
+            @RequestHeader("Authorization") String token,
+            @Valid @RequestBody ProcessVoucherRequestDto dto) {
+
+        String userId = jwtUtil.getUserIdFromToken(token);
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+
+        workflowEngine.processWorkflowAction(dto, userId, userRole);
+
+        return ResponseEntity.ok(Map.of("status", "SUCCESS", "message", "Workflow action processed successfully."));
+    }
+
+
+
+
+    // ==================================================================================
+    // 1. ASYNC BULK OPERATIONS
+    // ==================================================================================
+
+    /**
+     * Creates a batch from pre-validated cache data.
+     * Uses fire-and-forget logic; returns 202 Accepted immediately.
+     */
+    @PostMapping("/create-batch-from-cache")
+    public ResponseEntity<Map<String, Object>> createBatchFromCache(
+            @Valid @RequestBody CacheBatchPostingDto payload,
+            @RequestHeader("Authorization") String token) throws IOException {
+
+        String userId = jwtUtil.getUserIdFromToken(token);
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+        log.info("CACHE_BATCH_INIT | User: {} | ReqID: {}", userId, payload.getRequestId());
+
+        String batchId = commandService.createBatchFromCacheAsync(payload.getRequestId(), payload.getCommonBatchRemarks(), userId, userRole, payload.getVid());
+
+
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
+                "status", "PROCESSING", "message", "Batch creation initiated in background.", "batchId", batchId));
+    }
+
+
+    @PostMapping("/update-schedule")
+    public ResponseEntity<Map<String, String>> updateSchedule(@RequestBody Map<String, String> payload) {
+        commandService.updateBatchSchedule(payload.get("batchId"), payload.get("scheduledTime"));
+
+        Map<String, String> response = new HashMap<>();
+        response.put("message", "Schedule updated successfully.");
+        response.put("status", "SUCCESS");
+        return ResponseEntity.ok(response);
+    }
+
+
+    // ==================================================================================
+    // 5. MANUAL/SMALL BATCH ENDPOINTS
+    // ==================================================================================
+
+    @PostMapping("/create-batch")
+    public ResponseEntity<List<JournalRequest>> createBatchRequest(
+            @Valid @RequestBody BatchPostingDto batchDto,
+            @RequestHeader("Authorization") String token) {
+        try {
+            String userId = jwtUtil.getUserIdFromToken(token);
+            log.info("MANUAL_BATCH_CREATE | User: {} | Rows: {}", userId, batchDto.getRows().size());
+
+            List<JournalRequest> created = commandService.createBatchRequest(
+                    batchDto, userId, jwtUtil.getUserRoleFromToken(token));
+            return ResponseEntity.status(HttpStatus.CREATED).body(created);
+        } catch (CustomExceptions.DataMappingException e) {
+            log.error("MANUAL_BATCH_JSON_FAIL | Status: Payload serialization error");
+            throw new CustomExceptions.DataMappingException("Request contains invalid data format.");
+        }
+    }
+
+
+    @DeleteMapping("/my-requests/by-batch/{batchId}")
+    public ResponseEntity<ApiResponseDto> deletePendingBatch(@PathVariable String batchId, @RequestHeader("Authorization") String token) {
+        try {
+            commandService.deleteBatchRequest(batchId, jwtUtil.getUserIdFromToken(token.substring(7)));
+            return ResponseEntity.ok(new ApiResponseDto("Success", "Batch deletion process initiated.", null));
+        } catch (IllegalStateException e) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(new ApiResponseDto("Error", e.getMessage(), null));
+        } catch (CustomExceptions.InvalidDataException e) {
+            // FIX: Catch specific business errors and send the exact message to React
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(new ApiResponseDto("Error", e.getMessage(), null));
+        } catch (Exception e) {
+            log.error("BATCH_DELETE_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(new ApiResponseDto("Error", "An unexpected error occurred.", null));
+        }
+    }
+
+
+    @DeleteMapping("/my-request/{requestId}")
+    public ResponseEntity<Void> cancelMyRequest(@RequestHeader("Authorization") String token, @PathVariable Long requestId) {
+        commandService.cancelMyRequest(requestId, jwtUtil.getUserIdFromToken(token));
+        return ResponseEntity.noContent().build();
+    }
+}
+
+package com.fincore.VoucherService.Controllers;
+
+
+import com.fincore.VoucherService.Dto.BulkUploadStateDto;
+import com.fincore.VoucherService.Exception.CustomExceptions;
+import com.fincore.VoucherService.Service.validation.ValidationReportGenerator;
+import com.fincore.VoucherService.Service.validation.VoucherBulkValidationService;
+import jakarta.servlet.http.HttpServletRequest;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.core.io.Resource;
+import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.io.IOException;
+import java.time.LocalDate;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/voucher")
+@RequiredArgsConstructor
+@Slf4j
+public class VoucherBulkUploadController {
+
+    private final VoucherBulkValidationService voucherBulkValidationService;
+    private final ValidationReportGenerator validationReportGenerator;
+    /**
+     * Entry point for Journal File uploads. Validates file existence and starts parsing.
+     */
+
+    @PostMapping(value = "/bulk-validate-init", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<Map<String, Object>> initiateValidation(
+            @RequestParam("file") MultipartFile file,
+            @RequestParam("postingDate") @DateTimeFormat(pattern = "dd/MM/yyyy") LocalDate postingDate,
+            HttpServletRequest request) {
+
+        if (file == null || file.isEmpty()) {
+            return ResponseEntity.status(org.springframework.http.HttpStatus.BAD_REQUEST)
+                    .body(Map.of("message", "File is missing or empty."));
+        }
+
+        try {
+            String reqId = voucherBulkValidationService.initiateValidation(file, postingDate);
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.setCacheControl(org.springframework.http.CacheControl.noCache().mustRevalidate().sMaxAge(java.time.Duration.ZERO));
+            headers.setPragma("no-cache");
+            headers.setExpires(0L);
+            headers.set("X-Content-Type-Options", "nosniff");
+            headers.set("Content-Security-Policy", "default-src 'self'");
+
+            return ResponseEntity.ok()
+                    .headers(headers)
+                    .body(Map.of("status", "QUEUED", "requestId", reqId));
+
+        } catch (CustomExceptions.FileProcessingException e) {
+            // FIX: Explicitly catch our custom validation errors and send the EXACT message back to React
+            return ResponseEntity.status(org.springframework.http.HttpStatus.BAD_REQUEST)
+                    .body(Map.of("message", e.getMessage()));
+
+        } catch (Exception e) {
+            // Fallback for unexpected system errors
+            log.error("VALIDATION_INIT_FAIL | File: {} | Error: {}", file.getOriginalFilename(), e.getMessage());
+            return ResponseEntity.status(org.springframework.http.HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("message", "An unexpected error occurred during upload."));
+        }
+    }
+
+
+    @GetMapping("/bulk-status/{requestId}")
+    public ResponseEntity<BulkUploadStateDto> checkStatus(@PathVariable String requestId) {
+        BulkUploadStateDto state = voucherBulkValidationService.getState(requestId);
+        return state != null ? ResponseEntity.ok(state) : ResponseEntity.notFound().build();
+    }
+
+
+    /**
+     * Downloads the error report excel file.
+     */
+    @GetMapping("/download-bulk-file/{requestId}")
+    public ResponseEntity<Resource> downloadFile(@PathVariable String requestId, @RequestParam String type) {
+        byte[] data = voucherBulkValidationService.getFileBytes(requestId, type);
+        if (data == null) {
+            log.warn("DOWNLOAD_FAIL | File not found | ReqID: {} | Type: {}", requestId, type);
+            return ResponseEntity.notFound().build();
+        }
+
+        // Retrieves the strict date format (e.g., "2026-06-18") without timestamps
+        String filename = "Error_Report" + ".xlsx";
+
+
+        // Exclusively sets the MIME type to Excel (.xlsx) since CSV is no longer needed
+        MediaType mediaType = MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + filename + "\"")
+                .contentType(mediaType)
+                .body(new ByteArrayResource(data));
+    }
+
+    @GetMapping("/download-template")
+    public ResponseEntity<org.springframework.core.io.Resource> downloadTemplate() throws IOException {
+        return ResponseEntity.ok().header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Voucher_Template.xlsx\"").body(new ByteArrayResource(validationReportGenerator.generateExcelTemplateWithGuidelines()));
+    }
+
+}
+package com.fincore.VoucherService.Controllers;
+
+
+import com.fincore.VoucherService.Exception.CustomExceptions;
+import com.fincore.VoucherService.Models.RequestVoucher;
+import com.fincore.VoucherService.Service.JsEodMasterService;
+import com.fincore.VoucherService.Service.RequestVoucherService;
+import com.fincore.VoucherService.Service.core.VoucherQueryService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import com.fincore.VoucherService.Dto.*;
+import com.fincore.VoucherService.Models.JournalRequest;
+import com.fincore.commonutilities.jwt.JwtUtil;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+
+@RestController
+@RequestMapping("/api/voucher")
+@RequiredArgsConstructor
+@Slf4j
+public class VoucherQueryController {
+
+
+
+    private final VoucherQueryService queryService;
+    private final JsEodMasterService jsEodMasterService;
+    private final RequestVoucherService requestVoucherService;
+    private final JwtUtil jwtUtil;
+
+
+
+    /**
+     * Safeguard: Forces pagination if batch rows exceed 2000 to avoid Server OOM.
+     */
+    @GetMapping("/by-batch/{batchId}")
+    public ResponseEntity<?> getRequestsByBatchId(@PathVariable String batchId) {
+        long count = queryService.getRequestCountByBatchId(batchId);
+        if (count > 2000) return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE).body(Map.of("error", "Batch too large.", "suggestion", "/api/voucher/by-batch-paginated/" + batchId));
+        return ResponseEntity.ok(queryService.getRequestsByBatchId(batchId));
+    }
+
+
+
+    @GetMapping("/by-batch-paginated/{batchId}")
+    public ResponseEntity<?> getRequestsByBatchIdPaginated(@PathVariable String batchId, @RequestParam(defaultValue = "0") int page, @RequestParam(defaultValue = "10") int size) {
+        return ResponseEntity.ok(queryService.getRequestsByBatchIdPaginated(batchId, PageRequest.of(page, size)));
+    }
+
+    @GetMapping("/download-batch/{batchId}")
+    public ResponseEntity<?> downloadBatchExcel(@PathVariable String batchId, @RequestHeader("Authorization") String token) {
+        try {
+            if (!queryService.isUserAuthorizedForBatch(batchId, jwtUtil.getUserIdFromToken(token.substring(7)), jwtUtil.getUserRoleFromToken(token.substring(7)))) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("message", "You are not authorized to view this batch."));
+            }
+
+            byte[] fileData = queryService.generateBatchExcel(batchId);
+            org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
+            headers.setCacheControl(org.springframework.http.CacheControl.noCache().mustRevalidate().sMaxAge(java.time.Duration.ZERO));
+            headers.set(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Batch_" + batchId + ".xlsx\"");
+            headers.set(org.springframework.http.HttpHeaders.CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+
+            return ResponseEntity.ok().headers(headers).body(fileData);
+
+        } catch (CustomExceptions.InvalidDataException e) {
+            // FIX: Return the exact "No records found" message as JSON
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of("message", e.getMessage()));
+        } catch (Exception e) {
+            log.error("DOWNLOAD_ERROR | Batch: {} | Reason: {}", batchId, e.getMessage());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("message", "Failed to generate Excel file."));
+        }
+    }
+
+    @GetMapping("/pending-requests")
+    public List<JournalRequest> getPendingRequests(@RequestHeader("Authorization") String token) {
+        return queryService.getPendingRequests(jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token));
+    }
+
+    @GetMapping("/checker/pending-approvals")
+    public ResponseEntity<List<Map<String, Object>>> getPendingApprovals(@RequestHeader("Authorization") String token) {
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+        String userId = jwtUtil.getUserIdFromToken(token);
+        return ResponseEntity.ok(queryService.getPendingBatchesForChecker(userRole, userId));
+    }
+
+    // ==================================================================================
+    // 2. DASHBOARDS & SUMMARIES
+    // ==================================================================================
+
+    @GetMapping("/all-requests-summary")
+    public ResponseEntity<List<Map<String, Object>>> getAllRequestsSummary(@RequestHeader("Authorization") String token) {
+        String userId = jwtUtil.getUserIdFromToken(token);
+        return ResponseEntity.ok(queryService.getAllRequestsSummary(userId));
+    }
+
+    @GetMapping("/workflow-history/{batchId}")
+    public ResponseEntity<List<Map<String, Object>>> getWorkflowHistory(@PathVariable String batchId) {
+        return ResponseEntity.ok(queryService.getWorkflowHistory(batchId));
+    }
+
+    @GetMapping("/batch-summary/{batchId}")
+    public ResponseEntity<Map<String, Object>> getBatchSummaryDetails(@PathVariable String batchId) {
+        return ResponseEntity.ok(queryService.getBatchSummaryDetails(batchId));
+    }
+
+
+    // ==================================================================================
+    // 3. UTILITIES & METADATA
+    // ==================================================================================
+
+    @GetMapping("/current-posting-date")
+    public String getCurrentPostingDate() { return queryService.getCurrentPostingDate().format(DateTimeFormatter.ISO_LOCAL_DATE); }
+
+    @GetMapping("/eod_status")
+    public ResponseEntity<List<JsEodMasterDTO>> getEodStatus() { return new ResponseEntity<>(jsEodMasterService.getAllData(), HttpStatus.OK); }
+
+    @GetMapping("/filter")
+    public ResponseEntity<List<RequestVoucher>> getFilteredVouchers(@RequestParam(required = false) String category, @RequestParam(required = false) String role, @RequestParam(required = false) @DateTimeFormat(pattern = "yyyy-MM-dd") LocalDate date) {
+        return ResponseEntity.ok(requestVoucherService.getFilteredVouchers(category, role, date));
+    }
+
+    @GetMapping("/workflow/steps/{workflowCode}")
+    public ResponseEntity<List<Map<String, Object>>> getWorkflowSteps(@PathVariable String workflowCode) { return ResponseEntity.ok(queryService.getWorkflowSteps(workflowCode)); }
+
+    @GetMapping("/active-roles")
+    public ResponseEntity<Map<String, String>> getActiveRoles() { return ResponseEntity.ok(queryService.getActiveRoles()); }
+
+    @GetMapping("/vid-details/{vid}")
+    public ResponseEntity<Map<String, Object>> getVidDetails(@PathVariable String vid) { return ResponseEntity.ok(queryService.getVidDetails(vid)); }
+
+    @GetMapping("/active")
+    public ResponseEntity<Map<String, Object>> getAvailableVouchers(@RequestParam Long roleId) {
+        Map<String, Object> response = new HashMap<>(); response.put("data", queryService.getAvailableVouchersVid(roleId)); response.put("message", "Success"); response.put("status", "OK");
+        return ResponseEntity.ok(response);
+    }
+}
+
+
+DTO-------------------------------
+package com.fincore.VoucherService.Dto;
+
+
+import lombok.Builder;
+import lombok.Data;
+import java.time.LocalDateTime;
+import java.util.List;
+
+@Data
+@Builder
+public class ApiErrorResponseDto {
+    private LocalDateTime timestamp;
+    private int status;
+    private String error;
+    private String message;
+    private String path;
+    private List<ValidationError> validationErrors;
+
+    @Data
+    @Builder
+    public static class ValidationError {
+        private String field;
+        private String message;
+    }
+}
+
+
+
+package com.fincore.VoucherService.Dto;
+
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+
+public class ApiResponseDto {
+
+    private String status;
+    private String message;
+    private Object data;
+
+    public ApiResponseDto(String success, String s, Object o) {
+    }
+}
+
+
+
+
+package com.fincore.VoucherService.Dto;
+
+import com.fincore.VoucherService.Models.enums.ChangeType;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import lombok.Data;
+
+import java.time.LocalDateTime;
+import java.util.List;
+
+@Data
+public class BatchPostingDto {
+
+    @Data
+    public static class JournalRequestRow {
+        @NotNull
+        private ChangeType changeType = ChangeType.ADD;
+
+
+        private Long masterJournalId;
+
+
+        private LocalDate postingDate;
+
+
+        @jakarta.validation.constraints.NotBlank(message = "Branch is required")
+        @jakarta.validation.constraints.Size(min = 5, max = 5, message = "Branch code must be exactly 5 characters")
+        private String branch;
+
+
+        @jakarta.validation.constraints.NotBlank(message = "Currency is required")
+        @jakarta.validation.constraints.Size(min = 3, max = 3, message = "Currency must be exactly 3 characters")
+        private String currency;
+
+        @jakarta.validation.constraints.NotBlank(message = "CGL is required")
+        @jakarta.validation.constraints.Pattern(regexp = "^\\d{10}$", message = "CGL must be exactly 10 digits")
+        private String cgl;
+
+        @jakarta.validation.constraints.NotNull(message = "Amount is required")
+        @jakarta.validation.constraints.Digits(integer = 16, fraction = 4, message = "Amount cannot exceed 16 integer digits and 4 fractional digits")
+        private BigDecimal amount;
+
+        @jakarta.validation.constraints.Pattern(regexp = "^\\d{0,8}$", message = "Product Type must be numeric and up to 8 digits")
+        private String productType;
+
+        @jakarta.validation.constraints.NotBlank(message = "Remarks are required")
+        @jakarta.validation.constraints.Pattern(
+                regexp = "^[a-zA-Z0-9 \\-_]{2,30}$",
+                message = "Remarks must be 2-30 alphanumeric characters, including spaces, hyphens, or underscores"
+        )
+        private String remarks;
+
+        @Size(min = 1, max = 1)
+        private String arFlag = "A";
+
+        @Size(min = 1, max = 1)
+        private String acClassification;
+    }
+
+    @jakarta.validation.constraints.Pattern(regexp = "^([a-zA-Z0-9 ]{2,30})?$", message = "Common remarks must be 2-30 alphanumeric characters and spaces only, if provided")
+    private String commonBatchRemarks;
+
+    @Valid
+    @jakarta.validation.constraints.NotEmpty(message = "Batch must contain at least one row")
+    private List<JournalRequestRow> rows;
+
+    @com.fasterxml.jackson.annotation.JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss")
+    private LocalDateTime scheduledTime;
+
+    // Assuming VID is passed from frontend to identify the voucher type
+    @jakarta.validation.constraints.NotBlank(message = "VID is required")
+    private String vid;
+
+}
+
+
+package com.fincore.VoucherService.Dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class BranchDto {
+    private String code;
+    private String name;
+    
+}
+package com.fincore.VoucherService.Dto;
+
+
+import com.fincore.VoucherService.Models.enums.RequestStatus;
+
+import jakarta.validation.constraints.NotNull;
+import lombok.Data;
+
+@Data
+public class BulkProcessVoucherPostingDto {
+
+    @jakarta.validation.constraints.NotBlank(message = "Batch ID is required")
+    private String batchId;
+
+
+    @NotNull
+    private RequestStatus status;
+
+    @jakarta.validation.constraints.NotBlank(message = "Remarks are required")
+    @jakarta.validation.constraints.Pattern(regexp = "^[a-zA-Z0-9 ]{2,30}$", message = "Remarks must be 2-30 alphanumeric characters and spaces only")
+    private String remarks;
+}
+
+
+package com.fincore.VoucherService.Dto;
+
+import lombok.Data;
+import java.io.Serializable;
+
+@Data
+public class BulkUploadStateDto implements Serializable {
+    private String requestId;
+    private String status; // PROCESSING, SUCCESS, ERROR
+    private Integer currentStage; // 1..4
+    private Integer totalRows;
+    private Long errorCount;
+    private String message;
+    private String previewDataJson;
+    private boolean hasProductColumn;
+    private boolean hasErrorFile;
+    private boolean hasSuccessFile;
+
+    private transient String errorFilePath;
+    private transient String successFilePath;
+}
+
+
+package com.fincore.VoucherService.Dto;
+
+import com.fasterxml.jackson.annotation.JsonFormat;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class CacheBatchPostingDto {
+
+    @NotBlank(message = "Request ID is required")
+    @JsonProperty("requestId") // <-- THIS BYPASSES THE COMPILER ISSUE
+    private String requestId;
+
+    // (Also included the Regex fix here so financial characters like '/' don't break it!)
+    @Pattern(regexp = "^([a-zA-Z0-9 \\/&(),.\\-]{2,30})?$", message = "Common batch remarks must be 2-30 characters")
+    @JsonProperty("commonBatchRemarks") // <-- THIS BYPASSES THE COMPILER ISSUE
+    private String commonBatchRemarks;
+
+    @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "dd/MM/yyyy")
+    @JsonProperty("postingDate") // <-- THIS BYPASSES THE COMPILER ISSUE
+    private LocalDate postingDate;
+
+    @JsonProperty("scheduledTime") // <-- THIS BYPASSES THE COMPILER ISSUE
+    private LocalDateTime scheduledTime;
+
+    @JsonProperty("vid") // <-- THIS BYPASSES THE COMPILER ISSUE
+    private String vid;
+}
+
+
+package com.fincore.VoucherService.Dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class CglDto {
+    private String cglNumber;
+    private String description;
+}
+
+
+package com.fincore.VoucherService.Dto;
+
+import com.fasterxml.jackson.annotation.*;
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+@JsonFormat(shape = JsonFormat.Shape.ARRAY)
+@JsonPropertyOrder({
+        "rowIndex", "branch", "currency", "cgl", "txnType", "remarks",
+        "productCode", "amount", "isSystemFormat", "sysSite", "sysDate",
+        "sysYear", "sysPeriod", "formatErrors", "dbErrors", "balErrors"
+})
+public class ExcelRowData {
+
+    @JsonProperty("0") // rowIndex
+    public int rowIndex;
+
+    @JsonProperty("1") // branch
+    public String branch = "";
+
+    @JsonProperty("2") // currency
+    public String currency = "";
+
+    @JsonProperty("3") // cgl
+    public String cgl = "";
+
+    @JsonProperty("4") // txnType
+    public String txnType = "";
+
+    @JsonProperty("5") // remarks
+    public String remarks = "";
+
+    @JsonProperty("6") // productCode
+    public String productCode = "";
+
+    @JsonProperty("7") // amount
+    public BigDecimal amount;
+
+    @JsonProperty("8") // isSystemFormat
+    public boolean isSystemFormat = false;
+
+    @JsonProperty("9") // sysSite
+    public String sysSite = "";
+
+    @JsonProperty("10") // sysDate
+    public String sysDate = "";
+
+    @JsonProperty("11") // sysYear
+    public String sysYear = "";
+
+    @JsonProperty("12") // sysPeriod
+    public String sysPeriod = "";
+
+    // Validation Lists (Indices 13, 14, 15)
+    @JsonProperty("13")
+    public final List<String> formatErrors = Collections.synchronizedList(new ArrayList<>());
+
+    @JsonProperty("14")
+    public final List<String> dbErrors = Collections.synchronizedList(new ArrayList<>());
+
+    @JsonProperty("15")
+    public final List<String> balErrors = Collections.synchronizedList(new ArrayList<>());
+
+    public boolean hasErrors() {
+        return !formatErrors.isEmpty() || !dbErrors.isEmpty() || !balErrors.isEmpty();
+    }
+
+    @JsonIgnore
+    public String getAllErrors() {
+        List<String> all = new ArrayList<>(formatErrors);
+        all.addAll(dbErrors);
+        all.addAll(balErrors);
+        return String.join("; ", all);
+    }
+}
+
+
+package com.fincore.VoucherService.Dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class HdfsSyncDto {
+    private String branch;
+    private String currency;
+    private String cgl;
+    private LocalDate balanceDate;
+    private BigDecimal newBalance;
+    private BigDecimal newInrBalance;
+}
+
+package com.fincore.VoucherService.Dto;
+
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+
+public class JsEodMasterDTO {
+
+    private Integer eodStatus;
+}
+
+
+
+package com.fincore.VoucherService.Dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class NotificationConfigDto {
+    private String targetUrl;
+    private String targetRoles; // Comma separated string: "51,52,55"
+}
+
+
+
+package com.fincore.VoucherService.Dto;
+
+
+import java.util.List;
+
+public class ParsingResult {
+    public List<ExcelRowData> rows;
+    public boolean hasProductColumn;
+
+    public ParsingResult(List<ExcelRowData> rows, boolean hasProductColumn) {
+        this.rows = rows;
+        this.hasProductColumn = hasProductColumn;
+    }
+}
+
+
+package com.fincore.VoucherService.Dto;
+
+import com.fasterxml.jackson.annotation.JsonFormat;
+import com.fincore.VoucherService.Models.enums.RequestStatus;
+
+import jakarta.validation.constraints.NotNull;
+import lombok.Data;
+import lombok.Getter;
+import lombok.Setter;
+
+import java.time.LocalDateTime;
+
+@Data
+@Getter
+@Setter
+public class ProcessVoucherRequestDto {
+
+    @NotNull(message = "Batch ID is required")
+    private String batchId; // Changed from requestId to batchId for bulk approval
+
+    @NotNull(message = "Status is required")
+    private RequestStatus status;
+
+    @jakarta.validation.constraints.NotBlank(message = "Remarks are required")
+    @jakarta.validation.constraints.Pattern(regexp = "^[a-zA-Z0-9 ]+$", message = "Remarks must be alphanumeric characters and spaces only")
+    private String remarks;
+
+    // --- NEW FIELDS FOR SCHEDULING WORKFLOW ---
+    private Boolean overrideScheduleLapse; // True if the user chooses to post immediately after a lapse prompt
+
+    @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss")
+    private LocalDateTime newScheduledTime; // If the final approver decides to set a new time
+}
+
+
+
+package com.fincore.VoucherService.Dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.io.Serializable;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class TaskProgressDto implements Serializable {
+    private String taskId;      // Unique Job ID (e.g., Batch ID)
+    private String userId;      // The User receiving the progress
+    private int percentage;     // 0-100
+    private String status;      // PROCESSING, COMPLETED, FAILED
+    private String message;     // User-facing update (e.g., "Row 500/1000...")
+}
+package com.fincore.VoucherService.Dto;
+
+import lombok.Data;
+import java.time.LocalDateTime;
+
+import com.fincore.VoucherService.Models.JournalRequest;
+import com.fincore.VoucherService.Models.enums.RequestStatus;
+
+@Data
+public class VoucherRequestStatusDto {
+
+    private RequestStatus requestStatus;
+    private LocalDateTime requestDate;
+    private String creatorId;
+    private String executorId;
+    private String executorRemarks;
+    private String batchId;
+    private String journalId;
+
+    // A helper constructor 
+    public VoucherRequestStatusDto(JournalRequest request) {
+        this.requestStatus = request.getRequestStatus();
+        this.requestDate = request.getRequestDate();
+        this.creatorId = request.getCreatorId();
+//        this.executorId = request.getExecutorId();
+//        this.executorRemarks = request.getExecutorRemarks();
+        this.batchId = request.getBatchId();
+        this.journalId = request.getJournalId();
+    }
+}
+
+package com.fincore.VoucherService.Dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.AssertTrue;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class VoucherRowDto {
+
+    @NotBlank(message = "Branch is mandatory")
+    private String branch;
+
+    @NotBlank(message = "Currency is mandatory")
+    private String currency;
+
+    @NotBlank(message = "CGL is mandatory")
+    private String cgl;
+
+    // Allows optional '-', up to 16 digits, and optional decimal up to 4 places
+    @NotBlank(message = "Amount is mandatory")
+    @Pattern(regexp = "^-?\\d{1,16}(\\.\\d{1,4})?$", message = "Amount must be a valid number with up to 16 digits and a maximum of 4 decimal places")
+    private String amount;
+
+    // Optional field, so we just restrict it to 0-8 digits
+    @Pattern(regexp = "^\\d{0,8}$", message = "Product Code must be a maximum of 8 digits")
+    private String productCode;
+
+    @NotBlank(message = "Remarks are mandatory")
+    @Pattern(regexp = "^[a-zA-Z0-9]{2,30}$", message = "Remarks must be between 2 and 30 alphanumeric characters")
+    private String remarks;
+
+    @NotBlank(message = "AR Flag is mandatory")
+    private String arFlag;
+
+    // --- CROSS-FIELD VALIDATION (The Currency/Decimal Rule) ---
+    // Spring Boot will automatically run any method annotated with @AssertTrue during validation
+    @AssertTrue(message = "INR currency allows a maximum of 2 decimal places. Other currencies allow up to 4.")
+    public boolean isAmountDecimalValid() {
+        if (amount == null || currency == null) return true; // Skip if null, let @NotBlank handle the error
+
+        String[] parts = amount.replace("-", "").split("\\.");
+        int fractionLength = parts.length > 1 ? parts[1].length() : 0;
+
+        if ("INR".equalsIgnoreCase(currency)) {
+            return fractionLength <= 2;
+        } else {
+            return fractionLength <= 4;
+        }
+    }
+
+
+}
+
+
+
+Exception
+
+package com.fincore.VoucherService.Exception;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.ResponseStatus;
+
+/**
+ * Centralized custom exceptions for the Journal Service.
+ * Provides specific HTTP status mappings for consistent API error responses.
+ */
+public class CustomExceptions {
+
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public static class FileProcessingException extends RuntimeException {
+        public FileProcessingException(String message, Throwable cause) { super(message, cause); }
+        public FileProcessingException(String message) { super(message); }
+    }
+
+    @ResponseStatus(HttpStatus.GONE)
+    public static class CacheExpiredException extends RuntimeException {
+        public CacheExpiredException(String message) { super(message); }
+    }
+
+    @ResponseStatus(HttpStatus.CONFLICT)
+    public static class ConcurrencyLockException extends RuntimeException {
+        public ConcurrencyLockException(String message) { super(message); }
+    }
+
+    @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
+    public static class DatabaseOperationException extends RuntimeException {
+        public DatabaseOperationException(String message) { super(message); }
+        public DatabaseOperationException(String message, Throwable cause) { super(message, cause); }
+    }
+
+    @ResponseStatus(HttpStatus.SERVICE_UNAVAILABLE)
+    public static class RedisOperationException extends RuntimeException {
+        public RedisOperationException(String message, Throwable cause) { super(message, cause); }
+    }
+
+    @ResponseStatus(HttpStatus.UNPROCESSABLE_ENTITY)
+    public static class DataMappingException extends RuntimeException {
+        public DataMappingException(String message) { super(message); }
+    }
+
+    @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
+    public static class BatchProcessingException extends RuntimeException {
+        public BatchProcessingException(String message) {
+            super(message);
+        }
+
+        public BatchProcessingException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public static class InvalidDataException extends RuntimeException {
+        public InvalidDataException(String message) {
+            super(message);
+        }
+    }
+    @ResponseStatus(HttpStatus.CONFLICT)
+    public static class ScheduleLapsedException extends RuntimeException {
+        public ScheduleLapsedException(String message) {
+            super(message);
+        }
+    }
+
+}
+
+
+package com.fincore.VoucherService.Exception;
+
+import com.fincore.VoucherService.Dto.ApiErrorResponseDto;
+import jakarta.servlet.http.HttpServletRequest;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataAccessException;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.validation.FieldError;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.ResponseStatus;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.multipart.MaxUploadSizeExceededException;
+
+import java.io.IOException;
+import java.time.LocalDateTime;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+/**
+ * Centralized error management for consistent and secure API responses.
+ */
+@RestControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<ApiErrorResponseDto> handleValidation(MethodArgumentNotValidException ex, HttpServletRequest request) {
+        List<ApiErrorResponseDto.ValidationError> errors = ex.getBindingResult().getFieldErrors().stream()
+                .map(err -> ApiErrorResponseDto.ValidationError.builder()
+                        .field(err.getField())
+                        .message(err.getDefaultMessage())
+                        .build())
+                .collect(Collectors.toList());
+
+        // Join the custom messages for the React frontend Snackbar
+        String joinedMessage = ex.getBindingResult().getFieldErrors().stream()
+                .map(org.springframework.validation.FieldError::getDefaultMessage)
+                .collect(Collectors.joining(" | "));
+
+        log.warn("VALIDATION_FAILED | Path: {} | Errors: {}", request.getRequestURI(), errors.size());
+
+        // Feed the joinedMessage into the response instead of the generic string
+        return buildResponse(HttpStatus.BAD_REQUEST, "Validation Failed", joinedMessage, request.getRequestURI(), errors);
+    }
+
+    @ExceptionHandler(MaxUploadSizeExceededException.class)
+    public ResponseEntity<ApiErrorResponseDto> handleMaxSize(MaxUploadSizeExceededException ex, HttpServletRequest request) {
+        log.error("FILE_TOO_LARGE | Path: {}", request.getRequestURI());
+        return buildResponse(HttpStatus.PAYLOAD_TOO_LARGE, "File Too Large", "Maximum upload size exceeded", request.getRequestURI(), null);
+    }
+
+
+    @ExceptionHandler(CustomExceptions.FileProcessingException.class)
+    public ResponseEntity<ApiErrorResponseDto> handleFileProcessing(CustomExceptions.FileProcessingException ex, HttpServletRequest request) {
+        log.error("FILE_PROCESS_ERROR | Path: {} | Type: {}", request.getRequestURI(), ex.getClass().getSimpleName());
+        return buildResponse(HttpStatus.BAD_REQUEST, "File Error", "Failed to process the uploaded file.", request.getRequestURI(), null);
+    }
+
+    /**
+     * FIXED: Removed IllegalStateException from here to resolve the Ambiguous mapping error.
+     */
+    @ExceptionHandler(CustomExceptions.ConcurrencyLockException.class)
+    public ResponseEntity<ApiErrorResponseDto> handleConcurrency(CustomExceptions.ConcurrencyLockException ex, HttpServletRequest request) {
+        log.warn("CONCURRENCY_CONFLICT | Path: {} | Message: {}", request.getRequestURI(), ex.getMessage());
+        return buildResponse(HttpStatus.CONFLICT, "Operation Conflict", ex.getMessage(), request.getRequestURI(), null);
+    }
+
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<ApiErrorResponseDto> handleNotFound(ResourceNotFoundException ex, HttpServletRequest request) {
+        log.info("RESOURCE_NOT_FOUND | Path: {} | Resource: {}", request.getRequestURI(), ex.getMessage());
+        return buildResponse(HttpStatus.NOT_FOUND, "Not Found", ex.getMessage(), request.getRequestURI(), null);
+    }
+
+    @ExceptionHandler(CustomExceptions.CacheExpiredException.class)
+    public ResponseEntity<ApiErrorResponseDto> handleCacheExpired(CustomExceptions.CacheExpiredException ex, HttpServletRequest request) {
+        log.warn("CACHE_EXPIRED | Path: {}", request.getRequestURI());
+        return buildResponse(HttpStatus.GONE, "Session Expired", ex.getMessage(), request.getRequestURI(), null);
+    }
+
+    @ExceptionHandler(DataIntegrityViolationException.class)
+    public ResponseEntity<ApiErrorResponseDto> handleSqlIntegrity(DataIntegrityViolationException ex, HttpServletRequest request) {
+        log.error("DB_INTEGRITY_VIOLATION | Path: {} | Type: Constraint violation", request.getRequestURI());
+        return buildResponse(HttpStatus.CONFLICT, "Data Integrity Error", "Constraint violation or duplicate entry.", request.getRequestURI(), null);
+    }
+
+
+    @ExceptionHandler(IOException.class)
+    public ResponseEntity<ApiErrorResponseDto> handleIoException(IOException ex, HttpServletRequest request) {
+        log.error("IO_STREAM_FAILURE | Path: {} | Type: {}", request.getRequestURI(), ex.getClass().getSimpleName());
+        return buildResponse(HttpStatus.INTERNAL_SERVER_ERROR, "IO Error", "Internal storage access failure.", request.getRequestURI(), null);
+    }
+
+
+    @ExceptionHandler(IllegalStateException.class)
+    public ResponseEntity<ApiErrorResponseDto> handleStateErrors(IllegalStateException ex, HttpServletRequest request) {
+        log.warn("INVALID_STATE | Path: {} | Msg: {}", request.getRequestURI(), ex.getMessage());
+        return buildResponse(HttpStatus.CONFLICT, "Invalid State", ex.getMessage(), request.getRequestURI(), null);
+    }
+
+    @ExceptionHandler({NullPointerException.class, ArrayIndexOutOfBoundsException.class})
+    public ResponseEntity<ApiErrorResponseDto> handleInternalLogicErrors(Exception ex, HttpServletRequest request) {
+        log.error("INTERNAL_LOGIC_ERROR | Path: {} | Type: {}", request.getRequestURI(), ex.getClass().getSimpleName());
+        return buildResponse(HttpStatus.INTERNAL_SERVER_ERROR, "Processing Error", "An internal error occurred.", request.getRequestURI(), null);
+    }
+
+    private ResponseEntity<ApiErrorResponseDto> buildResponse(HttpStatus status, String error, String message, String path, List<ApiErrorResponseDto.ValidationError> validationErrors) {
+        ApiErrorResponseDto response = ApiErrorResponseDto.builder()
+                .timestamp(LocalDateTime.now())
+                .status(status.value())
+                .error(error)
+                .message(message)
+                .path(path)
+                .validationErrors(validationErrors)
+                .build();
+        return new ResponseEntity<>(response, status);
+    }
+
+
+    @ExceptionHandler(org.springframework.dao.DataAccessException.class)
+    public ResponseEntity<ApiErrorResponseDto> handleDatabaseOperation(
+            org.springframework.dao.DataAccessException ex,
+            jakarta.servlet.http.HttpServletRequest request) {
+
+        String errorCode = "DB_TECHNICAL_ERROR";
+
+        Throwable cause = ex;
+        while (cause != null) {
+            if (cause instanceof java.sql.SQLException sqlEx) {
+                errorCode = "ORA-" + sqlEx.getErrorCode();
+                break;
+            }
+            cause = cause.getCause();
+        }
+
+        // 2. Log the sanitized code + the actual message for backend debugging
+        log.error("DATABASE_FAULT | Path: {} | ErrorCode: {} | Real Message: {}",
+                request.getRequestURI(), errorCode, ex.getMessage());
+
+        // 3. Return a clean, safe response to the frontend
+        return buildResponse(
+                HttpStatus.INTERNAL_SERVER_ERROR,
+                "Database Error",
+                "A technical error occurred in the data layer. Reference: " + errorCode,
+                request.getRequestURI(),
+                null
+        );
+    }
+
+
+    @ExceptionHandler(CustomExceptions.InvalidDataException.class)
+    public ResponseEntity<ApiErrorResponseDto> handleInvalidData(CustomExceptions.InvalidDataException ex, HttpServletRequest request) {
+        log.warn("INVALID_DATA | Path: {} | Msg: {}", request.getRequestURI(), ex.getMessage());
+        return buildResponse(HttpStatus.BAD_REQUEST, "Invalid Data", ex.getMessage(), request.getRequestURI(), null);
+    }
+    @ExceptionHandler(CustomExceptions.ScheduleLapsedException.class)
+    public ResponseEntity<ApiErrorResponseDto> handleScheduleLapsed(CustomExceptions.ScheduleLapsedException ex, HttpServletRequest request) {
+        log.warn("SCHEDULE_LAPSED | Path: {} | Msg: {}", request.getRequestURI(), ex.getMessage());
+        return buildResponse(HttpStatus.CONFLICT, "SCHEDULE_LAPSED", ex.getMessage(), request.getRequestURI(), null);
+    }
+}
+
+
+
+package com.fincore.VoucherService.Exception;
+
+
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.ResponseStatus;
+
+@ResponseStatus(HttpStatus.NOT_FOUND)
+public class ResourceNotFoundException extends RuntimeException {
+    public ResourceNotFoundException(String message) {
+        super(message);
+    }
+}
+
+
+ ENUM--------------------------------
+ 
+ 
+package com.fincore.VoucherService.Models.enums;
+
+import lombok.Getter;
+
+@Getter
+public enum ChangeType {
+	    ADD("A"),
+	    UPDATE("U"),
+	    DELETE("D");
+
+	    private final String code;
+
+	    ChangeType(String code) {
+	        this.code = code;
+	    }
+}
+
+
+package com.fincore.VoucherService.Models.enums;
+
+
+import lombok.Getter;
+
+@Getter
+public enum RequestStatus {
+    PENDING("P"),
+    ACCEPTED("A"),
+    REJECTED("R");
+
+    private final String code;
+
+    RequestStatus(String code) {
+        this.code = code;
+    }
+}
+
+package com.fincore.VoucherService.Models.enums;
+public enum VoucherStatus {
+    ACTIVE,  // Ready to be selected in the UI
+    USED,       // Selected and submitted, currently stuck in workflow
+    COMPLETED   // Fully approved and posted to the GL
+}
+
+
+package com.fincore.VoucherService.Models;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Data;
+import java.time.LocalDate;
+
+
+@Entity
+@Table(name = "BRANCH_MASTER")
+@Data
+public class BranchMaster {
+
+
+    @Id
+    @Column(name = "CODE" )
+    private String code;
+
+    @Column(name = "NAME")
+    private String name;
+
+    @Column(name = "CIRCLE_CODE")
+    private String circleCode;
+
+    @Column(name = "STATE")
+    private String state;
+
+    @Column(name = "CITY")
+    private String city;
+
+    @Column(name = "ADDRESS")
+    private String address;
+
+    @Column(name = "PINCODE")
+    private String pincode;
+
+    @Column(name = "PHONE_NUMBER")
+    private String phoneNumber;
+
+    @Column(name = "EMAIL_ID")
+    private String emailId;
+
+    @Column(name = "NMR_CODE" )
+    private String nmrCode;
+
+    @Column(name = "STATUS")
+    private Integer status;
+
+    @Column(name = "OPEN_DATE")
+    private LocalDate openDate;
+
+    @Column(name = "CLOSE_DATE")
+    private LocalDate closeDate;
+
+    @Column(name = "MERGE_DATE")
+    private LocalDate mergeDate;
+
+    @Column(name = "MERGED_WITH_BRANCH" )
+    private String mergedWithBranch;
+
+    @Column(name = "LAST_CHANGE_DATE")
+    private LocalDate lastChangeDate;
+
+    @Column(name = "CPC_FLAG")
+    private Boolean cpcFlag;
+
+    @Column(name = "FOOD_CREDIT_FLAG")
+    private Boolean foodCreditFlag;
+
+    @Column(name = "CURR_CHEST_FLAG")
+    private Boolean currChestFlag;
+
+    @Column(name = "BRANCH_TYPE")
+    private String branchType;
+}
+
+package com.fincore.VoucherService.Models;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Data;
+import java.time.LocalDate;
+
+
+@Entity
+@Table(name = "CGL_MASTER")
+@Data
+public class CglMaster {
+
+    @Id
+    @Column(name = "CGL_NUMBER", length = 10, updatable = false, insertable = false)
+    private String cglNumber;
+
+
+    @Column(name = "COMP_1", length = 4, nullable = false)
+    private String comp1;
+
+
+    @Column(name = "SEGMENT_CODE", length = 4, nullable = false)
+    private String segmentCode;
+
+    @Column(name = "COMP_2", length = 2, nullable = false)
+    private String comp2;
+
+    @Column(name = "DESCRIPTION", length = 100, nullable = false)
+    private String description;
+
+    @Column(name = "AC_CLASSIFICATION", length = 1, nullable = false)
+    private String acClassification;
+
+    @Column(name = "BAL_FWD", nullable = false)
+    private Boolean balFwd = false;
+
+    @Column(name = "DEF_BAL_TYPE", length = 1, nullable = false)
+    private String defBalType;
+
+    @Column(name = "STATUS", nullable = false)
+    private Boolean status = true;
+
+    @Column(name = "OPEN_DATE", nullable = false)
+    private LocalDate openDate;
+
+    @Column(name = "CLOSE_DATE")
+    private LocalDate closeDate;
+
+    @Column(name = "BAL_COMPARE", nullable = false)
+    private Boolean balCompare = true;
+
+    @Column(name = "MANUAL_POSTING", nullable = false)
+    private Boolean manualPosting = true;
+}
+
+
+package com.fincore.VoucherService.Models;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Data;
+
+import java.math.BigDecimal;
+
+@Entity
+@Table(name = "CURRENCY_MASTER")
+@Data
+public class CurrencyMaster {
+    @Id
+    @Column(name = "CURRENCY_CODE", length = 3)
+    private String currencyCode;
+
+    @Column(name = "CURRENCY_NAME", length = 50)
+    private String currencyName;
+    
+    // 1 = Active, 0 = Inactive
+    @Column(name = "FLAG")
+    private Integer flag;
+
+    @Column(name = "CURRENCY_RATE", precision = 18, scale = 6)
+    private BigDecimal currencyRate;
+}
+
+
+package com.fincore.VoucherService.Models;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Data;
+import java.time.LocalDate;
+
+@Entity
+@Table(name = "FINCORE_DATE")
+@Data
+public class FincoreDate {
+
+    @Id
+    @Column(name = "USERS_DATE")
+    private LocalDate usersDate;
+
+    @Column(name = "ETL_DATE")
+    private LocalDate etlDate;
+}
+package com.fincore.VoucherService.Models;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+
+@Entity
+@Table(name = "GL_BALANCE")
+@Data
+public class GlBalance {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "GL_BALANCE_SEQ")
+    @SequenceGenerator(name = "GL_BALANCE_SEQ", sequenceName = "GL_BALANCE_SEQ", allocationSize = 1)
+    @Column(name = "ID")
+    private Long id;
+
+    @Column(name = "BALANCE_DATE")
+    private LocalDate balanceDate;
+
+    @Column(name = "BRANCH_CODE", length = 5, nullable = false)
+    private String branchCode;
+
+    @Column(name = "CURRENCY", length = 3, nullable = false)
+    private String currency;
+
+    @Column(name = "CGL", length = 10, nullable = false)
+    private String cgl;
+
+    @Column(name = "BALANCE", precision = 25, scale = 4)
+    private BigDecimal balance;
+
+    @Column(name = "INR_BALANCE", precision = 25, scale = 4)
+    private BigDecimal inrBalance;
+}
+
+
+package com.fincore.VoucherService.Models;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "GL_TRANSACTIONS")
+@Data
+
+public class GlTransaction {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "GL_TRANSACTIONS_SEQ")
+    @SequenceGenerator(name = "GL_TRANSACTIONS_SEQ", sequenceName = "GL_TRANSACTIONS_SEQ", allocationSize = 1)
+    @Column(name = "TRANSACTION_ID")
+    private Long transactionId;
+
+    @Column(name = "BATCH_ID", length = 50) 
+    private String batchId;
+
+    @Column(name = "JOURNAL_ID", length = 50)
+    private String journalId;
+
+    @Column(name = "TRANSACTION_DATE")
+    private LocalDate transactionDate;
+
+    @Column(name = "POST_DATE")
+    private LocalDateTime postDate;
+
+    @Column(name = "BRANCH_CODE", length = 50)
+    private String branchCode;
+
+    @Column(name = "CURRENCY", length = 3)
+    private String currency;
+
+    @Column(name = "CGL", length = 10)
+    private String cgl;
+
+    @Column(name = "NARRATION", length = 40)
+    private String narration;
+
+    @Column(name = "DEBIT_AMOUNT", precision = 25, scale = 4)
+    private BigDecimal debitAmount;
+
+    @Column(name = "CREDIT_AMOUNT", precision = 25, scale = 4)
+    private BigDecimal creditAmount;
+
+    @Column(name = "TRANSACTION_COUNT")
+    private Integer transactionCount;
+
+    @Column(name = "SOURCE_FLAG", length = 1)
+    private String sourceFlag;
+}
+
+
+
+
+package com.fincore.VoucherService.Models;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "AUDIT_LOG")
+@Data
+public class JournalLog {
+
+
+    
+	@Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "AUDIT_LOG_SEQ")
+    @SequenceGenerator(
+        name = "AUDIT_LOG_SEQ", 
+        sequenceName = "AUDIT_LOG_SEQ", 
+        allocationSize = 1
+    )
+    @Column(name = "LOG_ID")
+    private Long id;
+
+    @Column(name = "ACTION_TIME")
+    private LocalDateTime actionTime;
+
+    @Column(name = "ACTION_TYPE", length = 255)
+    private String actionType; // e.g., CREATE, APPROVE, REJECT
+
+    @Column(name = "CHANGE_TYPE", length = 255)
+    private String changeType; // e.g., BATCH_UPLOAD, STATUS_CHANGE
+
+    @Column(name = "IP_ADDRESS", length = 255)
+    private String ipAddress;
+
+    @Column(name = "NEW_VALUE", length = 4000) // Adjusted length for safety
+    private String newValue;
+
+    @Column(name = "OLD_VALUE", length = 4000)
+    private String oldValue;
+
+    @Column(name = "REQUEST_ID")
+    private Long requestId; // Links to specific Journal Request ID (PK)
+
+    @Column(name = "USER_ID", length = 255)
+    private String userId;
+}
+
+
+package com.fincore.VoucherService.Models;
+
+import com.fincore.VoucherService.Models.enums.RequestStatus;
+import com.fincore.VoucherService.config.RequestStatusConverter;
+import jakarta.persistence.*;
+import lombok.Data;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+
+
+@Entity
+@Table(name = "VOUCHER_POSTING_DATA")
+@Data
+public class JournalRequest {
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "JOURNAL_REQUEST_SEQ")
+    @SequenceGenerator(name = "JOURNAL_REQUEST_SEQ", sequenceName = "JOURNAL_REQUEST_SEQ", allocationSize = 1)
+    @Column(name = "REQ_ID")
+    private Long id;
+
+    @Convert(converter = RequestStatusConverter.class)
+    @Column(name = "REQ_STATUS", length = 10)
+    private RequestStatus requestStatus;
+
+
+
+    @Column(name = "REQ_DATE", updatable = false)
+    private LocalDateTime requestDate = LocalDateTime.now();
+
+    @Column(name = "CREATOR_ID", length = 12, updatable = false)
+    private String creatorId;
+
+
+
+    @Column(name = "EXECUTION_DATE")
+    private LocalDateTime executionDate;
+
+    @Column(name = "BATCH_ID", length = 50)
+    private String batchId;
+
+    @Column(name = "JOURNAL_ID", length = 50)
+    private String journalId;
+
+
+    @Column(name = "REQ_BRANCH_CODE", length = 50)
+    private String branchCode;
+
+    @Column(name = "REQ_CURRENCY", length = 3)
+    private String currency;
+
+    @Column(name = "REQ_CGL", length = 50)
+    private String cgl;
+
+    @Column(name = "REQ_AMOUNT", precision = 25, scale = 4)
+    private BigDecimal amount;
+
+
+    @Column(name = "REQ_NARRATION", length = 200)
+    private String narration;
+
+    @Column(name = "REQ_PRODUCT", length = 50)
+    private String productCode;
+}
+
+
+
+
+package com.fincore.VoucherService.Models;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "JS_EOD_MASTER")
+@Data
+public class JsEodMaster {
+
+    @Id
+    @Column(name = "ID")
+    private Long id;
+
+    @Column(name = "JS_STATUS")
+    private Integer jsStatus;
+
+    @Column(name = "EOD_STATUS")
+    private Integer eodStatus;
+
+    @Column(name = "JS_UPDATED_AT")
+    private LocalDateTime jsUpdatedAt;
+
+    @Column(name = "EOD_UPDATED_AT")
+    private LocalDateTime eodUpdatedAt;
+
+    @Column(name = "JS_PENDING_COUNTER")
+    private Long jsPendingCounter;
+}
+package com.fincore.VoucherService.Models;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+import org.springframework.data.jpa.domain.support.AuditingEntityListener;
+
+import java.io.Serializable;
+import java.time.Instant;
+import java.util.UUID;
+
+@Entity
+@Table(name = "NOTIFICATIONS")
+@Builder
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@EntityListeners(AuditingEntityListener.class)
+public class Notifications implements Serializable {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    @Column(name = "EVENT_ID", nullable = false, updatable = false)
+    private UUID eventId; // Maps to RAW(16)
+
+    @Column(name = "USER_ID", length = 255)
+    private String userId;
+
+    @Column(name = "MESSAGE", length = 1024, nullable = false)
+    private String message;
+
+    @Column(name = "LINK_URL", length = 1024)
+    private String linkUrl;
+
+    @Column(name = "EVENT_SOURCE", length = 100)
+    private String eventSource;
+
+    @Column(name = "AGGREGATE_ID", length = 255)
+    private String aggregateId;
+
+    @CreationTimestamp
+    @Column(name = "EVENT_TIMESTAMP", nullable = false, updatable = false)
+    private Instant eventTimestamp; // Maps to TIMESTAMP(6) WITH TIME ZONE
+
+    @Column(name = "TARGET_ROLE", length = 100)
+    private String targetRole;
+}
+
+package com.fincore.VoucherService.Models;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+@Entity
+@Table(name = "MENU_ITEMS") // Mapped to your existing table
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@ToString
+public class Permissions {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "menu_item_seq_gen")
+    @SequenceGenerator(name = "menu_item_seq_gen", sequenceName = "FINCORE.MENU_ITEMS_SEQ", allocationSize = 1)
+    @Column(name = "MENU_ID", nullable = false)
+    private int menuId;
+
+    @Column(name = "MENU_TITLE", length = 100)
+    private String menuTitle;
+
+    @Column(name = "MENU_ICON", length = 100)
+    private String menuIcon;
+
+    @Column(name = "MENU_SUBMENU", length = 100)
+    private String menuSubmenu;
+
+    @Column(name = "MENU_ACTION", length = 200)
+    private String menuAction;
+
+    @Column(name = "MENU_URL", length = 200)
+    private String menuUrl;
+
+    @Column(name = "MENU_COMPONENT_PATH", length = 200)
+    private String menuComponentPath;
+
+    @Column(name = "MENU_DESCRIPTION", length = 255)
+    private String menuDescription;
+
+    @Column(name = "MENU_DEPENDANT")
+    private Integer menuDependant;
+
+    // This is the key field used for Journal Authorization logic
+    @Column(name = "MAPPED_REQUEST_TYPE", length = 50)
+    private String mappedRequestType; 
+}
+
+
+package com.fincore.VoucherService.Models;
+
+
+import jakarta.persistence.*;
+import lombok.Data;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "REQUEST_VOUCHER")
+@Data
+public class RequestVoucher {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "ID")
+    private Long id;
+
+    @Transient
+    private String timeSinceLastAction;
+
+    @Column(name = "VID", length = 20, nullable = false)
+    private String vid;
+
+
+    @Column(name = "DESCRIPTION", length = 500, nullable = false)
+    private String description;
+
+    @Column(name = "ALLOWED_ROLE", length = 100, nullable = false)
+    private Integer  allowedRole;
+
+    @Column(name = "SD_REQ_NO", length = 100)
+    private String sdReqNo;
+
+    @Column(name = "CREATED_BY", length = 100)
+    private String createdBy;
+
+    @Column(name = "CREATED_AT", updatable = false)
+    private LocalDateTime createdAt = LocalDateTime.now();
+
+    @Column(name = "TERMINATED_BY", length = 100)
+    private String terminatedBy;
+
+    @Column(name = "TERMINATED_AT")
+    private LocalDateTime terminatedAt;
+
+    @Column(name = "STATUS", length = 30, nullable = false)
+    private String status;
+
+    @Column(name = "REMARKS", length = 50)
+    private String remarks;
+}
+package com.fincore.VoucherService.Models;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "VOUCHER_POSTING")
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class VoucherPosting {
+
+
+    @Id
+    @Column(name = "BATCH_ID", length = 50, nullable = false)
+    private String batchId;
+
+    @Column(name = "VID_FK", length = 20, nullable = false)
+    private String vidFk;
+
+    @Column(name = "WORKFLOW_CODE", length = 100)
+    private String workflowCode;
+
+    @Column(name = "CREATED_BY", length = 100)
+    private String createdBy;
+
+    @Column(name = "CREATED_AT", insertable = false, updatable = false)
+    private LocalDateTime createdAt; // Maps to TIMESTAMP(6) with CURRENT_TIMESTAMP default
+
+    @Column(name = "PENDING_AT")
+    private Long pendingAt;
+
+    // --- SCHEDULING FIELDS ---
+    @Column(name = "IS_EXECUTION_SCHEDULED", length = 3)
+    private String IS_EXECUTION_SCHEDULED; // Maps to 'YES' / 'NO'
+
+    @Column(name = "SCHEDULED_TIME")
+    private LocalDateTime scheduledTime;
+
+    @Column(name = "IS_SCHEDULE_OVERRIDE", length = 3)
+    private String isScheduleOverride; // Maps to 'YES' / 'NO'
+
+    // --- EXECUTION & STATUS FIELDS ---
+    @Column(name = "EXECUTED_AT")
+    private LocalDateTime executedAt;
+
+    @Column(name = "BATCH_STATUS", length = 20)
+    private String batchStatus; // Now strictly using 'P', 'A', 'R', 'QUEUED', 'ERROR'
+
+    @Column(name = "RECORDS_COUNT")
+    private Long recordsCount;
+
+
+
+    @Column(name = "COMMON_BATCH_REMARKS", length = 50)
+    private String commonBatchRemarks;
+
+    @Column(name = "CREATOR_ROLE")
+    private Integer creatorRole;
+
+    @Column(name = "EXECUTOR_ID", length = 100)
+    private String executorId;
+}
+
+
+package com.fincore.VoucherService.Models;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "VOUCHER_WORKFLOW")
+@Data
+public class VoucherWorkflow {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "WORKFLOW_ID")
+    private Long workflowId;
+
+    @Column(name = "BATCH_ID_FK", length = 50, nullable = false)
+    private String batchIdFk;
+
+    @Column(name = "VID_FK", length = 20, nullable = false)
+    private String vidFk;
+
+    @Column(name = "LAST_ACTION", length = 30)
+    private String lastAction;
+
+    @Column(name = "LAST_ACTION_BY", length = 100)
+    private String lastActionBy;
+
+    @Column(name = "LAST_ACTION_AT")
+    private LocalDateTime lastActionAt = LocalDateTime.now();
+
+    @Column(name = "REMARKS", length = 500)
+    private String remarks;
+
+    @Column(name = "SCHEDULED_TIME")
+    private LocalDateTime scheduledTime;
+}
+
+Repository---------------------------
+
+
+
+package com.fincore.VoucherService.Repository;
+
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.VoucherService.Models.BranchMaster;
+
+import java.util.List;
+
+@Repository
+public interface BranchMasterRepository extends JpaRepository<BranchMaster, String> {
+
+    List<BranchMaster> findByNameContainingIgnoreCaseOrCodeContainingIgnoreCase(String name, String code, Pageable pageable);
+}
+
+
+
+
+package com.fincore.VoucherService.Repository;
+
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.VoucherService.Models.CglMaster;
+
+import java.util.List;
+
+@Repository
+public interface CglMasterRepository extends JpaRepository<CglMaster, String> {
+
+    List<CglMaster> findByCglNumberContainingOrDescriptionContainingIgnoreCase(String cglNumber, String description, Pageable pageable);
+}
+package com.fincore.VoucherService.Repository;
+
+
+import com.fincore.VoucherService.Models.FincoreDate;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.stereotype.Repository;
+
+import java.time.LocalDate;
+
+@Repository
+public interface FincoreDateRepository extends JpaRepository<FincoreDate, LocalDate> {
+
+    @Query(value = "SELECT USERS_DATE FROM FINCORE_DATE FETCH FIRST 1 ROWS ONLY", nativeQuery = true)
+    LocalDate findCurrentPostingDate();
+}
+
+
+package com.fincore.VoucherService.Repository;
+
+import java.util.List;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
+import org.springframework.stereotype.Repository;
+import org.springframework.data.repository.query.Param;
+
+import com.fincore.VoucherService.Models.JournalRequest;
+import com.fincore.VoucherService.Models.enums.RequestStatus;
+
+/**
+ * Handles data access for journal entries with optimized native queries for batch processing.
+ * Includes specialized queries for high-volume summaries and chunked deletions.
+ */
+@Repository
+public interface JournalRequestRepository extends JpaRepository<JournalRequest, Long>, JpaSpecificationExecutor<JournalRequest> {
+
+
+
+
+
+    /**
+     * PAGINATED DETAIL FETCH
+     * Retrieves specific rows for a batch with stable ordering for UI consistency.
+     */
+    @Query(value = "SELECT * FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId ORDER BY REQ_ID ASC",
+            countQuery = "SELECT count(*) FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId",
+            nativeQuery = true)
+    Page<JournalRequest> findByBatchIdPaginated(@Param("batchId") String batchId, Pageable pageable);
+
+
+    // Standard Finder Methods
+    List<JournalRequest> findByBatchId(String batchId);
+    List<JournalRequest> findByCreatorId(String creatorId);
+    List<JournalRequest> findByRequestStatus(RequestStatus status);
+
+
+
+
+}
+
+
+
+package com.fincore.VoucherService.Repository;
+
+import com.fincore.VoucherService.Models.JsEodMaster;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface JsEodMasterRepository extends JpaRepository<JsEodMaster, Long> {
+
+
+
+}
+
+
+package com.fincore.VoucherService.Repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+import com.fincore.VoucherService.Models.Notifications;
+import java.util.UUID;
+
+@Repository
+public interface NotificationRepository extends JpaRepository<Notifications, UUID> {
+}
+package com.fincore.VoucherService.Repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.VoucherService.Models.Permissions;
+
+import java.util.List;
+
+@Repository
+public interface PermissionRepository extends JpaRepository<Permissions, Integer> {
+
+    @Query(value = """
+       SELECT p.MENU_URL, rp.ROLE_ID
+       FROM MENU_ITEMS p
+       JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
+       JOIN ROLES r ON rp.ROLE_ID = r.ROLE_ID
+       WHERE p.MAPPED_REQUEST_TYPE = :requestType
+         -- FIX: Wrapped MENU_ACTION in LOWER() for case-insensitive matching
+         AND (LOWER(p.MENU_ACTION) LIKE '%approve%' OR LOWER(p.MENU_ACTION) LIKE '%reject%')
+         AND r.ROLE_STATUS = 'ACTIVE'
+   """, nativeQuery = true)
+    List<Object[]> findUrlAndRolesByRequestType(@Param("requestType") String requestType);
+}
+
+
+package com.fincore.VoucherService.Repository;
+
+
+import com.fincore.VoucherService.Models.RequestVoucher;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface RequestVoucherRepository extends JpaRepository<RequestVoucher, Long>, JpaSpecificationExecutor<RequestVoucher> {
+}
+
+package com.fincore.VoucherService.Repository;
+
+import com.fincore.VoucherService.Models.JournalLog;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+
+@Repository
+public interface VoucherLogRepository extends JpaRepository<JournalLog, Long> {
+}
+
+package com.fincore.VoucherService.Repository;
+import com.fincore.VoucherService.Models.VoucherPosting;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface VoucherPostingRepository extends JpaRepository<VoucherPosting, String> {
+}
+package com.fincore.VoucherService.Repository;
+
+
+import com.fincore.VoucherService.Models.VoucherWorkflow;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+import java.util.Optional;
+
+@Repository
+public interface VoucherWorkflowRepository extends JpaRepository<VoucherWorkflow, Long> {
+    List<VoucherWorkflow> findByBatchIdFkOrderByLastActionAtAsc(String batchIdFk);
+    Optional<VoucherWorkflow> findTopByBatchIdFkOrderByLastActionAtDesc(String batchIdFk);
+}
+
+
+
