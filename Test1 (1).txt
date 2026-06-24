@@ -1,51 +1,63 @@
-I completely understand the confusion. When you change how data is fetched from memory, it can be tricky to see how the pieces fit together.
-Right now, your getValidRowsFromCache method fetches **every single chunk** from Redis and glues them together into one massive list (allRows.addAll(chunkRows);). That is what causes the Out of Memory (OOM) crash.
-To fix this, we are going to break that single method into **two separate methods**.
-Here is the exact code. Open your ValidationStateManager.java and paste these **two new methods** right below your existing getValidRowsFromCache method:
+Your IDE is very smart! It is highlighting those new methods as "not in use" because we added them to ValidationStateManager, but we haven't yet updated your VoucherAsyncWorker to actually call them.
+Right now, your VoucherAsyncWorker.java is still using the old method (getValidRowsFromCache) that causes the memory crash.
+Here is exactly how to connect the new methods and fix the "not in use" warning.
+### Step-by-Step Fix
+ 1. Open your **VoucherAsyncWorker.java** file.
+ 2. Find the method named **executeAsyncBatchCreation**.
+ 3. Inside that method, **delete everything** starting from List<ExcelRowData> cachedRows = ... all the way down to CompletableFuture.allOf....
+ 4. **Paste this new logic** in its place:
 ```java
-    // ==================================================================================
-    // TRUE STREAMING METHODS (Prevents OOM Crashes)
-    // ==================================================================================
+            // --- NEW: TRUE STREAMING LOGIC ---
+            progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Preparing Data...");
 
-    /**
-     * Step 1: Just get the total number of chunks so the Async Worker knows how many threads to spin up.
-     * It does NOT load the actual data.
-     */
-    public int getTotalChunks(String requestId) {
-        byte[] metaBytes = redisTemplate.opsForValue().get("DATA_META_" + requestId);
-        if (metaBytes == null) {
-            throw new CustomExceptions.CacheExpiredException("Validation data expired (TTL 1 Hour). Please re-upload.");
-        }
+            // 1. Ask Redis how many chunks exist (Does NOT load data into memory)
+            int totalChunks = validationStateManager.getTotalChunks(requestId);
+            
+            if (totalChunks == 0) {
+                log.error("CACHE_MISS | Batch: {} | Status: No valid rows found", batchId);
+                progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired or empty.");
+                return;
+            }
 
-        try {
-            Map<String, Object> meta = objectMapper.readValue(metaBytes, new TypeReference<>() {});
-            return (int) meta.get("totalChunks");
-        } catch (IOException | DataAccessException e) {
-            throw new CustomExceptions.FileProcessingException("Failed to read chunk metadata", e);
-        }
-    }
+            int batchSize = 5000; 
+            long totalRows = batchSize * (long) totalChunks; // Used for progress bar estimation
+            
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
+            AtomicReference<BigDecimal> totalDebit = new AtomicReference<>(BigDecimal.ZERO);
+            AtomicReference<BigDecimal> totalCredit = new AtomicReference<>(BigDecimal.ZERO);
+            AtomicInteger completedChunks = new AtomicInteger(0);
 
-    /**
-     * Step 2: Fetch EXACTLY ONE chunk from Redis and decompress it.
-     * The Async worker will call this method from inside its background threads.
-     */
-    public List<ExcelRowData> getChunkFromCache(String requestId, int chunkIndex) {
-        byte[] compressedChunk = redisTemplate.opsForValue().get("DATA_CHUNK_" + requestId + "_" + chunkIndex);
-        
-        if (compressedChunk == null) {
-            throw new CustomExceptions.CacheExpiredException("Missing data chunk " + chunkIndex + ". Please re-upload.");
-        }
-        
-        try (GZIPInputStream gis = new GZIPInputStream(new ByteArrayInputStream(compressedChunk))) {
-            return objectMapper.readValue(gis, new TypeReference<List<ExcelRowData>>() {});
-        } catch (IOException | DataAccessException e) {
-            throw new CustomExceptions.FileProcessingException("Failed to reconstruct cached data chunk " + chunkIndex, e);
-        }
-    }
+            // 2. PARALLEL CHUNKING - Fetch exactly ONE chunk at a time inside the background thread
+            for (int i = 0; i < totalChunks; i++) {
+                final int chunkIndex = i;
+                final int startIdx = i * batchSize;
+
+                CompletableFuture<Void> future = CompletableFuture.supplyAsync(() -> {
+                    // -> THIS MAKES THE METHOD "IN USE" <-
+                    // The background thread fetches just its own 5000 rows, then garbage collects them
+                    return validationStateManager.getChunkFromCache(requestId, chunkIndex);
+                }, chunkWorkerExecutor).thenAcceptAsync(chunk -> {
+                    if (contextMap != null) MDC.setContextMap(contextMap);
+                    try {
+                        self.processChunkRaw(chunk, batchId, journalPrefix, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit);
+                        successfulRowsCount.addAndGet(chunk.size());
+                    } finally {
+                        MDC.clear();
+                    }
+                }, chunkWorkerExecutor).thenRun(() -> {
+                    int done = completedChunks.incrementAndGet();
+                    int percent = 5 + (done * 90 / totalChunks);
+                    progressService.sendProgress(batchId, creatorId, percent, "PROCESSING", String.format("Writing chunks: %d of %d", done, totalChunks));
+                });
+                
+                futures.add(future);
+            }
+
+            // Wait for all 50 threads to finish processing their individual chunks
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(45, TimeUnit.MINUTES);
+            // --- END NEW STREAMING LOGIC ---
 
 ```
-### Why this works:
-Instead of your application saying, *"Give me all 500,000 rows right now"* (which crashes the server), the VoucherAsyncWorker will now use these two methods to say:
- 1. *"How many chunks are there?"* (getTotalChunks) -> Server answers: "100".
- 2. Then, 50 different background threads will simultaneously call getChunkFromCache(requestId, 0), getChunkFromCache(requestId, 1), etc.
-This means the JVM heap only ever holds a small fraction of the data at any given millisecond, completely eliminating the Out of Memory crash!
+### Why this fixes the problem:
+By making this change, the old getValidRowsFromCache method will now be the one that shows as "not in use" (and you can safely delete it from ValidationStateManager).
+Instead of the main thread trying to hold 500,000 rows in memory, your application will now spin up background threads that each call getChunkFromCache(requestId, chunkIndex). They process their 5,000 rows, write them to the database, and immediately throw the data away, completely eliminating the Out of Memory crash!
