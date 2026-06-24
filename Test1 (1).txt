@@ -13,12 +13,13 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 
 public class SimpleValidatorTest {
 
-    // 1. Create a "Fake" Master Service purely in Java (No Mockito needed)
+    // 1. Create a "Fake" Master Service purely in Java
     private ValidationMasterService createFakeMasterService() {
-        return new ValidationMasterService(null) {
+        return new ValidationMasterService() {
             @Override
             public Set<String> getAllActiveBranches() {
                 return new HashSet<>(Arrays.asList("10301", "10302"));
@@ -34,7 +35,7 @@ public class SimpleValidatorTest {
         };
     }
 
-    // 2. Helper method to easily create rows for testing
+    // 2. Helper method to easily create rows
     private ExcelRowData createRow(String branch, String currency, String cgl, String amountStr, String type) {
         ExcelRowData row = new ExcelRowData();
         row.branch = branch;
@@ -43,45 +44,129 @@ public class SimpleValidatorTest {
         row.amount = new BigDecimal(amountStr);
         row.txnType = type;
         row.remarks = "Valid Remarks";
+        row.productCode = "12345678"; // Default valid product code
         
-        // Initialize the error lists so we don't get NullPointerExceptions
         row.formatErrors = Collections.synchronizedList(new ArrayList<>());
         row.dbErrors = Collections.synchronizedList(new ArrayList<>());
         row.balErrors = Collections.synchronizedList(new ArrayList<>());
         return row;
     }
 
+    // ==========================================================
+    // FORMAT CHECK TESTS
+    // ==========================================================
+
     @Test
     public void testFormatCheck_ConvertsCrToCredit() {
-        // Setup
         VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
         ExcelRowData row = createRow("10301", "INR", "1102003001", "500.00", "CR");
 
-        // Execute
         validator.runFormatCheck(Collections.singletonList(row));
 
-        // Verify
         assertEquals("Credit", row.txnType, "The validator should convert 'CR' to 'Credit'");
         assertTrue(row.formatErrors.isEmpty(), "There should be no format errors");
     }
 
     @Test
-    public void testDatabaseCheck_InvalidBranchFails() {
-        // Setup
+    public void testFormatCheck_NegativeOrZeroAmountFails() {
         VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
-        // 99999 is NOT in our fake master service
-        ExcelRowData row = createRow("99999", "INR", "1102003001", "500.00", "Debit");
+        ExcelRowData zeroRow = createRow("10301", "INR", "1102003001", "0.00", "Debit");
+        ExcelRowData negativeRow = createRow("10301", "INR", "1102003001", "-50.00", "Debit");
 
-        // Execute
-        validator.runDbCheck(Collections.singletonList(row));
+        validator.runFormatCheck(Arrays.asList(zeroRow, negativeRow));
 
-        // Verify
-        assertTrue(row.dbErrors.contains("Branch is inactive or not found: 99999"));
+        assertTrue(zeroRow.formatErrors.contains("Amount must be greater than 0."));
+        assertTrue(negativeRow.formatErrors.contains("Amount must be greater than 0."));
     }
 
     @Test
+    public void testFormatCheck_TooManyDecimalsFails() {
+        VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
+        // Max is 4 decimal places. This has 5.
+        ExcelRowData row = createRow("10301", "INR", "1102003001", "500.12345", "Debit");
+
+        validator.runFormatCheck(Collections.singletonList(row));
+
+        assertTrue(row.formatErrors.contains("Exceeded maximum 16 digits or 4 decimal places."));
+    }
+
+    @Test
+    public void testFormatCheck_InvalidRemarksFails() {
+        VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
+        ExcelRowData row = createRow("10301", "INR", "1102003001", "500.00", "Debit");
+        
+        // Starts with a space
+        row.remarks = " Invalid Remarks";
+        validator.runFormatCheck(Collections.singletonList(row));
+        assertTrue(row.formatErrors.contains("Remarks cannot start with a space or contain consecutive spaces."));
+
+        // Has special characters not allowed (like @ or #)
+        row.formatErrors.clear();
+        row.remarks = "Payment #123";
+        validator.runFormatCheck(Collections.singletonList(row));
+        assertTrue(row.formatErrors.contains("Allowed 2-30 chars: Alphanumeric, spaces, and / & ( ) , . -"));
+    }
+
+    @Test
+    public void testFormatCheck_InvalidProductCodeFails() {
+        VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
+        ExcelRowData row = createRow("10301", "INR", "1102003001", "500.00", "Debit");
+        
+        // Product code must be numbers up to 8 digits
+        row.productCode = "ABCDEFGH"; 
+        
+        validator.runFormatCheck(Collections.singletonList(row));
+        assertTrue(row.formatErrors.contains("Product code must be up to 8 digits or left blank."));
+    }
+
+    @Test
+    public void testFormatCheck_InvalidLengthsFail() {
+        VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
+        
+        // Currency is not 3 chars, CGL is not 10 digits, Branch is not 5 chars
+        ExcelRowData row = createRow("103", "IN", "11020", "500.00", "Debit");
+        
+        validator.runFormatCheck(Collections.singletonList(row));
+
+        assertTrue(row.formatErrors.contains("Currency code must be exactly 3 characters."));
+        assertTrue(row.formatErrors.contains("CGL must be exactly 10 digits."));
+        assertTrue(row.formatErrors.contains("Branch code must be exactly 5 alphanumeric characters."));
+    }
+
+    // ==========================================================
+    // DATABASE CHECK TESTS
+    // ==========================================================
+
+    @Test
+    public void testDatabaseCheck_ValidDataPasses() {
+        VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
+        // All these are inside our FakeMasterService
+        ExcelRowData row = createRow("10301", "INR", "1102003001", "500.00", "Debit");
+
+        validator.runDbCheck(Collections.singletonList(row));
+
+        assertTrue(row.dbErrors.isEmpty(), "Valid master data should not produce DB errors.");
+    }
+
+    @Test
+    public void testDatabaseCheck_InvalidMasterDataFails() {
+        VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
+        // Branch 99999, Currency USD, CGL 9999999999 are NOT in fake service
+        ExcelRowData row = createRow("99999", "USD", "9999999999", "500.00", "Debit");
+
+        validator.runDbCheck(Collections.singletonList(row));
+
+        assertTrue(row.dbErrors.contains("Branch is inactive or not found: 99999"));
+        assertTrue(row.dbErrors.contains("Currency is inactive or not found: USD"));
+        assertTrue(row.dbErrors.contains("CGL is inactive or not found: 9999999999"));
+    }
+
+    // ==========================================================
+    // BALANCE CHECK TESTS
+    // ==========================================================
+
+    @Test
     public void testBalanceCheck_PerfectlyBalancedPasses() {
-        // Setup
         VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
         
         // Total Debit: 1000.00 | Total Credit: 1000.00 -> Balanced!
@@ -89,28 +174,37 @@ public class SimpleValidatorTest {
         ExcelRowData debitRow1 = createRow("10301", "INR", "1102003002", "700.00", "Debit");
         ExcelRowData debitRow2 = createRow("10301", "INR", "1102003002", "300.00", "Debit");
 
-        // Execute
         validator.runBalanceCheck(Arrays.asList(creditRow, debitRow1, debitRow2));
 
-        // Verify
-        assertTrue(creditRow.balErrors.isEmpty(), "Credit row should have no balance errors");
-        assertTrue(debitRow1.balErrors.isEmpty(), "Debit row 1 should have no balance errors");
+        assertTrue(creditRow.balErrors.isEmpty());
+        assertTrue(debitRow1.balErrors.isEmpty());
     }
 
     @Test
     public void testBalanceCheck_UnbalancedFails() {
-        // Setup
         VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
         
         // Total Debit: 900.00 | Total Credit: 1000.00 -> Unbalanced!
         ExcelRowData creditRow = createRow("10301", "INR", "1102003001", "1000.00", "Credit");
         ExcelRowData debitRow = createRow("10301", "INR", "1102003002", "900.00", "Debit");
 
-        // Execute
         validator.runBalanceCheck(Arrays.asList(creditRow, debitRow));
 
-        // Verify
         assertTrue(creditRow.balErrors.contains("Branch, Currency, and CGL-wise balance mismatch."));
         assertTrue(debitRow.balErrors.contains("Branch, Currency, and CGL-wise balance mismatch."));
+    }
+
+    @Test
+    public void testBalanceCheck_MissingDebitOrCreditFails() {
+        VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
+        
+        // Only Debits! Even if there are two rows, there is no Credit entry for this branch.
+        ExcelRowData debitRow1 = createRow("10301", "INR", "1102003001", "500.00", "Debit");
+        ExcelRowData debitRow2 = createRow("10301", "INR", "1102003002", "500.00", "Debit");
+
+        validator.runBalanceCheck(Arrays.asList(debitRow1, debitRow2));
+
+        assertTrue(debitRow1.balErrors.contains("Branch must have at least one Debit and one Credit entry."));
+        assertTrue(debitRow2.balErrors.contains("Branch must have at least one Debit and one Credit entry."));
     }
 }
