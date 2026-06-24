@@ -472,3 +472,207 @@ public class VoucherAsyncWorker {
 
 
 }
+
+
+
+package com.fincore.VoucherService.Service.validation;
+
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.VoucherService.Dto.BulkUploadStateDto;
+import com.fincore.VoucherService.Dto.ExcelRowData;
+import com.fincore.VoucherService.Exception.CustomExceptions;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.dao.DataAccessException;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.stereotype.Service;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
+
+@Service
+@Slf4j
+public class ValidationStateManager {
+
+    private final ObjectMapper objectMapper;
+
+    @Autowired
+    @Qualifier("byteArrayRedisTemplate")
+    private RedisTemplate<String, byte[]> redisTemplate;
+
+    public ValidationStateManager(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
+    }
+
+    // ==================================================================================
+    // 1. REDIS STATE MANAGEMENT
+    // ==================================================================================
+    public void saveStatusToRedis(String reqId, BulkUploadStateDto state) {
+        try {
+            byte[] json = objectMapper.writeValueAsBytes(state);
+            redisTemplate.opsForValue().set("BULK_STATUS_" + reqId, json, 2, TimeUnit.HOURS);
+        } catch (JsonProcessingException e) {
+            log.error("SERIALIZATION_FAIL | ReqID: {} | Status: Object mapping error", reqId);
+        } catch (DataAccessException e) {
+            log.error("REDIS_WRITE_FAIL | ReqID: {} | Status: Connection/Persistence failure", reqId);
+        }
+    }
+
+    public BulkUploadStateDto getStatusFromRedis(String reqId) {
+        try {
+            byte[] json = redisTemplate.opsForValue().get("BULK_STATUS_" + reqId);
+            if (json == null) return null;
+            return objectMapper.readValue(json, BulkUploadStateDto.class);
+        } catch (IOException | DataAccessException e) {
+            log.error("REDIS_READ_FAIL | ReqID: {} | Type: {}", reqId, e.getClass().getSimpleName());
+            return null;
+        }
+    }
+    public synchronized void updateState(String requestId, Consumer<BulkUploadStateDto> updater) {
+        BulkUploadStateDto state = getStatusFromRedis(requestId);
+        if (state == null) {
+            state = new BulkUploadStateDto();
+            state.setRequestId(requestId);
+        }
+        updater.accept(state);
+        saveStatusToRedis(requestId, state);
+    }
+
+
+    public List<ExcelRowData> getValidRowsFromCache(String requestId) {
+        byte[] metaBytes = redisTemplate.opsForValue().get("DATA_META_" + requestId);
+        if (metaBytes == null) {
+            throw new CustomExceptions.CacheExpiredException("Validation data expired (TTL 1 Hour). Please re-upload.");
+        }
+
+        try {
+            Map<String, Object> meta = objectMapper.readValue(metaBytes, new TypeReference<>() {});
+            int totalChunks = (int) meta.get("totalChunks");
+            int totalRows = (int) meta.get("totalRows");
+            List<ExcelRowData> allRows = new ArrayList<>(totalRows);
+
+            for (int i = 0; i < totalChunks; i++) {
+                byte[] compressedChunk = redisTemplate.opsForValue().get("DATA_CHUNK_" + requestId + "_" + i);
+
+
+                if (compressedChunk == null) {
+                    throw new CustomExceptions.CacheExpiredException("Missing data chunk " + i + ". Please re-upload.");
+                }
+                try (GZIPInputStream gis = new GZIPInputStream(new ByteArrayInputStream(compressedChunk))) {
+                    List<ExcelRowData> chunkRows = objectMapper.readValue(gis, new TypeReference<List<ExcelRowData>>() {});
+                    allRows.addAll(chunkRows);
+                }
+            }
+            return allRows;
+        } catch (IOException | DataAccessException e) {
+            throw new CustomExceptions.FileProcessingException("Failed to reconstruct cached data", e);
+        }
+    }
+
+    // ==================================================================================
+    // TRUE STREAMING METHODS (Prevents OOM Crashes)
+    // ==================================================================================
+
+    /**
+     * Step 1: Just get the total number of chunks so the Async Worker knows how many threads to spin up.
+     * It does NOT load the actual data.
+     */
+    public int getTotalChunks(String requestId) {
+        byte[] metaBytes = redisTemplate.opsForValue().get("DATA_META_" + requestId);
+        if (metaBytes == null) {
+            throw new CustomExceptions.CacheExpiredException("Validation data expired (TTL 1 Hour). Please re-upload.");
+        }
+
+        try {
+            Map<String, Object> meta = objectMapper.readValue(metaBytes, new TypeReference<>() {});
+            return (int) meta.get("totalChunks");
+        } catch (IOException | DataAccessException e) {
+            throw new CustomExceptions.FileProcessingException("Failed to read chunk metadata", e);
+        }
+    }
+
+    /**
+     * Step 2: Fetch EXACTLY ONE chunk from Redis and decompress it.
+     * The Async worker will call this method from inside its background threads.
+     */
+    public List<ExcelRowData> getChunkFromCache(String requestId, int chunkIndex) {
+        byte[] compressedChunk = redisTemplate.opsForValue().get("DATA_CHUNK_" + requestId + "_" + chunkIndex);
+
+        if (compressedChunk == null) {
+            throw new CustomExceptions.CacheExpiredException("Missing data chunk " + chunkIndex + ". Please re-upload.");
+        }
+
+        try (GZIPInputStream gis = new GZIPInputStream(new ByteArrayInputStream(compressedChunk))) {
+            return objectMapper.readValue(gis, new TypeReference<List<ExcelRowData>>() {});
+        } catch (IOException | DataAccessException e) {
+            throw new CustomExceptions.FileProcessingException("Failed to reconstruct cached data chunk " + chunkIndex, e);
+        }
+    }
+
+
+    public void saveRowsToRedis(String requestId, List<ExcelRowData> rows) {
+        if (rows == null || rows.isEmpty()) return;
+        try {
+            int chunkSize = 5000;
+            int totalRows = rows.size();
+            int totalChunks = (int) Math.ceil((double) totalRows / chunkSize);
+
+            for (int i = 0; i < totalChunks; i++) {
+                int start = i * chunkSize;
+                int end = Math.min(start + chunkSize, totalRows);
+                List<ExcelRowData> chunk = rows.subList(start, end);
+
+                try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                     GZIPOutputStream gos = new GZIPOutputStream(baos)) {
+                    objectMapper.writeValue(gos, chunk);
+                    gos.finish();
+                    String chunkKey = "DATA_CHUNK_" + requestId + "_" + i;
+                    redisTemplate.opsForValue().set(chunkKey, baos.toByteArray(), 1, TimeUnit.HOURS);
+                }
+            }
+
+            Map<String, Object> meta = new HashMap<>();
+            meta.put("totalChunks", totalChunks);
+            meta.put("totalRows", totalRows);
+            byte[] metaBytes = objectMapper.writeValueAsBytes(meta);
+            redisTemplate.opsForValue().set("DATA_META_" + requestId, metaBytes, 1, TimeUnit.HOURS);
+
+        } catch (IOException | DataAccessException e) {
+            throw new CustomExceptions.RedisOperationException("Failed to cache large dataset", e);
+        }
+    }
+
+    public byte[] getFileBytes(String reqId, String type) {
+        try {
+            return redisTemplate.opsForValue().get("FILE_" + reqId + "_" + type);
+        } catch (DataAccessException e) {
+            return null;
+        }
+    }
+
+    public void saveErrorFileToRedis(String reqId, byte[] fileData) {
+        try {
+            redisTemplate.opsForValue().set("FILE_" + reqId + "_ERROR", fileData, 30, TimeUnit.MINUTES);
+        } catch (DataAccessException e) {
+            log.error("REDIS_WRITE_FAIL | ReqID: {} | Could not save error file to cache.", reqId);
+        }
+    }
+}
+
+
+
+check all are correctly pasted and 2nd thing is getValidRowsFromCache is not in use 
+
