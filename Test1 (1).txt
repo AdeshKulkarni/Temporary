@@ -1,126 +1,157 @@
-Let’s tackle **Issue #1: The "Anti-Pattern" Memory Leak (OOM Risk)**.
+package com.fincore.VoucherService.Service.validation;
 
-As a Senior Engineer, you built a very smart architecture here: you are zipping large datasets into 5,000-row chunks and storing them as raw byte arrays in Redis. This is the textbook way to handle massive file uploads without crashing the JVM.
 
-However, the way those chunks are being pulled back out completely defeats the purpose of the architecture.
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.VoucherService.Dto.BulkUploadStateDto;
+import com.fincore.VoucherService.Dto.ExcelRowData;
+import com.fincore.VoucherService.Exception.CustomExceptions;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.dao.DataAccessException;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.stereotype.Service;
 
-### The Trap
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
 
-Look at `ValidationStateManager.getValidRowsFromCache()`:
+@Service
+@Slf4j
+public class ValidationStateManager {
 
-```java
-int totalChunks = (int) meta.get("totalChunks");
-int totalRows = (int) meta.get("totalRows");
-List<ExcelRowData> allRows = new ArrayList<>(totalRows);
+    private final ObjectMapper objectMapper;
 
-for (int i = 0; i < totalChunks; i++) {
-    byte[] compressedChunk = redisTemplate.opsForValue().get("DATA_CHUNK_" + requestId + "_" + i);
-    // ... unzips chunk ...
-    List<ExcelRowData> chunkRows = objectMapper.readValue(gis, new TypeReference<List<ExcelRowData>>() {});
-    allRows.addAll(chunkRows); // <--- FATAL FLAW
-}
-return allRows;
+    @Autowired
+    @Qualifier("byteArrayRedisTemplate")
+    private RedisTemplate<String, byte[]> redisTemplate;
 
-```
-
-And then look at how it's used in `VoucherAsyncWorker.executeAsyncBatchCreation()`:
-
-```java
-// 1. Loads 100% of the data into the JVM heap on the main thread
-List<ExcelRowData> cachedRows = validationStateManager.getValidRowsFromCache(requestId);
-
-// 2. Iterates over that massive list to create MORE sub-lists for the workers
-for (int i = 0; i < totalRows; i += batchSize) {
-    final List<ExcelRowData> chunk = new ArrayList<>(cachedRows.subList(startIdx, endIdx));
-    // ... sends to thread pool ...
-}
-
-```
-
-### The Blast Radius
-
-If a user uploads a 500,000-row Excel file, `getValidRowsFromCache` pulls all 100 Redis chunks, unzips them, and attempts to instantiate 500,000 `ExcelRowData` objects simultaneously in the main thread's memory space.
-
-This will instantly trigger a `java.lang.OutOfMemoryError: Java heap space`. Your pod will crash, restart, and the background job will permanently die.
-
-### The Fix: True Streaming Architecture
-
-We need to stop assembling the `allRows` list. Instead, the `VoucherAsyncWorker` should ask for exactly **one chunk at a time**, hand it to a background thread, and let it get Garbage Collected immediately after insertion.
-
-**Step 1: Add these two methods to `ValidationStateManager.java**`
-(Leave your original method there if other parts of the app use it, but add these for the async worker).
-
-```java
-public int getTotalChunks(String requestId) {
-    byte[] metaBytes = redisTemplate.opsForValue().get("DATA_META_" + requestId);
-    if (metaBytes == null) throw new CustomExceptions.CacheExpiredException("Validation data expired.");
-    try {
-        Map<String, Object> meta = objectMapper.readValue(metaBytes, new TypeReference<>() {});
-        return (int) meta.get("totalChunks");
-    } catch (Exception e) { 
-        throw new CustomExceptions.FileProcessingException("Meta read failed"); 
+    public ValidationStateManager(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
     }
-}
 
-public List<ExcelRowData> getChunkFromCache(String requestId, int chunkIndex) {
-    byte[] compressedChunk = redisTemplate.opsForValue().get("DATA_CHUNK_" + requestId + "_" + chunkIndex);
-    if (compressedChunk == null) throw new CustomExceptions.CacheExpiredException("Missing data chunk " + chunkIndex);
-    
-    try (GZIPInputStream gis = new GZIPInputStream(new ByteArrayInputStream(compressedChunk))) {
-        return objectMapper.readValue(gis, new TypeReference<List<ExcelRowData>>() {});
-    } catch (Exception e) { 
-        throw new CustomExceptions.FileProcessingException("Failed to reconstruct cached data chunk", e); 
-    }
-}
-
-```
-
-**Step 2: Rewrite the chunking loop in `VoucherAsyncWorker.java**`
-Replace your entire `// 3. PARALLEL CHUNKING` block in `executeAsyncBatchCreation` with this true streaming approach:
-
-```java
-int totalChunks = validationStateManager.getTotalChunks(requestId);
-int batchSize = 5000; // Matches what you saved in Redis
-long totalRows = batchSize * (long) totalChunks; // Approximate for progress bar
-
-List<CompletableFuture<Void>> futures = new ArrayList<>();
-AtomicReference<BigDecimal> totalDebit = new AtomicReference<>(BigDecimal.ZERO);
-AtomicReference<BigDecimal> totalCredit = new AtomicReference<>(BigDecimal.ZERO);
-AtomicInteger completedChunks = new AtomicInteger(0);
-
-// 3. PARALLEL CHUNKING - TRUE STREAMING
-for (int i = 0; i < totalChunks; i++) {
-    final int chunkIndex = i;
-    final int startIdx = i * batchSize;
-
-    CompletableFuture<Void> future = CompletableFuture.supplyAsync(() -> {
-        // Fetch and unzip the chunk INSIDE the background thread. 
-        // The main thread never holds the data!
-        return validationStateManager.getChunkFromCache(requestId, chunkIndex);
-    }, chunkWorkerExecutor).thenAcceptAsync(chunk -> {
-        if (contextMap != null) MDC.setContextMap(contextMap);
+    // ==================================================================================
+    // 1. REDIS STATE MANAGEMENT
+    // ==================================================================================
+    public void saveStatusToRedis(String reqId, BulkUploadStateDto state) {
         try {
-            self.processChunkRaw(chunk, batchId, journalPrefix, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit);
-            successfulRowsCount.addAndGet(chunk.size());
-        } finally {
-            MDC.clear();
+            byte[] json = objectMapper.writeValueAsBytes(state);
+            redisTemplate.opsForValue().set("BULK_STATUS_" + reqId, json, 2, TimeUnit.HOURS);
+        } catch (JsonProcessingException e) {
+            log.error("SERIALIZATION_FAIL | ReqID: {} | Status: Object mapping error", reqId);
+        } catch (DataAccessException e) {
+            log.error("REDIS_WRITE_FAIL | ReqID: {} | Status: Connection/Persistence failure", reqId);
         }
-    }, chunkWorkerExecutor).thenRun(() -> {
-        int done = completedChunks.incrementAndGet();
-        int percent = 5 + (done * 90 / totalChunks);
-        progressService.sendProgress(batchId, creatorId, percent, "PROCESSING", "Writing chunks: " + done + "/" + totalChunks);
-    });
-    
-    futures.add(future);
+    }
+
+    public BulkUploadStateDto getStatusFromRedis(String reqId) {
+        try {
+            byte[] json = redisTemplate.opsForValue().get("BULK_STATUS_" + reqId);
+            if (json == null) return null;
+            return objectMapper.readValue(json, BulkUploadStateDto.class);
+        } catch (IOException | DataAccessException e) {
+            log.error("REDIS_READ_FAIL | ReqID: {} | Type: {}", reqId, e.getClass().getSimpleName());
+            return null;
+        }
+    }
+    public synchronized void updateState(String requestId, Consumer<BulkUploadStateDto> updater) {
+        BulkUploadStateDto state = getStatusFromRedis(requestId);
+        if (state == null) {
+            state = new BulkUploadStateDto();
+            state.setRequestId(requestId);
+        }
+        updater.accept(state);
+        saveStatusToRedis(requestId, state);
+    }
+
+
+    public List<ExcelRowData> getValidRowsFromCache(String requestId) {
+        byte[] metaBytes = redisTemplate.opsForValue().get("DATA_META_" + requestId);
+        if (metaBytes == null) {
+            throw new CustomExceptions.CacheExpiredException("Validation data expired (TTL 1 Hour). Please re-upload.");
+        }
+
+        try {
+            Map<String, Object> meta = objectMapper.readValue(metaBytes, new TypeReference<>() {});
+            int totalChunks = (int) meta.get("totalChunks");
+            int totalRows = (int) meta.get("totalRows");
+            List<ExcelRowData> allRows = new ArrayList<>(totalRows);
+
+            for (int i = 0; i < totalChunks; i++) {
+                byte[] compressedChunk = redisTemplate.opsForValue().get("DATA_CHUNK_" + requestId + "_" + i);
+
+                
+                if (compressedChunk == null) {
+                    throw new CustomExceptions.CacheExpiredException("Missing data chunk " + i + ". Please re-upload.");
+                }
+                try (GZIPInputStream gis = new GZIPInputStream(new ByteArrayInputStream(compressedChunk))) {
+                    List<ExcelRowData> chunkRows = objectMapper.readValue(gis, new TypeReference<List<ExcelRowData>>() {});
+                    allRows.addAll(chunkRows);
+                }
+            }
+            return allRows;
+        } catch (IOException | DataAccessException e) {
+            throw new CustomExceptions.FileProcessingException("Failed to reconstruct cached data", e);
+        }
+    }
+
+
+
+    public void saveRowsToRedis(String requestId, List<ExcelRowData> rows) {
+        if (rows == null || rows.isEmpty()) return;
+        try {
+            int chunkSize = 5000;
+            int totalRows = rows.size();
+            int totalChunks = (int) Math.ceil((double) totalRows / chunkSize);
+
+            for (int i = 0; i < totalChunks; i++) {
+                int start = i * chunkSize;
+                int end = Math.min(start + chunkSize, totalRows);
+                List<ExcelRowData> chunk = rows.subList(start, end);
+
+                try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                     GZIPOutputStream gos = new GZIPOutputStream(baos)) {
+                    objectMapper.writeValue(gos, chunk);
+                    gos.finish();
+                    String chunkKey = "DATA_CHUNK_" + requestId + "_" + i;
+                    redisTemplate.opsForValue().set(chunkKey, baos.toByteArray(), 1, TimeUnit.HOURS);
+                }
+            }
+
+            Map<String, Object> meta = new HashMap<>();
+            meta.put("totalChunks", totalChunks);
+            meta.put("totalRows", totalRows);
+            byte[] metaBytes = objectMapper.writeValueAsBytes(meta);
+            redisTemplate.opsForValue().set("DATA_META_" + requestId, metaBytes, 1, TimeUnit.HOURS);
+
+        } catch (IOException | DataAccessException e) {
+            throw new CustomExceptions.RedisOperationException("Failed to cache large dataset", e);
+        }
+    }
+
+    public byte[] getFileBytes(String reqId, String type) {
+        try {
+            return redisTemplate.opsForValue().get("FILE_" + reqId + "_" + type);
+        } catch (DataAccessException e) {
+            return null;
+        }
+    }
+
+    public void saveErrorFileToRedis(String reqId, byte[] fileData) {
+        try {
+            redisTemplate.opsForValue().set("FILE_" + reqId + "_ERROR", fileData, 30, TimeUnit.MINUTES);
+        } catch (DataAccessException e) {
+            log.error("REDIS_WRITE_FAIL | ReqID: {} | Could not save error file to cache.", reqId);
+        }
+    }
 }
-
-CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(45, TimeUnit.MINUTES);
-
-```
-
-By shifting the Redis fetch *into* `CompletableFuture.supplyAsync`, the JVM only ever holds the exact number of chunks as you have active threads in your `chunkWorkerExecutor`. It scales perfectly and will never OOM.
-
----
-
-That leaves us with the final critical flaw: the **Native SQL Schema Mismatch** that will cause your HDFS sync to fail. Are you ready to patch that Oracle `JdbcTemplate` query?
-
