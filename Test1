@@ -1,55 +1,53 @@
-I completely understand your frustration. When a backend hides a JSON parsing crash behind a generic "IO Error", it makes debugging a nightmare.
-I have analyzed your React code, and I found **exactly** what is crashing the Spring Boot backend. The problem is indeed coming from the frontend payloads.
-By default, Java's Jackson JSON parser is very strict. If you send it fields it doesn't recognize, or dates in the wrong format, it throws a MismatchedInputException. Because this exception extends IOException, your Spring Boot GlobalExceptionHandler is catching it and spitting out "Internal storage access failure." instead of telling you the JSON is bad.
-Here are the **three fatal flaws** in your React payloads and exactly how to replace them.
-### Crash 1: Bulk Upload Payload (create-batch-from-cache)
-In your VoucherBulkUpload.jsx file, look at your autoSubmitBatch function. You are sending vid, VID, and vidFk all at the same time. Because VID and vidFk do not exist in your Java CacheBatchPostingDto, the backend crashes instantly trying to map them.
-**The Fix:** Remove the extra keys so it matches the backend perfectly.
-Replace your payload object inside autoSubmitBatch with this:
-```javascript
-      const payload = {
-        requestId: reqId,
-        postingDate: selectedDate.format("DD/MM/YYYY"),
-        vid: currentVid, // Only send 'vid', remove the uppercase VID and vidFk
-        commonBatchRemarks: "Voucher created successfully",
-      };
+You are asking the exact right question. The message "Internal storage access failure" is useless for debugging because it hides the real problem.
+You cannot know if Redis is full, if the disk is full, or if Jackson failed to parse the JSON just by looking at that 500 error in the browser network tab.
+To find out **exactly** what is failing in the ST environment right now, you need to test the infrastructure directly. Here is exactly how you test it, step-by-step, without changing any more code.
+### Step 1: Check the Spring Boot Backend Logs (The Ultimate Truth)
+The React UI only shows the generic 500 error message, but your Spring Boot server console/log file prints the **exact Java stack trace**.
+You must look at the ST backend logs for the exact moment the error happened (2026-06-24T12:54:32). Look for the line that says c.f.V.Exception.GlobalExceptionHandler : IO_STREAM_FAILURE.
+ * If the next word is Type: MismatchedInputException or HttpMessageNotReadableException, **your infrastructure is fine**. The ST server is still rejecting the JSON payload (meaning the ST server is likely running an old build that didn't get your new React/DTO changes).
+ * If the next word is RedisConnectionFailureException or QueryTimeoutException, then you have an actual storage failure.
+### Step 2: How to Test if Redis is Full or Down
+If the backend logs point to Redis, or you just want to verify ST Redis health, you need to connect to the ST server terminal and run these commands:
+ 1. **Test Connection:** Run redis-cli ping. It should return PONG. If it times out, your Spring Boot app cannot reach Redis in ST.
+ 2. **Test Memory:** Run redis-cli info memory. Look at used_memory_human. If it is at 100% of its limit, Redis is full and will reject new file chunks, causing an IOException.
+ 3. **Test Eviction:** Run redis-cli info stats. Look for evicted_keys. If this number is high and growing, Redis is actively deleting your data because it is out of space.
+### Step 3: How to Test if the Server Disk is Full
+Sometimes "IO Error" literally means the Linux server running your ST pod has run out of hard drive space, so Java cannot create temp files for the upload.
+ 1. Connect to your ST server terminal (or use kubectl exec -it <pod-name> -- /bin/sh if using Kubernetes).
+ 2. Run df -h.
+ 3. Look at the Use% column for the main mount (/). If it says 100%, your server is full. Spring Boot will instantly throw IOExceptions when trying to process file uploads.
+### Step 4: The Postman "Isolation" Test
+To prove once and for all if the problem is the React frontend payload or the ST backend infrastructure, completely bypass React.
+Open Postman and send a raw POST request to https://fincorest.sbi/api/voucher/create-batch.
+Use this exact, ultra-simple JSON body:
+```json
+{
+    "vid": "VOUCHER-123",
+    "commonBatchRemarks": "Test Postman",
+    "scheduledTime": null,
+    "rows": [
+        {
+            "branch": "10301",
+            "currency": "INR",
+            "cgl": "1102003001",
+            "amount": 500.00,
+            "txnType": "Debit",
+            "remarks": "Test Row 1",
+            "postingDate": "24/06/2026"
+        },
+        {
+            "branch": "10301",
+            "currency": "INR",
+            "cgl": "1102003002",
+            "amount": 500.00,
+            "txnType": "Credit",
+            "remarks": "Test Row 2",
+            "postingDate": "24/06/2026"
+        }
+    ]
+}
 
 ```
-### Crash 2: Manual Upload Payload (create-batch)
-In your VoucherPosting.jsx file, inside the handleSubmit function, your rowPayloads.push logic has three massive issues that are causing the 500 error:
- 1. **Garbage Field:** You are sending arFlag: "A", which doesn't exist in the backend JournalRequestRow DTO. This crashes the parser.
- 2. **Date Format Mismatch:** Your backend strictly expects "dd/MM/yyyy" (e.g., "24/06/2026"), but your React code is converting it to "YYYY-MM-DD" ("2026-06-24").
- 3. **Missing Data:** You completely forgot to include txnType: row.txnType.
-**The Fix:** Format the date with slashes, remove arFlag, and add the missing txnType.
-Inside handleSubmit, replace the date formatting and the rowPayloads.push block with this exact code:
-```javascript
-    // FIX: Format date strictly to "DD/MM/YYYY" to match the Java backend @JsonFormat
-    const [day, month, year] = postingDate.split("-");
-    const formattedBackendDate = `${day}/${month}/${year}`; 
-
-    const branchCurrencyTotals = new Map();
-    // ... (keep your intermediate mapping logic) ...
-
-      const finalAmount = row.txnType === "Credit" ? "-" + row.amount : row.amount;
-
-      rowPayloads.push({
-        branch: row.branch.code,
-        currency: row.currency,
-        cgl: row.cgl.cglNumber,
-        amount: finalAmount,
-        txnType: row.txnType,          // FIX: Added missing txnType
-        productType: row.productCode,
-        remarks: row.remarks,
-                                       // FIX: Removed 'arFlag: "A"'
-        postingDate: formattedBackendDate 
-      });
-
-```
-### How to Prevent This Forever
-If you want to stop the backend from crashing with a 500 Error every time the React UI accidentally sends an extra field, you must add this single line to the top of **all** your DTO classes in Spring Boot:
-```java
-@JsonIgnoreProperties(ignoreUnknown = true)
-
-```
-If you add this to CacheBatchPostingDto.java and BatchPostingDto.java, Jackson will simply ignore garbage fields like arFlag instead of blowing up the server.
-Make those quick payload changes in your React files, and both of your endpoints will start working immediately.
+ * **If Postman succeeds (200 OK):** Your ST infrastructure (Redis, Database, Disk) is **100% healthy**. The error is purely because the React frontend in ST is sending a slightly malformed JSON payload that Jackson is rejecting.
+ * **If Postman fails with the exact same 500 Error:** You have definitively proven that the ST backend infrastructure is failing (either a database lock, a Redis crash, or out of memory).
+**Do the Postman test right now.** It will take 60 seconds and it will instantly tell you whether to focus on the frontend payload or the backend servers.
