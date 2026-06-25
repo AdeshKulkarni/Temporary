@@ -1,156 +1,45 @@
-This is exactly what we need to do! We are going to add **"Eventual Consistency"** UX to your VoucherPostingStatus.jsx file.
-Because we already set up your backend to use the 'S' (Draft) status while writing the 1 Lakh rows, the Checkers (Approvers) won't see the batch at all until it's 100% finished. We only need to protect the **Maker's Status Screen**.
-Here are the **3 exact steps** to update your VoucherPostingStatus.jsx file so it automatically handles giant background uploads beautifully!
-### Step 1: Update the Fetch Function for "Silent Polling"
-We need to tell our fetch function to pull data *without* showing the giant loading spinner, so the screen doesn't flash every 5 seconds.
-**Find your fetchMyBatches function (around line 348) and update its signature:**
-```javascript
-  // Add 'isSilent = false' to the parameter
-  const fetchMyBatches = useCallback(async (isSilent = false) => {
-    if (!isSilent) setLoading(true); // Only show big spinner if it's NOT silent
-    try {
-      console.log("1. Starting API call to /JS/voucher/all-requests-summary");
+You are absolutely right to check this. When dealing with an async process that takes 3 to 4 minutes to insert 5 Lakh records, notifications become the primary way the user knows what is happening.
+I reviewed your **VoucherAsyncWorker.java** file to trace exactly what happens when those 5 Lakh rows finish (or crash).
+Here is the current state of your notifications:
+### 1. If the 5 Lakh batch FAILS ❌ (It works perfectly)
+**Yes, you are currently sending a failure notification.** If the database crashes or the worker runs out of memory on row 400,000, your code drops into the handleAsyncFailure method and executes this exact line (around line 112):
+```java
+sendNotification(creatorId, null, "Batch creation Failed for Batch ID : " + batchId, batchId);
 
 ```
-### Step 2: Add the Auto-Polling useEffect
-Right below your existing useEffect(() => { fetchMyBatches(); }, [fetchMyBatches]); (around line 405), add this new hook. It will watch your rows, and if it sees an 'S' batch, it will silently poll the server every 5 seconds until it's done!
-```javascript
-  useEffect(() => {
-    fetchMyBatches();
-  }, [fetchMyBatches]);
+The Maker will immediately get an alert telling them their massive upload failed.
+### 2. If the 5 Lakh batch SUCCEEDS ✅ (There is a bug!)
+Currently, the **Checkers** get notified that there is a new batch ready for approval, but **the Maker does NOT get notified** that their 4-minute wait is over.
+Why? Because the line of code meant to notify the Maker is **commented out** in your executeAsyncBatchCreation method!
+**Find this block in VoucherAsyncWorker.java (around line 90):**
+```java
+            String nextStepSql = """
+                    SELECT w.ALLOWED_ROLE_ID 
+                    FROM VOUCHER_POSTING vp
+                    JOIN WORKFLOW_TRANSITIONS w 
+                      ON vp.WORKFLOW_CODE = w.WORKFLOW_CODE
+                    WHERE vp.BATCH_ID = ? AND w.WORKFLOW_ORDER = 2
+                """;
 
-  // --- NEW: AUTO-POLLING FOR GIANT EXCEL UPLOADS ---
-  const hasProcessingBatches = rows.some((row) => row.batchStatus === 'S');
-  
-  useEffect(() => {
-    let interval;
-    if (hasProcessingBatches) {
-      interval = setInterval(() => {
-        fetchMyBatches(true); // true = silent mode
-      }, 5000); // Ping server every 5 seconds
-    }
-    return () => clearInterval(interval);
-  }, [hasProcessingBatches, fetchMyBatches]);
-  // -------------------------------------------------
+            // --- NEW: ROUTE NOTIFICATIONS AFTER BACKGROUND TASK COMPLETES ---
+            String workflowCode = jdbcTemplate.queryForObject("SELECT WORKFLOW_CODE FROM VOUCHER_POSTING WHERE BATCH_ID = ?", String.class, batchId);
+            String nextApproverRoleId = jdbcTemplate.queryForObject(nextStepSql, String.class, batchId);
 
-```
-### Step 3: Upgrade the Columns (Progress Bar & Action Button)
-Now we update the DataGrid columns so the user sees a beautiful "System Processing..." badge instead of the stepper, and we lock the Action button.
-**Find your columns array, and replace the currentStatus and actions columns with this updated logic:**
-```javascript
-    {
-      field: "currentStatus",
-      headerName: "Workflow Progress",
-      width: 440,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: true,
-      sortable: false,
-      renderCell: (params) => {
-        // --- NEW: CATCH DRAFT / PROCESSING STATE ---
-        if (params.row.batchStatus === 'S') {
-          return (
-            <Box sx={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "flex-start", pl: 2, height: "100%" }}>
-              <Chip
-                icon={<CircularProgress size={16} sx={{ color: 'primary.main' }} />}
-                label="System is compiling data..."
-                variant="outlined"
-                color="primary"
-                sx={{ fontWeight: 'bold', borderStyle: 'dashed' }}
-              />
-            </Box>
-          );
-        }
+//            notificationWriterService.createBatchSubmissionNotification(batchId, creatorId);
 
-        const state = params.value || "";
-        const workflow = params.row.approvalWorkflow;
-        const isRejected = params.row.currentStatus === "REJECTED" || params.row.batchStatus === "R";
-        const steps = workflowStepsMap[workflow] || [];
-        let activeStep = params.row.currentOrder ? params.row.currentOrder - 1 : 0;
-
-        if (!isRejected && (state === "POSTED" || state === "SCHEDULED" || state === "C" || state === "S" || params.row.currentStatus === "POSTED")) {
-          activeStep = steps.length;
-        }
-        if (activeStep === -1) activeStep = 0;
-
-        const escalationHours = params.row.escalationTime || 24;
-        const hoursPending = Math.abs(new Date() - new Date(params.row.requestDate)) / 36e5;
-        const isEscalated = !isRejected && activeStep < steps.length && hoursPending > escalationHours;
-
-        return (
-          <Box sx={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "flex-start", pl: 2, height: "100%" }}>
-            <Stepper activeStep={activeStep} alternativeLabel connector={<CustomConnector />} sx={{ width: "100%", mt: 0.5 }}>
-              {steps.map((step, index) => {
-                const isCompleted = index < activeStep;
-                const isCurrent = index === activeStep;
-
-                let statusFlag = "PENDING";
-                if (isCompleted) statusFlag = "COMPLETED";
-                if (isCurrent && isRejected) statusFlag = "REJECTED";
-                else if (isCurrent && isEscalated) statusFlag = "ESCALATED";
-                else if (isCurrent) statusFlag = "ACTIVE";
-
-                const label = step?.designation || step?.state || "Unknown";
-
-                return (
-                  <Tooltip title={statusFlag === "ESCALATED" ? "Escalation Time Breached - Attention Required" : label} key={`${label}-${index}`} arrow>
-                    <Step completed={isCompleted} active={isCurrent} sx={{ px: 0, opacity: isRejected && index > activeStep ? 0.3 : 1 }}>
-                      <StepLabel
-                        StepIconComponent={() => (
-                          <CustomWorkflowIcon
-                            statusFlag={statusFlag}
-                            iconLetter={label.charAt(0).toUpperCase()}
-                            label={label}
-                            isMini={true}
-                          />
-                        )}
-                        sx={{ p: 0, m: 0 }}
-                      />
-                    </Step>
-                  </Tooltip>
-                );
-              })}
-            </Stepper>
-          </Box>
-        );
-      },
-    },
+            // Notifies strictly using the TARGET_ROLE
+            notificationWriterService.createNextStepApprovalNotification(batchId, nextApproverRoleId);
 
 ```
-**And replace the actions column at the very end of the array:**
-```javascript
-    {
-      field: "actions",
-      headerName: "Action",
-      width: 140,
-      align: "center",
-      headerAlign: "center",
-      disableColumnMenu: true,
-      sortable: false,
-      renderCell: (params) => {
-        const isDraft = params.row.batchStatus === 'S'; // NEW: Check if still compiling
-
-        return (
-          <Tooltip title={isDraft ? "Data is currently being compiled. Please wait." : "View & actions"} arrow>
-            <span> {/* Required span to allow Tooltip to show over a disabled button */}
-              <Button
-                variant="contained"
-                size="small"
-                disabled={isDraft} // NEW: Locks the button
-                onClick={() => handleOpenViewModal(params.row)}
-                sx={{ textTransform: "none", borderRadius: 2, boxShadow: 0 }}
-              >
-                View & actions
-              </Button>
-            </span>
-          </Tooltip>
-        );
-      },
-    },
+### The Fix
+To ensure the Maker gets a satisfying "Ding! Your 500,000 rows are ready!" notification after waiting for 4 minutes, you need to either uncomment that line, or (if that specific method doesn't exist in your NotificationWriterService), use your generic sendNotification method instead.
+**Replace the commented line with this:**
+```java
+            // NOTIFY THE MAKER THAT THEIR MASSIVE ASYNC UPLOAD FINISHED SUCCESSFULLY
+            sendNotification(creatorId, null, "Success! Your batch upload (" + batchId + ") has finished processing and is now pending approval.", batchId);
 
 ```
-### The Result
-Now, if a user uploads a 1 Lakh row Excel file and gets redirected to this screen:
- 1. They will see a beautiful dashed blue badge saying **"System is compiling data..."** with a spinning loader.
- 2. The Action button will be **grayed out** so they cannot break the system.
- 3. Every 5 seconds, the screen checks the backend silently. The exact moment the 1 Lakh rows are saved, the loader vanishes, the normal Approval Stepper appears, and the buttons unlock automatically!
+With that one line added, the UX for massive 5 Lakh row uploads is complete:
+ 1. They see the pulsing "System is compiling data..." UI we just built.
+ 2. They can navigate away and do other work.
+ 3. 4 minutes later, a notification pops up saying it's done or it failed!
