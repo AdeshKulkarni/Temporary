@@ -1,6 +1,33 @@
+Here is the complete, enterprise-ready version of the getAllRequestsSummary method.
+It combines the **Global Dashboard logic** (the EXISTS clause so Approvers see everything) with the **Server-Side Pagination logic** (OFFSET and FETCH NEXT), ensuring that even if there are millions of records, the database only works exactly 10 rows at a time!
+Replace your current method in **VoucherQueryService.java** with this exact code:
+```java
+    public Map<String, Object> getAllRequestsSummary(String userId, Integer roleId, int page, int size) {
+        
+        // 1. EXTRACT THE WHERE CLAUSE
+        // We separate this so we can accurately count the totals WITHOUT downloading the data
+        String whereClause = """
+            WHERE UPPER(TRIM(p.CREATED_BY)) = UPPER(TRIM(?)) 
+               OR EXISTS (
+                   SELECT 1 FROM WORKFLOW_TRANSITIONS wt 
+                   WHERE wt.WORKFLOW_CODE = p.WORKFLOW_CODE 
+                   AND wt.ALLOWED_ROLE_ID = ? 
+                   AND wt.WORKFLOW_ORDER > 1
+               )
+        """;
 
-    public List<Map<String, Object>> getAllRequestsSummary(String userId, Integer roleId) {
-        String sql = """
+        // 2. FAST COUNT QUERY
+        // Instantly counts how many total records match the user's view
+        String countSql = "SELECT COUNT(*) FROM VOUCHER_POSTING p " + whereClause;
+        Long totalElements = jdbcTemplate.queryForObject(countSql, Long.class, userId, roleId);
+        if (totalElements == null) {
+            totalElements = 0L;
+        }
+
+        // 3. PAGINATED DATA QUERY
+        // Uses OFFSET and FETCH NEXT to pull only the specific 10 (or size) rows for the UI
+        int offset = page * size;
+        String dataSql = """
             SELECT 
                 p.BATCH_ID, 
                 p.VID_FK,
@@ -15,18 +42,14 @@
             FROM VOUCHER_POSTING p
             LEFT JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
             LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
-            WHERE UPPER(TRIM(p.CREATED_BY)) = UPPER(TRIM(?)) 
-               OR EXISTS (
-                   -- NEW LOGIC: Show if the user's role is in this workflow AND it's not the Creation step (Order > 1)
-                   SELECT 1 FROM WORKFLOW_TRANSITIONS wt 
-                   WHERE wt.WORKFLOW_CODE = p.WORKFLOW_CODE 
-                   AND wt.ALLOWED_ROLE_ID = ? 
-                   AND wt.WORKFLOW_ORDER > 1
-               )
+            """ 
+            + whereClause + 
+            """
             ORDER BY p.CREATED_AT DESC
-        """;
+            OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+            """;
 
-        return jdbcTemplate.query(sql, (rs, rowNum) -> {
+        List<Map<String, Object>> content = jdbcTemplate.query(dataSql, (rs, rowNum) -> {
             Map<String, Object> map = new HashMap<>();
             map.put("batchId", rs.getString("BATCH_ID"));
             map.put("vid", rs.getString("VID_FK"));
@@ -41,10 +64,44 @@
             String bStatus = rs.getString("BATCH_STATUS");
             map.put("batchStatus", bStatus);
 
-            if ("R".equals(bStatus)) map.put("currentStatus", "REJECTED");
-            else if ("A".equals(bStatus) || "C".equals(bStatus)) map.put("currentStatus", "POSTED");
-            else map.put("currentStatus", rs.getString("WORKFLOW_STAGE") != null ? rs.getString("WORKFLOW_STAGE") : "PENDING");
+            if ("R".equals(bStatus)) {
+                map.put("currentStatus", "REJECTED");
+            } else if ("A".equals(bStatus) || "C".equals(bStatus)) {
+                map.put("currentStatus", "POSTED");
+            } else {
+                map.put("currentStatus", rs.getString("WORKFLOW_STAGE") != null ? rs.getString("WORKFLOW_STAGE") : "PENDING");
+            }
 
             return map;
-        }, userId, roleId); // Pass BOTH userId and roleId to the SQL query
+        }, userId, roleId, offset, size);
+
+        // 4. WRAP IN A PAGINATION OBJECT
+        // This perfectly matches the format your React frontend expects
+        Map<String, Object> response = new HashMap<>();
+        response.put("content", content);
+        response.put("totalElements", totalElements);
+        response.put("totalPages", (int) Math.ceil((double) totalElements / size));
+        
+        return response;
     }
+
+```
+### Don't forget the Controller Update!
+Because the parameters changed from returning a List to returning a Map containing page and size, you just need to make sure your endpoint in the Controller accepts those variables.
+Update your /JS/voucher/all-requests-summary endpoint (likely in VoucherQueryController.java) to look like this:
+```java
+    @GetMapping("/all-requests-summary")
+    public ResponseEntity<Map<String, Object>> getAllRequestsSummary(
+            @RequestParam("roleId") Integer roleId,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "10") int size,
+            HttpServletRequest request) { // Or however you get the userId
+
+        // (Extract your userId from the token/session here as you normally do)
+        String userId = "your_extracted_user_id";
+
+        Map<String, Object> response = queryService.getAllRequestsSummary(userId, roleId, page, size);
+        return ResponseEntity.ok(response);
+    }
+
+```
