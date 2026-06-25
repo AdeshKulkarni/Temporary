@@ -1,88 +1,6 @@
-This is a brilliant architectural catch! You are absolutely right. Right now, your system is doing **Client-Side Pagination**. It fetches *all* the records from the backend and lets the frontend DataGrid split them into pages.
-For 20 records, it takes milliseconds. For 10,000 records, the API payload will become massive, the browser will freeze, and the database will take a huge performance hit.
-To make this enterprise-grade and capable of handling millions of records instantly, you need to switch to **Server-Side Pagination**. This means the frontend only asks the backend for exactly 10 rows at a time, and the database only fetches those 10 rows.
-Here is exactly how you upgrade your architecture to handle massive scale.
-### Step 1: Frontend Update (VoucherPostingStatus.jsx)
-We need to tell the DataGrid to stop doing the pagination itself and instead rely on the server. We also need to send the page and size to the backend.
-**1. Add the Pagination State:**
-At the top of your component (around line 300), add these states to track the current page and total row count:
-```javascript
-  const [paginationModel, setPaginationModel] = useState({ page: 0, pageSize: 10 });
-  const [totalRowCount, setTotalRowCount] = useState(0);
 
-```
-**2. Update fetchMyBatches to send the page details:**
-Modify your API call (around line 360) to include page and size:
-```javascript
-      // 2. PASS ROLE ID, PAGE, AND SIZE TO BACKEND
-      const response = await callApi(
-        `/JS/voucher/all-requests-summary?roleId=${actualRoleId}&page=${paginationModel.page}&size=${paginationModel.pageSize}`,
-        null,
-        "GET"
-      );
-      
-      // Update how you extract the data and the total count
-      let fetchedRows = [];
-      if (response && response.content) {
-        fetchedRows = response.content;            // The 10 rows
-        setTotalRowCount(response.totalElements);  // The true database total
-      } else if (Array.isArray(response)) {
-        fetchedRows = response;
-        setTotalRowCount(response.length);
-      }
-
-```
-**3. Update the DataGrid component:**
-Scroll down to your <DataGrid /> (around line 770) and add the server-side props:
-```javascript
-        <DataGrid
-          rows={rows}
-          columns={columns}
-          loading={loading}
-          getRowId={(row) => row.batchId}
-          disableRowSelectionOnClick
-          pageSizeOptions={[5, 10, 25]}
-          disableColumnResize
-          rowHeight={52}
-          
-          // --- NEW: SERVER SIDE PAGINATION PROPS ---
-          paginationMode="server"
-          rowCount={totalRowCount}
-          paginationModel={paginationModel}
-          onPaginationModelChange={setPaginationModel}
-          // -----------------------------------------
-
-          slots={{ noRowsOverlay: CustomNoRowsOverlay }}
-          sx={styles.dataGridContainer}
-        />
-
-```
-*(Don't forget to also add paginationModel to the dependency array of your useEffect that calls fetchMyBatches, so it re-fetches automatically when the user clicks "Next Page").*
-### Step 2: Backend Update (VoucherQueryService.java)
-Now we need to update the Spring Boot backend so it only asks Oracle for the specific 10 rows requested, rather than downloading the entire table.
-**Update your getAllRequestsSummary method to accept page and size and use Oracle's pagination logic (OFFSET and FETCH NEXT):**
-```java
-    // Add page and size to parameters
-    public Map<String, Object> getAllRequestsSummary(String userId, Integer roleId, int page, int size) {
-        
-        // 1. Base WHERE clause (Shared by both count and data queries)
-        String whereClause = """
-            WHERE UPPER(TRIM(p.CREATED_BY)) = UPPER(TRIM(?)) 
-               OR EXISTS (
-                   SELECT 1 FROM WORKFLOW_TRANSITIONS wt 
-                   WHERE wt.WORKFLOW_CODE = p.WORKFLOW_CODE 
-                   AND wt.ALLOWED_ROLE_ID = ? 
-                   AND wt.WORKFLOW_ORDER > 1
-               )
-        """;
-
-        // 2. Fast Count Query (How many total records exist?)
-        String countSql = "SELECT COUNT(*) FROM VOUCHER_POSTING p " + whereClause;
-        Long totalElements = jdbcTemplate.queryForObject(countSql, Long.class, userId, roleId);
-
-        // 3. Paginated Data Query (Fetch only 10 rows)
-        int offset = page * size;
-        String dataSql = """
+    public List<Map<String, Object>> getAllRequestsSummary(String userId, Integer roleId) {
+        String sql = """
             SELECT 
                 p.BATCH_ID, 
                 p.VID_FK,
@@ -97,36 +15,36 @@ Now we need to update the Spring Boot backend so it only asks Oracle for the spe
             FROM VOUCHER_POSTING p
             LEFT JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
             LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
-            """ 
-            + whereClause + 
-            """
+            WHERE UPPER(TRIM(p.CREATED_BY)) = UPPER(TRIM(?)) 
+               OR EXISTS (
+                   -- NEW LOGIC: Show if the user's role is in this workflow AND it's not the Creation step (Order > 1)
+                   SELECT 1 FROM WORKFLOW_TRANSITIONS wt 
+                   WHERE wt.WORKFLOW_CODE = p.WORKFLOW_CODE 
+                   AND wt.ALLOWED_ROLE_ID = ? 
+                   AND wt.WORKFLOW_ORDER > 1
+               )
             ORDER BY p.CREATED_AT DESC
-            OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
-            """;
+        """;
 
-        List<Map<String, Object>> content = jdbcTemplate.query(dataSql, (rs, rowNum) -> {
-            // ... (Keep your exact same mapping logic here) ...
+        return jdbcTemplate.query(sql, (rs, rowNum) -> {
             Map<String, Object> map = new HashMap<>();
             map.put("batchId", rs.getString("BATCH_ID"));
-            // ...
+            map.put("vid", rs.getString("VID_FK"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("creatorName", rs.getString("CREATOR_NAME"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
+            map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
+            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
+
+            String bStatus = rs.getString("BATCH_STATUS");
+            map.put("batchStatus", bStatus);
+
+            if ("R".equals(bStatus)) map.put("currentStatus", "REJECTED");
+            else if ("A".equals(bStatus) || "C".equals(bStatus)) map.put("currentStatus", "POSTED");
+            else map.put("currentStatus", rs.getString("WORKFLOW_STAGE") != null ? rs.getString("WORKFLOW_STAGE") : "PENDING");
+
             return map;
-        }, userId, roleId, offset, size);
-
-        // 4. Return the paginated response wrapper
-        Map<String, Object> response = new HashMap<>();
-        response.put("content", content);
-        response.put("totalElements", totalElements);
-        response.put("totalPages", (int) Math.ceil((double) totalElements / size));
-        
-        return response;
+        }, userId, roleId); // Pass BOTH userId and roleId to the SQL query
     }
-
-```
-*(Remember to update the Controller to accept @RequestParam(defaultValue = "0") int page and @RequestParam(defaultValue = "10") int size).*
-### The Result:
-With these changes, even if you have **5 Million** batches in the database:
- 1. The frontend asks for exactly 10 rows.
- 2. Oracle does a hyper-fast query to pull just those 10 rows using OFFSET/FETCH.
- 3. The API response is tiny (less than 2KB).
- 4. The React DataGrid renders instantly, but the footer accurately says 1-10 of 5,000,000.
-This applies equally to both your VoucherPostingStatus (Maker) screen and your VoucherAuthorization (Checker) screen!
