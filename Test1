@@ -1,94 +1,96 @@
-/**
-     * Retrieves all Active Voucher Configurations that a specific role is allowed to initiate.
-     * Uses a highly optimized "Fetch & Merge" pattern to prevent N+1 database queries
-     * and handle 1-to-Many relationships without returning duplicate rows.
-     */
-    public List<Map<String, Object>> getAvailableVouchersVid(Long roleId) {
-        
-        // ==================================================================================
-        // STEP 1: FETCH CORE VOUCHER DATA
-        // Purpose: Get the distinct master records and basic details in a single query.
-        // Note: We use LEFT JOINs so the voucher is still returned even if user/category data is missing.
-        // ==================================================================================
-        String sql = """
-            SELECT 
-                rv.ID,
-                rv.VID,
-                rv.DESCRIPTION,
-                c.CATEGORY_NAME,
-                rv.CREATED_BY AS CREATOR_ID,
-                -- Fallback: If user isn't found in USERS table, just return their raw ID
-                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, rv.CREATED_BY) AS CREATOR_NAME,
-                rv.CREATED_AT
-            FROM REQUEST_VOUCHER rv
-            LEFT JOIN VOUCHER_CATEGORY c ON rv.CATEGORY_ID = c.ID
-            LEFT JOIN USERS u ON rv.CREATED_BY = u.USER_ID
-            WHERE rv.ALLOWED_ROLE = ? AND rv.STATUS = 'ACTIVE'
-            ORDER BY rv.CREATED_AT DESC
-        """;
+package com.fincore.VoucherService.Dto;
 
-        // Manually mapping to guarantee every key exists in the JSON response, 
-        // preventing UI crashes if Oracle decides to drop a null column.
-        List<Map<String, Object>> vouchers = jdbcTemplate.query(sql, (rs, rowNum) -> {
-            Map<String, Object> map = new HashMap<>();
-            map.put("id", rs.getLong("ID"));
-            map.put("vid", rs.getString("VID"));
-            map.put("description", rs.getString("DESCRIPTION"));
-            map.put("categoryName", rs.getString("CATEGORY_NAME"));
-            map.put("createdBy", rs.getString("CREATOR_ID"));
-            map.put("createdByName", rs.getString("CREATOR_NAME"));
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fincore.VoucherService.Models.enums.ChangeType;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
 
-            java.sql.Timestamp ts = rs.getTimestamp("CREATED_AT");
-            map.put("createdAt", ts != null ? ts.toInstant().toString() : null);
-            return map;
-        }, roleId);
+import java.math.BigDecimal;
+import java.time.LocalDate;
 
-        // Early Exit: If no vouchers are found, return immediately to save a DB call.
-        if (vouchers.isEmpty()) {
-            return vouchers;
-        }
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
 
-        // ==================================================================================
-        // STEP 2: FETCH 1-TO-MANY RELATIONSHIPS (ISSUE CATEGORIES) IN BULK
-        // Purpose: Avoid the N+1 query problem. Instead of querying categories 1-by-1 in a loop,
-        // we extract all the IDs and ask the database for everything at once.
-        // ==================================================================================
-        List<Long> voucherIds = vouchers.stream()
-                .map(v -> (Long) v.get("id"))
-                .toList();
+import java.time.LocalDateTime;
+import java.util.List;
 
-        // Dynamically build the "?, ?, ?" string for the SQL IN clause based on the list size
-        String inClause = String.join(",", Collections.nCopies(voucherIds.size(), "?"));
+@Data
+@NoArgsConstructor      // <--- ADD THIS
+@AllArgsConstructor
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class BatchPostingDto {
 
-        // Oracle's LISTAGG function groups multiple rows into a single comma-separated string 
-        // (e.g., "Category A, Category B"). This prevents Java from having to do string manipulation.
-        String issueSql = String.format("""
-            SELECT 
-                rvic.REQUEST_VOUCHER_ID, 
-                LISTAGG(ic.ISSUE_CATEGORY_NAME, ', ') WITHIN GROUP (ORDER BY ic.ISSUE_CATEGORY_NAME) AS CATEGORIES
-            FROM REQUEST_VOUCHER_ISSUE_CATEGORY rvic
-            JOIN ISSUE_CATEGORY ic ON rvic.ISSUE_CATEGORY_ID = ic.ID
-            WHERE rvic.REQUEST_VOUCHER_ID IN (%s)
-            GROUP BY rvic.REQUEST_VOUCHER_ID
-        """, inClause);
+    @Data
+    public static class JournalRequestRow {
+        @NotNull
+        private ChangeType changeType = ChangeType.ADD;
 
-        // Store the results in a Map where Key = Voucher ID, Value = "CatA, CatB"
-        Map<Long, String> issueCategoryMap = new HashMap<>();
-        jdbcTemplate.query(issueSql, rs -> {
-            issueCategoryMap.put(rs.getLong("REQUEST_VOUCHER_ID"), rs.getString("CATEGORIES"));
-        }, voucherIds.toArray());
 
-        // ==================================================================================
-        // STEP 3: STITCH DATA TOGETHER IN MEMORY
-        // Purpose: Attach the category strings back to their original voucher objects.
-        // ==================================================================================
-        for (Map<String, Object> voucher : vouchers) {
-            Long vId = (Long) voucher.get("id");
-            
-            // If the voucher has no issue categories, default to "N/A" so the React UI 
-            // doesn't render an empty blank space.
-            voucher.put("issueCategories", issueCategoryMap.getOrDefault(vId, "N/A"));
-        }
+        private Long masterJournalId;
 
-        return vouchers;
+
+        @com.fasterxml.jackson.annotation.JsonFormat(shape = com.fasterxml.jackson.annotation.JsonFormat.Shape.STRING, pattern = "dd/MM/yyyy")
+        @com.fasterxml.jackson.annotation.JsonProperty("postingDate")
+        private LocalDate postingDate;
+
+
+        @jakarta.validation.constraints.NotBlank(message = "Branch is required")
+        @jakarta.validation.constraints.Size(min = 5, max = 5, message = "Branch code must be exactly 5 characters")
+        private String branch;
+
+
+        @jakarta.validation.constraints.NotBlank(message = "Currency is required")
+        @jakarta.validation.constraints.Size(min = 3, max = 3, message = "Currency must be exactly 3 characters")
+        private String currency;
+
+        @jakarta.validation.constraints.NotBlank(message = "CGL is required")
+        @jakarta.validation.constraints.Pattern(regexp = "^\\d{10}$", message = "CGL must be exactly 10 digits")
+        private String cgl;
+
+        @jakarta.validation.constraints.NotNull(message = "Amount is required")
+        @jakarta.validation.constraints.Digits(integer = 16, fraction = 4, message = "Amount cannot exceed 16 integer digits and 4 fractional digits")
+        private BigDecimal amount;
+
+        @jakarta.validation.constraints.Pattern(regexp = "^\\d{0,8}$", message = "Product Type must be numeric and up to 8 digits")
+        private String productType;
+
+        @jakarta.validation.constraints.Pattern(
+                regexp = "^([a-zA-Z0-9 \\/&(),.\\-]{2,30})?$",
+                message = "Remarks must be 2-30 characters: Alphanumeric, spaces, and / & ( ) , . -"
+        )
+        private String remarks;
+
+        @Size(min = 1, max = 1)
+        private String arFlag = "A";
+
+        @Size(min = 1, max = 1)
+        private String acClassification;
     }
+
+    @jakarta.validation.constraints.Pattern(regexp = "^([a-zA-Z0-9 ]{2,30})?$", message = "Common remarks must be 2-30 alphanumeric characters and spaces only, if provided")
+    private String commonBatchRemarks;
+
+    @Valid
+    @jakarta.validation.constraints.NotEmpty(message = "Batch must contain at least one row")
+    private List<JournalRequestRow> rows;
+
+    @com.fasterxml.jackson.annotation.JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss")
+    private LocalDateTime scheduledTime;
+
+    // Assuming VID is passed from frontend to identify the voucher type
+    @jakarta.validation.constraints.NotBlank(message = "VID is required")
+    private String vid;
+
+}
+
+this is dto of manual posting in which we 
+tell mi why we are 
+        @Size(min = 1, max = 1)
+        private String arFlag = "A";
+
+        @Size(min = 1, max = 1)
+        private String acClassification;
+
+we are not using this this is it ?
