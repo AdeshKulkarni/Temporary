@@ -1,60 +1,63 @@
-/**
-     * Retrieves the comprehensive summary details for a specific Voucher Batch.
-     * This method hydrates the "View & Action" modal in the UI, merging runtime batch data 
-     * with its underlying configuration blueprint (VID) in a single atomic database trip.
-     */
-    public Map<String, Object> getBatchSummaryDetails(String batchId) {
+
+    public List<Map<String, Object>> getPendingBatchesForChecker(Integer userRole, String userId) {
         String sql = """
             SELECT 
-                -- ==========================================
-                -- 1. RUNTIME BATCH DETAILS (The actual transaction submitted today)
-                -- ==========================================
-                vp.VID_FK AS VID,
-                vp.CREATED_BY AS BATCH_CREATOR_ID,
-                -- Defensive fallback: If the user was deleted from the system, return their raw ID
-                COALESCE(bu.FIRST_NAME || ' ' || bu.LAST_NAME, vp.CREATED_BY) AS BATCH_CREATED_BY_NAME,
-                vp.CREATED_AT AS BATCH_CREATED_AT,
-                vp.CREATOR_ROLE AS CREATORS_ROLE,
-                vp.SCHEDULED_TIME,
-                vp.EXECUTED_AT,
-                
-                -- ==========================================
-                -- 2. CONFIGURATION BLUEPRINT DETAILS (The VID template setup)
-                -- ==========================================
-                vc.CATEGORY_NAME,
-                
-                -- Inline Scalar Subquery: Aggregates multiple Issue Categories into a single comma-separated 
-                -- string so we strictly return only 1 row for the queryForMap to consume safely.
-                (
-                    SELECT LISTAGG(ic.ISSUE_CATEGORY_NAME, ', ') WITHIN GROUP (ORDER BY ic.ISSUE_CATEGORY_NAME)
-                    FROM REQUEST_VOUCHER_ISSUE_CATEGORY rvic
-                    JOIN ISSUE_CATEGORY ic ON rvic.ISSUE_CATEGORY_ID = ic.ID
-                    WHERE rvic.REQUEST_VOUCHER_ID = rv.ID
-                ) AS ISSUE_CATEGORIES,
-                
-                rv.CREATED_BY AS VID_CREATOR_ID,
-                -- Distinguishes between who created the batch vs who originally configured the VID
-                COALESCE(vu.FIRST_NAME || ' ' || vu.LAST_NAME, rv.CREATED_BY) AS VID_CREATED_BY_NAME,
-                rv.CREATED_AT AS VID_CREATED_AT,
-                rv.DESCRIPTION
-                
-            FROM VOUCHER_POSTING vp
-            -- Link the Batch to its Master Configuration Template
-            LEFT JOIN REQUEST_VOUCHER rv ON vp.VID_FK = rv.VID
-            LEFT JOIN VOUCHER_CATEGORY vc ON rv.CATEGORY_ID = vc.ID
-            -- First User Join: Resolves the Maker who uploaded the file
-            LEFT JOIN USERS bu ON vp.CREATED_BY = bu.USER_ID
-            -- Second User Join: Resolves the Admin who created the VID
-            LEFT JOIN USERS vu ON rv.CREATED_BY = vu.USER_ID
-            WHERE vp.BATCH_ID = ?
+                p.BATCH_ID, 
+                p.VID_FK AS VID, 
+                p.CREATED_BY AS CREATOR_ID, 
+                p.CREATED_AT AS REQ_DATE, 
+                p.COMMON_BATCH_REMARKS AS BATCH_REMARKS,
+                p.RECORDS_COUNT AS TOTAL_ROWS, 
+                p.SCHEDULED_TIME,
+                w.WORKFLOW_STAGE, 
+                w.WORKFLOW_CODE, 
+                w.ESCALATION_TIME, 
+                w.WORKFLOW_ORDER, 
+                w.IS_FINAL_APPROVAL,
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME
+            FROM VOUCHER_POSTING p
+            INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+            LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
+            WHERE w.ALLOWED_ROLE_ID = ? AND p.BATCH_STATUS = 'P'
+            AND NOT EXISTS (
+                SELECT 1 FROM VOUCHER_WORKFLOW vw 
+                WHERE vw.BATCH_ID_FK = p.BATCH_ID AND vw.LAST_ACTION_BY = ?
+            )
+            ORDER BY p.CREATED_AT DESC
         """;
 
-        try {
-            // queryForMap expects exactly 1 row. If the batchId is valid, it returns the Key-Value map.
-            return jdbcTemplate.queryForMap(sql, batchId);
-        } catch (EmptyResultDataAccessException e) {
-            // Graceful degradation: If a bad Batch ID is passed, return an empty object 
-            // instead of throwing a 500 Internal Server Error, allowing the UI to handle it cleanly.
-            return new HashMap<>();
+        // 1. Fetch the data from Oracle and store it in a List
+        List<Map<String, Object>> pendingList = jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("vid", rs.getString("VID"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("creatorName", rs.getString("CREATOR_NAME"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
+            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+            map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
+            map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
+            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
+            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
+            map.put("isFinalApproval", rs.getString("IS_FINAL_APPROVAL"));
+            return map;
+        }, userRole, userId);
+
+        // 2. Loop through the list, calculate the time, and inject it into the map
+        for (Map<String, Object> row : pendingList) {
+            String batchId = (String) row.get("batchId");
+
+            // Calls the helper method you already added!
+            String pendingTime = calculateTimeSinceLastAction(batchId);
+
+            // Injects the new string into the JSON response
+            row.put("timeSinceLastAction", pendingTime);
         }
+
+        // 3. Return the completed list to the Controller
+        return pendingList;
     }
+
+
+do this for same and is this method that after apprval from any stage what things does in in the frontend and in the backend as well 
