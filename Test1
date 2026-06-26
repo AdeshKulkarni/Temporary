@@ -1,5 +1,15 @@
+/**
+     * Retrieves all Active Voucher Configurations that a specific role is allowed to initiate.
+     * Uses a highly optimized "Fetch & Merge" pattern to prevent N+1 database queries
+     * and handle 1-to-Many relationships without returning duplicate rows.
+     */
     public List<Map<String, Object>> getAvailableVouchersVid(Long roleId) {
-        // Step 1: Fetch the core voucher data (No inline subquery to avoid Oracle null stripping)
+        
+        // ==================================================================================
+        // STEP 1: FETCH CORE VOUCHER DATA
+        // Purpose: Get the distinct master records and basic details in a single query.
+        // Note: We use LEFT JOINs so the voucher is still returned even if user/category data is missing.
+        // ==================================================================================
         String sql = """
             SELECT 
                 rv.ID,
@@ -7,6 +17,7 @@
                 rv.DESCRIPTION,
                 c.CATEGORY_NAME,
                 rv.CREATED_BY AS CREATOR_ID,
+                -- Fallback: If user isn't found in USERS table, just return their raw ID
                 COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, rv.CREATED_BY) AS CREATOR_NAME,
                 rv.CREATED_AT
             FROM REQUEST_VOUCHER rv
@@ -16,6 +27,8 @@
             ORDER BY rv.CREATED_AT DESC
         """;
 
+        // Manually mapping to guarantee every key exists in the JSON response, 
+        // preventing UI crashes if Oracle decides to drop a null column.
         List<Map<String, Object>> vouchers = jdbcTemplate.query(sql, (rs, rowNum) -> {
             Map<String, Object> map = new HashMap<>();
             map.put("id", rs.getLong("ID"));
@@ -30,18 +43,25 @@
             return map;
         }, roleId);
 
+        // Early Exit: If no vouchers are found, return immediately to save a DB call.
         if (vouchers.isEmpty()) {
             return vouchers;
         }
 
-        // Step 2: Fetch the Issue Categories for these specific Vouchers
+        // ==================================================================================
+        // STEP 2: FETCH 1-TO-MANY RELATIONSHIPS (ISSUE CATEGORIES) IN BULK
+        // Purpose: Avoid the N+1 query problem. Instead of querying categories 1-by-1 in a loop,
+        // we extract all the IDs and ask the database for everything at once.
+        // ==================================================================================
         List<Long> voucherIds = vouchers.stream()
                 .map(v -> (Long) v.get("id"))
                 .toList();
 
-        // Dynamically build the IN clause (?,?,?)
+        // Dynamically build the "?, ?, ?" string for the SQL IN clause based on the list size
         String inClause = String.join(",", Collections.nCopies(voucherIds.size(), "?"));
 
+        // Oracle's LISTAGG function groups multiple rows into a single comma-separated string 
+        // (e.g., "Category A, Category B"). This prevents Java from having to do string manipulation.
         String issueSql = String.format("""
             SELECT 
                 rvic.REQUEST_VOUCHER_ID, 
@@ -52,19 +72,23 @@
             GROUP BY rvic.REQUEST_VOUCHER_ID
         """, inClause);
 
+        // Store the results in a Map where Key = Voucher ID, Value = "CatA, CatB"
         Map<Long, String> issueCategoryMap = new HashMap<>();
         jdbcTemplate.query(issueSql, rs -> {
             issueCategoryMap.put(rs.getLong("REQUEST_VOUCHER_ID"), rs.getString("CATEGORIES"));
         }, voucherIds.toArray());
 
-        // Step 3: Map the categories back to the vouchers (Defaults to "N/A" so Jackson never drops the key)
+        // ==================================================================================
+        // STEP 3: STITCH DATA TOGETHER IN MEMORY
+        // Purpose: Attach the category strings back to their original voucher objects.
+        // ==================================================================================
         for (Map<String, Object> voucher : vouchers) {
             Long vId = (Long) voucher.get("id");
+            
+            // If the voucher has no issue categories, default to "N/A" so the React UI 
+            // doesn't render an empty blank space.
             voucher.put("issueCategories", issueCategoryMap.getOrDefault(vId, "N/A"));
         }
 
         return vouchers;
     }
-
-
-let understand this how this works and what we are doing here and also add a comment above that so i can understand 
