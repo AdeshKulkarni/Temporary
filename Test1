@@ -1,84 +1,85 @@
-  public Map<String, Object> getAllRequestsSummary(String userId, Integer roleId, int page, int size) {
+public Map<String, Object> getAllRequestsSummary(String userId, Integer roleId, int page, int size) {
 
-        // 1. EXTRACT THE WHERE CLAUSE
-        // We separate this so we can accurately count the totals WITHOUT downloading the data
-        String whereClause = """
-            WHERE UPPER(TRIM(p.CREATED_BY)) = UPPER(TRIM(?)) 
-               OR EXISTS (
-                   SELECT 1 FROM WORKFLOW_TRANSITIONS wt 
-                   WHERE wt.WORKFLOW_CODE = p.WORKFLOW_CODE 
-                   AND wt.ALLOWED_ROLE_ID = ? 
-                   AND wt.WORKFLOW_ORDER > 1
-               )
-        """;
+    // 1. CLEAN WHERE CLAUSE: Remove UPPER/TRIM. 
+    // Oracle redaction policies trigger ORA-28094 when functions are used on redacted columns.
+    String whereClause = """
+        WHERE p.CREATED_BY = ? 
+           OR EXISTS (
+               SELECT 1 FROM WORKFLOW_TRANSITIONS wt 
+               WHERE wt.WORKFLOW_CODE = p.WORKFLOW_CODE 
+               AND wt.ALLOWED_ROLE_ID = ? 
+               AND wt.WORKFLOW_ORDER > 1
+           )
+    """;
 
-        // 2. FAST COUNT QUERY
-        // Instantly counts how many total records match the user's view
-        String countSql = "SELECT COUNT(*) FROM VOUCHER_POSTING p " + whereClause;
-        Long totalElements = jdbcTemplate.queryForObject(countSql, Long.class, userId, roleId);
-        if (totalElements == null) {
-            totalElements = 0L;
+    // 2. FAST COUNT QUERY
+    String countSql = "SELECT COUNT(*) FROM VOUCHER_POSTING p " + whereClause;
+    Long totalElements = jdbcTemplate.queryForObject(countSql, Long.class, userId, roleId);
+    if (totalElements == null) totalElements = 0L;
+
+    // 3. PAGINATED DATA QUERY
+    // REMOVED: COALESCE/UPPER/TRIM. We fetch raw columns and handle formatting in the RowMapper.
+    int offset = page * size;
+    String dataSql = """
+        SELECT 
+            p.BATCH_ID, 
+            p.VID_FK,
+            p.CREATED_BY AS CREATOR_ID, 
+            u.FIRST_NAME,
+            u.LAST_NAME,
+            p.CREATED_AT AS REQ_DATE, 
+            p.RECORDS_COUNT AS TOTAL_ROWS, 
+            p.BATCH_STATUS, 
+            w.WORKFLOW_STAGE, 
+            w.WORKFLOW_CODE,
+            w.WORKFLOW_ORDER
+        FROM VOUCHER_POSTING p
+        LEFT JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+        LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
+        """ + whereClause + """
+        ORDER BY p.CREATED_AT DESC
+        OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+    """;
+
+    List<Map<String, Object>> content = jdbcTemplate.query(dataSql, (rs, rowNum) -> {
+        Map<String, Object> map = new HashMap<>();
+        map.put("batchId", rs.getString("BATCH_ID"));
+        map.put("vid", rs.getString("VID_FK"));
+        map.put("creatorId", rs.getString("CREATOR_ID"));
+        
+        // JAVA-SIDE FORMATTING: Safely concatenate names in Java memory, not in the SQL engine
+        String fName = rs.getString("FIRST_NAME");
+        String lName = rs.getString("LAST_NAME");
+        String fullName = (fName != null || lName != null) 
+                          ? ((fName != null ? fName : "") + " " + (lName != null ? lName : "")).trim() 
+                          : rs.getString("CREATOR_ID");
+        map.put("creatorName", fullName);
+
+        map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+        map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+        map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
+        map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
+        map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
+
+        String bStatus = rs.getString("BATCH_STATUS");
+        map.put("batchStatus", bStatus);
+
+        if ("R".equals(bStatus)) {
+            map.put("currentStatus", "REJECTED");
+        } else if ("A".equals(bStatus) || "C".equals(bStatus)) {
+            map.put("currentStatus", "POSTED");
+        } else {
+            map.put("currentStatus", rs.getString("WORKFLOW_STAGE") != null ? rs.getString("WORKFLOW_STAGE") : "PENDING");
         }
 
-        // 3. PAGINATED DATA QUERY
-        // Uses OFFSET and FETCH NEXT to pull only the specific 10 (or size) rows for the UI
-        int offset = page * size;
-        String dataSql = """
-            SELECT 
-                p.BATCH_ID, 
-                p.VID_FK,
-                p.CREATED_BY AS CREATOR_ID, 
-                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME,
-                p.CREATED_AT AS REQ_DATE, 
-                p.RECORDS_COUNT AS TOTAL_ROWS, 
-                p.BATCH_STATUS, 
-                w.WORKFLOW_STAGE, 
-                w.WORKFLOW_CODE,
-                w.WORKFLOW_ORDER
-            FROM VOUCHER_POSTING p
-            LEFT JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
-            LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
-            """
-                + whereClause +
-                """
-                ORDER BY p.CREATED_AT DESC
-                OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
-                """;
+        return map;
+    }, userId, roleId, offset, size);
 
-        List<Map<String, Object>> content = jdbcTemplate.query(dataSql, (rs, rowNum) -> {
-            Map<String, Object> map = new HashMap<>();
-            map.put("batchId", rs.getString("BATCH_ID"));
-            map.put("vid", rs.getString("VID_FK"));
-            map.put("creatorId", rs.getString("CREATOR_ID"));
-            map.put("creatorName", rs.getString("CREATOR_NAME"));
-            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
-            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
-            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
-            map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
-            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
+    // 4. WRAP IN PAGINATION
+    Map<String, Object> response = new HashMap<>();
+    response.put("content", content);
+    response.put("totalElements", totalElements);
+    response.put("totalPages", (int) Math.ceil((double) totalElements / size));
 
-            String bStatus = rs.getString("BATCH_STATUS");
-            map.put("batchStatus", bStatus);
-
-            if ("R".equals(bStatus)) {
-                map.put("currentStatus", "REJECTED");
-            } else if ("A".equals(bStatus) || "C".equals(bStatus)) {
-                map.put("currentStatus", "POSTED");
-            } else {
-                map.put("currentStatus", rs.getString("WORKFLOW_STAGE") != null ? rs.getString("WORKFLOW_STAGE") : "PENDING");
-            }
-
-            return map;
-        }, userId, roleId, offset, size);
-
-        // 4. WRAP IN A PAGINATION OBJECT
-        // This perfectly matches the format your React frontend expects
-        Map<String, Object> response = new HashMap<>();
-        response.put("content", content);
-        response.put("totalElements", totalElements);
-        response.put("totalPages", (int) Math.ceil((double) totalElements / size));
-
-        return response;
-    }
-
-give mi complete method with changes required here 
+    return response;
+}
