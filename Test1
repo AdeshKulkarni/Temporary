@@ -1,8 +1,60 @@
+    public byte[] generateBatchExcel(String batchId) {
+        
+        // 1. THE MEMORY HACK: Tell Java to start with a 5MB buffer so it doesn't 
+        // spend CPU time constantly resizing and copying small arrays in RAM.
+        int initialBufferSize = 5 * 1024 * 1024; // 5 MB
+        
+        try (org.apache.poi.xssf.streaming.SXSSFWorkbook workbook = new org.apache.poi.xssf.streaming.SXSSFWorkbook(100);
+             java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(initialBufferSize)) {
+            
+            org.apache.poi.ss.usermodel.Sheet sheet = workbook.createSheet("Batch Details");
+            org.apache.poi.ss.usermodel.Row headerRow = sheet.createRow(0);
+            String[] headers = {"Branch", "Currency", "CGL", "Amount", "Type", "Remarks", "Product Code"};
+            for (int i = 0; i < headers.length; i++) headerRow.createCell(i).setCellValue(headers[i]);
 
-Error starting at line : 1 in command -
-CREATE INDEX idx_voucher_data_batch ON VOUCHER_POSTING_DATA(BATCH_ID)
-Error report -
-ORA-01408: such column list already indexed
-01408. 00000 -  "such column list already indexed"
-*Cause:    
-*Action:
+            String sql = "SELECT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_NARRATION, REQ_PRODUCT FROM VOUCHER_POSTING_DATA WHERE BATCH_ID = ?";
+            int[] rowIdx = {1}; 
+
+            // 2. THE NETWORK HACK: Use a custom PreparedStatement to force 
+            // Oracle to send us 2,000 rows per network trip instead of 10.
+            jdbcTemplate.query(
+                connection -> {
+                    java.sql.PreparedStatement ps = connection.prepareStatement(
+                        sql, 
+                        java.sql.ResultSet.TYPE_FORWARD_ONLY, 
+                        java.sql.ResultSet.CONCUR_READ_ONLY
+                    );
+                    ps.setFetchSize(2000); // <--- This reduces network trips by 99%
+                    ps.setString(1, batchId);
+                    return ps;
+                },
+                rs -> {
+                    org.apache.poi.ss.usermodel.Row row = sheet.createRow(rowIdx[0]++);
+                    
+                    row.createCell(0).setCellValue(rs.getString("REQ_BRANCH_CODE") != null ? rs.getString("REQ_BRANCH_CODE") : "");
+                    row.createCell(1).setCellValue(rs.getString("REQ_CURRENCY") != null ? rs.getString("REQ_CURRENCY") : "");
+                    row.createCell(2).setCellValue(rs.getString("REQ_CGL") != null ? rs.getString("REQ_CGL") : "");
+                    
+                    BigDecimal amt = rs.getBigDecimal("REQ_AMOUNT");
+                    if (amt != null) {
+                        row.createCell(3).setCellValue(amt.abs().stripTrailingZeros().toPlainString());
+                        row.createCell(4).setCellValue(amt.compareTo(BigDecimal.ZERO) < 0 ? "Credit" : "Debit");
+                    }
+                    
+                    row.createCell(5).setCellValue(rs.getString("REQ_NARRATION") != null ? rs.getString("REQ_NARRATION") : "");
+                    row.createCell(6).setCellValue(rs.getString("REQ_PRODUCT") != null ? rs.getString("REQ_PRODUCT") : "");
+                }
+            );
+
+            if (rowIdx[0] == 1) {
+                throw new CustomExceptions.InvalidDataException("No records found for batch.");
+            }
+            
+            workbook.write(out); 
+            workbook.dispose(); 
+            return out.toByteArray();
+            
+        } catch (java.io.IOException e) { 
+            throw new CustomExceptions.DatabaseOperationException("Failed to generate Excel file", e); 
+        }
+    }
