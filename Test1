@@ -1,60 +1,51 @@
-    public byte[] generateBatchExcel(String batchId) {
-        
-        // 1. THE MEMORY HACK: Tell Java to start with a 5MB buffer so it doesn't 
-        // spend CPU time constantly resizing and copying small arrays in RAM.
-        int initialBufferSize = 5 * 1024 * 1024; // 5 MB
-        
-        try (org.apache.poi.xssf.streaming.SXSSFWorkbook workbook = new org.apache.poi.xssf.streaming.SXSSFWorkbook(100);
-             java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(initialBufferSize)) {
-            
-            org.apache.poi.ss.usermodel.Sheet sheet = workbook.createSheet("Batch Details");
-            org.apache.poi.ss.usermodel.Row headerRow = sheet.createRow(0);
-            String[] headers = {"Branch", "Currency", "CGL", "Amount", "Type", "Remarks", "Product Code"};
-            for (int i = 0; i < headers.length; i++) headerRow.createCell(i).setCellValue(headers[i]);
-
-            String sql = "SELECT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_NARRATION, REQ_PRODUCT FROM VOUCHER_POSTING_DATA WHERE BATCH_ID = ?";
-            int[] rowIdx = {1}; 
-
-            // 2. THE NETWORK HACK: Use a custom PreparedStatement to force 
-            // Oracle to send us 2,000 rows per network trip instead of 10.
-            jdbcTemplate.query(
-                connection -> {
-                    java.sql.PreparedStatement ps = connection.prepareStatement(
-                        sql, 
-                        java.sql.ResultSet.TYPE_FORWARD_ONLY, 
-                        java.sql.ResultSet.CONCUR_READ_ONLY
-                    );
-                    ps.setFetchSize(2000); // <--- This reduces network trips by 99%
-                    ps.setString(1, batchId);
-                    return ps;
-                },
-                rs -> {
-                    org.apache.poi.ss.usermodel.Row row = sheet.createRow(rowIdx[0]++);
-                    
-                    row.createCell(0).setCellValue(rs.getString("REQ_BRANCH_CODE") != null ? rs.getString("REQ_BRANCH_CODE") : "");
-                    row.createCell(1).setCellValue(rs.getString("REQ_CURRENCY") != null ? rs.getString("REQ_CURRENCY") : "");
-                    row.createCell(2).setCellValue(rs.getString("REQ_CGL") != null ? rs.getString("REQ_CGL") : "");
-                    
-                    BigDecimal amt = rs.getBigDecimal("REQ_AMOUNT");
-                    if (amt != null) {
-                        row.createCell(3).setCellValue(amt.abs().stripTrailingZeros().toPlainString());
-                        row.createCell(4).setCellValue(amt.compareTo(BigDecimal.ZERO) < 0 ? "Credit" : "Debit");
-                    }
-                    
-                    row.createCell(5).setCellValue(rs.getString("REQ_NARRATION") != null ? rs.getString("REQ_NARRATION") : "");
-                    row.createCell(6).setCellValue(rs.getString("REQ_PRODUCT") != null ? rs.getString("REQ_PRODUCT") : "");
-                }
+This is not a bug in your Java code; it is a **Database Configuration issue**, and your code is actually doing exactly what it's supposed to do—protecting the system.
+If you look at the createBatchRequest method we reviewed earlier, it contains this exact block:
+```java
+        try {
+            workflowCode = jdbcTemplate.queryForObject(
+                    "SELECT WORKFLOW_CODE FROM WORKFLOW_TRANSITIONS WHERE ALLOWED_ROLE_ID = ? AND WORKFLOW_ORDER = 1 FETCH FIRST 1 ROWS ONLY",
+                    String.class, creatorRole
             );
-
-            if (rowIdx[0] == 1) {
-                throw new CustomExceptions.InvalidDataException("No records found for batch.");
-            }
-            
-            workbook.write(out); 
-            workbook.dispose(); 
-            return out.toByteArray();
-            
-        } catch (java.io.IOException e) { 
-            throw new CustomExceptions.DatabaseOperationException("Failed to generate Excel file", e); 
+        } catch (EmptyResultDataAccessException e) {
+            throw new CustomExceptions.InvalidDataException("Configuration Error: No workflow mapped for Role ID " + creatorRole);
         }
-    }
+
+```
+### Why is this happening?
+When a user (let's say they have Role ID 9001) clicks "Submit Batch", the system looks at the WORKFLOW_TRANSITIONS table to figure out which workflow template they belong to.
+It asks the database: *"Show me the WORKFLOW_CODE where the first step (WORKFLOW_ORDER = 1) is assigned to Role 9001."*
+The database returned **0 rows**. Because the system doesn't know which workflow to put this batch into, it throws the error to stop the batch from entering a "limbo" state.
+### How to Fix It (The Lead Engineer Playbook)
+You need to fix the data in your WORKFLOW_TRANSITIONS table.
+#### Step 1: Identify the missing Role ID
+Look closely at the error message on your screen or in your logs. It will say exactly what role is missing (e.g., Configuration Error: No workflow mapped for Role ID 105). Note that number.
+#### Step 2: Check your current configurations
+Run this query in your database to see who is *actually* allowed to create batches right now:
+```sql
+SELECT WORKFLOW_CODE, ALLOWED_ROLE_ID, WORKFLOW_STAGE 
+FROM WORKFLOW_TRANSITIONS 
+WHERE WORKFLOW_ORDER = 1;
+
+```
+If you don't see the Role ID from Step 1 in this list, that confirms the configuration is missing.
+#### Step 3: Insert the missing configuration
+You (or your DBA) need to insert a row into WORKFLOW_TRANSITIONS linking that user's Role ID to the starting step of a workflow.
+Here is the SQL template to fix it (replace the values in the brackets with your actual data):
+```sql
+INSERT INTO WORKFLOW_TRANSITIONS (
+    WORKFLOW_ID, 
+    WORKFLOW_CODE, 
+    WORKFLOW_ORDER, 
+    WORKFLOW_STAGE, 
+    ALLOWED_ROLE_ID
+) VALUES (
+    [Generate_Next_Sequence_ID], -- e.g., 501
+    'workflow_3',                -- Whichever workflow code they should use
+    1,                           -- Order 1 means "Maker" or "Creator"
+    'Maker',                     -- Stage name
+    [The_Missing_Role_ID]        -- The Role ID from the error message
+);
+COMMIT;
+
+```
+Once you insert that row and COMMIT, the user will instantly be able to create batches. The Java code will find the mapping and seamlessly assign their batch to workflow_3!
