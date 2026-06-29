@@ -1,151 +1,66 @@
- @Transactional
-    public List<JournalRequest> createBatchRequest(BatchPostingDto dto, String creatorId, Integer creatorRole) {
-        String batchId = sequenceService.getNextBatchId();
-        String journalPrefix = sequenceService.getNextJournalIdPrefix();
+This is the correct architectural decision. Moving the notification to the updateBatchSchedule method (or the final step where the batch actually becomes 'Pending') prevents the "False Notification" problem—where checkers get alerts for batches that are still empty or currently loading data.
+Here is the finalized logic. We will strip the notification out of createBatchRequest and move it entirely into the updateBatchSchedule method where the Batch status flip occurs.
+### 1. Remove from createBatchRequest
+Simply delete the code block we discussed earlier from createBatchRequest. Your workflow logic in the creation phase should only be responsible for:
+ 1. Validating/Balancing the data.
+ 2. Saving the initial records.
+ 3. Locking the VID.
+ 4. Returning control to the user.
+### 2. Consolidate in updateBatchSchedule
+This is the **single source of truth** for notifications. This ensures that the Checker is only notified when the batch is:
+ 1. Fully loaded.
+ 2. Has its schedule finalized.
+ 3. Is ready for approval.
+```java
+    @Transactional
+    public void updateBatchSchedule(String batchId, String scheduledTime) {
+        // ... (Existing validation and update logic) ...
 
-        // --- STRICT VID DUPLICATION CHECK ---
-        if (dto.getVid() == null || dto.getVid().trim().isEmpty()) {
-            throw new CustomExceptions.InvalidDataException("VID is missing from the payload. Cannot save batch.");
-        }
+        // SMART DOUBLE-LOCK LOGIC:
+        // Check if the AsyncWorker is finished inserting all rows
+        String checkDataLoadedSql = """
+            SELECT CASE WHEN p.RECORDS_COUNT = (SELECT COUNT(*) FROM VOUCHER_POSTING_DATA d WHERE d.BATCH_ID = p.BATCH_ID) 
+            THEN 1 ELSE 0 END FROM VOUCHER_POSTING p WHERE p.BATCH_ID = ?
+        """;
 
-        // Checks if the VID is already used by an active/pending batch, ignoring rejected ones
-        Integer vidExists = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM VOUCHER_POSTING WHERE VID_FK = ? AND BATCH_STATUS NOT IN ('R', 'REJECTED', 'ERROR')",
-                Integer.class, dto.getVid()
-        );
+        Integer isDataLoaded = jdbcTemplate.queryForObject(checkDataLoadedSql, Integer.class, batchId);
 
-        if (vidExists != null && vidExists > 0) {
-            throw new CustomExceptions.InvalidDataException("Voucher ID (" + dto.getVid() + ") is currently in use by an active batch. Please select a fresh VID.");
-        }
+        if (isDataLoaded != null && isDataLoaded == 1) {
+            // 1. Flip status to PENDING
+            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
 
-        List<JournalRequest> entities = new ArrayList<>();
-        Map<String, BigDecimal> balancingMap = new java.util.HashMap<>();
-        int rowIndex = 1;
+            // 2. DYNAMIC NOTIFICATION TRIGGER
+            // This is the only place it happens now!
+            try {
+                // Using the PK join to avoid ORA-00904
+                String wfSql = """
+                    SELECT wt.ALLOWED_ROLE_ID, wt.DESIGNATION 
+                    FROM VOUCHER_POSTING vp 
+                    JOIN WORKFLOW_TRANSITIONS wt ON vp.PENDING_AT = wt.WORKFLOW_ID 
+                    WHERE vp.BATCH_ID = ? AND wt.WORKFLOW_ORDER = 2
+                """;
+                
+                Map<String, Object> step2Info = jdbcTemplate.queryForMap(wfSql, batchId);
+                String nextApproverRoleId = String.valueOf(step2Info.get("ALLOWED_ROLE_ID"));
+                String stageName = (String) step2Info.get("DESIGNATION");
 
-        for (BatchPostingDto.JournalRequestRow row : dto.getRows()) {
-            JournalRequest entity = new JournalRequest();
-            entity.setRequestStatus(RequestStatus.PENDING);
-            entity.setRequestDate(LocalDateTime.now());
-            entity.setCreatorId(creatorId);
-            entity.setBatchId(batchId);
-
-            String journalId = journalPrefix + "-" + rowIndex;
-            entity.setJournalId(journalId);
-            entity.setBranchCode(row.getBranch());
-            entity.setCurrency(row.getCurrency());
-
-            String cgl = row.getCgl() != null ? row.getCgl().trim() : "";
-            entity.setCgl(cgl);
-
-            BigDecimal amount = row.getAmount();
-
-            if (amount == null || amount.compareTo(BigDecimal.ZERO) == 0) {
-                throw new CustomExceptions.InvalidDataException("Transaction amount cannot be zero.");
+                notificationWriterService.createNextStepApprovalNotification(batchId, nextApproverRoleId, stageName);
+                log.info("Batch {} is now PENDING. Notification sent to Role {}.", batchId, nextApproverRoleId);
+                
+            } catch (EmptyResultDataAccessException e) {
+                log.error("Batch {} is PENDING, but no Step 2 workflow config found to send notification.", batchId);
             }
-
-            entity.setAmount(amount);
-            entity.setNarration(row.getRemarks());
-            entity.setProductCode(row.getProductType());
-
-            // --- STRICT BACKEND BALANCING RULE ---
-            // 1. Create Composite Key (e.g., "10301-INR-MEMO")
-            String cglType = cgl.startsWith("5") ? "MEMO" : "NORMAL";
-            String compositeKey = row.getBranch() + " - " + row.getCurrency() + " - " + cglType;
-
-            // 2. Add to Group Balance (Debits are positive, Credits are negative)
-            // If the UI sends "Credit" as negative, it naturally subtracts.
-            // If the UI sends it as positive but flags it as "Credit", make sure to handle that negation here.
-            balancingMap.put(compositeKey, balancingMap.getOrDefault(compositeKey, BigDecimal.ZERO).add(amount));
-
-            entities.add(entity);
-            rowIndex++;
-        }
-
-        // --- ENFORCE BALANCE ---
-        // If Debits and Credits match perfectly, the sum for every group will be exactly 0.00
-        for (Map.Entry<String, BigDecimal> entry : balancingMap.entrySet()) {
-            if (entry.getValue().compareTo(BigDecimal.ZERO) != 0) {
-                throw new CustomExceptions.InvalidDataException(
-                        "Balancing rule failed for [" + entry.getKey() + "]. Total Debits and Credits must exactly match."
-                );
-            }
-        }
-
-        List<JournalRequest> savedEntities = journalRequestRepository.saveAll(entities);
-
-        // ==========================================
-        // 2. DYNAMIC WORKFLOW INITIALIZATION (FOREIGN KEY BASED)
-        // ==========================================
-        String workflowCode;
-        try {
-            workflowCode = jdbcTemplate.queryForObject(
-                    "SELECT WORKFLOW_CODE FROM WORKFLOW_TRANSITIONS WHERE ALLOWED_ROLE_ID = ? AND WORKFLOW_ORDER = 1 FETCH FIRST 1 ROWS ONLY",
-                    String.class, creatorRole
-            );
-        } catch (EmptyResultDataAccessException e) {
-            throw new CustomExceptions.InvalidDataException("Configuration Error: No workflow mapped for Role ID " + creatorRole);
-        }
-
-        // --- FETCH WORKFLOW_ID, ALLOWED_ROLE_ID, AND DESIGNATION (STAGE NAME) FOR STEP 2 ---
-        Map<String, Object> step2Info;
-        try {
-            step2Info = jdbcTemplate.queryForMap(
-                    "SELECT WORKFLOW_ID, ALLOWED_ROLE_ID, DESIGNATION FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = 2",
-                    workflowCode
-            );
-        } catch (EmptyResultDataAccessException e) {
-            throw new CustomExceptions.InvalidDataException("Configuration Error: Missing Step 2 for " + workflowCode);
-        }
-
-        Long firstApproverWorkflowId = ((Number) step2Info.get("WORKFLOW_ID")).longValue();
-        String nextApproverRoleId = String.valueOf(step2Info.get("ALLOWED_ROLE_ID"));
-
-        // Extract the Stage Name from the DB
-        String stageName = (String) step2Info.get("DESIGNATION");
-
-        VoucherPosting posting = new VoucherPosting();
-        posting.setBatchId(batchId);
-        posting.setVidFk(dto.getVid());
-        posting.setCreatedBy(creatorId);
-        posting.setPendingAt(firstApproverWorkflowId);
-        posting.setBatchStatus("S"); // 'P' = Pending
-        posting.setWorkflowCode(workflowCode);
-        posting.setCommonBatchRemarks(dto.getCommonBatchRemarks());
-        posting.setCreatorRole(creatorRole);
-
-        if (dto.getRows() != null) {
-            posting.setRecordsCount((long) dto.getRows().size());
-        }
-
-        // Handle Maker Scheduling
-        if (dto.getScheduledTime() != null) {
-            workflowEngine.validateScheduledTime(dto.getScheduledTime());
-            posting.setIS_EXECUTION_SCHEDULED("YES");
-            posting.setScheduledTime(dto.getScheduledTime());
-            posting.setIsScheduleOverride("NO");
         } else {
-            posting.setIS_EXECUTION_SCHEDULED("NO");
-            posting.setIsScheduleOverride("NO");
+            // Data is still loading, do not notify yet. 
+            // Note: Your AsyncWorker MUST also call this notification logic 
+            // once it finishes its final row insertion and performs the BATCH_STATUS = 'P' update.
+            log.info("Schedule updated for Batch {}, data still loading. Notification deferred.", batchId);
         }
-
-        voucherPostingRepository.save(posting);
-
-        logAudit(creatorId, "BATCH_MANUAL", "ADD", "Manual Batch " + batchId + " Created under " + workflowCode);
-
-        // ==========================================
-        // SMART NOTIFICATION ROUTING
-        // ==========================================
-        // 1. Notify the Checkers (Strictly to TARGET_ROLE)
-        //notificationWriterService.createNextStepApprovalNotification(batchId, nextApproverRoleId, stageName);
-
-        // ---> TRIGGER 1: LOCK THE VID AS USED <---
-        if (dto.getVid() != null && !dto.getVid().isEmpty()) {
-            workflowEngine.updateVidStatus(dto.getVid(), VoucherStatus.USED);
-        }
-
-        workflowEngine.logWorkflowAction(batchId, dto.getVid(), "Submitted", creatorId, dto.getCommonBatchRemarks(), dto.getScheduledTime());
-
-        return savedEntities;
     }
 
-in this when we are sending the create notification check how we fetching that do same there 
+```
+### Critical Lead Engineer Note: The "Worker" Handshake
+Since you are now triggering notifications here, you must ensure that your VoucherAsyncWorker (which runs in the background to insert the bulk/manual rows) is also aware of this.
+ * If the **User** triggers the status flip via updateBatchSchedule, this code handles the notification.
+ * If the **Worker** finishes the row insertion *after* the user has already called updateBatchSchedule, the Worker must detect the RECORDS_COUNT match and **also** trigger the notification.
+**Would you like to see how to implement a shared NotificationHelper method so both your updateBatchSchedule and your AsyncWorker can call the exact same logic without code duplication?**
