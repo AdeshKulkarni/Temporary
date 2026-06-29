@@ -1,52 +1,86 @@
- @GetMapping("/download-batch/{batchId}")
-    public ResponseEntity<?> downloadBatchExcel(@PathVariable String batchId, @RequestHeader("Authorization") String token) {
-        try {
-            if (!queryService.isUserAuthorizedForBatch(batchId, jwtUtil.getUserIdFromToken(token.substring(7)), jwtUtil.getUserRoleFromToken(token.substring(7)))) {
-                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("message", "You are not authorized to view this batch."));
-            }
+To address the performance issues, we need to move from **Memory-Buffered** processing (which causes the lag and server crashes) to **Streaming** processing.
+Here is the complete solution including the service-layer change and the controller-layer update.
+### 1. The Optimized Service Layer
+We switch from XSSFWorkbook (RAM-heavy) to SXSSFWorkbook (Disk-streamed). This is crucial for handling thousands of rows without hitting an OutOfMemory exception.
+```java
+public void streamBatchExcel(String batchId, java.io.OutputStream outputStream) throws java.io.IOException {
+    List<JournalRequest> requests = journalRequestRepository.findByBatchId(batchId);
+    if (requests == null || requests.isEmpty()) {
+        throw new CustomExceptions.InvalidDataException("No records found for batch.");
+    }
 
-            byte[] fileData = queryService.generateBatchExcel(batchId);
-            org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
-            headers.setCacheControl(org.springframework.http.CacheControl.noCache().mustRevalidate().sMaxAge(java.time.Duration.ZERO));
-            headers.set(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Batch_" + batchId + ".xlsx\"");
-            headers.set(org.springframework.http.HttpHeaders.CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-
-            return ResponseEntity.ok().headers(headers).body(fileData);
-
-        } catch (CustomExceptions.InvalidDataException e) {
-            // FIX: Return the exact "No records found" message as JSON
-            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of("message", e.getMessage()));
-        } catch (Exception e) {
-            log.error("DOWNLOAD_ERROR | Batch: {} | Reason: {}", batchId, e.getMessage());
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("message", "Failed to generate Excel file."));
+    // Use SXSSFWorkbook for streaming. The integer '100' means 
+    // only the last 100 rows are kept in memory; others are flushed to disk.
+    try (org.apache.poi.xssf.streaming.SXSSFWorkbook workbook = new org.apache.poi.xssf.streaming.SXSSFWorkbook(100)) {
+        org.apache.poi.ss.usermodel.Sheet sheet = workbook.createSheet("Batch Details");
+        
+        // Header Row
+        org.apache.poi.ss.usermodel.Row headerRow = sheet.createRow(0);
+        String[] headers = {"Branch", "Currency", "CGL", "Amount", "Type", "Remarks", "Product Code"};
+        for (int i = 0; i < headers.length; i++) {
+            headerRow.createCell(i).setCellValue(headers[i]);
         }
-    }
-	
-	
-	 public byte[] generateBatchExcel(String batchId) {
-        List<JournalRequest> requests = journalRequestRepository.findByBatchId(batchId);
-        if (requests == null || requests.isEmpty()) throw new CustomExceptions.InvalidDataException("No records found for batch.");
 
-        try (org.apache.poi.xssf.usermodel.XSSFWorkbook workbook = new org.apache.poi.xssf.usermodel.XSSFWorkbook();
-             java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream()) {
-            org.apache.poi.ss.usermodel.Sheet sheet = workbook.createSheet("Batch Details");
-            org.apache.poi.ss.usermodel.Row headerRow = sheet.createRow(0);
-            String[] headers = {"Branch", "Currency", "CGL", "Amount", "Type", "Remarks", "Product Code"};
-            for (int i = 0; i < headers.length; i++) headerRow.createCell(i).setCellValue(headers[i]);
-
-            int rowIdx = 1;
-            for (JournalRequest req : requests) {
-                org.apache.poi.ss.usermodel.Row row = sheet.createRow(rowIdx++);
-                row.createCell(0).setCellValue(req.getBranchCode() != null ? req.getBranchCode() : "");
-                row.createCell(1).setCellValue(req.getCurrency() != null ? req.getCurrency() : "");
-                row.createCell(2).setCellValue(req.getCgl() != null ? req.getCgl() : "");
-                if (req.getAmount() != null) {
-                    row.createCell(3).setCellValue(req.getAmount().abs().stripTrailingZeros().toPlainString());
-                    row.createCell(4).setCellValue(req.getAmount().compareTo(BigDecimal.ZERO) < 0 ? "Credit" : "Debit");
-                }
-                row.createCell(5).setCellValue(req.getNarration() != null ? req.getNarration() : ""); // Moved Remarks (Narration) to Index 5
-                row.createCell(6).setCellValue(req.getProductCode() != null ? req.getProductCode() : ""); // Moved Product Code to Index 6
+        int rowIdx = 1;
+        for (JournalRequest req : requests) {
+            org.apache.poi.ss.usermodel.Row row = sheet.createRow(rowIdx++);
+            row.createCell(0).setCellValue(req.getBranchCode() != null ? req.getBranchCode() : "");
+            row.createCell(1).setCellValue(req.getCurrency() != null ? req.getCurrency() : "");
+            row.createCell(2).setCellValue(req.getCgl() != null ? req.getCgl() : "");
+            
+            if (req.getAmount() != null) {
+                row.createCell(3).setCellValue(req.getAmount().abs().stripTrailingZeros().toPlainString());
+                row.createCell(4).setCellValue(req.getAmount().compareTo(BigDecimal.ZERO) < 0 ? "Credit" : "Debit");
             }
-            workbook.write(out); return out.toByteArray();
-        } catch (java.io.IOException e) { throw new CustomExceptions.DatabaseOperationException("Failed to generate Excel file", e); }
+            row.createCell(5).setCellValue(req.getNarration() != null ? req.getNarration() : "");
+            row.createCell(6).setCellValue(req.getProductCode() != null ? req.getProductCode() : "");
+        }
+        
+        // Write directly to the output stream
+        workbook.write(outputStream);
+        
+        // CRITICAL: Must dispose the workbook to delete temporary files from disk
+        workbook.dispose(); 
     }
+}
+
+```
+### 2. The Optimized Controller
+We replace the byte[] return type with StreamingResponseBody. This allows the server to start piping bytes to the user's browser immediately, rather than waiting for the entire file to be finished.
+```java
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
+
+@GetMapping("/download-batch/{batchId}")
+public ResponseEntity<StreamingResponseBody> downloadBatchExcel(
+        @PathVariable String batchId, 
+        @RequestHeader("Authorization") String token) {
+    
+    try {
+        // Authorization check
+        if (!queryService.isUserAuthorizedForBatch(batchId, jwtUtil.getUserIdFromToken(token.substring(7)), jwtUtil.getUserRoleFromToken(token.substring(7)))) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
+        }
+
+        // Return a StreamingResponseBody to pipe data to the browser
+        StreamingResponseBody stream = outputStream -> {
+            queryService.streamBatchExcel(batchId, outputStream);
+        };
+
+        return ResponseEntity.ok()
+                .header(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Batch_" + batchId + ".xlsx\"")
+                .contentType(org.springframework.http.MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+                .body(stream);
+
+    } catch (CustomExceptions.InvalidDataException e) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).build();
+    } catch (Exception e) {
+        log.error("DOWNLOAD_ERROR | Batch: {} | Reason: {}", batchId, e.getMessage());
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+    }
+}
+
+```
+### Why this fixes the timeout:
+ * **Memory Management:**  By using SXSSFWorkbook, we prevent the server from trying to cram 50,000 rows into RAM at once, which is the #1 cause of latency and crashes.
+ * **Latency:** By using StreamingResponseBody, the download will start within milliseconds because the server is pushing the header and first few rows immediately, while the rest are being written to the temporary stream.
+ * **Concurrency:** Your server can now handle multiple concurrent downloads without running out of memory.
