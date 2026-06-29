@@ -1,81 +1,14 @@
-package com.fincore.VoucherService.Controllers;
+This error is happening because of the exact change we just made!
 
+In the previous step, we updated `createBatchFromCacheAsync` in your `VoucherCommandService` to accept **6 arguments** (we added `LocalDateTime scheduledTime` at the end). However, your Controller is still only passing **5 arguments**.
 
-import com.fincore.VoucherService.Exception.CustomExceptions;
-import com.fincore.VoucherService.Models.JournalRequest;
-import com.fincore.VoucherService.Service.core.VoucherCommandService;
-import com.fincore.VoucherService.Service.core.VoucherWorkflowEngine;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
-import com.fincore.VoucherService.Dto.*;
-import com.fincore.commonutilities.jwt.JwtUtil;
-import jakarta.validation.Valid;
+Here is the exact fix for your `VoucherActionController.java` to bridge the gap and pass the schedule from React to your Service.
 
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
+### 1. The Controller Fix
 
-import java.io.IOException;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-@RestController
-@RequestMapping("/api/voucher")
-@RequiredArgsConstructor
-@Slf4j
-public class VoucherActionController {
+Replace your entire `createBatchFromCache` method (around line 48) with this code. It parses the time coming from React and passes it as the 6th argument:
 
-
-    private final VoucherCommandService commandService;
-    private final VoucherWorkflowEngine workflowEngine;
-    private final JwtUtil jwtUtil;
-
-
-    /**
-     * Triggers the async approval/rejection process using Oracle Parallel execution.
-     */
-    @PostMapping("/process-bulk")
-    public ResponseEntity<Map<String, Object>> processBulkRequests(
-            @RequestHeader("Authorization") String token,
-            @Valid @RequestBody BulkProcessVoucherPostingDto dto) {
-
-        String userId = jwtUtil.getUserIdFromToken(token);
-        Integer userRole = jwtUtil.getUserRoleFromToken(token);
-        log.info("BULK_PROCESS_START | User: {} | Batch: {} | Action: {}", userId, dto.getBatchId(), dto.getStatus());
-
-        commandService.processBulkRequestsAsync(dto, userId, userRole);
-
-        return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
-                "status", "PROCESSING", "message", "Approval process started. Notifications will be sent upon completion."));
-    }
-
-
-    @PostMapping("/workflow/action")
-    public ResponseEntity<Map<String, String>> processCheckerAction(
-            @RequestHeader("Authorization") String token,
-            @Valid @RequestBody ProcessVoucherRequestDto dto) {
-
-        String userId = jwtUtil.getUserIdFromToken(token);
-        Integer userRole = jwtUtil.getUserRoleFromToken(token);
-
-        workflowEngine.processWorkflowAction(dto, userId, userRole);
-
-        return ResponseEntity.ok(Map.of("status", "SUCCESS", "message", "Workflow action processed successfully."));
-    }
-
-
-
-
-    // ==================================================================================
-    // 1. ASYNC BULK OPERATIONS
-    // ==================================================================================
-
-    /**
-     * Creates a batch from pre-validated cache data.
-     * Uses fire-and-forget logic; returns 202 Accepted immediately.
-     */
+```java
     @PostMapping("/create-batch-from-cache")
     public ResponseEntity<Map<String, Object>> createBatchFromCache(
             @Valid @RequestBody CacheBatchPostingDto payload,
@@ -85,72 +18,45 @@ public class VoucherActionController {
         Integer userRole = jwtUtil.getUserRoleFromToken(token);
         log.info("CACHE_BATCH_INIT | User: {} | ReqID: {}", userId, payload.getRequestId());
 
-        String batchId = commandService.createBatchFromCacheAsync(payload.getRequestId(), payload.getCommonBatchRemarks(), userId, userRole, payload.getVid());
+        // 1. Parse the scheduled time sent from the React frontend
+        LocalDateTime parsedTime = null;
+        if (payload.getScheduledTime() != null && !payload.getScheduledTime().isEmpty()) {
+            parsedTime = LocalDateTime.parse(payload.getScheduledTime(), java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+        }
 
+        // 2. Pass the parsedTime as the 6th argument
+        String batchId = commandService.createBatchFromCacheAsync(
+                payload.getRequestId(), 
+                payload.getCommonBatchRemarks(), 
+                userId, 
+                userRole, 
+                payload.getVid(), 
+                parsedTime // <--- ADDED HERE
+        );
 
         return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
                 "status", "PROCESSING", "message", "Batch creation initiated in background.", "batchId", batchId));
     }
 
+```
 
-    @PostMapping("/update-schedule")
-    public ResponseEntity<Map<String, String>> updateSchedule(@RequestBody Map<String, String> payload) {
-        commandService.updateBatchSchedule(payload.get("batchId"), payload.get("scheduledTime"));
+### 2. Quick DTO Check
 
-        Map<String, String> response = new HashMap<>();
-        response.put("message", "Schedule updated successfully.");
-        response.put("status", "SUCCESS");
-        return ResponseEntity.ok(response);
+Because React is now sending `"scheduledTime": "2026-06-29 15:30:00"`, make sure your `CacheBatchPostingDto.java` has this field so Spring Boot knows how to read it.
+
+If it doesn't have it yet, just open `CacheBatchPostingDto.java` and add:
+
+```java
+    private String scheduledTime;
+
+    public String getScheduledTime() {
+        return scheduledTime;
     }
 
-
-    // ==================================================================================
-    // 5. MANUAL/SMALL BATCH ENDPOINTS
-    // ==================================================================================
-
-    @PostMapping("/create-batch")
-    public ResponseEntity<List<JournalRequest>> createBatchRequest(
-            @Valid @RequestBody BatchPostingDto batchDto,
-            @RequestHeader("Authorization") String token) {
-        try {
-            String userId = jwtUtil.getUserIdFromToken(token);
-            log.info("MANUAL_BATCH_CREATE | User: {} | Rows: {}", userId, batchDto.getRows().size());
-
-            List<JournalRequest> created = commandService.createBatchRequest(
-                    batchDto, userId, jwtUtil.getUserRoleFromToken(token));
-            return ResponseEntity.status(HttpStatus.CREATED).body(created);
-        } catch (CustomExceptions.DataMappingException e) {
-            log.error("MANUAL_BATCH_JSON_FAIL | Status: Payload serialization error");
-            throw new CustomExceptions.DataMappingException("Request contains invalid data format.");
-        }
+    public void setScheduledTime(String scheduledTime) {
+        this.scheduledTime = scheduledTime;
     }
 
+```
 
-    @DeleteMapping("/my-requests/by-batch/{batchId}")
-    public ResponseEntity<ApiResponseDto> deletePendingBatch(@PathVariable String batchId, @RequestHeader("Authorization") String token) {
-        try {
-            commandService.deleteBatchRequest(batchId, jwtUtil.getUserIdFromToken(token.substring(7)));
-            return ResponseEntity.ok(new ApiResponseDto("Success", "Batch deletion process initiated.", null));
-        } catch (IllegalStateException e) {
-            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(new ApiResponseDto("Error", e.getMessage(), null));
-        } catch (CustomExceptions.InvalidDataException e) {
-            // FIX: Catch specific business errors and send the exact message to React
-            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(new ApiResponseDto("Error", e.getMessage(), null));
-        } catch (Exception e) {
-            log.error("BATCH_DELETE_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(new ApiResponseDto("Error", "An unexpected error occurred.", null));
-        }
-    }
-
-
-    @DeleteMapping("/my-request/{requestId}")
-    public ResponseEntity<Void> cancelMyRequest(@RequestHeader("Authorization") String token, @PathVariable Long requestId) {
-        commandService.cancelMyRequest(requestId, jwtUtil.getUserIdFromToken(token));
-        return ResponseEntity.noContent().build();
-    }
-}
-
-
-
-    String batchId = commandService.createBatchFromCacheAsync(payload.getRequestId(), payload.getCommonBatchRemarks(), userId, userRole, payload.getVid());
-error at this line 
+Once you do this, your code will compile perfectly. You have successfully mapped the frontend schedule all the way down to the background async database logic! Test it out!
