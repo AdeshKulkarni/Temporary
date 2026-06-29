@@ -1,41 +1,151 @@
-Based on the ORA-00904: invalid identifier error you received and the table definition you provided, your SQL query is failing because it is trying to join on WORKFLOW_CODE using columns that might have different names in your metadata or simply because the join logic needs to be more robust.
-Looking at your table: VOUCHER_POSTING has WORKFLOW_CODE, and WORKFLOW_TRANSITIONS (based on standard workflows) likely has the same.
-However, the safest way to fix this—and make it immune to these "invalid identifier" errors—is to **join on the primary key relationship** (PENDING_AT matches WORKFLOW_ID) instead of relying on string codes for the join.
-### The Fix: Replace the entire try-catch block inside updateBatchSchedule
-Replace the existing wfSql block with this corrected version, which uses the primary key relationship already established in your table:
-```java
-            // 2. FETCH WORKFLOW DETAILS FOR NOTIFICATION
-            try {
-                // REPLACEMENT: Join on the primary key relationship (PENDING_AT = WORKFLOW_ID)
-                // This avoids ORA-00904 issues with the WORKFLOW_CODE column
-                String wfSql = """
-                    SELECT wt.ALLOWED_ROLE_ID, wt.DESIGNATION 
-                    FROM VOUCHER_POSTING vp 
-                    JOIN WORKFLOW_TRANSITIONS wt ON vp.PENDING_AT = wt.WORKFLOW_ID 
-                    WHERE vp.BATCH_ID = ? AND wt.WORKFLOW_ORDER = 2
-                """;
-                
-                Map<String, Object> step2Info = jdbcTemplate.queryForMap(wfSql, batchId);
+ @Transactional
+    public List<JournalRequest> createBatchRequest(BatchPostingDto dto, String creatorId, Integer creatorRole) {
+        String batchId = sequenceService.getNextBatchId();
+        String journalPrefix = sequenceService.getNextJournalIdPrefix();
 
-                String nextApproverRoleId = String.valueOf(step2Info.get("ALLOWED_ROLE_ID"));
-                String stageName = (String) step2Info.get("DESIGNATION");
+        // --- STRICT VID DUPLICATION CHECK ---
+        if (dto.getVid() == null || dto.getVid().trim().isEmpty()) {
+            throw new CustomExceptions.InvalidDataException("VID is missing from the payload. Cannot save batch.");
+        }
 
-                // 3. SEND THE NOTIFICATION TO THE CHECKERS NOW
-                notificationWriterService.createNextStepApprovalNotification(batchId, nextApproverRoleId, stageName);
+        // Checks if the VID is already used by an active/pending batch, ignoring rejected ones
+        Integer vidExists = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM VOUCHER_POSTING WHERE VID_FK = ? AND BATCH_STATUS NOT IN ('R', 'REJECTED', 'ERROR')",
+                Integer.class, dto.getVid()
+        );
 
-            } catch (EmptyResultDataAccessException e) {
-                log.error("Could not find Step 2 workflow configuration for Batch {} to send notification.", batchId);
+        if (vidExists != null && vidExists > 0) {
+            throw new CustomExceptions.InvalidDataException("Voucher ID (" + dto.getVid() + ") is currently in use by an active batch. Please select a fresh VID.");
+        }
+
+        List<JournalRequest> entities = new ArrayList<>();
+        Map<String, BigDecimal> balancingMap = new java.util.HashMap<>();
+        int rowIndex = 1;
+
+        for (BatchPostingDto.JournalRequestRow row : dto.getRows()) {
+            JournalRequest entity = new JournalRequest();
+            entity.setRequestStatus(RequestStatus.PENDING);
+            entity.setRequestDate(LocalDateTime.now());
+            entity.setCreatorId(creatorId);
+            entity.setBatchId(batchId);
+
+            String journalId = journalPrefix + "-" + rowIndex;
+            entity.setJournalId(journalId);
+            entity.setBranchCode(row.getBranch());
+            entity.setCurrency(row.getCurrency());
+
+            String cgl = row.getCgl() != null ? row.getCgl().trim() : "";
+            entity.setCgl(cgl);
+
+            BigDecimal amount = row.getAmount();
+
+            if (amount == null || amount.compareTo(BigDecimal.ZERO) == 0) {
+                throw new CustomExceptions.InvalidDataException("Transaction amount cannot be zero.");
             }
 
-```
-### Why this fixes it:
- 1. **Join Logic:** Your VOUCHER_POSTING table contains the column PENDING_AT (which is a NUMBER), and your WORKFLOW_TRANSITIONS table primary key is WORKFLOW_ID. Joining these two is the correct, standard way to traverse your database schema.
- 2. **Avoids String Joins:** The original query was trying to join on WORKFLOW_CODE (a VARCHAR2). If the column names in your schema don't match exactly (e.g., if one table is WORKFLOW_CODE and the other is WF_CD), Oracle throws the ORA-00904 error.
- 3. **Stability:** Using the ID-based join (PENDING_AT = WORKFLOW_ID) is significantly faster and more reliable than joining on strings.
-### One final check:
-If you still get the ORA-00904 error after this change, please run this query in your database:
-```sql
-SELECT column_name FROM user_tab_columns WHERE table_name = 'WORKFLOW_TRANSITIONS';
+            entity.setAmount(amount);
+            entity.setNarration(row.getRemarks());
+            entity.setProductCode(row.getProductType());
 
-```
-If you do not see ALLOWED_ROLE_ID or DESIGNATION in that output, those are the columns causing the crash, and you will need to replace them with the exact names found in that result.
+            // --- STRICT BACKEND BALANCING RULE ---
+            // 1. Create Composite Key (e.g., "10301-INR-MEMO")
+            String cglType = cgl.startsWith("5") ? "MEMO" : "NORMAL";
+            String compositeKey = row.getBranch() + " - " + row.getCurrency() + " - " + cglType;
+
+            // 2. Add to Group Balance (Debits are positive, Credits are negative)
+            // If the UI sends "Credit" as negative, it naturally subtracts.
+            // If the UI sends it as positive but flags it as "Credit", make sure to handle that negation here.
+            balancingMap.put(compositeKey, balancingMap.getOrDefault(compositeKey, BigDecimal.ZERO).add(amount));
+
+            entities.add(entity);
+            rowIndex++;
+        }
+
+        // --- ENFORCE BALANCE ---
+        // If Debits and Credits match perfectly, the sum for every group will be exactly 0.00
+        for (Map.Entry<String, BigDecimal> entry : balancingMap.entrySet()) {
+            if (entry.getValue().compareTo(BigDecimal.ZERO) != 0) {
+                throw new CustomExceptions.InvalidDataException(
+                        "Balancing rule failed for [" + entry.getKey() + "]. Total Debits and Credits must exactly match."
+                );
+            }
+        }
+
+        List<JournalRequest> savedEntities = journalRequestRepository.saveAll(entities);
+
+        // ==========================================
+        // 2. DYNAMIC WORKFLOW INITIALIZATION (FOREIGN KEY BASED)
+        // ==========================================
+        String workflowCode;
+        try {
+            workflowCode = jdbcTemplate.queryForObject(
+                    "SELECT WORKFLOW_CODE FROM WORKFLOW_TRANSITIONS WHERE ALLOWED_ROLE_ID = ? AND WORKFLOW_ORDER = 1 FETCH FIRST 1 ROWS ONLY",
+                    String.class, creatorRole
+            );
+        } catch (EmptyResultDataAccessException e) {
+            throw new CustomExceptions.InvalidDataException("Configuration Error: No workflow mapped for Role ID " + creatorRole);
+        }
+
+        // --- FETCH WORKFLOW_ID, ALLOWED_ROLE_ID, AND DESIGNATION (STAGE NAME) FOR STEP 2 ---
+        Map<String, Object> step2Info;
+        try {
+            step2Info = jdbcTemplate.queryForMap(
+                    "SELECT WORKFLOW_ID, ALLOWED_ROLE_ID, DESIGNATION FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = 2",
+                    workflowCode
+            );
+        } catch (EmptyResultDataAccessException e) {
+            throw new CustomExceptions.InvalidDataException("Configuration Error: Missing Step 2 for " + workflowCode);
+        }
+
+        Long firstApproverWorkflowId = ((Number) step2Info.get("WORKFLOW_ID")).longValue();
+        String nextApproverRoleId = String.valueOf(step2Info.get("ALLOWED_ROLE_ID"));
+
+        // Extract the Stage Name from the DB
+        String stageName = (String) step2Info.get("DESIGNATION");
+
+        VoucherPosting posting = new VoucherPosting();
+        posting.setBatchId(batchId);
+        posting.setVidFk(dto.getVid());
+        posting.setCreatedBy(creatorId);
+        posting.setPendingAt(firstApproverWorkflowId);
+        posting.setBatchStatus("S"); // 'P' = Pending
+        posting.setWorkflowCode(workflowCode);
+        posting.setCommonBatchRemarks(dto.getCommonBatchRemarks());
+        posting.setCreatorRole(creatorRole);
+
+        if (dto.getRows() != null) {
+            posting.setRecordsCount((long) dto.getRows().size());
+        }
+
+        // Handle Maker Scheduling
+        if (dto.getScheduledTime() != null) {
+            workflowEngine.validateScheduledTime(dto.getScheduledTime());
+            posting.setIS_EXECUTION_SCHEDULED("YES");
+            posting.setScheduledTime(dto.getScheduledTime());
+            posting.setIsScheduleOverride("NO");
+        } else {
+            posting.setIS_EXECUTION_SCHEDULED("NO");
+            posting.setIsScheduleOverride("NO");
+        }
+
+        voucherPostingRepository.save(posting);
+
+        logAudit(creatorId, "BATCH_MANUAL", "ADD", "Manual Batch " + batchId + " Created under " + workflowCode);
+
+        // ==========================================
+        // SMART NOTIFICATION ROUTING
+        // ==========================================
+        // 1. Notify the Checkers (Strictly to TARGET_ROLE)
+        //notificationWriterService.createNextStepApprovalNotification(batchId, nextApproverRoleId, stageName);
+
+        // ---> TRIGGER 1: LOCK THE VID AS USED <---
+        if (dto.getVid() != null && !dto.getVid().isEmpty()) {
+            workflowEngine.updateVidStatus(dto.getVid(), VoucherStatus.USED);
+        }
+
+        workflowEngine.logWorkflowAction(batchId, dto.getVid(), "Submitted", creatorId, dto.getCommonBatchRemarks(), dto.getScheduledTime());
+
+        return savedEntities;
+    }
+
+in this when we are sending the create notification check how we fetching that do same there 
