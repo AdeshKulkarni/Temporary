@@ -1,15 +1,55 @@
-BATCH_ID	VARCHAR2(50 BYTE)	No		1	
-VID_FK	VARCHAR2(20 BYTE)	No		2	
-WORKFLOW_CODE	VARCHAR2(100 BYTE)	Yes		3	
-CREATED_BY	VARCHAR2(100 BYTE)	Yes		4	
-CREATED_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	5	
-PENDING_AT	NUMBER	Yes		6	
-IS_EXECUTION_SCHEDULED	VARCHAR2(3 BYTE)	Yes		7	
-SCHEDULED_TIME	TIMESTAMP(6)	Yes		8	
-IS_SCHEDULE_OVERRIDE	VARCHAR2(3 BYTE)	Yes		9	
-EXECUTED_AT	TIMESTAMP(6)	Yes		10	
-BATCH_STATUS	VARCHAR2(20 BYTE)	Yes		11	
-RECORDS_COUNT	NUMBER	Yes		12	
-COMMON_BATCH_REMARKS	VARCHAR2(30 CHAR)	Yes		13	
-CREATOR_ROLE	NUMBER(10,0)	Yes		14	
-EXECUTOR_ID	VARCHAR2(10 BYTE)	Yes		15	
+    @Transactional
+    public void updateBatchSchedule(String batchId, String scheduledTime) {
+        Integer exists = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM VOUCHER_POSTING WHERE BATCH_ID = ?", Integer.class, batchId);
+        if (exists == null || exists == 0) {
+            throw new CustomExceptions.InvalidDataException("The batch is still being initialized. Please wait a few seconds.");
+        }
+
+        if (scheduledTime != null && !scheduledTime.isEmpty()) {
+            LocalDateTime parsedTime = LocalDateTime.parse(scheduledTime, java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+            workflowEngine.validateScheduledTime(parsedTime);
+
+            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS'), IS_SCHEDULE_OVERRIDE = 'NO', IS_EXECUTION_SCHEDULED = 'YES' WHERE BATCH_ID = ?", scheduledTime, batchId);
+            jdbcTemplate.update("UPDATE VOUCHER_WORKFLOW SET SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS') WHERE BATCH_ID_FK = ? AND LAST_ACTION = 'Submitted'", scheduledTime, batchId);
+        }
+
+        // SMART DOUBLE-LOCK LOGIC:
+        // Check if the AsyncWorker is still writing data. (If actual rows match requested rows, it's done!)
+        String checkDataLoadedSql = """
+            SELECT CASE WHEN p.RECORDS_COUNT = (SELECT COUNT(*) FROM VOUCHER_POSTING_DATA d WHERE d.BATCH_ID = p.BATCH_ID) 
+            THEN 1 ELSE 0 END FROM VOUCHER_POSTING p WHERE p.BATCH_ID = ?
+        """;
+
+        Integer isDataLoaded = jdbcTemplate.queryForObject(checkDataLoadedSql, Integer.class, batchId);
+
+        if (isDataLoaded != null && isDataLoaded == 1) {
+            // 1. Data is fully loaded. Safe to show to checkers!
+            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
+
+            // 2. FETCH WORKFLOW DETAILS FOR NOTIFICATION
+            try {
+                String wfSql = """
+                    SELECT wt.ALLOWED_ROLE_ID, wt.DESIGNATION 
+                    FROM VOUCHER_POSTING vp 
+                    JOIN WORKFLOW_TRANSITIONS wt ON vp.WORKFLOW_CODE = wt.WORKFLOW_CODE 
+                    WHERE vp.BATCH_ID = ? AND wt.WORKFLOW_ORDER = 2
+                """;
+                Map<String, Object> step2Info = jdbcTemplate.queryForMap(wfSql, batchId);
+
+                String nextApproverRoleId = String.valueOf(step2Info.get("ALLOWED_ROLE_ID"));
+                String stageName = (String) step2Info.get("DESIGNATION");
+
+                // 3. SEND THE NOTIFICATION TO THE CHECKERS NOW
+                notificationWriterService.createNextStepApprovalNotification(batchId, nextApproverRoleId, stageName);
+
+            } catch (EmptyResultDataAccessException e) {
+                log.error("Could not find Step 2 workflow configuration for Batch {} to send notification.", batchId);
+            }
+
+        } else {
+            // Data is still inserting. Leave it as 'S'.
+            // (Make sure your AsyncWorker sends the notification when it finally flips the status to 'P'!)
+            log.info("Schedule saved for Batch {}, but data is still loading. Status remains 'S'.", batchId);
+        }
+
+    }
