@@ -1,21 +1,52 @@
-            // 2. FETCH WORKFLOW DETAILS FOR NOTIFICATION
-            try {
-                // REPLACEMENT: Changed DESIGNATION to WORKFLOW_STAGE
-                String wfSql = """
-                    SELECT wt.ALLOWED_ROLE_ID, wt.WORKFLOW_STAGE 
-                    FROM VOUCHER_POSTING vp 
-                    JOIN WORKFLOW_TRANSITIONS wt ON vp.PENDING_AT = wt.WORKFLOW_ID 
-                    WHERE vp.BATCH_ID = ? AND wt.WORKFLOW_ORDER = 2
-                """;
-                
-                Map<String, Object> step2Info = jdbcTemplate.queryForMap(wfSql, batchId);
-
-                String nextApproverRoleId = String.valueOf(step2Info.get("ALLOWED_ROLE_ID"));
-                String stageName = (String) step2Info.get("WORKFLOW_STAGE"); // Update key here too
-
-                // 3. SEND THE NOTIFICATION TO THE CHECKERS NOW
-                notificationWriterService.createNextStepApprovalNotification(batchId, nextApproverRoleId, stageName);
-
-            } catch (EmptyResultDataAccessException e) {
-                log.error("Could not find Step 2 workflow configuration for Batch {} to send notification.", batchId);
+ @GetMapping("/download-batch/{batchId}")
+    public ResponseEntity<?> downloadBatchExcel(@PathVariable String batchId, @RequestHeader("Authorization") String token) {
+        try {
+            if (!queryService.isUserAuthorizedForBatch(batchId, jwtUtil.getUserIdFromToken(token.substring(7)), jwtUtil.getUserRoleFromToken(token.substring(7)))) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("message", "You are not authorized to view this batch."));
             }
+
+            byte[] fileData = queryService.generateBatchExcel(batchId);
+            org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
+            headers.setCacheControl(org.springframework.http.CacheControl.noCache().mustRevalidate().sMaxAge(java.time.Duration.ZERO));
+            headers.set(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Batch_" + batchId + ".xlsx\"");
+            headers.set(org.springframework.http.HttpHeaders.CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+
+            return ResponseEntity.ok().headers(headers).body(fileData);
+
+        } catch (CustomExceptions.InvalidDataException e) {
+            // FIX: Return the exact "No records found" message as JSON
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of("message", e.getMessage()));
+        } catch (Exception e) {
+            log.error("DOWNLOAD_ERROR | Batch: {} | Reason: {}", batchId, e.getMessage());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("message", "Failed to generate Excel file."));
+        }
+    }
+	
+	
+	 public byte[] generateBatchExcel(String batchId) {
+        List<JournalRequest> requests = journalRequestRepository.findByBatchId(batchId);
+        if (requests == null || requests.isEmpty()) throw new CustomExceptions.InvalidDataException("No records found for batch.");
+
+        try (org.apache.poi.xssf.usermodel.XSSFWorkbook workbook = new org.apache.poi.xssf.usermodel.XSSFWorkbook();
+             java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream()) {
+            org.apache.poi.ss.usermodel.Sheet sheet = workbook.createSheet("Batch Details");
+            org.apache.poi.ss.usermodel.Row headerRow = sheet.createRow(0);
+            String[] headers = {"Branch", "Currency", "CGL", "Amount", "Type", "Remarks", "Product Code"};
+            for (int i = 0; i < headers.length; i++) headerRow.createCell(i).setCellValue(headers[i]);
+
+            int rowIdx = 1;
+            for (JournalRequest req : requests) {
+                org.apache.poi.ss.usermodel.Row row = sheet.createRow(rowIdx++);
+                row.createCell(0).setCellValue(req.getBranchCode() != null ? req.getBranchCode() : "");
+                row.createCell(1).setCellValue(req.getCurrency() != null ? req.getCurrency() : "");
+                row.createCell(2).setCellValue(req.getCgl() != null ? req.getCgl() : "");
+                if (req.getAmount() != null) {
+                    row.createCell(3).setCellValue(req.getAmount().abs().stripTrailingZeros().toPlainString());
+                    row.createCell(4).setCellValue(req.getAmount().compareTo(BigDecimal.ZERO) < 0 ? "Credit" : "Debit");
+                }
+                row.createCell(5).setCellValue(req.getNarration() != null ? req.getNarration() : ""); // Moved Remarks (Narration) to Index 5
+                row.createCell(6).setCellValue(req.getProductCode() != null ? req.getProductCode() : ""); // Moved Product Code to Index 6
+            }
+            workbook.write(out); return out.toByteArray();
+        } catch (java.io.IOException e) { throw new CustomExceptions.DatabaseOperationException("Failed to generate Excel file", e); }
+    }
