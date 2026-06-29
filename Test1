@@ -1,39 +1,20 @@
-    @Transactional
-    public void updateBatchSchedule(String batchId, String scheduledTime) {
-        Integer exists = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM VOUCHER_POSTING WHERE BATCH_ID = ?", Integer.class, batchId);
-        if (exists == null || exists == 0) {
-            throw new CustomExceptions.InvalidDataException("The batch is still being initialized. Please wait a few seconds.");
-        }
-
-        if (scheduledTime != null && !scheduledTime.isEmpty()) {
-            LocalDateTime parsedTime = LocalDateTime.parse(scheduledTime, java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
-            workflowEngine.validateScheduledTime(parsedTime);
-
-            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS'), IS_SCHEDULE_OVERRIDE = 'NO', IS_EXECUTION_SCHEDULED = 'YES' WHERE BATCH_ID = ?", scheduledTime, batchId);
-            jdbcTemplate.update("UPDATE VOUCHER_WORKFLOW SET SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS') WHERE BATCH_ID_FK = ? AND LAST_ACTION = 'Submitted'", scheduledTime, batchId);
-        }
-
-        // SMART DOUBLE-LOCK LOGIC:
-        // Check if the AsyncWorker is still writing data. (If actual rows match requested rows, it's done!)
-        String checkDataLoadedSql = """
-            SELECT CASE WHEN p.RECORDS_COUNT = (SELECT COUNT(*) FROM VOUCHER_POSTING_DATA d WHERE d.BATCH_ID = p.BATCH_ID) 
-            THEN 1 ELSE 0 END FROM VOUCHER_POSTING p WHERE p.BATCH_ID = ?
-        """;
-
-        Integer isDataLoaded = jdbcTemplate.queryForObject(checkDataLoadedSql, Integer.class, batchId);
-
-        if (isDataLoaded != null && isDataLoaded == 1) {
-            // 1. Data is fully loaded. Safe to show to checkers!
-            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
-
+Based on the ORA-00904: invalid identifier error you received and the table definition you provided, your SQL query is failing because it is trying to join on WORKFLOW_CODE using columns that might have different names in your metadata or simply because the join logic needs to be more robust.
+Looking at your table: VOUCHER_POSTING has WORKFLOW_CODE, and WORKFLOW_TRANSITIONS (based on standard workflows) likely has the same.
+However, the safest way to fix this—and make it immune to these "invalid identifier" errors—is to **join on the primary key relationship** (PENDING_AT matches WORKFLOW_ID) instead of relying on string codes for the join.
+### The Fix: Replace the entire try-catch block inside updateBatchSchedule
+Replace the existing wfSql block with this corrected version, which uses the primary key relationship already established in your table:
+```java
             // 2. FETCH WORKFLOW DETAILS FOR NOTIFICATION
             try {
+                // REPLACEMENT: Join on the primary key relationship (PENDING_AT = WORKFLOW_ID)
+                // This avoids ORA-00904 issues with the WORKFLOW_CODE column
                 String wfSql = """
                     SELECT wt.ALLOWED_ROLE_ID, wt.DESIGNATION 
                     FROM VOUCHER_POSTING vp 
-                    JOIN WORKFLOW_TRANSITIONS wt ON vp.WORKFLOW_CODE = wt.WORKFLOW_CODE 
+                    JOIN WORKFLOW_TRANSITIONS wt ON vp.PENDING_AT = wt.WORKFLOW_ID 
                     WHERE vp.BATCH_ID = ? AND wt.WORKFLOW_ORDER = 2
                 """;
+                
                 Map<String, Object> step2Info = jdbcTemplate.queryForMap(wfSql, batchId);
 
                 String nextApproverRoleId = String.valueOf(step2Info.get("ALLOWED_ROLE_ID"));
@@ -46,10 +27,15 @@
                 log.error("Could not find Step 2 workflow configuration for Batch {} to send notification.", batchId);
             }
 
-        } else {
-            // Data is still inserting. Leave it as 'S'.
-            // (Make sure your AsyncWorker sends the notification when it finally flips the status to 'P'!)
-            log.info("Schedule saved for Batch {}, but data is still loading. Status remains 'S'.", batchId);
-        }
+```
+### Why this fixes it:
+ 1. **Join Logic:** Your VOUCHER_POSTING table contains the column PENDING_AT (which is a NUMBER), and your WORKFLOW_TRANSITIONS table primary key is WORKFLOW_ID. Joining these two is the correct, standard way to traverse your database schema.
+ 2. **Avoids String Joins:** The original query was trying to join on WORKFLOW_CODE (a VARCHAR2). If the column names in your schema don't match exactly (e.g., if one table is WORKFLOW_CODE and the other is WF_CD), Oracle throws the ORA-00904 error.
+ 3. **Stability:** Using the ID-based join (PENDING_AT = WORKFLOW_ID) is significantly faster and more reliable than joining on strings.
+### One final check:
+If you still get the ORA-00904 error after this change, please run this query in your database:
+```sql
+SELECT column_name FROM user_tab_columns WHERE table_name = 'WORKFLOW_TRANSITIONS';
 
-    }
+```
+If you do not see ALLOWED_ROLE_ID or DESIGNATION in that output, those are the columns causing the crash, and you will need to replace them with the exact names found in that result.
