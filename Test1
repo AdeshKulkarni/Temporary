@@ -1,75 +1,48 @@
-To remove the 30-minute restriction for Final Approvers, you need to change the validation logic and the TimePicker limits so that it only checks if the time is in the past (i.e., dayjs()), rather than forcing a 30-minute buffer.
-If you are building the **Checker/Approver** screen, here is exactly what you need to change:
-### 1. Change the Validation Logic
-In your submit function (like handleFinalizeRouting), update the minAllowed check so it only prevents past times.
-**Replace this:**
-```javascript
-const minAllowed = dayjs().add(30, 'minute');
+**Yes, a backend change is absolutely required.**
+If you only change the frontend, the backend will still block the request and throw an error.
+If you look at the Java code you shared earlier for updateBatchSchedule (and createBatchRequest), you have this exact line:
+```java
+workflowEngine.validateScheduledTime(parsedTime);
 
-if (finalSchedule.isBefore(minAllowed)) {
-  showSnackBar("Schedule time must be at least 31 minutes from now.", "warning");
-  setIsFinalizing(false);
-  return;
+```
+I can guarantee that inside that validateScheduledTime method in your Java code, there is logic checking if the time is at least 30 minutes in the future. If a Final Approver tries to schedule it for 5 minutes from now, the frontend will allow it, but **your Java backend will throw an exception.**
+### How to fix the Backend (2 Simple Steps)
+You need to update your Java workflowEngine so it knows *who* is scheduling the batch.
+**Step 1: Update the validateScheduledTime method signature**
+Add a boolean flag so the engine knows if it should apply the strict 30-minute rule or just a simple "not in the past" rule.
+```java
+// In your VoucherWorkflowEngine.java
+public void validateScheduledTime(LocalDateTime scheduledTime, boolean isFinalApproval) {
+    LocalDateTime now = LocalDateTime.now();
+    
+    // Rule for Final Approver: Just make sure it's not in the past
+    if (isFinalApproval) {
+        if (scheduledTime.isBefore(now)) {
+            throw new CustomExceptions.InvalidDataException("Schedule time cannot be in the past.");
+        }
+    } 
+    // Rule for Creators/Makers: Must be 30 mins in the future
+    else {
+        if (scheduledTime.isBefore(now.plusMinutes(30))) {
+            throw new CustomExceptions.InvalidDataException("Schedule time must be at least 30 minutes from now.");
+        }
+    }
+    
+    // (Keep your existing check for end of day here)
 }
 
 ```
-**With this:**
-```javascript
-const minAllowed = dayjs(); // Only prevents past time
-
-if (finalSchedule.isBefore(minAllowed)) {
-  showSnackBar("Schedule time cannot be in the past.", "warning");
-  setIsFinalizing(false);
-  return;
-}
+**Step 2: Pass the flag from your Controller/Service**
+When the Final Approver calls the API to approve and schedule the batch, pass true.
+```java
+// Example in your Approver Service method:
+workflowEngine.validateScheduledTime(parsedTime, true); 
 
 ```
-### 2. Update the TimePicker Component
-Update the minTime property on the TimePicker and adjust the helper text so it doesn't mention the 30-minute rule.
-**Replace your current <TimePicker/> with this:**
-```javascript
-<TimePicker
-  value={scheduledTime}
-  onChange={(newValue) => setScheduledTime(newValue)}
-  minTime={dayjs()} // <--- REMOVED the 30-minute restriction
-  maxTime={dayjs().endOf('day')}
-  timeSteps={{ minutes: 1 }}
-  slotProps={{
-    textField: {
-      size: 'medium',
-      fullWidth: true,
-      sx: { caretColor: 'transparent' },
-      // Updated helper text for the Approver
-      helperText: "Execution must be scheduled for a future time before 11:59 PM today.",
-      onKeyDown: (e) => e.preventDefault(),
-      onPaste: (e) => e.preventDefault(),
-      inputProps: { readOnly: true }
-    }
-  }}
-/>
+When the Creator/Maker is saving their initial batch, pass false.
+```java
+// Example in your createBatchRequest method:
+workflowEngine.validateScheduledTime(parsedTime, false); 
 
 ```
-### Doing it Dynamically (If both use the same file)
-If you are handling both Creators and Approvers in the **same component**, you can make it dynamic based on their role.
-For example, assuming you have a boolean isCreator:
-```javascript
-// 1. Dynamic Validation
-const minAllowed = isCreator ? dayjs().add(30, 'minute') : dayjs();
-const errorMsg = isCreator 
-  ? "Schedule time must be at least 31 minutes from now." 
-  : "Schedule time cannot be in the past.";
-
-// 2. Dynamic TimePicker Props
-<TimePicker
-  minTime={isCreator ? dayjs().add(30, 'minute') : dayjs()}
-  slotProps={{
-    textField: {
-      helperText: isCreator 
-        ? "Execution must be scheduled at least 31 mins from now..."
-        : "Execution must be scheduled for a future time today.",
-      // ...
-    }
-  }}
-/>
-
-```
+If you don't make this Java change, your Final Approvers will get a red error box saying *"Schedule time must be at least 30 minutes from now"* every time they try to execute a batch immediately!
