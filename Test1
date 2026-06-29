@@ -1,51 +1,71 @@
-The reason you received an error when you added isFinalApproval is a **method signature mismatch**. If you change the parameters of a method from (LocalDateTime) to (LocalDateTime, boolean), Java will immediately throw an error everywhere else in your code that is still trying to call it with just one parameter.
-Here is the complete, updated method, along with the exact line you must fix inside your processWorkflowAction method to resolve the error.
-### 1. Replace the validateScheduledTime method
-Replace your existing method at the bottom of the file with this new version:
-```java
-    public void validateScheduledTime(LocalDateTime scheduledTime, boolean isFinalApproval) {
-        if (scheduledTime == null) return;
-        
-        LocalDateTime now = LocalDateTime.now();
-        LocalDateTime maxTime = now.with(java.time.LocalTime.MAX);
+  // Handle Maker Scheduling
+        if (dto.getScheduledTime() != null) {
+            workflowEngine.validateScheduledTime(dto.getScheduledTime() , false);
+            posting.setIS_EXECUTION_SCHEDULED("YES");
+            posting.setScheduledTime(dto.getScheduledTime());
+            posting.setIsScheduleOverride("NO");
+        } else {
+            posting.setIS_EXECUTION_SCHEDULED("NO");
+            posting.setIsScheduleOverride("NO");
+        }
 
-        if (isFinalApproval) {
-            // Rule for Final Approvers: Just make sure it's not in the past
-            if (scheduledTime.isBefore(now)) {
-                throw new CustomExceptions.InvalidDataException("Scheduled time cannot be in the past.");
+
+  @Transactional
+    public void updateBatchSchedule(String batchId, String scheduledTime) {
+        Integer exists = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM VOUCHER_POSTING WHERE BATCH_ID = ?", Integer.class, batchId);
+        if (exists == null || exists == 0) {
+            throw new CustomExceptions.InvalidDataException("The batch is still being initialized. Please wait a few seconds.");
+        }
+
+        if (scheduledTime != null && !scheduledTime.isEmpty()) {
+            LocalDateTime parsedTime = LocalDateTime.parse(scheduledTime, java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+            workflowEngine.validateScheduledTime(parsedTime);
+
+            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS'), IS_SCHEDULE_OVERRIDE = 'NO', IS_EXECUTION_SCHEDULED = 'YES' WHERE BATCH_ID = ?", scheduledTime, batchId);
+            jdbcTemplate.update("UPDATE VOUCHER_WORKFLOW SET SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS') WHERE BATCH_ID_FK = ? AND LAST_ACTION = 'Submitted'", scheduledTime, batchId);
+        }
+
+        // SMART DOUBLE-LOCK LOGIC:
+        // Check if the AsyncWorker is still writing data. (If actual rows match requested rows, it's done!)
+        String checkDataLoadedSql = """
+            SELECT CASE WHEN p.RECORDS_COUNT = (SELECT COUNT(*) FROM VOUCHER_POSTING_DATA d WHERE d.BATCH_ID = p.BATCH_ID) 
+            THEN 1 ELSE 0 END FROM VOUCHER_POSTING p WHERE p.BATCH_ID = ?
+        """;
+
+        Integer isDataLoaded = jdbcTemplate.queryForObject(checkDataLoadedSql, Integer.class, batchId);
+
+        if (isDataLoaded != null && isDataLoaded == 1) {
+            // 1. Data is fully loaded. Safe to show to checkers!
+            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
+
+            // 2. FETCH WORKFLOW DETAILS FOR NOTIFICATION
+            // 2. DYNAMIC NOTIFICATION TRIGGER
+            // This is the only place it happens now!
+            try {
+                // REPLACEMENT: Changed DESIGNATION to WORKFLOW_STAGE
+                String wfSql = """
+                    SELECT wt.ALLOWED_ROLE_ID, wt.WORKFLOW_STAGE 
+                    FROM VOUCHER_POSTING vp 
+                    JOIN WORKFLOW_TRANSITIONS wt ON vp.PENDING_AT = wt.WORKFLOW_ID 
+                    WHERE vp.BATCH_ID = ? AND wt.WORKFLOW_ORDER = 2
+                """;
+
+                Map<String, Object> step2Info = jdbcTemplate.queryForMap(wfSql, batchId);
+
+                String nextApproverRoleId = String.valueOf(step2Info.get("ALLOWED_ROLE_ID"));
+                String stageName = (String) step2Info.get("WORKFLOW_STAGE"); // Update key here too
+
+                // 3. SEND THE NOTIFICATION TO THE CHECKERS NOW
+                notificationWriterService.createNextStepApprovalNotification(batchId, nextApproverRoleId, stageName);
+
+            } catch (EmptyResultDataAccessException e) {
+                log.error("Could not find Step 2 workflow configuration for Batch {} to send notification.", batchId);
             }
         } else {
-            // Rule for Creators: Must be ~30 minutes in the future
-            LocalDateTime minTime = now.plusMinutes(28); 
-            if (scheduledTime.isBefore(minTime)) {
-                throw new CustomExceptions.InvalidDataException("Scheduled time must be at least 30 minutes from the current time.");
-            }
+            // Data is still loading, do not notify yet.
+            // Note: Your AsyncWorker MUST also call this notification logic
+            // once it finishes its final row insertion and performs the BATCH_STATUS = 'P' update.
+            log.info("Schedule updated for Batch {}, data still loading. Notification deferred.", batchId);
         }
 
-        if (scheduledTime.isAfter(maxTime)) {
-            throw new CustomExceptions.InvalidDataException("Scheduled time cannot exceed today's end of day (11:59 PM).");
-        }
     }
-
-```
-### 2. Fix the caller in processWorkflowAction
-If you look around **line 114** in the code you just shared, inside the if (isFinalStep) block, you have this code:
-```java
-            if (isOverride) {
-                if (dto.getNewScheduledTime() != null) {
-                    validateScheduledTime(dto.getNewScheduledTime()); // <-- THIS IS CAUSING THE ERROR
-                }
-
-```
-Because this is happening during the Final Approval step, you must update that line to pass true to the new parameter.
-**Change it to this:**
-```java
-            if (isOverride) {
-                if (dto.getNewScheduledTime() != null) {
-                    // Pass 'true' because this override is happening at Final Approval
-                    validateScheduledTime(dto.getNewScheduledTime(), true); 
-                }
-
-```
-*(Note: You will also need to find where validateScheduledTime is called inside your createBatchRequest and updateBatchSchedule methods and change those to validateScheduledTime(time, false) so they continue to enforce the 30-minute rule for the creators).*
-Are there any other classes in your project throwing errors regarding this method signature change?
