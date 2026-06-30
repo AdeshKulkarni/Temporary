@@ -1,59 +1,115 @@
-You nailed it. The `ORA-00904` error is occurring because the column name is **`WORKFLOW_STAGE`**, but your Java code is looking for a column named **`DESIGNATION`**.
 
-In your `VoucherCommandService.java` (and likely in `VoucherWorkflowEngine.java`), you have a query that looks like this:
+    @Async("bulkExecutor")
+    public void executeAsyncBatchCreation(String batchId, String journalPrefix, String requestId, String commonRemarks, String creatorId, Integer creatorRole,  String vid) {
+        String lockKey = "LOCK_REQ_" + requestId;
+        MDC.put("batchId", batchId);
+        MDC.put("user", creatorId);
 
-```sql
-SELECT WORKFLOW_ID, ALLOWED_ROLE_ID, DESIGNATION ... 
 
-```
+        Map<String, String> contextMap = MDC.getCopyOfContextMap();
+        AtomicInteger successfulRowsCount = new AtomicInteger(0);
 
-Since `DESIGNATION` does not exist in the table structure you just provided, Oracle throws an error.
+        log.info("ASYNC_BATCH_START | Batch: {} | Source: {}", batchId, requestId);
+        long start = System.currentTimeMillis();
 
-### The Fix
+        try {
+            // 2. IDEMPOTENCY
+            jdbcTemplate.update("DELETE FROM VOUCHER_POSTING_DATA WHERE BATCH_ID = ?", batchId);
+//            jdbcTemplate.update("DELETE FROM VOUCHER_POSTING WHERE BATCH_ID = ?", batchId);
 
-You need to update your SQL queries to use `WORKFLOW_STAGE` instead of `DESIGNATION`.
+            // --- NEW: TRUE STREAMING LOGIC ---
+            progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Preparing Data...");
 
-#### 1. In `VoucherCommandService.java`
+            // 1. Ask Redis how many chunks exist (Does NOT load data into memory)
+            int totalChunks = validationStateManager.getTotalChunks(requestId);
 
-Find the `createBatchRequest` method. Replace the `SELECT` statement to match your database schema:
+            if (totalChunks == 0) {
+                log.error("CACHE_MISS | Batch: {} | Status: No valid rows found", batchId);
+                progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired or empty.");
+                return;
+            }
 
-```java
-// BEFORE:
-// "SELECT WORKFLOW_ID, ALLOWED_ROLE_ID, DESIGNATION FROM WORKFLOW_TRANSITIONS WHERE ..."
+            int batchSize = 5000;
+            long totalRows = batchSize * (long) totalChunks; // Used for progress bar estimation
 
-// AFTER:
-"SELECT WORKFLOW_ID, ALLOWED_ROLE_ID, WORKFLOW_STAGE FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = 2"
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
+            AtomicReference<BigDecimal> totalDebit = new AtomicReference<>(BigDecimal.ZERO);
+            AtomicReference<BigDecimal> totalCredit = new AtomicReference<>(BigDecimal.ZERO);
+            AtomicInteger completedChunks = new AtomicInteger(0);
 
-```
+            // 2. PARALLEL CHUNKING - Fetch exactly ONE chunk at a time inside the background thread
+            for (int i = 0; i < totalChunks; i++) {
+                final int chunkIndex = i;
+                final int startIdx = i * batchSize;
 
-And update the line that extracts the value:
+                CompletableFuture<Void> future = CompletableFuture.supplyAsync(() -> {
+                    // -> THIS MAKES THE METHOD "IN USE" <-
+                    // The background thread fetches just its own 5000 rows, then garbage collects them
+                    return validationStateManager.getChunkFromCache(requestId, chunkIndex);
+                }, chunkWorkerExecutor).thenAcceptAsync(chunk -> {
+                    if (contextMap != null) MDC.setContextMap(contextMap);
+                    try {
+                        self.processChunkRaw(chunk, batchId, journalPrefix, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit);
+                        successfulRowsCount.addAndGet(chunk.size());
+                    } finally {
+                        MDC.clear();
+                    }
+                }, chunkWorkerExecutor).thenRun(() -> {
+                    int done = completedChunks.incrementAndGet();
+                    int percent = 5 + (done * 90 / totalChunks);
+                    progressService.sendProgress(batchId, creatorId, percent, "PROCESSING", String.format("Writing chunks: %d of %d", done, totalChunks));
+                });
 
-```java
-// BEFORE:
-// String stageName = (String) step2Info.get("DESIGNATION");
+                futures.add(future);
+            }
+            // Wait for all 50 threads to finish processing their individual chunks
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(45, TimeUnit.MINUTES);
 
-// AFTER:
-String stageName = (String) step2Info.get("WORKFLOW_STAGE");
+            progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
 
-```
+            // 1. FLIP STATUS TO PENDING
+            jdbcTemplate.update("""
+                UPDATE VOUCHER_POSTING 
+                SET BATCH_STATUS = 'P' 
+                WHERE BATCH_ID = ? 
+                AND (IS_EXECUTION_SCHEDULED = 'YES' OR IS_EXECUTION_SCHEDULED = 'NO')
+                AND BATCH_STATUS = 'S'
+            """, batchId);
 
-#### 2. In `VoucherWorkflowEngine.java`
+            log.info("BATCH_CREATION_FINISHED | Batch: {} | Rows: {}", batchId, totalRows);
 
-Check your `processWorkflowAction` method. You are using `w.WORKFLOW_STAGE` correctly there, but double-check that you aren't accidentally referencing `DESIGNATION` anywhere else in that file.
+            // 2. SEND CHECKER NOTIFICATION NOW THAT ROWS ARE LOADED
+            try {
+                String wfSql = """
+                    SELECT wt.ALLOWED_ROLE_ID, wt.WORKFLOW_STAGE 
+                    FROM VOUCHER_POSTING vp 
+                    JOIN WORKFLOW_TRANSITIONS wt ON vp.PENDING_AT = wt.WORKFLOW_ID 
+                    WHERE vp.BATCH_ID = ? AND wt.WORKFLOW_ORDER = 2
+                """;
 
----
+                Map<String, Object> step2Info = jdbcTemplate.queryForMap(wfSql, batchId);
+                String nextApproverRoleId = String.valueOf(step2Info.get("ALLOWED_ROLE_ID"));
+                String stageName = (String) step2Info.get("WORKFLOW_STAGE");
 
-### Pro-Tip for Senior Engineers:
+                notificationWriterService.createNextStepApprovalNotification(batchId, nextApproverRoleId, stageName);
+                log.info("Notification sent to Checker Role {} for Bulk Batch {}", nextApproverRoleId, batchId);
+            } catch (EmptyResultDataAccessException e) {
+                log.error("Could not find Step 2 workflow configuration for Batch {} to send notification.", batchId);
+            }
 
-Whenever you see an `ORA-00904`, always check your SQL against the **actual** database metadata.
 
-If you are ever unsure about a column name in the future, you can run this query to get a clean list of columns for any table in Oracle:
+        }
 
-```sql
-SELECT column_name 
-FROM user_tab_columns 
-WHERE table_name = 'WORKFLOW_TRANSITIONS';
+        catch (Exception e) {
+            log.error("BATCH_FATAL_ERROR | Batch: {} | Error: {}", batchId, e.getMessage());
+            handleAsyncFailure(batchId, creatorId, requestId, "An internal error occurred.");
+        } finally {
+            // Clean up Redis...
+            redisTemplate.delete(lockKey);
+            MDC.clear();
+        }
+    }
 
-```
 
-Once you update that query in your Java code to use `WORKFLOW_STAGE`, the error will disappear and your workflow will proceed to Step 2 correctly!
+this is method in which tell mi in details what this does what we get in the output and input we get
+what is the purpose of this and why we are using this when this methods calls 
