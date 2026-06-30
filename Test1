@@ -1,143 +1,44 @@
-You are absolutely right. Yesterday, we updated the **Java Backend (VoucherWorkflowEngine)** so that the Final Approver doesn't have the 30-minute restriction.
-However, your React frontend (VoucherAuthorization.jsx) still has the minTime={dayjs().add(31, 'minute')} hardcoded in the UI, which is blocking the Final Approver from picking a sooner time!
-Here are the exact 3 places in **VoucherAuthorization.jsx** that you need to fix to remove this UI restriction for the Final Approver:
-### 1. Fix the Validation Logic (Inside handleSubmitAction)
-Around line **445**, the frontend checks if the time is 30 minutes in the future before sending it to the backend. Change it so it only checks if the time is in the past.
-**Find this:**
-```javascript
-      const minAllowed = dayjs().add(28, 'minute'); // 2 min buffer
-      const maxAllowed = dayjs().endOf('day'); // 11:59:59 PM today
-
-      if (finalSchedule.isBefore(minAllowed)) {
-        showSnackBar("Schedule time must be at least 30 minutes from now.", "warning");
-        setIsSubmitting(false);
-        return;
-      }
+This is a classic "Timezone Offset" issue, and it is happening because of the way Java and the Database handle **UTC versus Local Time**.
+The reason manual upload works while bulk upload fails is likely because the manual upload is being created entirely within your Java application logic, while the bulk upload's REQ_DATE or EXECUTION_DATE is being set by **Oracle’s internal system clock** or a different LocalDateTime.now() implementation.
+### Why you see "5.5 hours"
+Navi Mumbai (IST) is **UTC+5:30**.
+When you see a timestamp exactly 5.5 hours off, it means the system is taking a UTC time and displaying it as if it were local time, or vice-versa.
+### The Fix
+You need to standardize how timestamps are generated across your Java services and your Oracle Database.
+#### 1. Fix the Java Side (VoucherAsyncWorker.java)
+In your processChunkRaw method, you are currently using LocalDateTime.now(). This uses the server's default timezone.
+**Change this:**
+```java
+ps.setTimestamp(2, java.sql.Timestamp.valueOf(LocalDateTime.now())); 
 
 ```
-**Replace with:**
-```javascript
-      const minAllowed = dayjs(); // Just needs to be in the future
-      const maxAllowed = dayjs().endOf('day'); // 11:59:59 PM today
-
-      if (finalSchedule.isBefore(minAllowed)) {
-        showSnackBar("Schedule time cannot be in the past.", "warning");
-        setIsSubmitting(false);
-        return;
-      }
+**To this (Force IST explicitly):**
+```java
+// Use ZonedDateTime to ensure it is always IST regardless of server settings
+java.time.ZonedDateTime istTime = java.time.ZonedDateTime.now(java.time.ZoneId.of("Asia/Kolkata"));
+ps.setTimestamp(2, java.sql.Timestamp.from(istTime.toInstant()));
 
 ```
-### 2. Fix the "Schedule Lapsed" Modal TimePicker
-Around line **771**, the TimePicker for the Lapsed Modal forces a 31-minute wait.
-**Find this:**
-```javascript
-                  disablePast
-                  minTime={dayjs().add(31, 'minute')} // Changed to 31
-                  maxTime={dayjs().endOf('day')}
-                  timeSteps={{ minutes: 1 }}
-                  slotProps={{
-                    popper: { placement: "top" },
-                    textField: {
-                      size: 'small',
-                      fullWidth: true,
-                      required: true,
-                      sx: {
-                        caretColor: 'transparent',
-                        '& .MuiFormHelperText-root': { whiteSpace: 'normal', wordBreak: 'break-word', marginInline: 0, mt: 1 }
-                      },
-                      helperText: "Execution must be scheduled at least 31 mins from now, and before 11:59 PM today.", // Text updated
+#### 2. Fix the Database Side (PROCESS_JOURNAL_BATCH)
+In your stored procedure, you are using CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'. This is correct, but check your FINCORE_DATE logic. If v_users_date is being derived from a database system date, ensure the database session timezone matches the application.
+Update your INSERT and UPDATE statements inside the procedure to explicitly cast to IST:
+```sql
+-- Use this for your EXECUTION_DATE or POST_DATE columns
+FROM_TZ(CAST(CURRENT_TIMESTAMP AS TIMESTAMP), 'Asia/Kolkata')
 
 ```
-**Replace with:**
-```javascript
-                  disablePast
-                  minTime={dayjs()} // Removed the 31-minute block
-                  maxTime={dayjs().endOf('day')}
-                  timeSteps={{ minutes: 1 }}
-                  slotProps={{
-                    popper: { placement: "top" },
-                    textField: {
-                      size: 'small',
-                      fullWidth: true,
-                      required: true,
-                      sx: {
-                        caretColor: 'transparent',
-                        '& .MuiFormHelperText-root': { whiteSpace: 'normal', wordBreak: 'break-word', marginInline: 0, mt: 1 }
-                      },
-                      helperText: "Execution must be scheduled for a future time before 11:59 PM today.", 
+#### 3. Why the discrepancy between Manual and Bulk?
+ * **Manual Upload:** Likely uses your VoucherCommandService which probably uses a different way of getting the time (or uses the LocalDateTime object directly, which the JPA repository then saves using the JDBC driver's timezone configuration).
+ * **Bulk Upload:** Your VoucherAsyncWorker uses processChunkRaw with batchUpdate and ps.setTimestamp(). The PreparedStatement often defaults to the **server's JVM timezone**, which is likely set to UTC.
+### How to verify
+Run this query in your Oracle SQL Developer to see what the database *thinks* the current time is:
+```sql
+SELECT CURRENT_TIMESTAMP, 
+       SYSTIMESTAMP, 
+       SESSIONTIMEZONE 
+FROM DUAL;
 
 ```
-### 3. Fix the Main Action Screen Override
-Around line **1230**, the Override button auto-fills +31 minutes, and the TimePicker right below it restricts it.
-**Find this (The Click Event):**
-```javascript
-                                onClick={() => {
-                                  setScheduleOverrideType("OVERRIDE");
-                                  // Auto-fill time to +31 mins immediately upon clicking
-                                  setFinalScheduleTime(dayjs().add(31, 'minute').format("YYYY-MM-DDTHH:mm"));
-                                }}
-
-```
-**Replace with:**
-```javascript
-                                onClick={() => {
-                                  setScheduleOverrideType("OVERRIDE");
-                                  // Auto-fill to just 5 minutes from now as a polite default
-                                  setFinalScheduleTime(dayjs().add(5, 'minute').format("YYYY-MM-DDTHH:mm"));
-                                }}
-
-```
-**And directly below that, find the TimePicker (around line 1264):**
-```javascript
-                                  disablePast // Visually disables all past times
-                                  minTime={dayjs().add(30, 'minute')} // FIX: 31
-                                  maxTime={dayjs().endOf('day')}
-                                  timeSteps={{ minutes: 1 }}
-                                  slotProps={{
-                                    // CRITICAL: Forces the clock popup to open UPWARDS
-                                    popper: {
-                                      placement: "top",
-                                    },
-                                    textField: {
-                                      size: 'small',
-                                      fullWidth: true,
-                                      required: true,
-                                      sx: {
-                                        caretColor: 'transparent',
-                                        '& .MuiFormHelperText-root': {
-                                          whiteSpace: 'normal',
-                                          wordBreak: 'break-word',
-                                          marginInline: 0,
-                                          mt: 1
-                                        }
-                                      },
-                                      helperText: "Execution must be scheduled at least 30 mins from now, and before 11:59 PM today.", // FIX: 31
-
-```
-**Replace with:**
-```javascript
-                                  disablePast 
-                                  minTime={dayjs()} // Removed the 30-minute block
-                                  maxTime={dayjs().endOf('day')}
-                                  timeSteps={{ minutes: 1 }}
-                                  slotProps={{
-                                    popper: {
-                                      placement: "top",
-                                    },
-                                    textField: {
-                                      size: 'small',
-                                      fullWidth: true,
-                                      required: true,
-                                      sx: {
-                                        caretColor: 'transparent',
-                                        '& .MuiFormHelperText-root': {
-                                          whiteSpace: 'normal',
-                                          wordBreak: 'break-word',
-                                          marginInline: 0,
-                                          mt: 1
-                                        }
-                                      },
-                                      helperText: "Execution must be scheduled for a future time before 11:59 PM today.",
-
-```
-Make these changes and your frontend will perfectly align with the backend logic we updated yesterday. The Final Approver will now be able to select **any** future time!
+If SESSIONTIMEZONE is not +05:30 (or Asia/Kolkata), that is your root cause.
+**Recommendation:**
+Standardize all date/time generation in your Java code using java.time.ZonedDateTime.now(ZoneId.of("Asia/Kolkata")) instead of LocalDateTime.now(). LocalDateTime is "timezone-naive" (it doesn't know where it is), whereas ZonedDateTime is "timezone-aware." Once you switch to ZonedDateTime, these 5.5-hour gaps will disappear forever.
