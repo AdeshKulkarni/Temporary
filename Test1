@@ -1,67 +1,76 @@
-After reviewing your code—VoucherAsyncWorker.java, VoucherCommandService.java, and VoucherBulkValidationService.java—the architecture is solid, but there is one **critical race condition risk** and one **timezone consistency fix** you must address.
-Here is the breakdown of what needs to be changed to ensure your "VID Active/Used" logic and time consistency work perfectly.
-### 1. VoucherCommandService.java (The Fix for VID Concurrency)
-You currently check SELECT COUNT(*) FROM VOUCHER_POSTING to see if a VID is used. **This is dangerous.** If two users click "Submit" at the exact same time, both might see COUNT(*) = 0 and both will try to create a batch for the same VID.
-**Replace your VID check (lines 75–83) with this Atomic Lock logic:**
+To make your system reliable and concurrency-safe, we need to focus on two files: **VoucherCommandService.java** (to fix the VID concurrency) and **VoucherAsyncWorker.java** (to fix the Timezone offset).
+Here is exactly what to replace.
+### 1. In VoucherCommandService.java
+Find the createBatchFromCacheAsync method. You currently use a COUNT(*) query to check for VID availability, which causes race conditions. Replace the VID check block (lines 75–83) with this **Atomic Lock** logic:
+**Find this:**
 ```java
-// REPLACE YOUR EXISTING VID CHECK WITH THIS:
-// We use a "Pessimistic Lock" on the REQUEST_VOUCHER row.
-// If the VID is 'ACTIVE', this locks the row and returns it.
-// If it is 'USED', this will throw an exception.
-String lockSql = "SELECT STATUS FROM REQUEST_VOUCHER WHERE VID = ? FOR UPDATE";
-String vidStatus;
-try {
-    vidStatus = jdbcTemplate.queryForObject(lockSql, String.class, vid);
-} catch (EmptyResultDataAccessException e) {
-    throw new CustomExceptions.InvalidDataException("VID (" + vid + ") does not exist.");
-}
-
-if (!"ACTIVE".equals(vidStatus)) {
-    throw new CustomExceptions.InvalidDataException("VID (" + vid + ") is already in use by another batch.");
-}
-
-// Immediately mark as USED while we hold the row lock
-workflowEngine.updateVidStatus(vid, VoucherStatus.USED);
+            //  FIX 2: Check if VID is already used! This completely prevents the HTTP 409 Constraint Violation!
+            Integer vidExists = jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM VOUCHER_POSTING WHERE VID_FK = ? AND BATCH_STATUS NOT IN ('R', 'REJECTED')",
+                    Integer.class, vid
+            );
+            if (vidExists != null && vidExists > 0) {
+                throw new CustomExceptions.InvalidDataException("Voucher ID (" + vid + ") has already been used in another batch. Please select a fresh VID.");
+            }
 
 ```
-*This ensures that even with 10 users clicking simultaneously, only one will successfully get past this check.*
-### 2. VoucherAsyncWorker.java (The Timezone Fix)
-You are generating timestamps in the background worker. If this server's time differs from the DB, you get the 5.5-hour offset issue.
-**Update lines 220–222 in processChunkRaw:**
-**Find:**
+**Replace it with this:**
 ```java
-java.time.ZonedDateTime istTime = java.time.ZonedDateTime.now(java.time.ZoneId.of("Asia/Kolkata"));
-ps.setTimestamp(2, java.sql.Timestamp.from(istTime.toInstant()));
+            // --- ATOMIC LOCK: Prevents two users from grabbing the same VID simultaneously ---
+            String lockSql = "SELECT STATUS FROM REQUEST_VOUCHER WHERE VID = ? FOR UPDATE";
+            String vidStatus;
+            try {
+                vidStatus = jdbcTemplate.queryForObject(lockSql, String.class, vid);
+            } catch (EmptyResultDataAccessException e) {
+                throw new CustomExceptions.InvalidDataException("VID (" + vid + ") does not exist.");
+            }
+
+            if (!"ACTIVE".equals(vidStatus)) {
+                throw new CustomExceptions.InvalidDataException("VID (" + vid + ") is currently in use or locked. Please select a fresh VID.");
+            }
+
+            // Immediately mark as USED while we hold the row lock
+            workflowEngine.updateVidStatus(vid, VoucherStatus.USED);
 
 ```
-**Change to:**
+### 2. In VoucherAsyncWorker.java
+You are currently using java.sql.Timestamp.from(istTime.toInstant()). This sometimes converts the time to UTC based on the server's environment. We want to force it to "Wall Clock" IST time.
+**Find this in processChunkRaw (around line 220):**
 ```java
-// Force the timestamp to be generated in IST and explicitly cast to prevent offset shifts
-java.time.ZonedDateTime istTime = java.time.ZonedDateTime.now(java.time.ZoneId.of("Asia/Kolkata"));
-ps.setTimestamp(2, java.sql.Timestamp.valueOf(istTime.toLocalDateTime())); 
+                    java.time.ZonedDateTime istTime = java.time.ZonedDateTime.now(java.time.ZoneId.of("Asia/Kolkata"));
+                    ps.setTimestamp(2, java.sql.Timestamp.from(istTime.toInstant()));         // REQ_DATE
 
 ```
-*Using toLocalDateTime() on a Zoned object that is already set to Asia/Kolkata ensures the DB driver sends the correct wall-clock time for your timezone.*
-### 3. VoucherBulkValidationService.java (The Cleanup Fix)
-In your processAsync method, you are using self.processAsync (which is good), but you must ensure the finally block is robust.
-**Ensure your finally block is exactly this to avoid leaving files behind:**
+**Replace it with this:**
 ```java
-finally {
-    // Force delete if it still exists
-    if (tempFile != null && tempFile.exists()) {
+                    java.time.ZonedDateTime istTime = java.time.ZonedDateTime.now(java.time.ZoneId.of("Asia/Kolkata"));
+                    // Convert to LocalDateTime to preserve the exact IST time string without UTC conversion
+                    ps.setTimestamp(2, java.sql.Timestamp.valueOf(istTime.toLocalDateTime()));         // REQ_DATE
+
+```
+### 3. In VoucherCommandService.java (Manual Posting)
+You also need to apply the same VID locking logic to your **Manual Posting** method (createBatchRequest).
+**Find the // --- STRICT VID DUPLICATION CHECK --- section (around line 245):**
+**Replace the entire VID check block with this:**
+```java
+        // --- ATOMIC LOCK FOR MANUAL POSTING ---
+        String lockSql = "SELECT STATUS FROM REQUEST_VOUCHER WHERE VID = ? FOR UPDATE";
+        String vidStatus;
         try {
-            Files.deleteIfExists(tempFile.toPath());
-        } catch (IOException e) {
-            log.warn("CLEANUP_WARN | Path: {} | Status: Temp file purge failed", tempFilePath);
+            vidStatus = jdbcTemplate.queryForObject(lockSql, String.class, dto.getVid());
+        } catch (EmptyResultDataAccessException e) {
+            throw new CustomExceptions.InvalidDataException("VID (" + dto.getVid() + ") does not exist.");
         }
-    }
-    MDC.clear();
-}
+
+        if (!"ACTIVE".equals(vidStatus)) {
+            throw new CustomExceptions.InvalidDataException("VID (" + dto.getVid() + ") is currently in use or locked.");
+        }
+
+        // Immediately mark as USED
+        workflowEngine.updateVidStatus(dto.getVid(), VoucherStatus.USED);
 
 ```
-### Summary Checklist for you:
- 1. **VID Logic:** The FOR UPDATE lock I provided in VoucherCommandService is the **only** way to handle multi-user VID grabbing safely without adding a column. Keep your USED / ACTIVE status logic exactly as it is; the lock just protects it.
- 2. **Notification Flow:** Your VoucherAsyncWorker has the createNextStepApprovalNotification logic correctly placed at the end of the batch process (Step 2 notification). This is correct—only notify the checker **after** all data is loaded.
- 3. **Manual/Bulk Integrity:** Since you are using the same NotificationWriterService for both, the Checker will receive the notification correctly regardless of the entry method.
-**One final recommendation:** In VoucherCommandService.java, ensure workflowEngine and commandService are not creating circular dependencies. Since you used @Lazy, you have already handled this correctly, so that is fine to keep as is.
-Your logic is now robust against concurrency, timezone-safe, and handles async failures properly. You are ready to deploy.
+### Why these exact changes?
+ 1. **FOR UPDATE**: By adding this to your SELECT statement, Oracle will freeze that VID row the millisecond a user clicks. If a second user tries to click "Submit" for that same VID, Oracle makes them wait until the first user's transaction is finished.
+ 2. **valueOf(istTime.toLocalDateTime())**: This is the "Gold Standard" for Java-to-Oracle time. It forces the driver to write the exact yyyy-MM-dd HH:mm:ss that you see on your clock in Navi Mumbai, ignoring the server's underlying UTC timezone settings.
+These changes handle your multi-user VID concurrency and your timezone issues perfectly without adding new columns or complex cron jobs.
