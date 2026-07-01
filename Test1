@@ -1,128 +1,47 @@
- @Transactional
-    public String createBatchFromCacheAsync(String requestId, String commonRemarks, String creatorId, Integer creatorRole, String vid , LocalDateTime scheduledTime) {
-        String lockKey = "LOCK_REQ_" + requestId;
-        Boolean acquired;
+Ah, the classic 5.5-hour timezone offset! This happens because your Spring Boot application is likely running on a server (or in a Docker container) that defaults to the **UTC** timezone, while you need it to record time in **IST (UTC +5:30)**.
+Because we were so focused on the database locks in the previous steps, you missed the timezone fix I provided earlier for your bulk worker.
+Here are the **two exact things** you need to change to permanently kill this 5.5-hour bug.
+### 1. Fix the Bulk Insert Time (VoucherAsyncWorker.java)
+In your bulk worker, you are currently converting an IST time object into an Instant. When Java's JDBC driver sees an Instant, it converts it *back* to the server's default timezone (UTC) before saving it to Oracle!
+**Open VoucherAsyncWorker.java and find this exact code inside processChunkRaw (around line 220):**
+```java
+// --- FIND THESE TWO LINES ---
+java.time.ZonedDateTime istTime = java.time.ZonedDateTime.now(java.time.ZoneId.of("Asia/Kolkata"));
+ps.setTimestamp(2, java.sql.Timestamp.from(istTime.toInstant()));         // REQ_DATE
 
-        try {
-            acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, new byte[0], 60, TimeUnit.MINUTES);
-        } catch (DataAccessException e) {
-            log.error("REDIS_LOCK_FAIL | ReqID: {} | Status: Connection to lock service failed", requestId);
-            throw new CustomExceptions.DatabaseOperationException("Distributed lock service unavailable", e);
-        }
+```
+**REPLACE them with this:**
+```java
+// --- REPLACE WITH THIS ---
+// This forces the exact IST wall-clock time into the database without UTC conversion
+java.time.LocalDateTime istTime = java.time.LocalDateTime.now(java.time.ZoneId.of("Asia/Kolkata"));
+ps.setTimestamp(2, java.sql.Timestamp.valueOf(istTime));         // REQ_DATE
 
-        if (Boolean.FALSE.equals(acquired)) {
-            log.warn("CONCURRENCY_LOCKED | ReqID: {} | Status: Processing already in progress", requestId);
-            throw new CustomExceptions.ConcurrencyLockException("Batch creation is already in progress for this Request ID.");
-        }
+```
+### 2. The "Silver Bullet" Global Timezone Fix
+If your bulk rows are now fixing themselves, but you notice that your *Batch Creation Time* or *Workflow Approval Time* is still 5 hours behind, it is because you have LocalDateTime.now() scattered across your VoucherCommandService and VoucherWorkflowEngine.
+Instead of hunting down every single LocalDateTime.now() and changing it, you can force your entire Spring Boot application to run in the Asia/Kolkata timezone the moment it starts up.
+**Open your main application class** (the one with @SpringBootApplication, usually VoucherServiceApplication.java or similar) and add this method:
+```java
+import jakarta.annotation.PostConstruct;
+import java.util.TimeZone;
 
-        try {
-            // FIX 1: Validate VID existence to prevent "null" crashes
-            if (vid == null || vid.trim().isEmpty()) {
-                throw new CustomExceptions.InvalidDataException("VID is missing from the payload. Cannot save batch.");
-            }
+@SpringBootApplication
+public class VoucherServiceApplication {
 
-            // --- ATOMIC LOCK FOR MANUAL POSTING ---
-            String lockSql = "SELECT STATUS FROM REQUEST_VOUCHER WHERE VID = ? FOR UPDATE";
-            String vidStatus;
-            try {
-                vidStatus = jdbcTemplate.queryForObject(lockSql, String.class, vid);
-            } catch (EmptyResultDataAccessException e) {
-                throw new CustomExceptions.InvalidDataException("VID (" +vid + ") does not exist.");
-            }
-
-            if (!"ACTIVE".equals(vidStatus)) {
-                throw new CustomExceptions.InvalidDataException("VID (" + vid + ") is currently in use or locked.");
-            }
-
-            // Immediately mark as USED
-            workflowEngine.updateVidStatus(vid, VoucherStatus.USED);
-
-            // 1. GENERATE IDs
-            String batchId = sequenceService.getNextBatchId();
-            String journalPrefix = sequenceService.getNextJournalIdPrefix();
-
-            // 2. FETCH ROW COUNT
-            byte[] metaBytes = redisTemplate.opsForValue().get("DATA_META_" + requestId);
-            long totalRows = 0;
-            if (metaBytes != null) {
-                try {
-                    Map<String, Object> meta = objectMapper.readValue(metaBytes, new TypeReference<>() {
-                    });
-                    totalRows = ((Number) meta.get("totalRows")).longValue();
-                } catch (Exception ignored) {
-                }
-            }
-
-            // 3. WORKFLOW ROUTING
-            String workflowCode;
-            try {
-                workflowCode = jdbcTemplate.queryForObject(
-                        "SELECT WORKFLOW_CODE FROM WORKFLOW_TRANSITIONS WHERE ALLOWED_ROLE_ID = ? AND WORKFLOW_ORDER = 1 FETCH FIRST 1 ROWS ONLY",
-                        String.class, creatorRole
-                );
-            } catch (EmptyResultDataAccessException e) {
-                throw new CustomExceptions.InvalidDataException("Configuration Error: No workflow mapped for Role ID " + creatorRole);
-            }
-
-            Long firstApproverWorkflowId;
-            try {
-                firstApproverWorkflowId = jdbcTemplate.queryForObject(
-                        "SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = 2",
-                        Long.class, workflowCode
-                );
-            } catch (EmptyResultDataAccessException e) {
-                throw new CustomExceptions.InvalidDataException("Configuration Error: Missing Step 2 for " + workflowCode);
-            }
-
-            // 4. SYNCHRONOUS MASTER RECORD CREATION
-            VoucherPosting posting = new VoucherPosting();
-            posting.setBatchId(batchId);
-            posting.setVidFk(vid);
-            posting.setCommonBatchRemarks(commonRemarks);
-            posting.setCreatorRole(creatorRole);
-            posting.setCreatedBy(creatorId);
-            posting.setWorkflowCode(workflowCode);
-            posting.setPendingAt(firstApproverWorkflowId);
-            posting.setBatchStatus("S");
-
-            // Save the schedule directly from Step 3 UI
-            if (scheduledTime != null) {
-                workflowEngine.validateScheduledTime(scheduledTime, false);
-                posting.setIS_EXECUTION_SCHEDULED("YES");
-                posting.setScheduledTime(scheduledTime);
-            } else {
-                posting.setIS_EXECUTION_SCHEDULED("NO");
-                posting.setScheduledTime(null);
-            }
-            posting.setIsScheduleOverride("NO");
-            posting.setRecordsCount(totalRows);
-
-            // --- ADD THIS LOCK (Right before you save the batch) ---
-            if (vid != null && !vid.isEmpty()) {
-                workflowEngine.updateVidStatus(vid, VoucherStatus.USED);
-            }
-
-            voucherPostingRepository.save(posting);
-
-            // 5. UPDATE DEPENDENCIES
-            workflowEngine.updateVidStatus(vid, VoucherStatus.USED);
-            workflowEngine.logWorkflowAction(batchId, vid, "Submitted", creatorId, commonRemarks, null);
-
-            progressService.sendProgress(batchId, creatorId, 0, "PROCESSING", "Initializing Batch Creation...");
-
-            // 6. ASYNC HANDOFF (Pass to background thread)
-            asyncWorker.executeAsyncBatchCreation(batchId, journalPrefix, requestId, commonRemarks, creatorId, creatorRole, vid);
-
-            return batchId;
-        } catch (org.springframework.dao.DataIntegrityViolationException e) {
-            redisTemplate.delete(lockKey);
-            log.error("DB_CONSTRAINT_FAIL | ReqID: {} | Error: {}", requestId, e.getRootCause() != null ? e.getRootCause().getMessage() : e.getMessage());
-            throw new CustomExceptions.InvalidDataException("Database constraint failed. Ensure the VID is not duplicated or missing.");
-        } catch (DataAccessException e) {
-            redisTemplate.delete(lockKey);
-            log.error("SEQUENCE_GEN_FAIL | ReqID: {} | Status: Failed to generate sequence", requestId);
-            throw new CustomExceptions.DatabaseOperationException("Failed to generate Batch ID sequence", e);
-        }
+    public static void main(String[] args) {
+        SpringApplication.run(VoucherServiceApplication.class, args);
     }
 
-can u tell min which locks should i remove
+    // --- ADD THIS METHOD ---
+    @PostConstruct
+    public void init() {
+        // Forces the entire Spring Boot app to use IST, completely bypassing server UTC defaults
+        TimeZone.setDefault(TimeZone.getTimeZone("Asia/Kolkata"));
+    }
+}
+
+```
+### Why this solves it forever:
+By applying the @PostConstruct fix, every time your code calls LocalDateTime.now()—whether it's generating a journal request date, logging a workflow action, or setting the batch execution time—it will automatically pull the correct local time, regardless of where your server is physically located.
+Make those two changes, restart your server, and your 5.5-hour time travel bug will be gone for good!
