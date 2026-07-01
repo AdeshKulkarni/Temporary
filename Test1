@@ -1,151 +1,80 @@
-package com.fincore.VoucherService.Service.schedule;
-
-
-import com.fincore.VoucherService.Service.NotificationWriterService;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.scheduling.annotation.Scheduled;
-import org.springframework.stereotype.Component;
-
-import java.util.List;
-import java.util.Map;
-
-@Component
-@RequiredArgsConstructor
-@Slf4j
-public class VoucherEscalationScheduler {
-
-    private final JdbcTemplate jdbcTemplate;
-    private final NotificationWriterService notificationWriterService;
-
-    /**
-     * Runs every 1 minute (60,000 milliseconds) in the background.
-     * Scans for any pending batches that have breached their designated ESCALATION_TIME.
-     */
-    @Scheduled(fixedRate = 60000)
-    public void checkAndTriggerEscalations() {
-
-        // --- THE ESCALATION QUERY ---
-        // 1. Finds 'Pending' batches with an escalation limit > 0
-        // 2. Checks if (Last Action Time + Escalation Minutes) is older than RIGHT NOW
-        // 3. Ensures we haven't already sent an escalation for this specific stage to prevent spam
-        String sql = """
-            SELECT 
-                vp.BATCH_ID, 
-                vp.CREATED_BY, 
-                TO_CHAR(wt.ALLOWED_ROLE_ID) AS ROLE_ID, 
-                wt.WORKFLOW_STAGE
-            FROM VOUCHER_POSTING vp
-            JOIN WORKFLOW_TRANSITIONS wt ON vp.PENDING_AT = wt.WORKFLOW_ID
-            WHERE vp.BATCH_STATUS = 'P' 
-              AND wt.ESCALATION_TIME > 0
-              AND (
-                    SELECT MAX(LAST_ACTION_AT) 
-                    FROM VOUCHER_WORKFLOW 
-                    WHERE BATCH_ID_FK = vp.BATCH_ID
-                  ) + NUMTODSINTERVAL(wt.ESCALATION_TIME, 'MINUTE') < SYSTIMESTAMP
-              AND NOT EXISTS (
-                    SELECT 1 FROM NOTIFICATIONS n 
-                    WHERE n.AGGREGATE_ID = vp.BATCH_ID 
-                      AND n.EVENT_SOURCE = 'EscalationEngine'
-                      AND n.MESSAGE LIKE '%' || wt.WORKFLOW_STAGE || '%'
-              )
-        """;
-
+Here is the complete, combined set of changes. This implements the exact logic we discussed:
+ 1. Separating the error handling for Scheduled vs. Immediate batches.
+ 2. Introducing the 'Q' (Queued) status to hide auto-retrying batches from the Checker.
+ 3. Permanently killing the batch, returning the VID to ACTIVE, and notifying the Maker if it fails 5 times.
+Make these exact replacements in your three backend files:
+### 1. File: VoucherAsyncWorker.java
+Replace your entire handleAsyncApprovalError method (at the bottom of the file) with this updated version:
+```java
+    private void handleAsyncApprovalError(String batchId, String executorId, RequestStatus actionStatus, String errorContext) {
+        
+        // 1. Check if this batch is handled by the Auto-Scheduler
+        String scheduleFlag = "NO";
         try {
-            List<Map<String, Object>> breachedBatches = jdbcTemplate.queryForList(sql);
+            scheduleFlag = jdbcTemplate.queryForObject(
+                "SELECT IS_EXECUTION_SCHEDULED FROM VOUCHER_POSTING WHERE BATCH_ID = ?", 
+                String.class, batchId
+            );
+        } catch (Exception ignored) {}
 
-            if (!breachedBatches.isEmpty()) {
-                log.warn("ESCALATION_ENGINE | Found {} batches breaching SLA limits.", breachedBatches.size());
+        String finalMsg;
+
+        // 2. Route the Status and Message correctly
+        if ("YES".equalsIgnoreCase(scheduleFlag)) {
+            // Auto-Retry Scenario: Set to 'Q' to hide from Checker queue
+            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'Q' WHERE BATCH_ID = ?", batchId);
+            finalMsg = "System fault. The background scheduler will automatically retry this execution shortly.";
+        } else {
+            // Manual Retry Scenario: Set to 'P' so Checker can click Approve again
+            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
+            finalMsg = "Execution failed due to system fault. Please click Approve again to retry.";
+        }
+
+        progressService.sendProgress(batchId, executorId, 0, "FAILED", finalMsg);
+
+        String vid = null;
+        String creatorId = null;
+
+        // 3. Fetch BOTH the VID and the original Creator (Maker)
+        try {
+            Map<String, Object> batchInfo = jdbcTemplate.queryForMap(
+                "SELECT VID_FK, CREATED_BY FROM VOUCHER_POSTING WHERE BATCH_ID = ?", batchId
+            );
+            vid = (String) batchInfo.get("VID_FK");
+            creatorId = (String) batchInfo.get("CREATED_BY");
+        } catch (org.springframework.dao.EmptyResultDataAccessException e) {
+            log.warn("Batch info not found for Batch: {}", batchId);
+        }
+
+        // 4. Log the system failure in the Workflow History
+        workflowEngine.logWorkflowAction(batchId, vid, "Execution Failed", "SYSTEM", finalMsg, null);
+
+        String actionName = (actionStatus == RequestStatus.ACCEPTED) ? "approve" : "reject";
+        
+        try {
+            // 5A. Notify the Checker
+            String checkerMsg = String.format("SYSTEM ERROR: Failed to %s Journal Batch '%s'. %s", actionName, batchId, finalMsg);
+            notificationWriterService.createNotification(executorId, null, checkerMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
+            
+            // 5B. Notify the Maker
+            if (creatorId != null && !creatorId.equalsIgnoreCase(executorId)) {
+                String makerMsg = String.format("SYSTEM ERROR: Final execution failed for your Batch '%s'. %s", batchId, finalMsg);
+                notificationWriterService.createNotification(creatorId, null, makerMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
             }
-
-            // Loop through the breached batches and fire the notifications
-            for (Map<String, Object> batch : breachedBatches) {
-                String batchId = (String) batch.get("BATCH_ID");
-                String targetRoleId = (String) batch.get("ROLE_ID");
-                String stageName = (String) batch.get("WORKFLOW_STAGE");
-                String creatorId = (String) batch.get("CREATED_BY");
-
-                notificationWriterService.createEscalationNotification(batchId, targetRoleId, stageName, creatorId);
-
-                log.info("ESCALATION_TRIGGERED | Batch: {} | Stage: {} | Alerted Role: {}", batchId, stageName, targetRoleId);
-            }
-
         } catch (Exception e) {
-            log.error("ESCALATION_ENGINE_FAIL | Error running scheduled SLA check: {}", e.getMessage());
+            log.warn("NOTIFICATION_WARN | Batch: {} | Could not send failure notifications", batchId);
         }
     }
-}
 
-
-
-
-package com.fincore.VoucherService.Service.schedule;
-
-import com.fincore.VoucherService.Models.enums.RequestStatus;
-import com.fincore.VoucherService.Dto.BulkProcessVoucherPostingDto;
-import com.fincore.VoucherService.Service.core.VoucherCommandService;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.dao.EmptyResultDataAccessException;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.scheduling.annotation.Scheduled;
-import org.springframework.stereotype.Service;
-
-import java.time.LocalDateTime;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.TimeUnit;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class VoucherExecutionScheduler {
-
-    private final JdbcTemplate jdbcTemplate;
-    private final StringRedisTemplate stringRedisTemplate;
-    private final VoucherCommandService voucherCommandService;
-
-    private static final int MAX_RETRIES = 5;
-
-    /**
-     * Runs every 60 seconds. Uses a Redis lock to ensure only one pod
-     * executes the scheduled batches in a distributed environment.
-     */
-    @Scheduled(fixedRate = 60000)
-    public void executeScheduledBatches() {
-        String lockKey = "SYSTEM_LOCK_SCHEDULED_EXECUTION";
-        boolean lockAcquired = false;
-
-        try {
-            // 1. Distributed lock so only one server pod runs this at a time
-            Boolean acquired = stringRedisTemplate.opsForValue()
-                    .setIfAbsent(lockKey, "LOCKED", 50, TimeUnit.SECONDS);
-            lockAcquired = Boolean.TRUE.equals(acquired);
-
-            if (!lockAcquired) return;
-
-            // --- STEP 1: HOUSEKEEPING (Update success states) ---
-            // If the core service successfully processed the batch, it changed the BATCH_STATUS to 'A' or 'C'.
-            // We find those and cleanly mark them as COMPLETED in our retry tracker.
-            String cleanupSql = """
-                        UPDATE SCHEDULED_BATCH_RETRY r 
-                        SET r.STATUS = 'COMPLETED' 
-                        WHERE r.STATUS = 'PENDING' 
-                        AND EXISTS (
-                            SELECT 1 FROM VOUCHER_POSTING p 
-                            WHERE p.BATCH_ID = r.BATCH_ID 
-                            AND p.BATCH_STATUS IN ('A', 'C', 'POSTED')
-                        )
-                    """;
-            jdbcTemplate.update(cleanupSql);
-
+```
+### 2. File: VoucherExecutionScheduler.java
+You need to make two changes in this file inside the executeScheduledBatches method.
+**A. Update the fetchSql to include 'Q':**
+```java
             // --- STEP 2: FETCH DUE BATCHES ---
             String fetchSql = """
                         SELECT p.BATCH_ID FROM VOUCHER_POSTING p 
-                        WHERE p.BATCH_STATUS = 'P' 
+                        WHERE p.BATCH_STATUS IN ('P', 'Q') 
                         AND p.IS_EXECUTION_SCHEDULED = 'YES' 
                         AND p.SCHEDULED_TIME <= ? 
                         AND EXISTS (
@@ -155,72 +84,61 @@ public class VoucherExecutionScheduler {
                         )
                     """;
 
-            java.sql.Timestamp currentTime = java.sql.Timestamp.valueOf(LocalDateTime.now());
-            List<String> dueBatches = jdbcTemplate.queryForList(fetchSql, String.class, currentTime);
-
-            if (dueBatches.isEmpty()) return;
-
-            log.info("SCHEDULER_WAKEUP | Found {} scheduled batches ready for execution.", dueBatches.size());
-
-            // --- STEP 3: PROCESS WITH RETRY TRACKING ---
-            for (String batchId : dueBatches) {
-                try {
-                    int currentRetries = 0;
-
-                    // A. Check tracking table
-                    try {
-                        Map<String, Object> retryData = jdbcTemplate.queryForMap(
-                                "SELECT RETRY_COUNT, STATUS FROM SCHEDULED_BATCH_RETRY WHERE BATCH_ID = ?", batchId);
-                        currentRetries = ((Number) retryData.get("RETRY_COUNT")).intValue();
-                    } catch (EmptyResultDataAccessException e) {
-                        // First attempt: Create tracking record
-                        jdbcTemplate.update(
-                                "INSERT INTO SCHEDULED_BATCH_RETRY (BATCH_ID, CREATED_AT, RETRY_COUNT, STATUS) VALUES (?, SYSTIMESTAMP, 0, 'PENDING')",
-                                batchId);
-                    }
-
+```
+**B. Update the Max Retries logic to release the VID and kill the batch:**
+```java
                     // B. Validate Limits
                     if (currentRetries >= MAX_RETRIES) {
                         log.error("SCHEDULER_EXHAUSTED | Batch {} failed after {} attempts. Halting execution.", batchId, MAX_RETRIES);
 
-                        // Mark Tracker as FAILED
+                        // 1. Fetch the VID
+                        String vid = null;
+                        try {
+                            vid = jdbcTemplate.queryForObject("SELECT VID_FK FROM VOUCHER_POSTING WHERE BATCH_ID = ?", String.class, batchId);
+                        } catch (EmptyResultDataAccessException ignored) {}
+
+                        // 2. Release the VID back to ACTIVE so it can be reused safely
+                        if (vid != null) {
+                            jdbcTemplate.update("UPDATE REQUEST_VOUCHER SET STATUS = 'ACTIVE' WHERE VID = ?", vid);
+                        }
+
+                        // 3. Mark Tracker as FAILED
                         jdbcTemplate.update("UPDATE SCHEDULED_BATCH_RETRY SET STATUS = 'FAILED' WHERE BATCH_ID = ?", batchId);
 
-                        // FIX: Set status to ERROR and explicitly disable the scheduler flag so it is never fetched again.
+                        // 4. Mark Master Record as ERROR and permanently disable scheduling
                         jdbcTemplate.update(
                                 "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'ERROR', IS_EXECUTION_SCHEDULED = 'NO' WHERE BATCH_ID = ?",
                                 batchId
                         );
+
+                        // 5. Notify the original Creator (Maker) that the batch permanently failed
+                        try {
+                            String creatorId = jdbcTemplate.queryForObject("SELECT CREATED_BY FROM VOUCHER_POSTING WHERE BATCH_ID = ?", String.class, batchId);
+                            if (creatorId != null) {
+                                String failMsg = "CRITICAL: Batch " + batchId + " permanently failed execution after " + MAX_RETRIES + " attempts. Please review the data and create a new batch.";
+                                notificationWriterService.createNotification(creatorId, null, failMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
+                            }
+                        } catch (Exception ignored) {}
+                        
                         continue;
                     }
 
-                    // C. Increment Attempt Count
-                    jdbcTemplate.update("UPDATE SCHEDULED_BATCH_RETRY SET RETRY_COUNT = RETRY_COUNT + 1 WHERE BATCH_ID = ?", batchId);
+```
+### 3. File: VoucherQueryService.java
+Update the UI mapping so the frontend knows what 'Q' means. Find the getAllRequestsSummary method, and update the status block (around line 125):
+```java
+            String bStatus = rs.getString("BATCH_STATUS");
+            map.put("batchStatus", bStatus);
 
-                    // D. Fire the Core Execution
-                    BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
-                    execDto.setBatchId(batchId);
-                    execDto.setStatus(RequestStatus.ACCEPTED);
-                    execDto.setRemarks("Executed automatically by System Scheduler");
-
-                    voucherCommandService.processBulkRequestsAsync(execDto, "SYSTEM", 9001);
-                    log.info("SCHEDULER_TRIGGERED | Batch: {} processing started (Attempt {}/{}).", batchId, (currentRetries + 1), MAX_RETRIES);
-
-                } catch (Exception e) {
-                    log.error("SCHEDULER_LOOP_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
-                }
+            if ("R".equals(bStatus)) {
+                map.put("currentStatus", "REJECTED");
+            } else if ("A".equals(bStatus) || "C".equals(bStatus)) {
+                map.put("currentStatus", "POSTED");
+            } else if ("Q".equals(bStatus)) {
+                // --- ADD THIS TO RENDER THE QUEUED STATUS ---
+                map.put("currentStatus", "QUEUED FOR RETRY"); 
+            } else {
+                map.put("currentStatus", rs.getString("WORKFLOW_STAGE") != null ? rs.getString("WORKFLOW_STAGE") : "PENDING");
             }
 
-        } catch (Exception e) {
-            log.error("SCHEDULER_CRITICAL_ERROR | {}", e.getMessage());
-        } finally {
-            if (lockAcquired) {
-                stringRedisTemplate.delete(lockKey);
-            }
-        }
-    }
-}
-
-
-
-
+```
