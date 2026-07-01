@@ -1,10 +1,149 @@
-Here is the complete, combined set of changes. This implements the exact logic we discussed:
- 1. Separating the error handling for Scheduled vs. Immediate batches.
- 2. Introducing the 'Q' (Queued) status to hide auto-retrying batches from the Checker.
- 3. Permanently killing the batch, returning the VID to ACTIVE, and notifying the Maker if it fails 5 times.
-Make these exact replacements in your three backend files:
-### 1. File: VoucherAsyncWorker.java
-Replace your entire handleAsyncApprovalError method (at the bottom of the file) with this updated version:
+Here is the complete, final set of changes for all four files. These blocks contain the exact optimized logic we discussed to handle concurrency, timezones, and the complete retry/failure lifecycle.
+Copy and replace these specific sections in your codebase.
+### 1. VoucherCommandService.java
+**A. Replace createBatchFromCacheAsync (Bulk Flow)**
+Replace the entire method to ensure the VID is only locked **once** efficiently.
+```java
+    @Transactional
+    public String createBatchFromCacheAsync(String requestId, String commonRemarks, String creatorId, Integer creatorRole, String vid, LocalDateTime scheduledTime) {
+        String lockKey = "LOCK_REQ_" + requestId;
+        Boolean acquired;
+
+        try {
+            acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, new byte[0], 60, TimeUnit.MINUTES);
+        } catch (DataAccessException e) {
+            log.error("REDIS_LOCK_FAIL | ReqID: {} | Status: Connection to lock service failed", requestId);
+            throw new CustomExceptions.DatabaseOperationException("Distributed lock service unavailable", e);
+        }
+
+        if (Boolean.FALSE.equals(acquired)) {
+            log.warn("CONCURRENCY_LOCKED | ReqID: {} | Status: Processing already in progress", requestId);
+            throw new CustomExceptions.ConcurrencyLockException("Batch creation is already in progress for this Request ID.");
+        }
+
+        try {
+            if (vid == null || vid.trim().isEmpty()) {
+                throw new CustomExceptions.InvalidDataException("VID is missing from the payload. Cannot save batch.");
+            }
+
+            // 1. ATOMIC LOCK (The "Grab")
+            String lockSql = "SELECT STATUS FROM REQUEST_VOUCHER WHERE VID = ? FOR UPDATE";
+            String vidStatus;
+            try {
+                vidStatus = jdbcTemplate.queryForObject(lockSql, String.class, vid);
+            } catch (EmptyResultDataAccessException e) {
+                throw new CustomExceptions.InvalidDataException("VID (" + vid + ") does not exist.");
+            }
+
+            if (!"ACTIVE".equals(vidStatus)) {
+                throw new CustomExceptions.InvalidDataException("VID (" + vid + ") is currently in use or locked.");
+            }
+
+            // 2. LOCK IT ONCE 
+            workflowEngine.updateVidStatus(vid, VoucherStatus.USED);
+
+            // 3. GENERATE IDs
+            String batchId = sequenceService.getNextBatchId();
+            String journalPrefix = sequenceService.getNextJournalIdPrefix();
+
+            // 4. FETCH ROW COUNT
+            byte[] metaBytes = redisTemplate.opsForValue().get("DATA_META_" + requestId);
+            long totalRows = 0;
+            if (metaBytes != null) {
+                try {
+                    Map<String, Object> meta = objectMapper.readValue(metaBytes, new TypeReference<>() {});
+                    totalRows = ((Number) meta.get("totalRows")).longValue();
+                } catch (Exception ignored) {}
+            }
+
+            // 5. WORKFLOW ROUTING
+            String workflowCode = jdbcTemplate.queryForObject(
+                    "SELECT WORKFLOW_CODE FROM WORKFLOW_TRANSITIONS WHERE ALLOWED_ROLE_ID = ? AND WORKFLOW_ORDER = 1 FETCH FIRST 1 ROWS ONLY",
+                    String.class, creatorRole
+            );
+
+            Long firstApproverWorkflowId = jdbcTemplate.queryForObject(
+                    "SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = 2",
+                    Long.class, workflowCode
+            );
+
+            // 6. SYNCHRONOUS MASTER RECORD CREATION
+            VoucherPosting posting = new VoucherPosting();
+            posting.setBatchId(batchId);
+            posting.setVidFk(vid);
+            posting.setCommonBatchRemarks(commonRemarks);
+            posting.setCreatorRole(creatorRole);
+            posting.setCreatedBy(creatorId);
+            posting.setWorkflowCode(workflowCode);
+            posting.setPendingAt(firstApproverWorkflowId);
+            posting.setBatchStatus("S");
+            posting.setRecordsCount(totalRows);
+
+            if (scheduledTime != null) {
+                workflowEngine.validateScheduledTime(scheduledTime, false);
+                posting.setIS_EXECUTION_SCHEDULED("YES");
+                posting.setScheduledTime(scheduledTime);
+            } else {
+                posting.setIS_EXECUTION_SCHEDULED("NO");
+                posting.setScheduledTime(null);
+            }
+            posting.setIsScheduleOverride("NO");
+
+            // 7. SAVE MASTER RECORD
+            voucherPostingRepository.save(posting);
+
+            // 8. LOG ACTION & START ASYNC
+            workflowEngine.logWorkflowAction(batchId, vid, "Submitted", creatorId, commonRemarks, null);
+            progressService.sendProgress(batchId, creatorId, 0, "PROCESSING", "Initializing Batch Creation...");
+            asyncWorker.executeAsyncBatchCreation(batchId, journalPrefix, requestId, commonRemarks, creatorId, creatorRole, vid);
+
+            return batchId;
+        } catch (Exception e) {
+            redisTemplate.delete(lockKey);
+            throw e; // Allows @Transactional to naturally rollback the lock if anything fails
+        }
+    }
+
+```
+**B. Update updateBatchSchedule (Manual Flow)**
+Add the lock logic right before finalizing the schedule.
+```java
+    @Transactional
+    public void updateBatchSchedule(String batchId, String scheduledTime) {
+        Integer exists = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM VOUCHER_POSTING WHERE BATCH_ID = ?", Integer.class, batchId);
+        if (exists == null || exists == 0) {
+            throw new CustomExceptions.InvalidDataException("The batch is still being initialized. Please wait a few seconds.");
+        }
+
+        // --- ADD THIS LOCK (Right before finalizing) ---
+        VoucherPosting posting = voucherPostingRepository.findById(batchId)
+                .orElseThrow(() -> new CustomExceptions.InvalidDataException("Batch not found."));
+
+        if (posting.getVidFk() != null) {
+            workflowEngine.updateVidStatus(posting.getVidFk(), VoucherStatus.USED);
+        }
+        // --- END ADDITION ---
+
+        // ... Keep the rest of the method exactly as it is (scheduledTime parsing, update 'P', send notification) ...
+
+```
+### 2. VoucherAsyncWorker.java
+**A. Timezone Fix in processChunkRaw**
+Find this block inside processChunkRaw (around line 220) and update it to force the local timestamp without UTC conversion.
+```java
+                    // 2. PERFECTLY MAPPED SETTERS (Shifted to 11 parameters)
+                    ps.setString(1, "P");                                                           // REQ_STATUS
+                    
+                    // --- APPLY THIS TIMEZONE FIX ---
+                    java.time.LocalDateTime istTime = java.time.LocalDateTime.now(java.time.ZoneId.of("Asia/Kolkata"));
+                    ps.setTimestamp(2, java.sql.Timestamp.valueOf(istTime));         // REQ_DATE
+                    // --- END FIX ---
+                    
+                    ps.setString(3, creatorId);                                                     // CREATOR_ID
+
+```
+**B. Replace handleAsyncApprovalError**
+Replace the entire method at the bottom of the file to handle 'Q' vs 'P' states, dual notifications, and auto-VID release.
 ```java
     private void handleAsyncApprovalError(String batchId, String executorId, RequestStatus actionStatus, String errorContext) {
         
@@ -21,11 +160,9 @@ Replace your entire handleAsyncApprovalError method (at the bottom of the file) 
 
         // 2. Route the Status and Message correctly
         if ("YES".equalsIgnoreCase(scheduleFlag)) {
-            // Auto-Retry Scenario: Set to 'Q' to hide from Checker queue
             jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'Q' WHERE BATCH_ID = ?", batchId);
             finalMsg = "System fault. The background scheduler will automatically retry this execution shortly.";
         } else {
-            // Manual Retry Scenario: Set to 'P' so Checker can click Approve again
             jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
             finalMsg = "Execution failed due to system fault. Please click Approve again to retry.";
         }
@@ -67,9 +204,9 @@ Replace your entire handleAsyncApprovalError method (at the bottom of the file) 
     }
 
 ```
-### 2. File: VoucherExecutionScheduler.java
-You need to make two changes in this file inside the executeScheduledBatches method.
-**A. Update the fetchSql to include 'Q':**
+### 3. VoucherExecutionScheduler.java
+**A. Update the fetchSql**
+Find this string around line 45 and add 'Q' to the IN clause.
 ```java
             // --- STEP 2: FETCH DUE BATCHES ---
             String fetchSql = """
@@ -85,7 +222,8 @@ You need to make two changes in this file inside the executeScheduledBatches met
                     """;
 
 ```
-**B. Update the Max Retries logic to release the VID and kill the batch:**
+**B. Update the Limits Validation (currentRetries >= MAX_RETRIES)**
+Replace that specific if block with this robust permanent-failure logic:
 ```java
                     // B. Validate Limits
                     if (currentRetries >= MAX_RETRIES) {
@@ -111,7 +249,7 @@ You need to make two changes in this file inside the executeScheduledBatches met
                                 batchId
                         );
 
-                        // 5. Notify the original Creator (Maker) that the batch permanently failed
+                        // 5. Notify the Maker that the batch permanently failed
                         try {
                             String creatorId = jdbcTemplate.queryForObject("SELECT CREATED_BY FROM VOUCHER_POSTING WHERE BATCH_ID = ?", String.class, batchId);
                             if (creatorId != null) {
@@ -124,8 +262,9 @@ You need to make two changes in this file inside the executeScheduledBatches met
                     }
 
 ```
-### 3. File: VoucherQueryService.java
-Update the UI mapping so the frontend knows what 'Q' means. Find the getAllRequestsSummary method, and update the status block (around line 125):
+### 4. VoucherQueryService.java
+**A. Map the 'Q' status for the Frontend UI**
+Inside the getAllRequestsSummary method, locate the status if/else checks (around line 125) and insert the logic for "Q".
 ```java
             String bStatus = rs.getString("BATCH_STATUS");
             map.put("batchStatus", bStatus);
@@ -135,7 +274,7 @@ Update the UI mapping so the frontend knows what 'Q' means. Find the getAllReque
             } else if ("A".equals(bStatus) || "C".equals(bStatus)) {
                 map.put("currentStatus", "POSTED");
             } else if ("Q".equals(bStatus)) {
-                // --- ADD THIS TO RENDER THE QUEUED STATUS ---
+                // --- ADD THIS BLOCK ---
                 map.put("currentStatus", "QUEUED FOR RETRY"); 
             } else {
                 map.put("currentStatus", rs.getString("WORKFLOW_STAGE") != null ? rs.getString("WORKFLOW_STAGE") : "PENDING");
