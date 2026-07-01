@@ -1,210 +1,65 @@
-package com.fincore.VoucherService.Service.validation;
+You have built an incredibly robust system here. The architecture is solid, the database locking is tight, and your async handling is highly advanced.
+However, putting my Tech Lead hat on and looking at this through the lens of a production environment, there are **three hidden landmines** in this code that will definitely cause bad User Experience (UX) or silent data bugs.
+Here are the critical issues and exactly how to fix them before this goes live.
+### 1. The "Auto-Retry Paradox" (Race Condition + Bad UX)
+In VoucherAsyncWorker.java, if the final database execution fails, you run this line:
+jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
+You are reverting the batch back to **'P' (Pending)**, while simultaneously telling the user in the UI: *"The background scheduler will automatically retry this."*
+**The Danger:** If the status goes back to 'P', it will reappear in the Checker's "Pending Approvals" queue on the frontend.
+ * The Checker might think, "Oh, I guess I need to click approve again."
+ * If the Checker clicks "Approve" at the exact same time your background scheduler picks it up, you create a massive race condition that could double-post the financial transaction.
+**The Fix:**
+You must decide on the actual business rule.
+ * **If a background scheduler is handling it:** Do NOT set the status back to 'P'. Create a new status like 'RETRY' or 'QUEUED' so it disappears from the Checker's screen.
+ * **If there is NO background scheduler:** Change the UI message to tell the Checker the truth.
+```java
+// If you want the Checker to manually retry, update the catch block message:
+handleAsyncApprovalError(batchId, executorId, dto.getStatus(), 
+    "System is busy. Please wait a few minutes and click Approve again.");
 
-import com.fincore.VoucherService.Dto.ExcelRowData;
-import com.fincore.VoucherService.Service.ValidationMasterService;
-import org.junit.jupiter.api.Test;
+```
+### 2. The Pagination "Phantom Row" Bug
+In VoucherQueryService.java, your getAllRequestsSummary method uses this pagination query:
+```sql
+ORDER BY p.CREATED_AT DESC
+OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
 
-import java.math.BigDecimal;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.Set;
+```
+**The Danger:**
+In Oracle (and most SQL databases), if multiple batches are created at the exact same second (which happens often in automated environments), CREATED_AT is not unique.
+When the user clicks "Page 2" on the React UI, the database doesn't guarantee the order of ties. This causes "Phantom Rows" (some records appear on both Page 1 and Page 2, while other records are completely skipped). Users will report that the system is losing data.
+**The Fix:**
+Always add a unique identifier as the tie-breaker in paginated SQL queries.
+```sql
+-- Change your ORDER BY to this:
+ORDER BY p.CREATED_AT DESC, p.BATCH_ID DESC
+OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.assertFalse;
+```
+### 3. The "Silent Row Loss" Vulnerability
+In VoucherAsyncWorker.java (executeAsyncBatchCreation), you are splitting up to 100,000 rows into parallel chunks and waiting 45 minutes for them to finish:
+```java
+CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(45, TimeUnit.MINUTES);
 
-public class SimpleValidatorTest {
+```
+**The Danger:**
+If CompletableFuture catches certain thread interruptions or silent memory errors, it is possible for the threads to finish without throwing a hard exception, but failing to insert all rows. Your code blindly assumes that if .get() doesn't crash, 100% of the data made it into Oracle, and it updates the batch to 'P'.
+**The Fix:**
+You already built a thread-safe counter (successfulRowsCount)! You just need to actually use it to verify the data before telling the Checker it is ready.
+Add this strict validation right after the .get() wait:
+```java
+CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(45, TimeUnit.MINUTES);
 
-    // 1. Create a "Fake" Master Service purely in Java
-    private ValidationMasterService createFakeMasterService() {
-        return new ValidationMasterService() {
-            @Override
-            public Set<String> getAllActiveBranches() {
-                return new HashSet<>(Arrays.asList("10301", "10302"));
-            }
-            @Override
-            public Set<String> getAllActiveCurrencies() {
-                return new HashSet<>(Collections.singletonList("INR"));
-            }
-            @Override
-            public Set<String> getAllActiveCgls() {
-                return new HashSet<>(Arrays.asList("1102003001", "1102003002"));
-            }
-        };
-    }
-
-    // 2. Helper method to easily create rows
-    private ExcelRowData createRow(String branch, String currency, String cgl, String amountStr, String type) {
-        ExcelRowData row = new ExcelRowData();
-        row.branch = branch;
-        row.currency = currency;
-        row.cgl = cgl;
-        row.amount = new BigDecimal(amountStr);
-        row.txnType = type;
-        row.remarks = "Valid Remarks";
-        row.productCode = "12345678"; // Default valid product code
-        
-        row.formatErrors = Collections.synchronizedList(new ArrayList<>());
-        row.dbErrors = Collections.synchronizedList(new ArrayList<>());
-        row.balErrors = Collections.synchronizedList(new ArrayList<>());
-        return row;
-    }
-
-    // ==========================================================
-    // FORMAT CHECK TESTS
-    // ==========================================================
-
-    @Test
-    public void testFormatCheck_ConvertsCrToCredit() {
-        VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
-        ExcelRowData row = createRow("10301", "INR", "1102003001", "500.00", "CR");
-
-        validator.runFormatCheck(Collections.singletonList(row));
-
-        assertEquals("Credit", row.txnType, "The validator should convert 'CR' to 'Credit'");
-        assertTrue(row.formatErrors.isEmpty(), "There should be no format errors");
-    }
-
-    @Test
-    public void testFormatCheck_NegativeOrZeroAmountFails() {
-        VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
-        ExcelRowData zeroRow = createRow("10301", "INR", "1102003001", "0.00", "Debit");
-        ExcelRowData negativeRow = createRow("10301", "INR", "1102003001", "-50.00", "Debit");
-
-        validator.runFormatCheck(Arrays.asList(zeroRow, negativeRow));
-
-        assertTrue(zeroRow.formatErrors.contains("Amount must be greater than 0."));
-        assertTrue(negativeRow.formatErrors.contains("Amount must be greater than 0."));
-    }
-
-    @Test
-    public void testFormatCheck_TooManyDecimalsFails() {
-        VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
-        // Max is 4 decimal places. This has 5.
-        ExcelRowData row = createRow("10301", "INR", "1102003001", "500.12345", "Debit");
-
-        validator.runFormatCheck(Collections.singletonList(row));
-
-        assertTrue(row.formatErrors.contains("Exceeded maximum 16 digits or 4 decimal places."));
-    }
-
-    @Test
-    public void testFormatCheck_InvalidRemarksFails() {
-        VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
-        ExcelRowData row = createRow("10301", "INR", "1102003001", "500.00", "Debit");
-        
-        // Starts with a space
-        row.remarks = " Invalid Remarks";
-        validator.runFormatCheck(Collections.singletonList(row));
-        assertTrue(row.formatErrors.contains("Remarks cannot start with a space or contain consecutive spaces."));
-
-        // Has special characters not allowed (like @ or #)
-        row.formatErrors.clear();
-        row.remarks = "Payment #123";
-        validator.runFormatCheck(Collections.singletonList(row));
-        assertTrue(row.formatErrors.contains("Allowed 2-30 chars: Alphanumeric, spaces, and / & ( ) , . -"));
-    }
-
-    @Test
-    public void testFormatCheck_InvalidProductCodeFails() {
-        VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
-        ExcelRowData row = createRow("10301", "INR", "1102003001", "500.00", "Debit");
-        
-        // Product code must be numbers up to 8 digits
-        row.productCode = "ABCDEFGH"; 
-        
-        validator.runFormatCheck(Collections.singletonList(row));
-        assertTrue(row.formatErrors.contains("Product code must be up to 8 digits or left blank."));
-    }
-
-    @Test
-    public void testFormatCheck_InvalidLengthsFail() {
-        VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
-        
-        // Currency is not 3 chars, CGL is not 10 digits, Branch is not 5 chars
-        ExcelRowData row = createRow("103", "IN", "11020", "500.00", "Debit");
-        
-        validator.runFormatCheck(Collections.singletonList(row));
-
-        assertTrue(row.formatErrors.contains("Currency code must be exactly 3 characters."));
-        assertTrue(row.formatErrors.contains("CGL must be exactly 10 digits."));
-        assertTrue(row.formatErrors.contains("Branch code must be exactly 5 alphanumeric characters."));
-    }
-
-    // ==========================================================
-    // DATABASE CHECK TESTS
-    // ==========================================================
-
-    @Test
-    public void testDatabaseCheck_ValidDataPasses() {
-        VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
-        // All these are inside our FakeMasterService
-        ExcelRowData row = createRow("10301", "INR", "1102003001", "500.00", "Debit");
-
-        validator.runDbCheck(Collections.singletonList(row));
-
-        assertTrue(row.dbErrors.isEmpty(), "Valid master data should not produce DB errors.");
-    }
-
-    @Test
-    public void testDatabaseCheck_InvalidMasterDataFails() {
-        VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
-        // Branch 99999, Currency USD, CGL 9999999999 are NOT in fake service
-        ExcelRowData row = createRow("99999", "USD", "9999999999", "500.00", "Debit");
-
-        validator.runDbCheck(Collections.singletonList(row));
-
-        assertTrue(row.dbErrors.contains("Branch is inactive or not found: 99999"));
-        assertTrue(row.dbErrors.contains("Currency is inactive or not found: USD"));
-        assertTrue(row.dbErrors.contains("CGL is inactive or not found: 9999999999"));
-    }
-
-    // ==========================================================
-    // BALANCE CHECK TESTS
-    // ==========================================================
-
-    @Test
-    public void testBalanceCheck_PerfectlyBalancedPasses() {
-        VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
-        
-        // Total Debit: 1000.00 | Total Credit: 1000.00 -> Balanced!
-        ExcelRowData creditRow = createRow("10301", "INR", "1102003001", "1000.00", "Credit");
-        ExcelRowData debitRow1 = createRow("10301", "INR", "1102003002", "700.00", "Debit");
-        ExcelRowData debitRow2 = createRow("10301", "INR", "1102003002", "300.00", "Debit");
-
-        validator.runBalanceCheck(Arrays.asList(creditRow, debitRow1, debitRow2));
-
-        assertTrue(creditRow.balErrors.isEmpty());
-        assertTrue(debitRow1.balErrors.isEmpty());
-    }
-
-    @Test
-    public void testBalanceCheck_UnbalancedFails() {
-        VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
-        
-        // Total Debit: 900.00 | Total Credit: 1000.00 -> Unbalanced!
-        ExcelRowData creditRow = createRow("10301", "INR", "1102003001", "1000.00", "Credit");
-        ExcelRowData debitRow = createRow("10301", "INR", "1102003002", "900.00", "Debit");
-
-        validator.runBalanceCheck(Arrays.asList(creditRow, debitRow));
-
-        assertTrue(creditRow.balErrors.contains("Branch, Currency, and CGL-wise balance mismatch."));
-        assertTrue(debitRow.balErrors.contains("Branch, Currency, and CGL-wise balance mismatch."));
-    }
-
-    @Test
-    public void testBalanceCheck_MissingDebitOrCreditFails() {
-        VoucherRuleValidator validator = new VoucherRuleValidator(createFakeMasterService());
-        
-        // Only Debits! Even if there are two rows, there is no Credit entry for this branch.
-        ExcelRowData debitRow1 = createRow("10301", "INR", "1102003001", "500.00", "Debit");
-        ExcelRowData debitRow2 = createRow("10301", "INR", "1102003002", "500.00", "Debit");
-
-        validator.runBalanceCheck(Arrays.asList(debitRow1, debitRow2));
-
-        assertTrue(debitRow1.balErrors.contains("Branch must have at least one Debit and one Credit entry."));
-        assertTrue(debitRow2.balErrors.contains("Branch must have at least one Debit and one Credit entry."));
-    }
+// --- ADD THIS STRICT AUDIT CHECK ---
+if (successfulRowsCount.get() != totalRows) {
+    throw new CustomExceptions.DatabaseOperationException(
+        "Data Integrity Failure: Expected " + totalRows + " rows but only inserted " + successfulRowsCount.get()
+    );
 }
+
+// Proceed to update status to 'P' and notify checker
+
+```
+By adding that one if statement, you guarantee that it is mathematically impossible for a batch to enter the workflow if it is missing even a single row of data.
+Fixing these three items will elevate this code from "working" to "bulletproof."
+Regarding the first issue—the Auto-Retry Paradox—does your system actually have a background @Scheduled job built to pick up failed executions, or do you want the Checkers to manually retry them?
