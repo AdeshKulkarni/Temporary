@@ -1,47 +1,52 @@
-Ah, the classic 5.5-hour timezone offset! This happens because your Spring Boot application is likely running on a server (or in a Docker container) that defaults to the **UTC** timezone, while you need it to record time in **IST (UTC +5:30)**.
-Because we were so focused on the database locks in the previous steps, you missed the timezone fix I provided earlier for your bulk worker.
-Here are the **two exact things** you need to change to permanently kill this 5.5-hour bug.
-### 1. Fix the Bulk Insert Time (VoucherAsyncWorker.java)
-In your bulk worker, you are currently converting an IST time object into an Instant. When Java's JDBC driver sees an Instant, it converts it *back* to the server's default timezone (UTC) before saving it to Oracle!
-**Open VoucherAsyncWorker.java and find this exact code inside processChunkRaw (around line 220):**
+This is a fantastic catch. You are thinking exactly like a Lead Engineer.
+Currently, if the Oracle database procedure crashes *after* the Checker clicks "Approve", your handleAsyncApprovalError method in VoucherAsyncWorker.java only sends a notification to the **Checker** (executorId).
+The **Maker** (the person who originally uploaded it) is completely blind to the fact that their batch just failed in the background!
+To fix this, we need to update the handleAsyncApprovalError method to fetch the Maker's ID (CREATED_BY) and explicitly send a notification to **both** the Maker and the Checker.
+### The Fix in VoucherAsyncWorker.java
+Find your existing handleAsyncApprovalError method (it is near the bottom of the file) and **replace the entire method with this updated version:**
 ```java
-// --- FIND THESE TWO LINES ---
-java.time.ZonedDateTime istTime = java.time.ZonedDateTime.now(java.time.ZoneId.of("Asia/Kolkata"));
-ps.setTimestamp(2, java.sql.Timestamp.from(istTime.toInstant()));         // REQ_DATE
+    private void handleAsyncApprovalError(String batchId, String executorId, RequestStatus actionStatus, String msg) {
+        // 1. Revert the batch to PENDING so it isn't stuck
+        jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
+        progressService.sendProgress(batchId, executorId, 0, "FAILED", msg);
 
-```
-**REPLACE them with this:**
-```java
-// --- REPLACE WITH THIS ---
-// This forces the exact IST wall-clock time into the database without UTC conversion
-java.time.LocalDateTime istTime = java.time.LocalDateTime.now(java.time.ZoneId.of("Asia/Kolkata"));
-ps.setTimestamp(2, java.sql.Timestamp.valueOf(istTime));         // REQ_DATE
+        String vid = null;
+        String creatorId = null;
 
-```
-### 2. The "Silver Bullet" Global Timezone Fix
-If your bulk rows are now fixing themselves, but you notice that your *Batch Creation Time* or *Workflow Approval Time* is still 5 hours behind, it is because you have LocalDateTime.now() scattered across your VoucherCommandService and VoucherWorkflowEngine.
-Instead of hunting down every single LocalDateTime.now() and changing it, you can force your entire Spring Boot application to run in the Asia/Kolkata timezone the moment it starts up.
-**Open your main application class** (the one with @SpringBootApplication, usually VoucherServiceApplication.java or similar) and add this method:
-```java
-import jakarta.annotation.PostConstruct;
-import java.util.TimeZone;
+        // 2. Fetch BOTH the VID and the original Creator (Maker)
+        try {
+            Map<String, Object> batchInfo = jdbcTemplate.queryForMap(
+                "SELECT VID_FK, CREATED_BY FROM VOUCHER_POSTING WHERE BATCH_ID = ?", batchId
+            );
+            vid = (String) batchInfo.get("VID_FK");
+            creatorId = (String) batchInfo.get("CREATED_BY");
+        } catch (org.springframework.dao.EmptyResultDataAccessException e) {
+            log.warn("Batch info not found for Batch: {}", batchId);
+        }
 
-@SpringBootApplication
-public class VoucherServiceApplication {
+        // 3. Log the system failure
+        workflowEngine.logWorkflowAction(batchId, vid, "Execution Failed", "SYSTEM", msg, null);
 
-    public static void main(String[] args) {
-        SpringApplication.run(VoucherServiceApplication.class, args);
+        String actionName = (actionStatus == RequestStatus.ACCEPTED) ? "approve" : "reject";
+        
+        try {
+            // 4A. Notify the Checker (The person who clicked Approve/Reject)
+            String checkerMsg = String.format("SYSTEM ERROR: Failed to %s Journal Batch '%s'. It has been returned to PENDING.", actionName, batchId);
+            notificationWriterService.createNotification(executorId, null, checkerMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
+            
+            // 4B. Notify the Maker (The person who created the batch)
+            if (creatorId != null && !creatorId.equalsIgnoreCase(executorId)) {
+                String makerMsg = String.format("SYSTEM ERROR: Final execution failed for your Batch '%s' after approval. It is back in PENDING status.", batchId);
+                notificationWriterService.createNotification(creatorId, null, makerMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
+            }
+        } catch (Exception e) {
+            log.warn("NOTIFICATION_WARN | Batch: {} | Could not send failure notifications", batchId);
+        }
     }
 
-    // --- ADD THIS METHOD ---
-    @PostConstruct
-    public void init() {
-        // Forces the entire Spring Boot app to use IST, completely bypassing server UTC defaults
-        TimeZone.setDefault(TimeZone.getTimeZone("Asia/Kolkata"));
-    }
-}
-
 ```
-### Why this solves it forever:
-By applying the @PostConstruct fix, every time your code calls LocalDateTime.now()—whether it's generating a journal request date, logging a workflow action, or setting the batch execution time—it will automatically pull the correct local time, regardless of where your server is physically located.
-Make those two changes, restart your server, and your 5.5-hour time travel bug will be gone for good!
+### Why this is the perfect solution:
+ 1. **Full Visibility:** Now, if Oracle throws an exception, hits a timeout, or a database lock occurs during PROCESS_JOURNAL_BATCH, the Checker gets a popup saying "Your approval failed," AND the Maker gets an alert saying "Your batch crashed during execution."
+ 2. **Safe Fallback:** By reverting the status to 'P' (Pending), the system allows the Checker to try approving it again later when the database issue is resolved.
+ 3. **No Duplicate Alerts:** The if (!creatorId.equalsIgnoreCase(executorId)) check ensures that if, for some crazy reason, the system allowed the Maker to approve their own batch, they wouldn't get two identical emails.
+This covers the final gap in your unhappy path. The system will now gracefully handle and communicate failures at every single stage!
