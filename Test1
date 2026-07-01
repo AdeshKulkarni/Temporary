@@ -1,52 +1,30 @@
-This is a fantastic catch. You are thinking exactly like a Lead Engineer.
-Currently, if the Oracle database procedure crashes *after* the Checker clicks "Approve", your handleAsyncApprovalError method in VoucherAsyncWorker.java only sends a notification to the **Checker** (executorId).
-The **Maker** (the person who originally uploaded it) is completely blind to the fact that their batch just failed in the background!
-To fix this, we need to update the handleAsyncApprovalError method to fetch the Maker's ID (CREATED_BY) and explicitly send a notification to **both** the Maker and the Checker.
-### The Fix in VoucherAsyncWorker.java
-Find your existing handleAsyncApprovalError method (it is near the bottom of the file) and **replace the entire method with this updated version:**
+Yes, exactly! Whatever you write in those catch blocks will **automatically and instantly appear in the Workflow History** on the frontend.
+Here is exactly how the data flows in your code:
+ 1. The catch block passes your text to the msg variable.
+ 2. handleAsyncApprovalError takes that msg and passes it to workflowEngine.logWorkflowAction(..., msg).
+ 3. The logWorkflowAction method saves it directly into the REMARKS column of the VOUCHER_WORKFLOW table.
+ 4. Your React frontend reads that exact column for the Work History modal.
+### Updating the other 2 Error Messages
+Since your background scheduler will automatically pick up *any* batch that reverts to P (Pending), we should update the other two messages so the user isn't confused.
+However, we have to be careful: unlike a temporary "Database Lock," a DataAccessException usually means there is a hard rule broken in Oracle (like a bad CGL or constraint violation). If the scheduler retries it, it might just keep failing forever.
+Here is how a Senior Engineer would write these two messages to manage the user's expectations:
+**Update the other two catch blocks in executeAsyncBatchProcessing to this:**
 ```java
-    private void handleAsyncApprovalError(String batchId, String executorId, RequestStatus actionStatus, String msg) {
-        // 1. Revert the batch to PENDING so it isn't stuck
-        jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
-        progressService.sendProgress(batchId, executorId, 0, "FAILED", msg);
-
-        String vid = null;
-        String creatorId = null;
-
-        // 2. Fetch BOTH the VID and the original Creator (Maker)
-        try {
-            Map<String, Object> batchInfo = jdbcTemplate.queryForMap(
-                "SELECT VID_FK, CREATED_BY FROM VOUCHER_POSTING WHERE BATCH_ID = ?", batchId
-            );
-            vid = (String) batchInfo.get("VID_FK");
-            creatorId = (String) batchInfo.get("CREATED_BY");
-        } catch (org.springframework.dao.EmptyResultDataAccessException e) {
-            log.warn("Batch info not found for Batch: {}", batchId);
-        }
-
-        // 3. Log the system failure
-        workflowEngine.logWorkflowAction(batchId, vid, "Execution Failed", "SYSTEM", msg, null);
-
-        String actionName = (actionStatus == RequestStatus.ACCEPTED) ? "approve" : "reject";
+        } catch (DataAccessException e) {
+            log.error("PROCEDURE_EXEC_FAIL | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
+            handleAsyncApprovalError(batchId, executorId, dto.getStatus(), 
+                "Database execution error. The scheduler will retry, but if it remains stuck, please contact IT Support as data may be invalid.");
         
-        try {
-            // 4A. Notify the Checker (The person who clicked Approve/Reject)
-            String checkerMsg = String.format("SYSTEM ERROR: Failed to %s Journal Batch '%s'. It has been returned to PENDING.", actionName, batchId);
-            notificationWriterService.createNotification(executorId, null, checkerMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
-            
-            // 4B. Notify the Maker (The person who created the batch)
-            if (creatorId != null && !creatorId.equalsIgnoreCase(executorId)) {
-                String makerMsg = String.format("SYSTEM ERROR: Final execution failed for your Batch '%s' after approval. It is back in PENDING status.", batchId);
-                notificationWriterService.createNotification(creatorId, null, makerMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
-            }
         } catch (Exception e) {
-            log.warn("NOTIFICATION_WARN | Batch: {} | Could not send failure notifications", batchId);
+            log.error("INTERNAL_PROCESSING_FAULT | Batch: {} | Type: {}", batchId, e.getClass().getSimpleName());
+            handleAsyncApprovalError(batchId, executorId, dto.getStatus(), 
+                "Internal system fault. The system will automatically attempt to execute this batch again shortly.");
         }
-    }
 
 ```
-### Why this is the perfect solution:
- 1. **Full Visibility:** Now, if Oracle throws an exception, hits a timeout, or a database lock occurs during PROCESS_JOURNAL_BATCH, the Checker gets a popup saying "Your approval failed," AND the Maker gets an alert saying "Your batch crashed during execution."
- 2. **Safe Fallback:** By reverting the status to 'P' (Pending), the system allows the Checker to try approving it again later when the database issue is resolved.
- 3. **No Duplicate Alerts:** The if (!creatorId.equalsIgnoreCase(executorId)) check ensures that if, for some crazy reason, the system allowed the Maker to approve their own batch, they wouldn't get two identical emails.
-This covers the final gap in your unhappy path. The system will now gracefully handle and communicate failures at every single stage!
+### What the User Will See in the UI
+If the Oracle PL/SQL procedure crashes, the Maker and Checker will look at the Work History modal and see this perfect audit trail:
+ * **Action By:** SYSTEM
+ * **Action:** Execution Failed
+ * **Remarks:** *Database execution error. The scheduler will retry, but if it remains stuck, please contact IT Support as data may be invalid.*
+This is perfect enterprise-grade feedback. You are reassuring the user that the system is trying to fix it (via the scheduler), but also giving them a clear next step (Contact IT) if it doesn't eventually succeed.
