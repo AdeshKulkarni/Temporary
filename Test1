@@ -1,48 +1,363 @@
-This is a classic "Hidden Seconds Mismatch" bug that causes terrible User Experience in date/time pickers.
-### Why this is happening
-When you wrote this line:
-minTime={dayjs().add(30, 'minute')}
-You told the TimePicker that the minimum time is exactly 30 minutes from *right now, down to the exact millisecond*.
-For example, if it is 10:00:45 AM, the minTime is evaluated as 10:30:45 AM.
-However, when a user clicks 10:30 on the UI clock dial, the picker sets the selected time to 10:30:00 AM (zero seconds). Because 10:30:00 is technically *before* 10:30:45, MUI immediately flags it as invalid and throws the red error, even though the user clicked what looked like a valid minute!
-### The Fix
-You need to force dayjs to strip the seconds and milliseconds off the minTime calculation so it perfectly matches the zero-second time the user selects from the clock UI.
-Scroll down to **STEP 3** in your code (around line 950) and update your <TimePicker> component to include .startOf('minute'):
-```javascript
-              {/* SMOOTH COLLAPSE FOR TIMEPICKER */}
-              <Collapse in={routingChoice === "SCHEDULE"}>
-                <Box sx={{ p: 3, mb: 4, border: '1px solid', borderColor: 'divider', borderRadius: 2 }}>
-                  <Typography variant="subtitle2" fontWeight="bold" align="left" gutterBottom>
-                    Select Time
-                  </Typography>
-                  <LocalizationProvider dateAdapter={AdapterDayjs}>
-                    <TimePicker
-                      value={scheduledTime}
-                      onChange={(newValue) => setScheduledTime(newValue)}
-                      
-                      // --- THE FIX IS HERE ---
-                      // .startOf('minute') forces seconds to :00 so it perfectly matches the UI selection
-                      minTime={dayjs().add(30, 'minute').startOf('minute')} 
-                      
-                      maxTime={dayjs().endOf('day')}
-                      timeSteps={{ minutes: 1 }}
-                      slotProps={{
-                        textField: {
-                          size: 'medium',
-                          fullWidth: true,
-                          sx: { caretColor: 'transparent' },
-                          helperText: "Execution must be scheduled at least 30 minutes from now, before 11:59 PM today.", 
-                          onKeyDown: (e) => e.preventDefault(),
-                          onPaste: (e) => e.preventDefault(),
-                          inputProps: { readOnly: true }
-                        }
-                      }}
-                    />
-                  </LocalizationProvider>
-                </Box>
-              </Collapse>
 
-```
-### Why does it still show the grayed-out minutes?
-MUI DatePickers will physically render the invalid numbers (like 10:28, 10:29) but gray them out. It does this because removing numbers dynamically from a clock face or a standardized dropdown list causes the UI to jump around unpredictably, which is considered bad accessibility design.
-By adding .startOf('minute'), those past minutes will remain properly disabled, but the exact 30-minute mark (e.g., 10:30) will now be 100% valid and will never trigger that frustrating red outline when clicked!
+package com.fincore.VoucherService.config;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.aop.interceptor.AsyncUncaughtExceptionHandler;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.AsyncConfigurer;
+import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+
+import java.util.concurrent.Executor;
+
+/**
+ * Configures dedicated thread pools for high-volume row processing and chunking.
+ * Implements global error handling for fire-and-forget async tasks.
+ */
+@Configuration
+@EnableAsync
+@EnableScheduling
+@Slf4j
+public class AsyncConfig implements AsyncConfigurer {
+
+
+    @Bean(name = "progressExecutor")
+    public Executor progressExecutor() {
+        log.info("ASYNC_CONFIG_INIT | Initializing Dedicated Progress Thread Pool");
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(5);
+        executor.setMaxPoolSize(10);
+        executor.setQueueCapacity(2000);
+        executor.setThreadNamePrefix("Progress-");
+        executor.initialize();
+        return executor;
+    }
+
+    /**
+     * Dedicated executor for high-volume journal operations (Coordinator pool).
+     * Logic for pool sizing and queue capacity is preserved exactly as established.
+     */
+    @Bean(name = "bulkExecutor")
+    public Executor bulkExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(20);
+        executor.setQueueCapacity(100);
+        executor.setThreadNamePrefix("BulkCoord-");
+        executor.initialize();
+        return executor;
+    }
+    /**
+     * Dedicated worker pool specifically for processing inner batch chunks.
+     * Prevents deadlock by separating chunk processing from the main coordinator threads.
+     */
+    @Bean(name = "chunkWorkerExecutor")
+    public Executor chunkWorkerExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(25);
+        executor.setMaxPoolSize(50);
+        executor.setQueueCapacity(500);
+        executor.setThreadNamePrefix("BulkWriter-");
+        executor.setRejectedExecutionHandler(new java.util.concurrent.ThreadPoolExecutor.CallerRunsPolicy());
+        executor.initialize();
+        return executor;
+    }
+
+    /**
+     * Global handler for uncaught exceptions in @Async methods that return void.
+     * Replaces generic catching with structured, descriptive logging.
+     */
+    @Override
+    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+        return (ex, method, params) -> {
+            log.error("ASYNC_TASK_EXCEPTION | Method: {} | Exception: {}",
+                    method.getName(), ex.getClass().getSimpleName());
+
+            if (ex instanceof org.springframework.dao.DataAccessException) {
+                log.error("ASYNC_DATA_FAILURE | Status: Database connectivity lost in background thread");
+            } else if (ex instanceof NullPointerException) {
+                log.error("ASYNC_LOGIC_FAILURE | Status: Null pointer encountered in async task");
+            }
+            else {
+                log.error("ASYNC_TECHNICAL_FAULT | Status: Unexpected background error");
+            }
+        };
+    }
+}
+
+
+package com.fincore.VoucherService.config;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.CacheManager;
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+
+@Configuration
+@EnableCaching
+@Slf4j
+public class CacheConfig {
+
+    @Bean
+    public CacheManager cacheManager(
+            RedisConnectionFactory connectionFactory,
+            ObjectMapper springDefaultMapper) { // <-- 1. Spring Boot automatically injects the safe mapper here!
+
+        log.info("CACHE_CONFIG_INIT | Using Redis-backed CacheManager for K8s compatibility");
+
+        org.springframework.data.redis.cache.RedisCacheConfiguration config =
+                org.springframework.data.redis.cache.RedisCacheConfiguration.defaultCacheConfig()
+                        .entryTtl(java.time.Duration.ofMinutes(30))
+                        .disableCachingNullValues()
+                        .serializeValuesWith(
+                                org.springframework.data.redis.serializer.RedisSerializationContext.SerializationPair
+                                        // 2. Pass Spring's safe mapper into Redis
+                                        .fromSerializer(new org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer(springDefaultMapper)));
+
+        return org.springframework.data.redis.cache.RedisCacheManager.builder(connectionFactory)
+                .cacheDefaults(config)
+                .withCacheConfiguration("notification_configs",
+                        config.entryTtl(java.time.Duration.ofHours(1)))
+                .build();
+    }
+}
+
+
+
+package com.fincore.VoucherService.config;
+
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.jdbc.DataSourceBuilder;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.jdbc.core.JdbcTemplate;
+import lombok.extern.slf4j.Slf4j;
+
+import javax.sql.DataSource;
+
+/**
+ * Configures the connection to the Data Lake (Delta Lake).
+ * Uses JdbcTemplate for direct SQL execution, suitable for high-volume analytics.
+ */
+@Configuration
+@Slf4j
+public class HiveDbConfig {
+
+    /**
+     * Configures the Hive/Thrift DataSource for Data Lake synchronization.
+     * Connection properties are externalized with the prefix 'spring.datasource.hive'.
+     */
+    @Bean(name = "hiveDataSource")
+    @ConfigurationProperties(prefix = "spring.datasource.hive")
+    public DataSource hiveDataSource() {
+        log.info("HIVE_DB_INIT | Initializing Secondary Hive/Thrift DataSource for Data Lake");
+        return DataSourceBuilder.create().build();
+    }
+
+    /**
+     * Provides a dedicated JdbcTemplate for interacting with the Hive Data Lake.
+     * The @Qualifier ensures the correct secondary datasource is injected.
+     */
+    @Bean(name = "hiveJdbcTemplate")
+    public JdbcTemplate hiveJdbcTemplate(@Qualifier("hiveDataSource") DataSource dataSource) {
+        log.info("HIVE_JDBC_TEMPLATE_INIT | Providing dedicated Hive JdbcTemplate bean");
+        return new JdbcTemplate(dataSource);
+    }
+}
+
+
+package com.fincore.VoucherService.config;
+
+import jakarta.persistence.EntityManagerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.jdbc.DataSourceBuilder;
+import org.springframework.boot.orm.jpa.EntityManagerFactoryBuilder;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.orm.jpa.JpaTransactionManager;
+import org.springframework.orm.jpa.LocalContainerEntityManagerFactoryBean;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.annotation.EnableTransactionManagement;
+import lombok.extern.slf4j.Slf4j;
+
+import javax.sql.DataSource;
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Ensures that all existing JPA Repositories and Entities are correctly mapped to the Oracle database.
+ * Marking beans as @Primary ensures this datasource is the default for injection into existing services.
+ */
+@Configuration
+@EnableTransactionManagement
+@EnableJpaRepositories(
+        basePackages = "com.fincore.VoucherService.Repository",
+        entityManagerFactoryRef = "oracleEntityManagerFactory",
+        transactionManagerRef = "oracleTransactionManager"
+)
+@Slf4j
+public class OracleDbConfig {
+
+    /**
+     * Configures the primary Oracle DataSource.
+     * Connection properties are externalized with the prefix 'spring.datasource.oracle'.
+     */
+    @Primary
+    @Bean(name = "oracleDataSource")
+    @ConfigurationProperties(prefix = "spring.datasource.oracle")
+    public DataSource oracleDataSource() {
+        log.info("ORACLE_DB_INIT | Initializing Primary Oracle DataSource");
+        return DataSourceBuilder.create().build();
+    }
+
+    /**
+     * Configures the EntityManagerFactory for Oracle using Hibernate as the JPA provider.
+     * Preserves original dialect and ddl-auto properties.
+     */
+    @Primary
+    @Bean(name = "oracleEntityManagerFactory")
+    public LocalContainerEntityManagerFactoryBean oracleEntityManagerFactory(
+            EntityManagerFactoryBuilder builder,
+            @Qualifier("oracleDataSource") DataSource dataSource) {
+
+        log.info("ORACLE_EMF_INIT | Building EntityManagerFactory for com.fincore.VoucherService.Models");
+
+        Map<String, Object> properties = new HashMap<>();
+        properties.put("hibernate.dialect", "org.hibernate.dialect.OracleDialect");
+        properties.put("hibernate.hbm2ddl.auto", "validate");
+
+        return builder
+                .dataSource(dataSource)
+                .packages("com.fincore.VoucherService.Models")
+                .persistenceUnit("oracle")
+                .properties(properties)
+                .build();
+    }
+
+    /**
+     * Configures the Transaction Manager for the primary Oracle database.
+     */
+    @Primary
+    @Bean(name = "oracleTransactionManager")
+    public PlatformTransactionManager oracleTransactionManager(
+            @Qualifier("oracleEntityManagerFactory") EntityManagerFactory entityManagerFactory) {
+        log.info("ORACLE_TX_MANAGER_INIT | Initializing JpaTransactionManager for Oracle");
+        return new JpaTransactionManager(entityManagerFactory);
+    }
+
+    /**
+     * Provides a primary JdbcTemplate for direct SQL operations against Oracle.
+     */
+    @Primary
+    @Bean(name = "oracleJdbcTemplate")
+    public JdbcTemplate oracleJdbcTemplate(@Qualifier("oracleDataSource") DataSource dataSource) {
+        log.info("ORACLE_JDBC_TEMPLATE_INIT | Providing primary JdbcTemplate bean");
+        return new JdbcTemplate(dataSource);
+    }
+}
+
+
+package com.fincore.VoucherService.config;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
+
+/**
+ * Configures templates to handle compressed binary data (GZIP).
+ * This strategy prevents Out-Of-Memory (OOM) errors by offloading large
+ * validation datasets to Redis rather than keeping them in the application heap.
+ */
+@Configuration
+@Slf4j
+public class RedisConfig {
+
+    /**
+     * Configures a RedisTemplate specifically for byte array values.
+     * Uses String serialization for keys to ensure they are readable in the Redis CLI,
+     * while keeping values as raw bytes to avoid the overhead of standard Java serialization.
+     */
+    @Bean(name = "byteArrayRedisTemplate")
+    public RedisTemplate<String, byte[]> byteArrayRedisTemplate(RedisConnectionFactory connectionFactory) {
+        log.info("REDIS_CONFIG_INIT | Initializing ByteArrayRedisTemplate for binary data storage");
+
+        RedisTemplate<String, byte[]> template = new RedisTemplate<>();
+        template.setConnectionFactory(connectionFactory);
+
+        // Keys are Strings (e.g., "DATA_UUID") for easy debugging and TTL management
+        template.setKeySerializer(new StringRedisSerializer());
+
+        // Values are kept as raw Byte Arrays (GZIP Compressed) to maximize performance
+        template.setEnableDefaultSerializer(false);
+
+        log.info("REDIS_CONFIG_SUCCESS | ByteArrayRedisTemplate configured with StringKeySerializer and disabled value serialization");
+
+        return template;
+    }
+
+}
+
+
+package com.fincore.VoucherService.config;
+
+import jakarta.persistence.AttributeConverter;
+import jakarta.persistence.Converter;
+import com.fincore.VoucherService.Models.enums.RequestStatus;
+import lombok.extern.slf4j.Slf4j;
+import java.util.stream.Stream;
+
+/**
+ * Automatically maps the RequestStatus enum to its corresponding database code ("P", "A", "R").
+ * This ensures that the database remains decoupled from Java enum naming conventions.
+ */
+@Converter(autoApply = true)
+@Slf4j
+public class RequestStatusConverter implements AttributeConverter<RequestStatus, String> {
+
+    /**
+     * Converts the enum value to its data representation for storage.
+     * Logic preserved: Returns the specific character code (e.g., 'P' for PENDING).
+     */
+    @Override
+    public String convertToDatabaseColumn(RequestStatus status) {
+        if (status == null) {
+            return null;
+        }
+        return status.getCode();
+    }
+
+    /**
+     * Reconstructs the enum value from the database character code.
+     * Logic preserved: Uses a stream to find the matching enum constant.
+     * @throws IllegalArgumentException if an unrecognized code is encountered in the database.
+     */
+    @Override
+    public RequestStatus convertToEntityAttribute(String code) {
+        if (code == null) {
+            return null;
+        }
+
+        return Stream.of(RequestStatus.values())
+                .filter(status -> status.getCode().equals(code))
+                .findFirst()
+                .orElseThrow(() -> {
+                    log.error("DB_INTEGRITY_ERROR | Status: UNKNOWN_CODE_ENCOUNTERED | Value: {}", code);
+                    return new IllegalArgumentException("Unknown status code found in database: " + code);
+                });
+    }
+}
+
+
