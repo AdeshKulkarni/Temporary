@@ -1,55 +1,109 @@
-Let's knock out the Distributed State Race Condition in **ValidationStateManager.java**.
-Since your application is utilizing Redis, you are preparing for a multi-server (or multi-pod) environment. The Java synchronized keyword only locks memory inside a single server. If Pod A and Pod B both try to update the progress bar at the exact same millisecond, one of those updates will overwrite the other.
-We will replace the JVM lock with a **Redis Distributed Spin Lock**. This forces the threads across all servers to politely wait in line for their turn to update the state.
+Let's tackle the second issue: **The Master Data "DB Hammer"** in **ValidationMasterService.java**.
+When 10 users upload files at once, your VoucherBulkValidationService runs runDbCheck, which asks this master service for all the Branches, Currencies, and CGLs. Without caching, your backend will blast the Oracle database with 30 heavy SELECT queries at the exact same millisecond.
+Since you already set up a beautiful Redis @EnableCaching architecture in your CacheConfig.java, we just need to activate it here!
 ### The Fix
-Open **ValidationStateManager.java**. Find your updateState method and replace the entire method with this updated block:
+Open **ValidationMasterService.java**. You just need to add the @Cacheable annotation to your three methods.
+Here is the updated class. Replace your existing methods with these:
 ```java
-    // 1. REMOVE the 'synchronized' keyword from the method signature
-    public void updateState(String requestId, Consumer<BulkUploadStateDto> updater) {
-        String lockKey = "LOCK_STATE_" + requestId;
-        int maxRetries = 50; // Try for ~2.5 seconds total
-        int delayMs = 50;
+package com.fincore.VoucherService.Service;
 
-        // 2. Implement a Distributed Spin Lock
-        for (int i = 0; i < maxRetries; i++) {
-            // Attempt to acquire a 5-second lock in Redis
-            Boolean acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, new byte[0], 5, TimeUnit.SECONDS);
-            
-            if (Boolean.TRUE.equals(acquired)) {
-                try {
-                    // --- CRITICAL SECTION: Safe from all other server pods ---
-                    BulkUploadStateDto state = getStatusFromRedis(requestId);
-                    if (state == null) {
-                        state = new BulkUploadStateDto();
-                        state.setRequestId(requestId);
-                    }
-                    updater.accept(state);
-                    saveStatusToRedis(requestId, state);
-                    return; // Success, exit the loop
-                    // ---------------------------------------------------------
-                } finally {
-                    // 3. ALWAYS release the lock so the next thread can proceed
-                    redisTemplate.delete(lockKey);
-                }
-            }
-            
-            // 4. Lock was busy, sleep for 50ms and try again
-            try {
-                Thread.sleep(delayMs);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                log.error("STATE_UPDATE_INTERRUPTED | ReqID: {}", requestId);
-                return;
-            }
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.dao.DataAccessException;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class ValidationMasterService {
+
+    @Autowired
+    @Qualifier("oracleJdbcTemplate")
+    private JdbcTemplate jdbcTemplate;
+
+    /**
+     * Fetches all active branch codes.
+     * Cached in Redis to prevent database hammering during concurrent bulk uploads.
+     */
+    @Cacheable(value = "master_branches", unless = "#result.isEmpty()")
+    public Set<String> getAllActiveBranches() {
+        long start = System.currentTimeMillis();
+        String sql = "SELECT CODE FROM BRANCH_MASTER WHERE STATUS = 1";
+
+        try {
+            List<String> list = jdbcTemplate.query(con -> {
+                var ps = con.prepareStatement(sql);
+                ps.setFetchSize(5000);
+                return ps;
+            }, (rs, rowNum) -> rs.getString(1));
+
+            log.info("MASTER_DATA_LOADED | Type: BRANCHES | Count: {} | Duration: {}ms", list.size(), System.currentTimeMillis() - start);
+            return new HashSet<>(list);
+
+        } catch (DataAccessException e) {
+            log.error("MASTER_DATA_FETCH_FAIL | Type: BRANCHES | Reason: {}", e.getMessage());
+            return new HashSet<>(); 
         }
-        
-        // 5. Failsafe if the system is completely gridlocked
-        log.error("STATE_UPDATE_TIMEOUT | ReqID: {} | Status: Failed to acquire distributed lock after {} attempts", requestId, maxRetries);
     }
 
+    /**
+     * Fetches all active currency codes.
+     */
+    @Cacheable(value = "master_currencies", unless = "#result.isEmpty()")
+    public Set<String> getAllActiveCurrencies() {
+        long start = System.currentTimeMillis();
+        String sql = "SELECT CURRENCY_CODE FROM CURRENCY_MASTER WHERE FLAG = 1";
+
+        try {
+            List<String> list = jdbcTemplate.query(con -> {
+                var ps = con.prepareStatement(sql);
+                ps.setFetchSize(1000);
+                return ps;
+            }, (rs, rowNum) -> rs.getString(1));
+
+            log.info("MASTER_DATA_LOADED | Type: CURRENCIES | Count: {} | Duration: {}ms", list.size(), System.currentTimeMillis() - start);
+            return new HashSet<>(list);
+
+        } catch (DataAccessException e) {
+            log.error("MASTER_DATA_FETCH_FAIL | Type: CURRENCIES | Reason: {}", e.getMessage());
+            return new HashSet<>();
+        }
+    }
+
+    /**
+     * Fetches all active CGL numbers.
+     */
+    @Cacheable(value = "master_cgls", unless = "#result.isEmpty()")
+    public Set<String> getAllActiveCgls() {
+        long start = System.currentTimeMillis();
+        String sql = "SELECT CGL_NUMBER FROM CGL_MASTER WHERE STATUS = 1";
+
+        try {
+            List<String> list = jdbcTemplate.query(con -> {
+                var ps = con.prepareStatement(sql);
+                ps.setFetchSize(2000);
+                return ps;
+            }, (rs, rowNum) -> rs.getString(1));
+
+            log.info("MASTER_DATA_LOADED | Type: CGLS | Count: {} | Duration: {}ms", list.size(), System.currentTimeMillis() - start);
+            return new HashSet<>(list);
+
+        } catch (DataAccessException e) {
+            log.error("MASTER_DATA_FETCH_FAIL | Type: CGLS | Reason: {}", e.getMessage());
+            return new HashSet<>();
+        }
+    }
+}
+
 ```
-### Why this is production-ready:
- * **True Distributed Safety:** setIfAbsent is an atomic Redis command. It guarantees that only one thread, across your entire server cluster, can hold the lock at a time.
- * **Spin Lock Loop:** Instead of just failing if the lock is busy, the thread sleeps for 50 milliseconds and asks again. This creates a highly efficient micro-queue for your UI progress updates.
- * **Auto-Expiration:** Passing 5, TimeUnit.SECONDS ensures that if a server completely crashes while holding the lock, Redis will automatically clear it 5 seconds later, preventing a permanent deadlock.
-Let me know when you have this pasted in, and we will move right into caching the Master Data queries!
+### Why this is the perfect implementation:
+Notice the unless = "#result.isEmpty()" parameter. This is a crucial safety net! If the Oracle database blips for a split second and returns an empty list, this prevents Spring from caching that empty list into Redis (which would cause all subsequent uploads to fail validation). It ensures only valid, populated master data is kept in memory.
+Whenever you are ready, let's move to **Issue 3: The Redundant Monitor Locks (Thread Contention)** in VoucherRuleValidator.java!
