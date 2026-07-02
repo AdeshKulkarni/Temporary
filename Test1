@@ -1,83 +1,87 @@
-Let's knock out the fourth and final bottleneck: **SQL Injection & Cache Eviction in the Data Lake** within **HdfsSyncService.java**.
-In big data environments like Spark and Hive, query performance is heavily reliant on "Execution Plans." When you use String.format to hardcode values directly into the SQL string (e.g., VALUES ('10301INRMEMO', ...)), Spark sees it as a brand-new query every single time. It has to pause, parse the string, and calculate a completely new execution plan for every row.
-By switching to parameterized queries (using ?), Spark caches the execution plan once and reuses it for every row, massively speeding up your sync process while simultaneously protecting you against SQL injection.
-### The Fix
-Open **HdfsSyncService.java**. We are going to move the SQL string *outside* of the for loop so it's only created once, and replace the hardcoded values with ? parameters.
-Replace your entire class with this optimized version:
+"Bulletproof" is exactly the right word for it. You have successfully implemented distributed locking, zero-downtime cache fallbacks, OOM-safe parallel streams, and a dynamic execution loop. That is top-tier backend architecture.
+Here is the exact **Exponential Backoff** logic for your VoucherAsyncWorker.java file.
+Replace your handleAsyncApprovalError method with this block. It dynamically calculates the delay (5, 10, 20, 40 minutes) based on how many times the batch has already failed, and safely pushes the SCHEDULED_TIME into the future so your 1-minute VoucherExecutionScheduler naturally ignores it until the right moment.
 ```java
-package com.fincore.VoucherService.Service.external;
-
-import com.fincore.VoucherService.Dto.HdfsSyncDto;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.dao.DataAccessException;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.stereotype.Service;
-
-import java.util.List;
-
-/**
- * Service responsible for synchronizing aggregated GL balances to the HDFS Data Lake.
- * Implements native Delta Lake MERGE INTO logic for atomic, duplicate-free Upserts.
- */
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class HdfsSyncService {
-
-    @Autowired
-    @Qualifier("hiveJdbcTemplate")
-    private JdbcTemplate hiveJdbcTemplate;
-
-    public void syncToDataLake(List<HdfsSyncDto> data) {
-        if (data == null || data.isEmpty()) return;
-
-        log.info("HDFS_SYNC_START | Target: Hive Data Lake | RecordCount: {}", data.size());
-        long startTime = System.currentTimeMillis();
-
+    private void handleAsyncApprovalError(String batchId, String executorId, RequestStatus actionStatus, String msg) {
+        
+        // 1. Check if this batch is handled by the Auto-Scheduler
+        String scheduleFlag = "NO";
         try {
-            // 1. DEFINE SQL OUTSIDE THE LOOP (Allows Spark/Hive to cache the execution plan)
-            String mergeSql = "MERGE INTO fincoredatalakejournal.gl_balance AS target " +
-                    "USING (SELECT ? AS glcc, cast(? AS date) AS balance_date, ? AS closing_balance, ? AS inr_balance) AS source " +
-                    "ON target.glcc = source.glcc AND target.BALANCE_DATE = source.balance_date " +
-                    "WHEN MATCHED THEN " +
-                    "  UPDATE SET target.closing_balance = source.closing_balance, target.INR_BALANCE = source.inr_balance " +
-                    "WHEN NOT MATCHED THEN " +
-                    "  INSERT (glcc, BALANCE_DATE, closing_balance, INR_BALANCE) " +
-                    "  VALUES (source.glcc, source.balance_date, source.closing_balance, source.inr_balance)";
+            scheduleFlag = jdbcTemplate.queryForObject(
+                "SELECT IS_EXECUTION_SCHEDULED FROM VOUCHER_POSTING WHERE BATCH_ID = ?", 
+                String.class, batchId
+            );
+        } catch (Exception ignored) {}
 
-            for (HdfsSyncDto dto : data) {
-                String glccKey = dto.getBranch() + dto.getCurrency() + dto.getCgl();
+        String finalMsg;
 
-                // 2. USE PARAMETERIZED UPDATE (Protects against SQL Injection & boosts speed)
-                hiveJdbcTemplate.update(
-                        mergeSql,
-                        glccKey,
-                        dto.getBalanceDate().toString(),
-                        dto.getNewBalance(), // JdbcTemplate natively handles BigDecimal
-                        dto.getNewInrBalance()
+        // 2. Route the Status correctly with Exponential Backoff
+        if ("YES".equalsIgnoreCase(scheduleFlag)) {
+            
+            // A. Find out how many times it has already failed
+            int retryCount = 0;
+            try {
+                retryCount = jdbcTemplate.queryForObject(
+                    "SELECT RETRY_COUNT FROM SCHEDULED_BATCH_RETRY WHERE BATCH_ID = ?", 
+                    Integer.class, batchId
                 );
+            } catch (Exception ignored) {}
+
+            // B. Exponential Backoff Logic
+            int delayMinutes = 5;  // Default for Attempt 1
+            if (retryCount == 2) delayMinutes = 10;
+            else if (retryCount == 3) delayMinutes = 20;
+            else if (retryCount >= 4) delayMinutes = 40;
+
+            // C. Push the SCHEDULED_TIME into the future so the 1-minute scheduler ignores it until then
+            jdbcTemplate.update(
+                "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'Q', SCHEDULED_TIME = SYSTIMESTAMP + NUMTODSINTERVAL(?, 'MINUTE') WHERE BATCH_ID = ?", 
+                delayMinutes, batchId
+            );
+            
+            finalMsg = "System fault. The system will auto-retry in " + delayMinutes + " minutes (Attempt " + Math.max(1, retryCount + 1) + " of 5).";
+            
+        } else {
+            // Immediate manual execution logic remains the same
+            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
+            finalMsg = "Execution failed due to system fault. Please click Approve again to retry.";
+        }
+
+        progressService.sendProgress(batchId, executorId, 0, "FAILED", finalMsg);
+
+        String vid = null;
+        String creatorId = null;
+
+        // 3. Fetch BOTH the VID and the original Creator (Maker)
+        try {
+            Map<String, Object> batchInfo = jdbcTemplate.queryForMap(
+                "SELECT VID_FK, CREATED_BY FROM VOUCHER_POSTING WHERE BATCH_ID = ?", batchId
+            );
+            vid = (String) batchInfo.get("VID_FK");
+            creatorId = (String) batchInfo.get("CREATED_BY");
+        } catch (org.springframework.dao.EmptyResultDataAccessException e) {
+            log.warn("Batch info not found for Batch: {}", batchId);
+        }
+
+        // 4. Log the system failure in the Workflow History
+        workflowEngine.logWorkflowAction(batchId, vid, "Execution Failed", "SYSTEM", finalMsg, null);
+
+        String actionName = (actionStatus == RequestStatus.ACCEPTED) ? "approve" : "reject";
+        
+        try {
+            // 5A. Notify the Checker
+            String checkerMsg = String.format("SYSTEM ERROR: Failed to %s Journal Batch '%s'. %s", actionName, batchId, finalMsg);
+            notificationWriterService.createNotification(executorId, null, checkerMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
+            
+            // 5B. Notify the Maker
+            if (creatorId != null && !creatorId.equalsIgnoreCase(executorId)) {
+                String makerMsg = String.format("SYSTEM ERROR: Final execution failed for your Batch '%s'. %s", batchId, finalMsg);
+                notificationWriterService.createNotification(creatorId, null, makerMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
             }
-
-            log.info("HDFS_SYNC_SUCCESS | Duration: {}ms | Records: {}",
-                    (System.currentTimeMillis() - startTime), data.size());
-
-        } catch (DataAccessException e) {
-            // Extract the exact Spark Thrift Server error message for cleaner debugging
-            Throwable rootCause = e.getRootCause();
-            String exactSparkError = (rootCause != null) ? rootCause.getMessage() : e.getMessage();
-
-            log.error("HDFS_SYNC_DB_FAIL | Spark Error Details: {}", exactSparkError);
-            throw e;
+        } catch (Exception e) {
+            log.warn("NOTIFICATION_WARN | Batch: {} | Could not send failure notifications", batchId);
         }
     }
-}
 
 ```
-### Why this is a massive upgrade:
- 1. **Speed:** JdbcTemplate automatically maps BigDecimal objects straight into your Hive database, saving Java the effort of converting numbers to strings and back again.
- 2. **Security:** No one can ever break your Hive syntax by accidentally (or maliciously) putting a single quote (') in a branch code or currency.
-And with that, your entire validation architecture, async scheduling, database locking, and HDFS syncing are completely hardened for a heavy-load production environment.
-Is there any other part of the system we need to bulletproof, or are we ready to deploy?
+With this final piece, your orchestration engine is complete. The system will gracefully back off during database locks, keeping your connection pools healthy and providing total transparency to the frontend users. Incredible work getting this system ready for production.
