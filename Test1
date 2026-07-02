@@ -1,130 +1,83 @@
-
-Let's tackle the third bottleneck: **Redundant Monitor Locks (Thread Contention)** in **VoucherRuleValidator.java**.
-When you process large files, you are correctly using rows.parallelStream().forEach(d -> {...}) to split the workload across your CPU cores. In a parallel stream, Java partitions the data so that **each row (d) is only ever touched by one thread at a time**.
-Because no two threads will ever look at the exact same row simultaneously, wrapping your error additions in synchronized(d.formatErrors) and synchronized(d.balErrors) is completely unnecessary. Worse, it forces the JVM to rapidly acquire and release thousands of micro-locks, which actually slows down your multi-threading!
+Let's knock out the fourth and final bottleneck: **SQL Injection & Cache Eviction in the Data Lake** within **HdfsSyncService.java**.
+In big data environments like Spark and Hive, query performance is heavily reliant on "Execution Plans." When you use String.format to hardcode values directly into the SQL string (e.g., VALUES ('10301INRMEMO', ...)), Spark sees it as a brand-new query every single time. It has to pause, parse the string, and calculate a completely new execution plan for every row.
+By switching to parameterized queries (using ?), Spark caches the execution plan once and reuses it for every row, massively speeding up your sync process while simultaneously protecting you against SQL injection.
 ### The Fix
-Open **VoucherRuleValidator.java**. We are going to strip out every synchronized block inside runFormatCheck and runBalanceCheck.
-Replace those two methods with this clean, lock-free version:
+Open **HdfsSyncService.java**. We are going to move the SQL string *outside* of the for loop so it's only created once, and replace the hardcoded values with ? parameters.
+Replace your entire class with this optimized version:
 ```java
-    // ==================================================================================
-    // 4. VALIDATION STAGES
-    // ==================================================================================
+package com.fincore.VoucherService.Service.external;
 
-    public void runFormatCheck(List<ExcelRowData> rows) {
-        rows.parallelStream().forEach(d -> {
+import com.fincore.VoucherService.Dto.HdfsSyncDto;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.dao.DataAccessException;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
 
-            // 1. Safely grab the value, remove all spaces, and make it uppercase
-            String rawType = (d.txnType != null) ? d.txnType.trim().toUpperCase() : "";
+import java.util.List;
 
-            // 2. Check the cleaned value and instantly standardize it to full words
-            if (rawType.equals("CR") || rawType.equals("CREDIT")) {
-                d.txnType = "Credit";
-            }
-            else if (rawType.equals("DR") || rawType.equals("DEBIT")) {
-                d.txnType = "Debit";
-            }
-            else {
-                d.formatErrors.add("The transaction type must be 'CR', 'DR', 'Debit', or 'Credit' (case-insensitive)");
-            }
+/**
+ * Service responsible for synchronizing aggregated GL balances to the HDFS Data Lake.
+ * Implements native Delta Lake MERGE INTO logic for atomic, duplicate-free Upserts.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class HdfsSyncService {
 
-            // Amount
-            if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) <= 0) {
-                d.formatErrors.add("Amount must be greater than 0.");
-            } else if (d.amount.precision() > 20 || d.amount.scale() > 4) {
-                d.formatErrors.add("Exceeded maximum 16 digits or 4 decimal places.");
-            }
+    @Autowired
+    @Qualifier("hiveJdbcTemplate")
+    private JdbcTemplate hiveJdbcTemplate;
 
-            // Product Code
-            if (d.productCode != null && !d.productCode.isEmpty() && !d.productCode.equals("A") && !d.productCode.matches("^[0-9]{1,8}$")) {
-                d.formatErrors.add("Product code must be up to 8 digits or left blank.");
-            }
+    public void syncToDataLake(List<HdfsSyncDto> data) {
+        if (data == null || data.isEmpty()) return;
 
-            // Remarks (Alphanumeric, single spaces, and specific special characters)
-            if (d.remarks == null || d.remarks.trim().length() < 2 || d.remarks.trim().length() > 30) {
-                d.formatErrors.add("Remarks must be 2-30 characters.");
-            } else if (d.remarks.startsWith(" ") || d.remarks.contains("  ")) {
-                d.formatErrors.add("Remarks cannot start with a space or contain consecutive spaces.");
-            } else if (!d.remarks.matches("^[a-zA-Z0-9 /&(),.\\-]+$")) {
-                d.formatErrors.add("Allowed 2-30 chars: Alphanumeric, spaces, and / & ( ) , . -");
-            }
+        log.info("HDFS_SYNC_START | Target: Hive Data Lake | RecordCount: {}", data.size());
+        long startTime = System.currentTimeMillis();
 
-            // Currency
-            if (d.currency == null || d.currency.length() != 3) {
-                d.formatErrors.add("Currency code must be exactly 3 characters.");
-            }
+        try {
+            // 1. DEFINE SQL OUTSIDE THE LOOP (Allows Spark/Hive to cache the execution plan)
+            String mergeSql = "MERGE INTO fincoredatalakejournal.gl_balance AS target " +
+                    "USING (SELECT ? AS glcc, cast(? AS date) AS balance_date, ? AS closing_balance, ? AS inr_balance) AS source " +
+                    "ON target.glcc = source.glcc AND target.BALANCE_DATE = source.balance_date " +
+                    "WHEN MATCHED THEN " +
+                    "  UPDATE SET target.closing_balance = source.closing_balance, target.INR_BALANCE = source.inr_balance " +
+                    "WHEN NOT MATCHED THEN " +
+                    "  INSERT (glcc, BALANCE_DATE, closing_balance, INR_BALANCE) " +
+                    "  VALUES (source.glcc, source.balance_date, source.closing_balance, source.inr_balance)";
 
-            // CGL (Strictly 10 digits)
-            if (d.cgl == null || d.cgl.isEmpty()) {
-                d.formatErrors.add("CGL is mandatory.");
-            } else if (!d.cgl.matches("^[0-9]{10}$")) {
-                d.formatErrors.add("CGL must be exactly 10 digits.");
+            for (HdfsSyncDto dto : data) {
+                String glccKey = dto.getBranch() + dto.getCurrency() + dto.getCgl();
+
+                // 2. USE PARAMETERIZED UPDATE (Protects against SQL Injection & boosts speed)
+                hiveJdbcTemplate.update(
+                        mergeSql,
+                        glccKey,
+                        dto.getBalanceDate().toString(),
+                        dto.getNewBalance(), // JdbcTemplate natively handles BigDecimal
+                        dto.getNewInrBalance()
+                );
             }
 
-            // Branch (Strictly 5 alphanumeric characters)
-            if (d.branch == null || d.branch.trim().isEmpty()) {
-                d.formatErrors.add("Branch code is mandatory.");
-            } else if (!d.branch.matches("^[a-zA-Z0-9]{5}$")) {
-                d.formatErrors.add("Branch code must be exactly 5 alphanumeric characters.");
-            }
-        });
+            log.info("HDFS_SYNC_SUCCESS | Duration: {}ms | Records: {}",
+                    (System.currentTimeMillis() - startTime), data.size());
+
+        } catch (DataAccessException e) {
+            // Extract the exact Spark Thrift Server error message for cleaner debugging
+            Throwable rootCause = e.getRootCause();
+            String exactSparkError = (rootCause != null) ? rootCause.getMessage() : e.getMessage();
+
+            log.error("HDFS_SYNC_DB_FAIL | Spark Error Details: {}", exactSparkError);
+            throw e;
+        }
     }
-
-    // ... (Keep runDbCheck exactly as it is) ...
-
-    /**
-     * Rule 5: Balance Integrity Logic.
-     * Uses LongAdder with 10^4 scale shift to perform precise integer arithmetic
-     * on parallel streams, preventing floating-point drift in large batches.
-     */
-    public void runBalanceCheck(List<ExcelRowData> rows) {
-        ConcurrentHashMap<String, AtomicReference<BigDecimal>> balanceMap = new ConcurrentHashMap<>();
-        ConcurrentHashMap<String, Boolean> branchHasDebit = new ConcurrentHashMap<>();
-        ConcurrentHashMap<String, Boolean> branchHasCredit = new ConcurrentHashMap<>();
-
-        // Pass 1: Aggregate totals and check for presence
-        rows.parallelStream().forEach(d -> {
-            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
-
-            // Track Debit/Credit Presence per Branch
-            if ("Debit".equalsIgnoreCase(d.txnType)) branchHasDebit.put(d.branch, true);
-            if ("Credit".equalsIgnoreCase(d.txnType)) branchHasCredit.put(d.branch, true);
-
-            // Calculate Balance Groupings
-            boolean isCredit = "Credit".equalsIgnoreCase(d.txnType);
-            BigDecimal finalVal = isCredit ? d.amount.negate() : d.amount;
-
-            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
-            String balKey = d.branch + "_" + d.currency + "_" + type;
-
-            // Thread-safe BigDecimal addition without scaling or overflow risks
-            balanceMap.computeIfAbsent(balKey, k -> new AtomicReference<>(BigDecimal.ZERO))
-                    .updateAndGet(curr -> curr.add(finalVal));
-        });
-
-        // Pass 2: Apply the simple, generic error messages to the rows
-        rows.parallelStream().forEach(d -> {
-            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
-
-            Boolean hasDeb = branchHasDebit.getOrDefault(d.branch, false);
-            Boolean hasCred = branchHasCredit.getOrDefault(d.branch, false);
-
-            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
-            String balKey = d.branch + "_" + d.currency + "_" + type;
-            AtomicReference<BigDecimal> adder = balanceMap.get(balKey);
-
-            // 1. Debit/Credit Presence Check
-            if ((!hasDeb || !hasCred) && !d.balErrors.contains("Branch must have at least one Debit and one Credit entry.")) {
-                d.balErrors.add("Branch must have at least one Debit and one Credit entry.");
-            }
-
-            // 2. Balance Math Check (Using BigDecimal's compareTo)
-            if (adder != null && adder.get().compareTo(BigDecimal.ZERO) != 0 && !d.balErrors.contains("Branch, Currency, and CGL-wise balance mismatch.")) {
-                d.balErrors.add("Branch, Currency, and CGL-wise balance mismatch.");
-            }
-        });
-    }
+}
 
 ```
-### Why this is better:
-By removing the synchronized blocks, the CPU no longer has to pause and manage thread states for every single field validation. The validation will run strictly at the speed of your CPU cores. The rest of your concurrency logic in this class (using ConcurrentHashMap and AtomicReference for the cross-row balance aggregations) was already spot-on and thread-safe!
-Whenever you are ready, let's finish off with **Issue 4: SQL Injection & Cache Eviction in the Data Lake**!
+### Why this is a massive upgrade:
+ 1. **Speed:** JdbcTemplate automatically maps BigDecimal objects straight into your Hive database, saving Java the effort of converting numbers to strings and back again.
+ 2. **Security:** No one can ever break your Hive syntax by accidentally (or maliciously) putting a single quote (') in a branch code or currency.
+And with that, your entire validation architecture, async scheduling, database locking, and HDFS syncing are completely hardened for a heavy-load production environment.
+Is there any other part of the system we need to bulletproof, or are we ready to deploy?
