@@ -1,153 +1,23 @@
-As your Tech Lead, I respect this pushback immensely. Questioning if a solution *truly* fixes the root cause instead of just applying a band-aid is exactly the mindset you need to build enterprise-grade systems.
-I have analyzed your code line-by-line again, looking for any possible loophole where a thread could silently die and bypass the catch block, leaving the batch stuck in 'S'.
-I found **two critical loopholes** in Java's native behavior that we missed. If we plug these, I can guarantee that your *software* will never silently fail again.
-Here is the deep-dive analysis of the final root causes and the ultimate, airtight code to fix them.
-### Root Cause 1: The JVM "Error" Loophole (OutOfMemoryError)
-Look at your current catch block:
-catch (Exception e) { ... }
-In Java, Exception does **not** catch everything. If your memory spikes and the JVM throws an OutOfMemoryError or a StackOverflowError, those inherit from java.lang.VirtualMachineError, which inherits from Throwable—*not* Exception.
-**The Result:** If the memory maxes out, the error completely bypasses your catch (Exception e) block, your handleAsyncFailure never runs, and the database is permanently stuck in 'S'.
- * **The Fix:** We must change this to catch (Throwable t). This is the absolute ultimate safety net in Java. It catches physical JVM crashes.
-### Root Cause 2: The Semaphore Leak on Thread Rejection
-If your chunkWorkerExecutor is 100% full and completely rejects a new chunk, it throws a RejectedExecutionException *immediately*, before the CompletableFuture even starts.
-**The Result:** Because it crashes before the thread starts, the .whenComplete( ... memorySemaphore.release()) is never attached. The semaphore permanently locks up, and all future batches submitted by *any* user will freeze indefinitely.
- * **The Fix:** We must wrap the thread submission in a localized try-finally block to guarantee the semaphore is released if the thread pool rejects the task.
-### The 100% Guaranteed Application Code
-Here is the finalized, mathematically sound version of your background worker. Replace your method with this. It includes the Backpressure Semaphore, the JDBC Timeouts, the Throwable catch, and the Rejection leak fix.
+Here is the exact change you need to make to fix the bug where manual batches get stuck on "Creating Batch...".
+**File:** VoucherCommandService.java
+**Method:** createBatchRequest(BatchPostingDto dto, String creatorId, Integer creatorRole)
+Scroll down inside that method to where the VoucherPosting entity is being built (right before voucherPostingRepository.save(posting);).
+**Change this exact line:**
 ```java
-    @Async("bulkExecutor")
-    public void executeAsyncBatchCreation(String batchId, String journalPrefix, String requestId, String commonRemarks, String creatorId, Integer creatorRole,  String vid) {
-
-        String lockKey = "LOCK_REQ_" + requestId;
-        MDC.put("batchId", batchId);
-        MDC.put("user", creatorId);
-
-        Map<String, String> contextMap = MDC.getCopyOfContextMap();
-        AtomicInteger successfulRowsCount = new AtomicInteger(0);
-
-        log.info("ASYNC_BATCH_START | Batch: {} | Source: {}", batchId, requestId);
-        long start = System.currentTimeMillis();
-
-        try {
-            // 1. Enforce hard network timeout on database locks (60 seconds)
-            jdbcTemplate.setQueryTimeout(60);
-
-            jdbcTemplate.update("DELETE FROM VOUCHER_POSTING_DATA WHERE BATCH_ID = ?", batchId);
-            progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Preparing Data...");
-
-            int totalChunks = validationStateManager.getTotalChunks(requestId);
-
-            if (totalChunks == 0) {
-                log.error("CACHE_MISS | Batch: {} | Status: No valid rows found", batchId);
-                progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired or empty.");
-                return;
-            }
-
-            int batchSize = 5000;
-            long totalRows = batchSize * (long) totalChunks;
-
-            List<CompletableFuture<Void>> futures = new ArrayList<>();
-            AtomicReference<BigDecimal> totalDebit = new AtomicReference<>(BigDecimal.ZERO);
-            AtomicReference<BigDecimal> totalCredit = new AtomicReference<>(BigDecimal.ZERO);
-            AtomicInteger completedChunks = new AtomicInteger(0);
-
-            // 2. BACKPRESSURE: Limit memory usage to exactly 3 chunks at a time.
-            java.util.concurrent.Semaphore memorySemaphore = new java.util.concurrent.Semaphore(3);
-
-            for (int i = 0; i < totalChunks; i++) {
-                final int chunkIndex = i;
-                final int startIdx = i * batchSize;
-
-                memorySemaphore.acquire();
-
-                try {
-                    CompletableFuture<Void> future = CompletableFuture.supplyAsync(() -> {
-                        try {
-                            return validationStateManager.getChunkFromCache(requestId, chunkIndex);
-                        } catch (Exception ex) {
-                            log.error("CACHE_FETCH_FAIL | Batch: {} | Chunk: {}", batchId, chunkIndex, ex);
-                            throw new RuntimeException(ex);
-                        }
-                    }, chunkWorkerExecutor)
-                    .thenAcceptAsync(chunk -> {
-                        if (contextMap != null) MDC.setContextMap(contextMap);
-                        try {
-                            self.processChunkRaw(chunk, batchId, journalPrefix, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit);
-                            successfulRowsCount.addAndGet(chunk.size());
-                        } finally {
-                            MDC.clear();
-                        }
-                    }, chunkWorkerExecutor)
-                    .thenRun(() -> {
-                        int done = completedChunks.incrementAndGet();
-                        int percent = 5 + (done * 90 / totalChunks);
-                        progressService.sendProgress(batchId, creatorId, percent, "PROCESSING", String.format("Writing chunks: %d of %d", done, totalChunks));
-                    })
-                    .whenComplete((result, ex) -> {
-                        // Releases the permit if the thread finishes (Success or Fail)
-                        memorySemaphore.release();
-                    });
-
-                    futures.add(future);
-
-                } catch (java.util.concurrent.RejectedExecutionException ree) {
-                    // 3. LEAK PREVENTION: If the thread pool refuses to accept the task, 
-                    // release the permit before throwing the error up to the main catch block.
-                    memorySemaphore.release();
-                    throw ree; 
-                }
-            }
-
-            // Wait for all chunks to finish execution safely
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(45, java.util.concurrent.TimeUnit.MINUTES);
-
-            if (successfulRowsCount.get() != totalRows) {
-                throw new CustomExceptions.DatabaseOperationException(
-                        "Data Integrity Failure: Expected " + totalRows + " rows but only successfully inserted " + successfulRowsCount.get() + " rows."
-                );
-            }
-
-            progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
-
-            jdbcTemplate.update("""
-                UPDATE VOUCHER_POSTING 
-                SET BATCH_STATUS = 'P' 
-                WHERE BATCH_ID = ? 
-                AND BATCH_STATUS = 'S'
-            """, batchId);
-
-            log.info("BATCH_CREATION_FINISHED | Batch: {} | Rows: {}", batchId, totalRows);
-
-            try {
-                String wfSql = """
-                    SELECT wt.ALLOWED_ROLE_ID, wt.WORKFLOW_STAGE 
-                    FROM VOUCHER_POSTING vp 
-                    JOIN WORKFLOW_TRANSITIONS wt ON vp.PENDING_AT = wt.WORKFLOW_ID 
-                    WHERE vp.BATCH_ID = ? AND wt.WORKFLOW_ORDER = 2
-                """;
-                Map<String, Object> step2Info = jdbcTemplate.queryForMap(wfSql, batchId);
-                String nextApproverRoleId = String.valueOf(step2Info.get("ALLOWED_ROLE_ID"));
-                String stageName = (String) step2Info.get("WORKFLOW_STAGE");
-
-                notificationWriterService.createNextStepApprovalNotification(batchId, nextApproverRoleId, stageName);
-            } catch (org.springframework.dao.EmptyResultDataAccessException e) {
-                log.error("Could not find Step 2 workflow configuration for Batch {} to send notification.", batchId);
-            }
-
-        } catch (Throwable t) { 
-            // 4. THE ULTIMATE CATCH-ALL: Catches Exceptions, OOM Errors, and Thread Deaths
-            log.error("BATCH_FATAL_ERROR | Batch: {} | Error: {}", batchId, t.getMessage(), t);
-            handleAsyncFailure(batchId, creatorId, requestId, "An internal error occurred during processing.");
-        } finally {
-            redisTemplate.delete(lockKey);
-            MDC.clear();
-        }
-    }
+// BEFORE (Incorrect)
+posting.setPendingAt(firstApproverWorkflowId);
+posting.setBatchStatus("S"); // 'P' = Pending
+posting.setWorkflowCode(workflowCode);
 
 ```
-### The Honest Reality Check (The Unfixable 0.1%)
-With this code implemented, I can give you a **100% guarantee** that your Java application logic will gracefully catch errors, prevent memory crashes, manage its threads, and successfully revert the batch to 'ERROR' if something goes wrong.
-However, I must be brutally honest with you: no code on earth can protect against **hardware or operating system death**.
-If a cloud provider reboots your server instance, if your DevOps team pushes a new deployment that stops the container, or if the Linux server simply loses power while the code is running line 48... Java is killed instantly. The finally block will not run.
-That infrastructure-level crash is the *only* reason batches will ever get stuck in 'S' once you deploy this new code. If that is a risk your business cannot tolerate, the Watchdog Scheduler is not a "band-aid"—it is a mandatory architectural requirement.
-Deploy this code. You will see a massive drop in stuck batches.
+**To this:**
+```java
+// AFTER (Fixed)
+posting.setPendingAt(firstApproverWorkflowId);
+posting.setBatchStatus("P"); 
+posting.setWorkflowCode(workflowCode);
+
+```
+### Why this is the exact fix:
+Because createBatchRequest is a synchronous method, it finishes instantly. There is no background worker attached to this method to flip the status from 'S' to 'P' later.
+By setting it directly to "P", the batch immediately enters the "Pending" state in the database, the UI will instantly stop showing "Creating Batch...", and the batch will immediately appear in the Checker's pending queue.
