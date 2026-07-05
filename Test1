@@ -1,37 +1,254 @@
-This is a classic "hardcoded assumption" bug, and the stack trace tells us exactly where it lives!
-Your database inserted the 2 rows perfectly, but the validation logic at the end of the method is doing bad math and failing the batch anyway.
-### The Root Cause: Bad Math in the Worker
-In your VoucherAsyncWorker.java, look at how you are calculating totalRows:
-```java
-int totalChunks = validationStateManager.getTotalChunks(requestId); 
-// ...
-int batchSize = 5000;
-long totalRows = batchSize * (long) totalChunks; // <--- THE BUG IS HERE
+Here are the exact blocks to replace in your React code to fix all 5 issues.
+
+### 1 & 4. Fix Remarks Tooltip and Add Min/Max Length
+
+Find the **Remarks (Individual)** grid item inside your `rows.map` and replace it. This adds the validation text to the tooltip and strictly enforces `minLength: 2` and `maxLength: 30` in the HTML inputs.
+
+**Replace this:**
+
+```javascript
+                        {/* Remarks (Individual) */}
+                        <Grid item size={{ xl: 2.5, lg: 3.5 }}>
+                          <Tooltip title="Enter remarks" placement="top-start">
+                            <TextField
+                              label="Remarks *"
+                              value={row.remarks}
+                              InputLabelProps={{ shrink: true }}
+                              placeholder="Enter remarks..."
+                              fullWidth
+                              inputProps={{ maxLength: 30 }}
+                              disabled={checked}
+// ... rest of remarks TextField
 
 ```
-If a user uploads a file with only **2 rows**, Redis stores it as **1 chunk**.
-Your code does the math: 5000 * 1 = 5000 expected rows.
-Then, it successfully inserts the 2 rows, hits your validation check (2 != 5000), and throws the error!
-### The Exact Fix
-Your VoucherCommandService already knows the true row count (it reads it from Redis and saves it in the RECORDS_COUNT column in the database before calling the async worker). The async worker just needs to read that true number from the database instead of guessing.
-**File:** VoucherAsyncWorker.java
-**Method:** executeAsyncBatchCreation
-**Remove these two lines:**
-```java
-int batchSize = 5000;
-long totalRows = batchSize * (long) totalChunks;
+
+**With this:**
+
+```javascript
+                        {/* Remarks (Individual) */}
+                        <Grid item size={{ xl: 2.5, lg: 3.5 }}>
+                          <Tooltip title="Allowed 2-30 chars: Alphanumeric, spaces, and / & ( ) , . -" placement="top-start">
+                            <TextField
+                              label="Remarks *"
+                              value={row.remarks}
+                              InputLabelProps={{ shrink: true }}
+                              placeholder="Enter remarks..."
+                              fullWidth
+                              inputProps={{ minLength: 2, maxLength: 30 }}
+                              disabled={checked}
 
 ```
-**Replace them with this exact code:**
-```java
-// Fetch the TRUE row count that the Command Service just saved to the database
-Long totalRows = jdbcTemplate.queryForObject(
-    "SELECT NVL(RECORDS_COUNT, 0) FROM VOUCHER_POSTING WHERE BATCH_ID = ?", 
-    Long.class, 
-    batchId
-);
 
-int batchSize = 5000; // Keep this just for the math in the loop offset
+### 3. Fix Currency Dropdown Hiding Behind Tooltip
+
+Find the **Currency** grid item. We will change the Tooltip placement to `top` and force the MUI Dropdown menu to only open *downwards* so they never overlap.
+
+**Replace this:**
+
+```javascript
+                        {/* Currency */}
+                        <Grid item size={{ xl: 1.5, lg: 2 }}>
+                          <Tooltip placement="top-start">
+                            <TextField
+                              select
+// ... inside SelectProps:
+                                MenuProps: {
+                                  PaperProps: {
+                                    style: {
+                                      maxHeight: 250, // Prevents the dropdown from getting too long if you have many currencies
+                                    },
+                                  },
+                                }
 
 ```
-By making this change, the totalRows variable will correctly equal 2. When the loop finishes inserting the 2 rows, successfulRowsCount.get() will also equal 2, the validation will pass, and the batch will successfully move to the 'P' state!
+
+**With this:**
+
+```javascript
+                        {/* Currency */}
+                        <Grid item size={{ xl: 1.5, lg: 2 }}>
+                          <Tooltip title="Select Currency" placement="top">
+                            <TextField
+                              select
+// ... keep other props the same, replace MenuProps inside SelectProps with this:
+                                MenuProps: {
+                                  PaperProps: { style: { maxHeight: 250 } },
+                                  anchorOrigin: { vertical: "bottom", horizontal: "left" },
+                                  transformOrigin: { vertical: "top", horizontal: "left" }
+                                }
+
+```
+
+### 5. Remove Validation Pop-up (Merge Submit Logic)
+
+We are going to merge `handleValidateClick` and `handleConfirmSubmit` so it posts directly to the backend without the extra modal, just like before.
+
+**Replace your entire `handleValidateClick` and `handleConfirmSubmit` methods with this single merged function:**
+
+```javascript
+  const handleValidateClick = async () => {
+    if (!isCommonRemarksValid(commonBatchRemarks)) {
+      showSnackBar("Common Batch Remarks must be 2-30 characters if provided.", "error");
+      return;
+    }
+
+    const branchCurrencyTotals = new Map();
+    const branchEntryCheck = new Map();
+
+    for (const [index, row] of rows.entries()) {
+      if (
+        !row.branch || !row.currency || !row.cgl || !row.amount ||
+        parseFloat(row.amount) === 0 || !row.txnType || !isRowRemarksValid(row.remarks)
+      ) {
+        showSnackBar(
+          `Row ${index + 1} is incomplete or has a zero amount. Amount must be greater than 0, and remarks must be 2-30 characters.`,
+          "error"
+        );
+        return;
+      }
+
+      const branchCode = row.branch.code;
+      const currency = row.currency;
+
+      const cglNumber = String(row.cgl.cglNumber);
+      const isMemo = cglNumber.startsWith("5");
+      const type = isMemo ? "MEMO" : "NORMAL";
+
+      const [integerPart = "0", fractionalPart = "0"] = (row.amount || "0").split(".");
+      const fractionalPadded = fractionalPart.substring(0, 4).padEnd(4, "0");
+      const amountAsBigInt = BigInt(integerPart + fractionalPadded);
+
+      const compositeKey = `${branchCode}-${currency}-${type}`;
+
+      if (!branchCurrencyTotals.has(compositeKey)) {
+        branchCurrencyTotals.set(compositeKey, { totalDebit: 0n, totalCredit: 0n });
+      }
+      const currencyTotals = branchCurrencyTotals.get(compositeKey);
+
+      if (row.txnType === "Debit") {
+        currencyTotals.totalDebit += amountAsBigInt;
+      } else if (row.txnType === "Credit") {
+        currencyTotals.totalCredit += amountAsBigInt;
+      }
+
+      if (!branchEntryCheck.has(branchCode)) {
+        branchEntryCheck.set(branchCode, { hasDebit: false, hasCredit: false });
+      }
+      const branchCheck = branchEntryCheck.get(branchCode);
+
+      if (row.txnType === "Debit" && amountAsBigInt > 0n) branchCheck.hasDebit = true;
+      else if (row.txnType === "Credit" && amountAsBigInt > 0n) branchCheck.hasCredit = true;
+    }
+
+    for (const [branchCode, totals] of branchEntryCheck.entries()) {
+      const { hasDebit, hasCredit } = totals;
+      if (!hasDebit || !hasCredit) {
+        showSnackBar("Branch must have at least one Debit and one Credit entry.", "error");
+        return;
+      }
+    }
+
+    for (const [compositeKey, totals] of branchCurrencyTotals.entries()) {
+      const { totalDebit, totalCredit } = totals;
+      if (totalDebit !== totalCredit) {
+        showSnackBar("Branch and Currency Debit/Credit Mismatch for Real/Memo CGL.", "error");
+        return;
+      }
+    }
+
+    // --- DIRECT SUBMIT LOGIC (Modal Removed) ---
+    setIsSubmitting(true);
+
+    const [day, month, year] = postingDate.split("-");
+    const formattedBackendDate = `${day}/${month}/${year}`;
+    const rowPayloads = [];
+
+    for (const row of rows) {
+      const finalAmount = row.txnType === "Credit" ? "-" + row.amount : row.amount;
+      rowPayloads.push({
+        branch: row.branch.code,
+        currency: row.currency,
+        cgl: row.cgl.cglNumber,
+        amount: finalAmount,
+        txnType: row.txnType,
+        productType: row.productCode,
+        remarks: row.remarks,
+        postingDate: formattedBackendDate
+      });
+    }
+
+    const finalPayload = {
+      vid: selectedVoucher?.vid,
+      scheduledTime: null,
+      commonBatchRemarks: commonBatchRemarks ? commonBatchRemarks.trim() : "Voucher created successfully",
+      rows: rowPayloads,
+    };
+
+    try {
+      const response = await callApi("/JS/voucher/create-batch", finalPayload, "POST");
+
+      const newBatchId = response?.[0]?.batchId || response?.batchId || "N/A";
+      setSubmittedBatchId(newBatchId);
+
+      // ISSUE 2 FIX: Added Batch ID to creation alert
+      showSnackBar(`Batch ${newBatchId} validated and created successfully.`, "success");
+
+      setRows([createNewRow()]);
+      setCommonBatchRemarks("");
+      setChecked(false);
+      setBranchInputValues({});
+      setCglInputValues({});
+      setActiveStep(3); // Proceed directly to Schedule Screen
+    } catch (error) {
+      const serverMsg = error?.response?.data?.message || error?.response?.data?.error || error?.message;
+      showSnackBar(serverMsg || "Unable to submit the voucher request. Please try again.", "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+```
+
+**Then, scroll down to the bottom of the JSX and DELETE the entire `<Dialog>` block:**
+
+```javascript
+      {/* --- CONFIRMATION MODAL --- */}
+      <Dialog 
+        // DELETE THIS ENTIRE COMPONENT
+      </Dialog>
+
+```
+
+**And change the text on your action button back to "Proceed":**
+
+```javascript
+                        <Button
+                         variant="contained"
+                          color="success"
+                         onClick={handleValidateClick}
+                          disabled={isSubmitting || !isCommonRemarksValid(commonBatchRemarks) || !isFormReadyToSubmit}
+                        >
+                          {isSubmitting ? <CircularProgress size={24} color="inherit" /> : "Proceed"}
+                        </Button>
+
+```
+
+### 2. Add Batch ID to Final Routing Alert
+
+Find your `handleFinalizeRouting` method at the top of the file.
+
+**Replace this:**
+
+```javascript
+      // SHOWS THE OFFICIAL SUBMISSION MESSAGE HERE
+      showSnackBar(`Success! Your batch is initialized and processing.`, "success");
+
+```
+
+**With this:**
+
+```javascript
+      // SHOWS THE OFFICIAL SUBMISSION MESSAGE HERE
+      showSnackBar(`Success! Batch ${submittedBatchId} is finalized and processing.`, "success");
+
+```
