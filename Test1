@@ -1,87 +1,92 @@
-Ah, that makes perfect sense!
-That long alphanumeric string (e.g., d5419f03...) is the **Request ID (UUID)** used to securely store your Excel file in the Redis cache during validation.
-In the Manual flow, the Oracle Database creates the Batch ID immediately at Step 2. But in the Bulk flow, the actual Oracle Batch ID isn't generated until the very last moment (when you click Submit on Step 3) so that the background worker can pick it up.
-Your frontend was accidentally printing the cache Request ID instead of capturing the brand new Batch ID returning from the database.
-Here is the exact fix for **VoucherPosting.js** to capture and display the correct Batch ID.
-Find your handleFinalizeRouting function at the top of the file and replace it entirely with this updated version:
-```javascript
-  const handleFinalizeRouting = async () => {
-    setIsFinalizing(true);
-    let formattedSchedule = null;
-    
-    // Default to the manual batch ID (since it's already created in Step 2)
-    let finalDisplayBatchId = submittedBatchId; 
-
-    try {
-      if (routingChoice === "SCHEDULE") {
-        if (!scheduledTime || !scheduledTime.isValid()) {
-          showSnackBar("Please select a valid time.", "warning");
-          setIsFinalizing(false);
-          return;
-        }
-
-        const today = dayjs();
-        const finalSchedule = scheduledTime
-          .year(today.year())
-          .month(today.month())
-          .date(today.date());
-
-        const minAllowed = dayjs().add(28, 'minute'); 
-        const maxAllowed = dayjs().endOf('day');
-
-        if (finalSchedule.isBefore(minAllowed)) {
-          showSnackBar("Schedule time must be at least 30 minutes from now.", "warning");
-          setIsFinalizing(false);
-          return;
-        }
-        if (finalSchedule.isAfter(maxAllowed)) {
-          showSnackBar("Schedule time cannot exceed today's end of day (11:59 PM).", "warning");
-          setIsFinalizing(false);
-          return;
-        }
-        formattedSchedule = finalSchedule.format('YYYY-MM-DD HH:mm:ss');
-      }
-
-      if (entryMethod === "BULK") {
-        // For Bulk, submittedBatchId actually holds the UUID. Create the batch NOW.
-        const [day, month, year] = postingDate.split("-");
-        const formattedBackendDate = `${day}/${month}/${year}`;
-
-        const response = await callApi("/JS/voucher/create-batch-from-cache", {
-          requestId: submittedBatchId,
-          postingDate: formattedBackendDate,
-          vid: selectedVoucher.vid,
-          commonBatchRemarks: "Voucher created successfully",
-          scheduledTime: formattedSchedule 
-        }, "POST");
-
-        // SAFELY EXTRACT THE REAL ORACLE BATCH ID
-        finalDisplayBatchId = response?.[0]?.batchId || response?.batchId || (typeof response === 'string' ? response : "N/A");
-
-      } else {
-        // For Manual, the batch is already created, just update the schedule.
-        await callApi("/JS/voucher/update-schedule", {
-          batchId: submittedBatchId,
-          scheduledTime: formattedSchedule
-        }, "POST");
-      }
-
-      // SHOWS THE OFFICIAL SUBMISSION MESSAGE WITH THE CORRECT BATCH ID
-      showSnackBar(`Success! Your batch ${finalDisplayBatchId} is initialized and processing.`, "success");
-      handleResetWizard();
-
-    } catch (error) {
-      const serverMsg = error?.response?.data?.message
-        || error?.response?.data?.error
-        || (typeof error?.response?.data === 'string' ? error.response.data : null)
-        || error?.message;
-
-      const errMsg = serverMsg || "Unable to finalize execution routing. Please try again.";
-      showSnackBar(errMsg, "error");
-    } finally {
-      setIsFinalizing(false);
-    }
-  };
+Here are the exact, step-by-step replacements you need to make to permanently resolve the "Fresh VID" selection bug.
+### Step 1: Update the UI Query to Hide In-Use VIDs
+This change ensures that if a VID is currently trapped inside a live/pending batch, it will physically disappear from the frontend table, making it impossible for a user to select it.
+**File:** VoucherQueryService.java
+**Method:** getAvailableVouchersVid
+**Find this exact block of code:**
+```java
+        // ==================================================================================
+        // STEP 1: FETCH CORE VOUCHER DATA
+        // Purpose: Get the distinct master records and basic details in a single query.
+        // Note: We use LEFT JOINs so the voucher is still returned even if user/category data is missing.
+        // ==================================================================================
+        String sql = """
+            SELECT 
+                rv.ID,
+                rv.VID,
+                rv.DESCRIPTION,
+                c.CATEGORY_NAME,
+                rv.CREATED_BY AS CREATOR_ID,
+                -- Fallback: If user isn't found in USERS table, just return their raw ID
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, rv.CREATED_BY) AS CREATOR_NAME,
+                rv.CREATED_AT
+            FROM REQUEST_VOUCHER rv
+            LEFT JOIN VOUCHER_CATEGORY c ON rv.CATEGORY_ID = c.ID
+            LEFT JOIN USERS u ON rv.CREATED_BY = u.USER_ID
+            WHERE rv.ALLOWED_ROLE = ? AND rv.STATUS = 'ACTIVE'
+            ORDER BY rv.CREATED_AT DESC
+        """;
 
 ```
-This properly extracts the response from /JS/voucher/create-batch-from-cache and guarantees that the user sees the true Oracle Batch ID (e.g., 0001057) when they finish uploading!
+**Replace it completely with this:**
+```java
+        // ==================================================================================
+        // STEP 1: FETCH CORE VOUCHER DATA
+        // Purpose: Get the distinct master records and basic details in a single query.
+        // Note: We use LEFT JOINs so the voucher is still returned even if user/category data is missing.
+        // ==================================================================================
+        String sql = """
+            SELECT 
+                rv.ID,
+                rv.VID,
+                rv.DESCRIPTION,
+                c.CATEGORY_NAME,
+                rv.CREATED_BY AS CREATOR_ID,
+                -- Fallback: If user isn't found in USERS table, just return their raw ID
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, rv.CREATED_BY) AS CREATOR_NAME,
+                rv.CREATED_AT
+            FROM REQUEST_VOUCHER rv
+            LEFT JOIN VOUCHER_CATEGORY c ON rv.CATEGORY_ID = c.ID
+            LEFT JOIN USERS u ON rv.CREATED_BY = u.USER_ID
+            WHERE rv.ALLOWED_ROLE = ? AND rv.STATUS = 'ACTIVE'
+            
+            -- FIX: THIS ENSURES VIDS CURRENTLY ATTACHED TO LIVE BATCHES ARE COMPLETELY HIDDEN FROM THE UI
+            AND NOT EXISTS (
+                SELECT 1 FROM VOUCHER_POSTING vp 
+                WHERE vp.VID_FK = rv.VID 
+                AND vp.BATCH_STATUS NOT IN ('R', 'REJECTED', 'ERROR')
+            )
+            
+            ORDER BY rv.CREATED_AT DESC
+        """;
+
+```
+### Step 2: Reactivate the Status Lock for Manual Posting
+During previous testing, the code that physically changes the database status from ACTIVE to USED was commented out. We need to uncomment it so the database strictly locks the VID.
+**File:** VoucherCommandService.java
+**Method:** createBatchRequest
+Scroll to the very bottom of the createBatchRequest method.
+**Find this exact block of commented-out code:**
+```java
+//        // ---> TRIGGER 1: LOCK THE VID AS USED <---
+//        if (dto.getVid() != null && !dto.getVid().isEmpty()) {
+//            workflowEngine.updateVidStatus(dto.getVid(), VoucherStatus.USED);
+//        }
+
+        workflowEngine.logWorkflowAction(batchId, dto.getVid(), "Submitted", creatorId, dto.getCommonBatchRemarks(), dto.getScheduledTime());
+
+        return savedEntities;
+
+```
+**Replace it completely with this (uncommented):**
+```java
+        // ---> TRIGGER 1: LOCK THE VID AS USED <---
+        if (dto.getVid() != null && !dto.getVid().isEmpty()) {
+            workflowEngine.updateVidStatus(dto.getVid(), VoucherStatus.USED);
+        }
+
+        workflowEngine.logWorkflowAction(batchId, dto.getVid(), "Submitted", creatorId, dto.getCommonBatchRemarks(), dto.getScheduledTime());
+
+        return savedEntities;
+
+```
