@@ -1,65 +1,20 @@
-This is a classic and very common data discrepancy bug. The root cause lies in how Spring Data JPA automatically generates SQL queries from long method names.
-Here is exactly why this happened:
- 1. **The Branch Bug:** Your BranchMasterRepository was completely missing the Status check in its method signature, meaning it searched the entire database including closed/inactive branches.
- 2. **The CGL Bug:** Your CglMasterRepository *did* have the status check (...AndStatusEquals), but in Spring Data JPA, OR has lower precedence than AND. This means the database read the query as: *"Find CGLs where the Description matches AND Status is Active, **OR** where just the CGL Number matches (ignoring status completely)."*
-Because the Bulk Upload uses ValidationMasterService (which has strict SQL queries), it correctly rejected them, while the UI repositories allowed them through.
-To fix this permanently without breaking your services, we need to override the Spring JPA auto-generation by providing an explicit @Query with strict parentheses.
-Here are the exact replacements for both files.
-### 1. Fix the Branch Repository
-**File:** BranchMasterRepository.java
-Replace the **entire file** with this to add the explicit status = 1 check:
+This fix must be applied entirely in the **backend**.
+In the bulk upload process, the user types data directly into an Excel file, which completely bypasses all frontend UI dropdown restrictions and React validations. When the Excel file reaches the backend, the runDbCheck method inside VoucherRuleValidator.java verifies the data against the master lists provided by your ValidationMasterService.
+If the bulk upload is accepting inactive branches and CGLs while the manual screen correctly rejects them, it means the SQL queries inside ValidationMasterService.java are pulling every record from the database without filtering by the STATUS column.
+To permanently synchronize the rules, you need to update the raw SQL queries in **ValidationMasterService.java** to explicitly enforce the active status.
+### 1. Fix the Branch Master Query
+Find the method responsible for loading branches (likely named getAllActiveBranches). Ensure the SQL query strictly filters for STATUS = 1 (Active):
 ```java
-package com.fincore.VoucherService.Repository;
-
-import org.springframework.data.domain.Pageable;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Query;
-import org.springframework.data.repository.query.Param;
-import org.springframework.stereotype.Repository;
-
-import com.fincore.VoucherService.Models.BranchMaster;
-
-import java.util.List;
-
-@Repository
-public interface BranchMasterRepository extends JpaRepository<BranchMaster, String> {
-
-    // FIX: Added explicit @Query to enforce STATUS = 1 (Active) for all manual searches
-    @Query("SELECT b FROM BranchMaster b WHERE b.status = 1 AND (LOWER(b.name) LIKE LOWER(CONCAT('%', :name, '%')) OR LOWER(b.code) LIKE LOWER(CONCAT('%', :code, '%')))")
-    List<BranchMaster> findByNameContainingIgnoreCaseOrCodeContainingIgnoreCase(@Param("name") String name, @Param("code") String code, Pageable pageable);
-}
+// Replace the existing branch query with this:
+String branchSql = "SELECT CODE FROM BRANCH_MASTER WHERE STATUS = 1";
 
 ```
-### 2. Fix the CGL Repository
-**File:** CglMasterRepository.java
-Replace the **entire file** with this to fix the OR logic precedence:
+### 2. Fix the CGL Master Query
+Find the method responsible for loading CGLs (likely named getAllActiveCgls). Ensure the SQL query also explicitly demands STATUS = 1:
 ```java
-package com.fincore.VoucherService.Repository;
-
-import org.springframework.data.domain.Pageable;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Query;
-import org.springframework.data.repository.query.Param;
-import org.springframework.stereotype.Repository;
-
-import com.fincore.VoucherService.Models.CglMaster;
-
-import java.util.List;
-
-@Repository
-public interface CglMasterRepository extends JpaRepository<CglMaster, String> {
-
-    // FIX: Added explicit @Query with parentheses. This forces BOTH CGL Number and Description searches to respect the STATUS flag.
-    @Query("SELECT c FROM CglMaster c WHERE c.status = :status AND (LOWER(c.cglNumber) LIKE LOWER(CONCAT('%', :cglNumber, '%')) OR LOWER(c.description) LIKE LOWER(CONCAT('%', :description, '%')))")
-    List<CglMaster> findByCglNumberContainingIgnoreCaseOrDescriptionContainingIgnoreCaseAndStatusEquals(
-            @Param("cglNumber") String cglNumber, 
-            @Param("description") String description, 
-            @Param("status") Integer status, 
-            Pageable pageable
-    );
-}
+// Replace the existing CGL query with this:
+String cglSql = "SELECT CGL_NUMBER FROM CGL_MASTER WHERE STATUS = 1";
 
 ```
-### Why this fixes the issue:
-By adding the @Query annotation, we lock down the SQL logic. The frontend UI drop-downs will now execute these strict queries and completely filter out any inactive Branches and CGLs.
-*(Note: Your CurrencyController already calls validationMasterService.getAllActiveCurrencies(), so it is already perfectly aligned with the Bulk Upload logic. Fixing the Branch and CGL repositories completely synchronizes your manual and bulk validation rules.)*
+By enforcing STATUS = 1 at the point where the master cache is loaded, the bulk upload validation engine will instantly start rejecting any Excel row that contains an inactive Branch or CGL, matching the manual UI rules flawlessly.
+Could you share the code for ValidationMasterService.java so we can verify exactly how those database calls are currently constructed?
