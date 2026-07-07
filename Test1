@@ -1,49 +1,20 @@
-CGL_MASTER
-
-COMP_1	VARCHAR2(4 BYTE)	No		1	4 digit comp1 code.
-SEGMENT_CODE	VARCHAR2(4 BYTE)	No		2	FK SEGMENT_CODE from SEGMENT_CODE_MASTER table.
-COMP_2	VARCHAR2(2 BYTE)	No		3	2 digit comp2 code.
-CGL_NUMBER	VARCHAR2(10 BYTE)	No	"COMP_1"||"SEGMENT_CODE"||"COMP_2"	4	10 digit CGL number computed as (COMP_1 + SEGMENT_CODE + COMP_2).
-DESCRIPTION	VARCHAR2(100 BYTE)	No		5	Short description of this CGL.
-AC_CLASSIFICATION	VARCHAR2(1 BYTE)	No		6	A: Asset, L: Liability, I: Income, E: Expense, M: Memo A/c
-BAL_FWD	NUMBER(1,0)	No	0	7	Flag on whether to carry forward the balance to the next year or not.
-DEF_BAL_TYPE	VARCHAR2(1 BYTE)	No		8	C: Credit, D: Debit, M: Memo
-STATUS	NUMBER(1,0)	No	1	9	Status of the CGL. 1: Active, 0: InActive.
-OPEN_DATE	DATE	No	SYSDATE	10	Date when this CGL opened. Defaults to SYSDATE.
-CLOSE_DATE	DATE	Yes		11	Date when this CGL closed. Defaults to SYSDATE at the time of closing.
-BAL_COMPARE	NUMBER(1,0)	No	1	12	Flag on whether to compare the balance or not.
-MANUAL_POSTING	NUMBER(1,0)	No	"1
-   "	13	Flag on whether to allow manual posting or not.
-   
-   
-BRANCH_MASTER
-
-CODE	VARCHAR2(255 CHAR)	No		1	Unique 5 digit branch code.
-NAME	VARCHAR2(255 CHAR)	No		2	Branch name.
-CIRCLE_CODE	VARCHAR2(255 CHAR)	No		3	FK Circle code of this branch.
-STATE	VARCHAR2(255 CHAR)	No		4	FK State code of this branch.
-CITY	VARCHAR2(255 CHAR)	Yes		5	City of this branch.
-ADDRESS	VARCHAR2(255 CHAR)	Yes		6	Street/Address of this branch.
-PINCODE	VARCHAR2(255 CHAR)	Yes		7	Pincode of this branch.
-PHONE_NUMBER	VARCHAR2(255 CHAR)	No		8	Contact number of this branch.
-EMAIL_ID	VARCHAR2(255 CHAR)	No		9	Contact email of this branch.
-NMR_CODE	VARCHAR2(255 CHAR)	No		10	N-M-R code (NETWORK_CODE - module_CODE - region_CODE).
-STATUS	NUMBER(1,0)	No		11	Status of this branch (Live/Closed). value: '1' or '0'
-OPEN_DATE	DATE	No		12	When this branch was created.
-CLOSE_DATE	DATE	Yes		13	When this branch was closed.
-MERGE_DATE	DATE	Yes		14	When this branch was merged with other branch.
-MERGED_WITH_BRANCH	VARCHAR2(255 CHAR)	Yes		15	Branch code of the branch with which this branch was merged.
-LAST_CHANGE_DATE	DATE	Yes	SYSDATE 	16	When this branch was last changed.
-CPC_FLAG	NUMBER(1,0)	Yes		17	CPC Flag.
-FOOD_CREDIT_FLAG	NUMBER(1,0)	No		18	Food credit flag.
-CURR_CHEST_FLAG	NUMBER(1,0)	No		19	CURR_CHEST_FLAG.
-BRANCH_TYPE	VARCHAR2(255 CHAR)	No		20	Type of this branch (A: Automated, M: Manual).
-
-
+This is a classic and very common data discrepancy bug. The root cause lies in how Spring Data JPA automatically generates SQL queries from long method names.
+Here is exactly why this happened:
+ 1. **The Branch Bug:** Your BranchMasterRepository was completely missing the Status check in its method signature, meaning it searched the entire database including closed/inactive branches.
+ 2. **The CGL Bug:** Your CglMasterRepository *did* have the status check (...AndStatusEquals), but in Spring Data JPA, OR has lower precedence than AND. This means the database read the query as: *"Find CGLs where the Description matches AND Status is Active, **OR** where just the CGL Number matches (ignoring status completely)."*
+Because the Bulk Upload uses ValidationMasterService (which has strict SQL queries), it correctly rejected them, while the UI repositories allowed them through.
+To fix this permanently without breaking your services, we need to override the Spring JPA auto-generation by providing an explicit @Query with strict parentheses.
+Here are the exact replacements for both files.
+### 1. Fix the Branch Repository
+**File:** BranchMasterRepository.java
+Replace the **entire file** with this to add the explicit status = 1 check:
+```java
 package com.fincore.VoucherService.Repository;
 
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
 import com.fincore.VoucherService.Models.BranchMaster;
@@ -53,14 +24,22 @@ import java.util.List;
 @Repository
 public interface BranchMasterRepository extends JpaRepository<BranchMaster, String> {
 
-    List<BranchMaster> findByNameContainingIgnoreCaseOrCodeContainingIgnoreCase(String name, String code, Pageable pageable);
+    // FIX: Added explicit @Query to enforce STATUS = 1 (Active) for all manual searches
+    @Query("SELECT b FROM BranchMaster b WHERE b.status = 1 AND (LOWER(b.name) LIKE LOWER(CONCAT('%', :name, '%')) OR LOWER(b.code) LIKE LOWER(CONCAT('%', :code, '%')))")
+    List<BranchMaster> findByNameContainingIgnoreCaseOrCodeContainingIgnoreCase(@Param("name") String name, @Param("code") String code, Pageable pageable);
 }
 
-
+```
+### 2. Fix the CGL Repository
+**File:** CglMasterRepository.java
+Replace the **entire file** with this to fix the OR logic precedence:
+```java
 package com.fincore.VoucherService.Repository;
 
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
 import com.fincore.VoucherService.Models.CglMaster;
@@ -70,373 +49,17 @@ import java.util.List;
 @Repository
 public interface CglMasterRepository extends JpaRepository<CglMaster, String> {
 
-    List<CglMaster> findByCglNumberContainingIgnoreCaseOrDescriptionContainingIgnoreCaseAndStatusEquals(String cglNumber, String description, Integer status, Pageable pageable);
+    // FIX: Added explicit @Query with parentheses. This forces BOTH CGL Number and Description searches to respect the STATUS flag.
+    @Query("SELECT c FROM CglMaster c WHERE c.status = :status AND (LOWER(c.cglNumber) LIKE LOWER(CONCAT('%', :cglNumber, '%')) OR LOWER(c.description) LIKE LOWER(CONCAT('%', :description, '%')))")
+    List<CglMaster> findByCglNumberContainingIgnoreCaseOrDescriptionContainingIgnoreCaseAndStatusEquals(
+            @Param("cglNumber") String cglNumber, 
+            @Param("description") String description, 
+            @Param("status") Integer status, 
+            Pageable pageable
+    );
 }
 
-package com.fincore.VoucherService.Service.validation;
-
-
-import com.fincore.VoucherService.Dto.ExcelRowData;
-import com.fincore.VoucherService.Service.ValidationMasterService;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Service;
-
-import java.math.BigDecimal;
-import java.util.List;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicReference;
-
-@Service
-public class VoucherRuleValidator {
-
-    @Autowired
-    private final ValidationMasterService validationMasterService;
-
-    public VoucherRuleValidator(ValidationMasterService validationMasterService) {
-        this.validationMasterService = validationMasterService;
-    }
-
-
-    // ==================================================================================
-    // 4. VALIDATION STAGES
-    // ==================================================================================
-    public void runFormatCheck(List<ExcelRowData> rows) {
-        rows.parallelStream().forEach(d -> {
-
-            // 1. Safely grab the value, remove all spaces, and make it uppercase
-            String rawType = (d.txnType != null) ? d.txnType.trim().toUpperCase() : "";
-
-            // 2. Check the cleaned value and instantly standardize it to full words
-            if (rawType.equals("CR") || rawType.equals("CREDIT")) {
-                d.txnType = "Credit";
-            }
-            else if (rawType.equals("DR") || rawType.equals("DEBIT")) {
-                d.txnType = "Debit";
-            }
-            else {
-                d.formatErrors.add("The transaction type must be 'CR', 'DR', 'Debit', or 'Credit' (case-insensitive)");
-            }
-
-            // Amount
-            if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) <= 0) {
-                d.formatErrors.add("Amount must be greater than 0.");
-            } else if (d.amount.precision() > 20 || d.amount.scale() > 4) {
-                d.formatErrors.add("Exceeded maximum 16 digits or 4 decimal places.");
-            }
-
-            // Product Code
-            if (d.productCode != null && !d.productCode.isEmpty() && !d.productCode.equals("A") && !d.productCode.matches("^[0-9]{1,8}$")) {
-                d.formatErrors.add("Product code must be up to 8 digits or left blank.");
-            }
-
-            // Remarks (Alphanumeric, single spaces, and specific special characters)
-            if (d.remarks == null || d.remarks.trim().length() < 2 || d.remarks.trim().length() > 30) {
-                d.formatErrors.add("Remarks must be 2-30 characters.");
-            } else if (d.remarks.startsWith(" ") || d.remarks.contains("  ")) {
-                d.formatErrors.add("Remarks cannot start with a space or contain consecutive spaces.");
-            } else if (!d.remarks.matches("^[a-zA-Z0-9 /&(),.\\-]+$")) {
-                d.formatErrors.add("Allowed 2-30 chars: Alphanumeric, spaces, and / & ( ) , . -");
-            }
-
-            // Currency
-            if (d.currency == null || d.currency.length() != 3) {
-                d.formatErrors.add("Currency code must be exactly 3 characters.");
-            }
-
-            // CGL (Strictly 10 digits)
-            if (d.cgl == null || d.cgl.isEmpty()) {
-                d.formatErrors.add("CGL is mandatory.");
-            } else if (!d.cgl.matches("^[0-9]{10}$")) {
-                d.formatErrors.add("CGL must be exactly 10 digits.");
-            }
-
-            // Branch (Strictly 5 alphanumeric characters)
-            if (d.branch == null || d.branch.trim().isEmpty()) {
-                d.formatErrors.add("Branch code is mandatory.");
-            } else if (!d.branch.matches("^[a-zA-Z0-9]{5}$")) {
-                d.formatErrors.add("Branch code must be exactly 5 alphanumeric characters.");
-            }
-        });
-    }
-
-    public void runDbCheck(List<ExcelRowData> rows) {
-        Set<String> validBranches = validationMasterService.getAllActiveBranches();
-        Set<String> validCurrs = validationMasterService.getAllActiveCurrencies();
-        Set<String> validCgls = validationMasterService.getAllActiveCgls();
-
-        rows.parallelStream().forEach(d -> {
-            if (d.branch != null && !d.branch.isEmpty() && !validBranches.contains(d.branch))
-                d.dbErrors.add("Branch is inactive or not found: " + d.branch);
-            if (d.currency != null && !d.currency.isEmpty() && !validCurrs.contains(d.currency))
-                d.dbErrors.add("Currency is inactive or not found: " + d.currency);
-            if (d.cgl != null && !d.cgl.isEmpty() && !validCgls.contains(d.cgl))
-                d.dbErrors.add("CGL is inactive or not found: " + d.cgl);
-        });
-    }
-
-
-    /**
-     * Rule 5: Balance Integrity Logic.
-     * Uses LongAdder with 10^4 scale shift to perform precise integer arithmetic
-     * on parallel streams, preventing floating-point drift in large batches.
-     */
-    public void runBalanceCheck(List<ExcelRowData> rows) {
-        ConcurrentHashMap<String, AtomicReference<BigDecimal>> balanceMap = new ConcurrentHashMap<>();
-        ConcurrentHashMap<String, Boolean> branchHasDebit = new ConcurrentHashMap<>();
-        ConcurrentHashMap<String, Boolean> branchHasCredit = new ConcurrentHashMap<>();
-
-        // Pass 1: Aggregate totals and check for presence
-        rows.parallelStream().forEach(d -> {
-            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
-
-            // Track Debit/Credit Presence per Branch
-            if ("Debit".equalsIgnoreCase(d.txnType)) branchHasDebit.put(d.branch, true);
-            if ("Credit".equalsIgnoreCase(d.txnType)) branchHasCredit.put(d.branch, true);
-
-            // Calculate Balance Groupings
-            boolean isCredit = "Credit".equalsIgnoreCase(d.txnType);
-            BigDecimal finalVal = isCredit ? d.amount.negate() : d.amount;
-
-            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
-            String balKey = d.branch + "_" + d.currency + "_" + type;
-
-            // Thread-safe BigDecimal addition without scaling or overflow risks
-            balanceMap.computeIfAbsent(balKey, k -> new AtomicReference<>(BigDecimal.ZERO))
-                    .updateAndGet(curr -> curr.add(finalVal));
-        });
-
-        // Pass 2: Apply the simple, generic error messages to the rows
-        rows.parallelStream().forEach(d -> {
-            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
-
-            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
-            String balKey = d.branch + "_" + d.currency + "_" + type;
-            AtomicReference<BigDecimal> adder = balanceMap.get(balKey);
-
-            // Strict check: If there is ANY entry for this specific ledger type, the sum MUST equal exactly 0.0000
-            if (adder != null && adder.get().compareTo(BigDecimal.ZERO) != 0) {
-                if (!d.balErrors.contains("Debit and Credit totals must match exactly for " + type + " entries.")) {
-                    d.balErrors.add("Debit and Credit totals must match exactly for " + type + " entries.");
-                }
-            }
-        });
-    }
-}
-
-
-package com.fincore.VoucherService.Service;
-
-import com.fincore.VoucherService.Dto.CglDto;
-import com.fincore.VoucherService.Models.CglMaster;
-import com.fincore.VoucherService.Repository.CglMasterRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.dao.DataAccessException;
-import org.springframework.data.domain.PageRequest;
-import org.springframework.data.domain.Pageable;
-import org.springframework.stereotype.Service;
-import org.springframework.util.StringUtils;
-
-
-import java.util.Collections;
-import java.util.List;
-import java.util.stream.Collectors;
-
-/**
- * Provides targeted search capabilities for ledger master data.
- * Implements specific exception handling for database access and secure logging practices.
- */
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class CglService {
-
-    private final CglMasterRepository cglMasterRepository;
-    private final Integer ACTIVE_CGL_STATUS=1;
-
-    /**
-     * Maps a CglMaster entity to a CglDto for API transmission.
-     */
-    private CglDto convertToDto(CglMaster cgl) {
-        return new CglDto(cgl.getCglNumber(), cgl.getDescription());
-    }
-
-    /**
-     * Performs a paginated search for CGLs by ledger number or description.
-     * Preserves the exact search and 50-record limiting logic for system responsiveness.
-     * * @param query The search string (CGL number or description text).
-     * @return A list of matching CglDto objects.
-     */
-    public List<CglDto> searchCgls(String query) {
-        // Log the search attempt metadata without logging potentially sensitive query values
-        log.info("CGL_SEARCH_INIT | QueryProvided: {}", StringUtils.hasText(query));
-
-        if (!StringUtils.hasText(query)) {
-            return Collections.emptyList();
-        }
-
-        try {
-            // Preserving exact pagination logic: Page 0, Size 50
-            Pageable limit = PageRequest.of(0, 50);
-
-            List<CglMaster> results = cglMasterRepository
-                    .findByCglNumberContainingIgnoreCaseOrDescriptionContainingIgnoreCaseAndStatusEquals(query, query,ACTIVE_CGL_STATUS, limit);
-
-            log.info("CGL_SEARCH_SUCCESS | ResultsFound: {}", results.size());
-
-            return results.stream()
-                    .map(this::convertToDto)
-                    .collect(Collectors.toList());
-
-        } catch (DataAccessException e) {
-            // Specifically catching Spring's database abstraction errors
-            log.error("CGL_SEARCH_FAIL | Reason: Database access error: {}", e.getMessage());
-            return Collections.emptyList();
-        }
-    }
-}
-
-
-
-
-package com.fincore.VoucherService.Controllers;
-
-import com.fincore.VoucherService.Dto.BranchDto;
-import com.fincore.VoucherService.Service.BranchService;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
-
-
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-
-/**
- * Exposes endpoints for branch master data retrieval and search.
- * Rule: Implements "Starts With" search logic to optimize Oracle Index Range Scans.
- */
-@RestController
-@RequestMapping("/api/branches-journal")
-@RequiredArgsConstructor
-@Slf4j
-public class BranchController {
-
-    private final BranchService branchService;
-
-    /**
-     * Endpoint to retrieve a complete map of branch codes to branch names.
-     */
-    @GetMapping("/map")
-    public ResponseEntity<Map<String, String>> getBranchMap() {
-        log.info("BRANCH_CONTROLLER_MAP_REQUEST | Action: Fetching all active branch mappings");
-        Map<String, String> branchMap = branchService.getBranchCodeAndNameMap();
-        return ResponseEntity.ok(branchMap);
-    }
-
-    /**
-     * Endpoint to perform a PREFIX search for branches.
-     * Logic: Returns results starting with the query string (e.g., '321' matches '32121').
-     */
-    @GetMapping("/search")
-    public ResponseEntity<List<BranchDto>> searchBranches(@RequestParam String query) {
-        // Log the prefix search initialization
-        log.info("BRANCH_CONTROLLER_PREFIX_SEARCH | Query: {}", query);
-
-        if (query == null || query.trim().isEmpty()) {
-            // Preservation of empty list logic for blank inputs
-            return ResponseEntity.ok(Collections.emptyList());
-        }
-
-        // Service layer now handles the "StartingWith" repository call
-        List<BranchDto> results = branchService.searchBranches(query.trim());
-        return ResponseEntity.ok(results);
-    }
-}
-
-
-package com.fincore.VoucherService.Controllers;
-
-import com.fincore.VoucherService.Dto.CglDto;
-import com.fincore.VoucherService.Service.CglService;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
-
-import java.util.Collections;
-import java.util.List;
-
-/**
- * Exposes endpoints for searching Common General Ledger (CGL) master data.
- * Updated to use "Starts With" logic for professional financial filtering.
- */
-@RestController
-@RequestMapping("/api/cgl-journal")
-@RequiredArgsConstructor
-@Slf4j
-public class CglController {
-
-    private final CglService cglService;
-
-    /**
-     * Endpoint to search for CGLs by prefix.
-     * Logic: Implements prefix matching (REQ_CGL LIKE 'query%') for high performance.
-     */
-    @GetMapping("/search")
-    public ResponseEntity<List<CglDto>> searchCgl(
-            @RequestParam(value = "query", required = false, defaultValue = "") String query) {
-
-        if (query == null || query.trim().isEmpty()) {
-            return ResponseEntity.ok(Collections.emptyList());
-        }
-
-        log.info("CGL_CONTROLLER_PREFIX_SEARCH | Action: Filtering CGLs starting with: {}", query);
-
-        // Service layer uses the repository's findBy...StartingWith logic
-        List<CglDto> results = cglService.searchCgls(query.trim());
-        return ResponseEntity.ok(results);
-    }
-}
-
-
-
-
-package com.fincore.VoucherService.Controllers;
-
-
-import com.fincore.VoucherService.Service.ValidationMasterService;
-import lombok.RequiredArgsConstructor;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
-
-import java.util.Set;
-
-@RestController
-@RequestMapping("/api/voucher")
-@RequiredArgsConstructor
-public class CurrencyController {
-
-    private final ValidationMasterService validationMasterService;
-
-    /**
-     * Purpose: Returns a list of only the active CURRENCY_CODEs.
-     */
-    @GetMapping("/currencies")
-    public ResponseEntity<Set<String>> getActiveCurrencies() {
-        // Reuses your existing high-performance JDBC method
-        Set<String> currencies = validationMasterService.getAllActiveCurrencies();
-
-        return ResponseEntity.ok(currencies);
-    }
-}
+```
+### Why this fixes the issue:
+By adding the @Query annotation, we lock down the SQL logic. The frontend UI drop-downs will now execute these strict queries and completely filter out any inactive Branches and CGLs.
+*(Note: Your CurrencyController already calls validationMasterService.getAllActiveCurrencies(), so it is already perfectly aligned with the Bulk Upload logic. Fixing the Branch and CGL repositories completely synchronizes your manual and bulk validation rules.)*
