@@ -1,101 +1,57 @@
-To perfectly mirror the Authorization screen's logic on your Status screen, we will make the Java backend the single source of truth for calculating the "Pending Since" time.
-Here are the exact replacements needed for both the backend and frontend to implement this cleanly.
-### 1. Update the Backend (VoucherQueryService.java)
-We need to inject the calculateTimeSinceLastAction() function directly into the SQL RowMapper for the Status screen's API (getAllRequestsSummary).
-Find the getAllRequestsSummary method in **VoucherQueryService.java**. Scroll down to the jdbcTemplate.query block where the variables are being mapped.
-**Find this exact block:**
+To implement this, we need to shift from showing only "Pending Since" for the current stage to showing a historical "Duration" for every completed stage in the workflow.
+### 1. Backend: Calculate Durations for All Stages
+We need a new service method to calculate the duration of *each* step based on the VOUCHER_WORKFLOW table logs.
+**In VoucherQueryService.java**, add this method:
 ```java
-            if ("R".equals(bStatus)) {
-                map.put("currentStatus", "REJECTED");
-            } else if ("A".equals(bStatus) || "C".equals(bStatus)) {
-                map.put("currentStatus", "POSTED");
-            } else if ("Q".equals(bStatus)) {
-                // --- ADD THIS BLOCK ---
-                map.put("currentStatus", "QUEUED FOR RETRY");
-            } else {
-                map.put("currentStatus", rs.getString("WORKFLOW_STAGE") != null ? rs.getString("WORKFLOW_STAGE") : "PENDING");
-            }
+public List<Map<String, String>> getStageDurations(String batchId) {
+    // Fetches every action and its timestamp in order
+    String sql = "SELECT LAST_ACTION, LAST_ACTION_AT FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = ? ORDER BY LAST_ACTION_AT ASC";
+    List<Map<String, Object>> history = jdbcTemplate.queryForList(sql, batchId);
+    List<Map<String, String>> durations = new ArrayList<>();
 
-            return map;
-        }, userId, roleId, offset, size);
-
-```
-**Replace it with this:**
-```java
-            if ("R".equals(bStatus)) {
-                map.put("currentStatus", "REJECTED");
-            } else if ("A".equals(bStatus) || "C".equals(bStatus)) {
-                map.put("currentStatus", "POSTED");
-            } else if ("Q".equals(bStatus)) {
-                // --- ADD THIS BLOCK ---
-                map.put("currentStatus", "QUEUED FOR RETRY");
-            } else {
-                map.put("currentStatus", rs.getString("WORKFLOW_STAGE") != null ? rs.getString("WORKFLOW_STAGE") : "PENDING");
-            }
-
-            // --- ADD THIS LINE TO MATCH THE AUTHORIZATION SCREEN ---
-            map.put("timeSinceLastAction", calculateTimeSinceLastAction(rs.getString("BATCH_ID")));
-
-            return map;
-        }, userId, roleId, offset, size);
+    for (int i = 0; i < history.size() - 1; i++) {
+        LocalDateTime start = ((Timestamp) history.get(i).get("LAST_ACTION_AT")).toLocalDateTime();
+        LocalDateTime end = ((Timestamp) history.get(i + 1).get("LAST_ACTION_AT")).toLocalDateTime();
+        Duration d = Duration.between(start, end);
+        
+        Map<String, String> entry = new HashMap<>();
+        entry.put("action", (String) history.get(i).get("LAST_ACTION"));
+        entry.put("duration", d.toHours() + "h " + d.toMinutesPart() + "m");
+        durations.add(entry);
+    }
+    return durations;
+}
 
 ```
-### 2. Update the Frontend (VoucherPostingStatus.js)
-Now that the backend is sending the pre-formatted string (e.g., "1h 15m"), we just need to capture it and display it in the view modal.
-**Step A: Add the State Variable**
-Find your existing state variables at the top of the component and add one for the new time string:
+### 2. Frontend Status Screen (VoucherPostingStatus.js)
+Update the timeline logic to show the "Total Batch Time" in the header and the "Duration" under completed steps.
+**A. Add the Total Time Header:**
+Inside the Workflow modal, find the "Workflow Progress" title and update it:
 ```javascript
-  const [viewingBatchRequestCount, setViewingBatchRequestCount] = useState(0);
-  // Add this directly below the line above:
-  const [viewingBatchTimeSinceLastAction, setViewingBatchTimeSinceLastAction] = useState("");
+// Calculate total time from the first log to now (or final log)
+const totalTime = calculateTotalBatchTime(workflowHistory); 
+<Typography variant="subtitle1" fontWeight="bold" color="text.primary" sx={{ mb: 3 }}>
+  Workflow Progress ({totalTime})
+</Typography>
 
 ```
-**Step B: Capture the String on Modal Open**
-Find the handleOpenViewModal function and update it to pull the string from the selected row:
+**B. Show Historical Durations in Stepper:**
+Inside your dynamicSteps.map loop, replace the Typography that shows the executor name with this logic:
 ```javascript
-  const handleOpenViewModal = async (row) => {
-    setViewingBatchId(row.batchId);
-    setViewingBatchCreatorId(row.creatorId);
-    setViewingBatchState(row.currentStatus || "");
-    setViewingBatchRawStatus(row.batchStatus || "");
-    setViewingBatchRequestDate(row.requestDate);
-    setViewingBatchRequestCount(row.requestCount || 0);
-    setViewingBatchOrder(row.currentOrder);
-    
-    // Add this line to capture the backend time string:
-    setViewingBatchTimeSinceLastAction(row.timeSinceLastAction || "");
+{isCompleted && (
+  <Typography variant="caption" display="block" color="success.main" sx={{ mt: 0.5, fontWeight: "bold" }}>
+    {/* Match the action name to the calculated duration map */}
+    Duration: {getDurationForAction(step.state)}
+  </Typography>
+)}
 
 ```
-**Step C: Display the String in the Workflow Timeline**
-Scroll down to your Stepper component inside the <DialogContent> where the "Pending Since" text is rendered.
-**Find this block:**
-```javascript
-                            {isCurrent && viewingBatchState !== "REJECTED" && (
-                              <Typography
-                                variant="caption"
-                                display="block"
-                                color={statusFlag === 'ESCALATED' ? "warning.main" : "text.secondary"}
-                                fontWeight="bold"
-                                sx={{ mt: 0.5 }}
-                              >
-                                Pending Since: {calculateTimeElapsed(viewingBatchRequestDate)}
-                              </Typography>
-                            )}
-
-```
-**Replace it completely with this:**
-```javascript
-                            {isCurrent && viewingBatchState !== "REJECTED" && (
-                              <Typography
-                                variant="caption"
-                                display="block"
-                                color={statusFlag === 'ESCALATED' ? "warning.main" : "text.secondary"}
-                                fontWeight="bold"
-                                sx={{ mt: 0.5 }}
-                              >
-                                Pending Since: {viewingBatchTimeSinceLastAction || "0h 0m"}
-                              </Typography>
-                            )}
-
-```
-*(You can now safely delete the frontend calculateTimeElapsed function from the top of VoucherPostingStatus.js, as it is no longer needed!)*
+### 3. Frontend Authorization Screen (VoucherAuthorization.js)
+Since the Authorization screen uses the same VoucherQueryService backend, you simply need to inject the stageDurations list into the view modal:
+ 1. **API Call**: When the user clicks "View Details" on a batch in the Authorization screen, call the new getStageDurations(batchId) endpoint.
+ 2. **Display**: Use the same Stepper logic as the Status screen to map these durations under each completed step.
+### Summary of Changes:
+ * **Backend**: Added getStageDurations to VoucherQueryService to calculate the delta between sequential rows in VOUCHER_WORKFLOW.
+ * **Frontend**: Updated the Stepper component to loop through historical logs rather than just showing the current state.
+ * **Consistency**: Because both screens now consume VoucherQueryService and use the same workflow history logic, the duration formatting will be identical on both pages.
+**One Important Note:** Ensure that your WORKFLOW_TRANSITIONS match the LAST_ACTION names in VOUCHER_WORKFLOW so that the action string lookup works correctly for the duration display.
