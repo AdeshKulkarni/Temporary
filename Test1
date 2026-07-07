@@ -1,57 +1,32 @@
-To implement this, we need to shift from showing only "Pending Since" for the current stage to showing a historical "Duration" for every completed stage in the workflow.
-### 1. Backend: Calculate Durations for All Stages
-We need a new service method to calculate the duration of *each* step based on the VOUCHER_WORKFLOW table logs.
-**In VoucherQueryService.java**, add this method:
-```java
-public List<Map<String, String>> getStageDurations(String batchId) {
-    // Fetches every action and its timestamp in order
-    String sql = "SELECT LAST_ACTION, LAST_ACTION_AT FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = ? ORDER BY LAST_ACTION_AT ASC";
-    List<Map<String, Object>> history = jdbcTemplate.queryForList(sql, batchId);
-    List<Map<String, String>> durations = new ArrayList<>();
+public List<Map<String, Object>> getWorkflowHistory(String batchId) {
+    // 1. Fetch history ordered by time
+    String sql = """
+        SELECT 
+            w.LAST_ACTION_BY, 
+            COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, w.LAST_ACTION_BY) AS ACTION_USER_NAME, 
+            w.LAST_ACTION, 
+            w.LAST_ACTION_AT, 
+            w.REMARKS,
+            w.SCHEDULED_TIME
+        FROM VOUCHER_WORKFLOW w 
+        LEFT JOIN USERS u ON w.LAST_ACTION_BY = u.USER_ID
+        WHERE w.BATCH_ID_FK = ? 
+        ORDER BY w.LAST_ACTION_AT ASC
+    """;
 
+    List<Map<String, Object>> history = jdbcTemplate.queryForList(sql, batchId);
+
+    // 2. Calculate durations between steps
     for (int i = 0; i < history.size() - 1; i++) {
         LocalDateTime start = ((Timestamp) history.get(i).get("LAST_ACTION_AT")).toLocalDateTime();
         LocalDateTime end = ((Timestamp) history.get(i + 1).get("LAST_ACTION_AT")).toLocalDateTime();
-        Duration d = Duration.between(start, end);
         
-        Map<String, String> entry = new HashMap<>();
-        entry.put("action", (String) history.get(i).get("LAST_ACTION"));
-        entry.put("duration", d.toHours() + "h " + d.toMinutesPart() + "m");
-        durations.add(entry);
+        Duration d = Duration.between(start, end);
+        String durationStr = d.toHours() + "h " + d.toMinutesPart() + "m";
+        
+        // Inject the duration into the entry that *completed* the step
+        history.get(i + 1).put("stageDuration", durationStr);
     }
-    return durations;
+    
+    return history;
 }
-
-```
-### 2. Frontend Status Screen (VoucherPostingStatus.js)
-Update the timeline logic to show the "Total Batch Time" in the header and the "Duration" under completed steps.
-**A. Add the Total Time Header:**
-Inside the Workflow modal, find the "Workflow Progress" title and update it:
-```javascript
-// Calculate total time from the first log to now (or final log)
-const totalTime = calculateTotalBatchTime(workflowHistory); 
-<Typography variant="subtitle1" fontWeight="bold" color="text.primary" sx={{ mb: 3 }}>
-  Workflow Progress ({totalTime})
-</Typography>
-
-```
-**B. Show Historical Durations in Stepper:**
-Inside your dynamicSteps.map loop, replace the Typography that shows the executor name with this logic:
-```javascript
-{isCompleted && (
-  <Typography variant="caption" display="block" color="success.main" sx={{ mt: 0.5, fontWeight: "bold" }}>
-    {/* Match the action name to the calculated duration map */}
-    Duration: {getDurationForAction(step.state)}
-  </Typography>
-)}
-
-```
-### 3. Frontend Authorization Screen (VoucherAuthorization.js)
-Since the Authorization screen uses the same VoucherQueryService backend, you simply need to inject the stageDurations list into the view modal:
- 1. **API Call**: When the user clicks "View Details" on a batch in the Authorization screen, call the new getStageDurations(batchId) endpoint.
- 2. **Display**: Use the same Stepper logic as the Status screen to map these durations under each completed step.
-### Summary of Changes:
- * **Backend**: Added getStageDurations to VoucherQueryService to calculate the delta between sequential rows in VOUCHER_WORKFLOW.
- * **Frontend**: Updated the Stepper component to loop through historical logs rather than just showing the current state.
- * **Consistency**: Because both screens now consume VoucherQueryService and use the same workflow history logic, the duration formatting will be identical on both pages.
-**One Important Note:** Ensure that your WORKFLOW_TRANSITIONS match the LAST_ACTION names in VOUCHER_WORKFLOW so that the action string lookup works correctly for the duration display.
