@@ -1,4 +1,109 @@
-2026-06-23T09:18:51.543Z  INFO 1 --- [VoucherService] [    BulkCoord-3] c.f.V.Service.ValidationMasterService    : MASTER_DATA_LOADED | Type: CGLS | Count: 8740 | Duration: 7ms
-2026-06-23T09:18:51.546Z  INFO 1 --- [VoucherService] [    BulkCoord-3] c.f.V.S.v.VoucherBulkValidationService   : VALIDATION_SUCCESS | ReqID: a0ff6cd8-6f6e-414d-b284-75b35223cec7 | Duration: 67ms
-2026-06-23T09:18:52.354Z ERROR 1 --- [VoucherService] [nio-9999-exec-9] c.f.V.Exception.GlobalExceptionHandler   : IO_STREAM_FAILURE | Path: /api/voucher/create-batch-from-cache | Type: MismatchedInputException
- 
+I completely understand what you are aiming for. This is a very common requirement for audit trails:
+ 1. **Top Details Section:** Must show the **current/updated** scheduled time.
+ 2. **Maker's History Row:** Must show the **original** time the maker scheduled (and never change, even if overridden later).
+ 3. **Final Approver's History Row:** Must show the **new** time they overrode it to (or immediate execution).
+Right now, the Maker's row shows "Immediate Execution" because when the Maker selects "Schedule" in Step 3, the backend updates the database but doesn't change the action tag to "Submitted (Scheduled)", causing the frontend to ignore it.
+Here is the complete, final fix for both the backend and frontend to cleanly separate these two timelines.
+### 1. The Backend Fix: Record the Maker's Schedule properly
+In **VoucherCommandService.java**, find the updateBatchSchedule method. We need to tell the database to explicitly update the Maker's action label to "Submitted (Scheduled)" so the frontend knows it was scheduled.
+**Replace this existing line:**
+```java
+jdbcTemplate.update("UPDATE VOUCHER_WORKFLOW SET SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS') WHERE BATCH_ID_FK = ? AND LAST_ACTION = 'Submitted'", scheduledTime, batchId);
+
+```
+**With this improved line:**
+```java
+// Updates the time AND explicitly renames the action so the React UI detects it as scheduled
+jdbcTemplate.update("UPDATE VOUCHER_WORKFLOW SET LAST_ACTION = 'Submitted (Scheduled)', SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS') WHERE BATCH_ID_FK = ? AND LAST_ACTION LIKE 'Submit%'", scheduledTime, batchId);
+
+```
+### 2. The Frontend Fix: Strict Separation of Timelines
+Your frontend code still has old "fallback" logic that tries to read the top-level batch time (vidDetails) instead of the specific history row time. We need to rip that out.
+In both **VoucherPostingStatus.jsx** AND **VoucherAuthorization.jsx**, replace the entire workflowHistory.map loop with this exact block. This enforces strict historical reading.
+```javascript
+                    <Stack spacing={2.5}>
+                      {workflowHistory.map((history, idx) => {
+                        const isSystem = history.LAST_ACTION_BY === "SYSTEM";
+                        const userName = history.ACTION_USER_NAME || (isSystem ? "Automated System" : "User");
+                        const initial = isSystem ? "S" : userName.charAt(0).toUpperCase();
+
+                        const isExecutionFail = history.LAST_ACTION?.toUpperCase().includes("FAILED");
+
+                        // 1. Clean the action label
+                        const rawAction = history.LAST_ACTION || "System Action";
+                        const cleanAction = rawAction.replace(/\s*\(.*?\)\s*/g, '').trim();
+
+                        // 2. Identify action types
+                        const isSubmission = rawAction.toUpperCase().includes("SUBMIT");
+                        const isFinalApproval = rawAction.toUpperCase().includes("FINAL") || rawAction.toUpperCase().includes("ACCEPT");
+                        
+                        const isSchOverride = rawAction.toUpperCase().includes("SCH. OVERRIDE");
+                        const isImmOverride = rawAction.toUpperCase().includes("IMM. OVERRIDE");
+                        const isKeptSchedule = rawAction.toUpperCase().includes("(SCHEDULED)");
+
+                        // 3. STRICT HISTORICAL SNAPSHOT: ONLY read from this specific history row!
+                        // We NO LONGER check vidDetails here. This prevents the "overwriting" bug.
+                        const historyRowTime = history.SCHEDULED_TIME;
+
+                        return (
+                          <Box key={idx} sx={{ display: 'flex', gap: 2, mb: 2 }}>
+                            <Box>
+                              <Avatar sx={{ bgcolor: isSystem ? 'secondary.main' : 'primary.main', width: 40, height: 40, fontWeight: 'bold', fontSize: '1rem' }}>
+                                {initial}
+                              </Avatar>
+                            </Box>
+                            <Box sx={{ flexGrow: 1, backgroundColor: "white", p: 2.5, borderRadius: 2, border: "1px solid", borderColor: isExecutionFail ? "#d32f2f" : isSystem ? "#9c27b0" : "#e2e8f0", borderLeftWidth: isExecutionFail || isSystem ? "4px" : "1px", boxShadow: "0 1px 2px 0 rgb(0 0 0 / 0.05)" }}>
+
+                              <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1, mb: 1 }}>
+                                <Typography variant="subtitle2" fontWeight="bold" color="text.primary">
+                                  {userName} {isSystem ? "" : `(${history.LAST_ACTION_BY})`}
+                                </Typography>
+                                <Typography variant="caption" color="text.secondary">• {formatDateTime(history.LAST_ACTION_AT)}</Typography>
+                              </Box>
+
+                              <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1.5, flexWrap: "wrap", gap: 1 }}>
+                                <Chip
+                                  label={cleanAction}
+                                  size="small"
+                                  sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold", backgroundColor: isExecutionFail || rawAction.includes("Reject") ? "#fee2e2" : isSystem ? "#f3e8ff" : "#e0e7ff", color: isExecutionFail || rawAction.includes("Reject") ? "#991b1b" : isSystem ? "#7e22ce" : "#3730a3" }}
+                                />
+
+                                {/* --- STRICT ISOLATED CHIP LOGIC --- */}
+                                
+                                {/* A. Logic exclusively for the Maker / Creator */}
+                                {isSubmission ? (
+                                    historyRowTime ? (
+                                        <Chip label={`Scheduled for: ${formatDateTime(historyRowTime)}`} size="small" color="info" variant="outlined" sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold" }} />
+                                    ) : (
+                                        <Chip label="Immediate Execution" size="small" color="default" variant="outlined" sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold", backgroundColor: "#f1f5f9" }} />
+                                    )
+                                ) 
+                                
+                                {/* B. Logic exclusively for the Final Approver */}
+                                : isFinalApproval && !isSystem ? (
+                                   isSchOverride && historyRowTime ? (
+                                       <Chip label={`Schedule Overridden to: ${formatDateTime(historyRowTime)}`} size="small" color="warning" variant="outlined" sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold" }} />
+                                   ) : isImmOverride ? (
+                                       <Chip label="Overridden to Immediate Execution" size="small" color="warning" variant="outlined" sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold" }} />
+                                   ) : isKeptSchedule && historyRowTime ? (
+                                       <Chip label={`Original Schedule Kept: ${formatDateTime(historyRowTime)}`} size="small" color="info" variant="outlined" sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold" }} />
+                                   ) : (
+                                       <Chip label="Immediate Execution" size="small" color="default" variant="outlined" sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold", backgroundColor: "#f1f5f9" }} />
+                                   )
+                                ) : null}
+
+                              </Stack>
+                              <Typography variant="body2" color="text.primary" sx={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
+                                {history.REMARKS || "Voucher Batch Created."}
+                              </Typography>
+                            </Box>
+                          </Box>
+                        );
+                      })}
+                    </Stack>
+
+```
+### Why this achieves exactly what you want:
+ 1. **Top Detail Section:** You didn't have to change anything here because it natively reads vidDetails.SCHEDULED_TIME, which always holds the most recently updated time.
+ 2. **Maker's Log (isSubmission):** By updating the SQL query, the database permanently logs the Maker's time. The frontend now *only* reads this permanent log (historyRowTime) and displays it.
+ 3. **Approver's Log (isFinalApproval):** This is mapped as a completely separate block in the frontend logic. The Final Approver gets their own dedicated row in the DB with their own overridden time, keeping the two timelines totally independent!
