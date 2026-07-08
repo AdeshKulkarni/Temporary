@@ -1,196 +1,118 @@
-package com.fincore.VoucherService.Dto;
+Thanks for providing the code. Looking directly at your VoucherActionController and ProcessVoucherRequestDto, the root cause of your JSON_PARSE_ERROR is clear:
+Your endpoint /workflow/action is expecting a standard JSON structure that perfectly maps to the fields in ProcessVoucherRequestDto, but your frontend/client is firing off a raw, encrypted String as the entire HTTP request body.
+Here is how you can resolve this based on your specific architecture.
+### The Problem in the Code
+In your VoucherActionController:
+```java
+@PostMapping("/workflow/action")
+public ResponseEntity<Map<String, String>> processCheckerAction(
+        @RequestHeader("Authorization") String token,
+        @Valid @RequestBody ProcessVoucherRequestDto dto) { // <-- Jackson fails here
 
-import com.fasterxml.jackson.annotation.JsonFormat;
-import com.fincore.VoucherService.Models.enums.RequestStatus;
+```
+Spring Boot's default MappingJackson2HttpMessageConverter intercepts the request body, sees the raw encrypted string (V9W...==), and attempts to map it directly to ProcessVoucherRequestDto. Because it's just a text string and not a JSON object (like {"batchId": "123", "status": "APPROVED"}), it crashes.
+### How to Fix It
+You have three main paths to solve this, depending on how you want to handle encryption in your application.
+#### Option 1: The Quick Fix (Decrypt in the Controller)
+If only a few endpoints receive encrypted payloads, you can change the controller to accept the raw string, decrypt it, and map it manually.
+**Controller Update:**
+```java
+import com.fasterxml.jackson.databind.ObjectMapper;
 
-import jakarta.validation.constraints.NotNull;
-import lombok.Data;
-import lombok.Getter;
-import lombok.Setter;
-import org.apache.htrace.fasterxml.jackson.annotation.JsonIgnoreProperties;
+@PostMapping(value = "/workflow/action", consumes = MediaType.TEXT_PLAIN_VALUE)
+public ResponseEntity<Map<String, String>> processCheckerAction(
+        @RequestHeader("Authorization") String token,
+        @RequestBody String encryptedPayload) { // Accept the raw string
 
-import java.time.LocalDateTime;
+    try {
+        // 1. Decrypt your payload here (using your decryption utility)
+        String decryptedJson = myCryptoService.decrypt(encryptedPayload);
 
-@Data
-@Getter
-@Setter
-@JsonIgnoreProperties(ignoreUnknown = true)
-public class ProcessVoucherRequestDto {
+        // 2. Map it to your DTO
+        ObjectMapper mapper = new ObjectMapper();
+        ProcessVoucherRequestDto dto = mapper.readValue(decryptedJson, ProcessVoucherRequestDto.class);
 
-    @NotNull(message = "Batch ID is required")
-    private String batchId; // Changed from requestId to batchId for bulk approval
-
-    @NotNull(message = "Status is required")
-    private RequestStatus status;
-
-    @jakarta.validation.constraints.Pattern(
-            regexp = "^([a-zA-Z0-9 \\/&(),.\\-]{2,30})?$",
-            message = "Remarks must be 2-30 characters: Alphanumeric, spaces, and / & ( ) , . -"
-    )
-    private String remarks;
-
-    // --- NEW FIELDS FOR SCHEDULING WORKFLOW ---
-    private Boolean overrideScheduleLapse; // True if the user chooses to post immediately after a lapse prompt
-
-    @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss")
-    private LocalDateTime newScheduledTime; // If the final approver decides to set a new time
-}
-package com.fincore.VoucherService.Controllers;
-
-
-import com.fincore.VoucherService.Exception.CustomExceptions;
-import com.fincore.VoucherService.Models.JournalRequest;
-import com.fincore.VoucherService.Service.core.VoucherCommandService;
-import com.fincore.VoucherService.Service.core.VoucherWorkflowEngine;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
-import com.fincore.VoucherService.Dto.*;
-import com.fincore.commonutilities.jwt.JwtUtil;
-import jakarta.validation.Valid;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-
-import java.io.IOException;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-@RestController
-@RequestMapping("/api/voucher")
-@RequiredArgsConstructor
-@Slf4j
-public class VoucherActionController {
-
-
-    private final VoucherCommandService commandService;
-    private final VoucherWorkflowEngine workflowEngine;
-    private final JwtUtil jwtUtil;
-
-
-    /**
-     * Triggers the async approval/rejection process using Oracle Parallel execution.
-     */
-    @PostMapping("/process-bulk")
-    public ResponseEntity<Map<String, Object>> processBulkRequests(
-            @RequestHeader("Authorization") String token,
-            @Valid @RequestBody BulkProcessVoucherPostingDto dto) {
-
+        // 3. Proceed with your business logic
         String userId = jwtUtil.getUserIdFromToken(token);
         Integer userRole = jwtUtil.getUserRoleFromToken(token);
-        log.info("BULK_PROCESS_START | User: {} | Batch: {} | Action: {}", userId, dto.getBatchId(), dto.getStatus());
-
-        commandService.processBulkRequestsAsync(dto, userId, userRole);
-
-        return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
-                "status", "PROCESSING", "message", "Approval process started. Notifications will be sent upon completion."));
-    }
-
-
-    @PostMapping("/workflow/action")
-    public ResponseEntity<Map<String, String>> processCheckerAction(
-            @RequestHeader("Authorization") String token,
-            @Valid @RequestBody ProcessVoucherRequestDto dto) {
-
-        String userId = jwtUtil.getUserIdFromToken(token);
-        Integer userRole = jwtUtil.getUserRoleFromToken(token);
-
         workflowEngine.processWorkflowAction(dto, userId, userRole);
 
         return ResponseEntity.ok(Map.of("status", "SUCCESS", "message", "Workflow action processed successfully."));
-    }
-
-
-
-
-    // ==================================================================================
-    // 1. ASYNC BULK OPERATIONS
-    // ==================================================================================
-
-    /**
-     * Creates a batch from pre-validated cache data.
-     * Uses fire-and-forget logic; returns 202 Accepted immediately.
-     */
-    @PostMapping("/create-batch-from-cache")
-    public ResponseEntity<Map<String, Object>> createBatchFromCache(
-            @Valid @RequestBody CacheBatchPostingDto payload,
-            @RequestHeader("Authorization") String token) throws IOException {
-
-        String userId = jwtUtil.getUserIdFromToken(token);
-        Integer userRole = jwtUtil.getUserRoleFromToken(token);
-        log.info("CACHE_BATCH_INIT | User: {} | ReqID: {}", userId, payload.getRequestId());
-
-        // FIX: Since the DTO already converted it to LocalDateTime,
-        // we just pass payload.getScheduledTime() directly to the service!
-        String batchId = commandService.createBatchFromCacheAsync(
-                payload.getRequestId(),
-                payload.getCommonBatchRemarks(),
-                userId,
-                userRole,
-                payload.getVid(),
-                payload.getScheduledTime() // <--- Passed directly
-        );
-
-        return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
-                "status", "PROCESSING", "message", "Batch creation initiated in background.", "batchId", batchId));
-    }
-
-
-    @PostMapping("/update-schedule")
-    public ResponseEntity<Map<String, String>> updateSchedule(@RequestBody Map<String, String> payload) {
-        commandService.updateBatchSchedule(payload.get("batchId"), payload.get("scheduledTime"));
-
-        Map<String, String> response = new HashMap<>();
-        response.put("message", "Schedule updated successfully.");
-        response.put("status", "SUCCESS");
-        return ResponseEntity.ok(response);
-    }
-
-
-    // ==================================================================================
-    // 5. MANUAL/SMALL BATCH ENDPOINTS
-    // ==================================================================================
-
-    @PostMapping("/create-batch")
-    public ResponseEntity<List<JournalRequest>> createBatchRequest(
-            @Valid @RequestBody BatchPostingDto batchDto,
-            @RequestHeader("Authorization") String token) {
-        try {
-            String userId = jwtUtil.getUserIdFromToken(token);
-            log.info("MANUAL_BATCH_CREATE | User: {} | Rows: {}", userId, batchDto.getRows().size());
-
-            List<JournalRequest> created = commandService.createBatchRequest(
-                    batchDto, userId, jwtUtil.getUserRoleFromToken(token));
-            return ResponseEntity.status(HttpStatus.CREATED).body(created);
-        } catch (CustomExceptions.DataMappingException e) {
-            log.error("MANUAL_BATCH_JSON_FAIL | Status: Payload serialization error");
-            throw new CustomExceptions.DataMappingException("Request contains invalid data format.");
-        }
-    }
-
-
-    @DeleteMapping("/my-requests/by-batch/{batchId}")
-    public ResponseEntity<ApiResponseDto> deletePendingBatch(@PathVariable String batchId, @RequestHeader("Authorization") String token) {
-        try {
-            commandService.deleteBatchRequest(batchId, jwtUtil.getUserIdFromToken(token.substring(7)));
-            return ResponseEntity.ok(new ApiResponseDto("Success", "Batch deletion process initiated.", null));
-        } catch (IllegalStateException e) {
-            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(new ApiResponseDto("Error", e.getMessage(), null));
-        } catch (CustomExceptions.InvalidDataException e) {
-            // FIX: Catch specific business errors and send the exact message to React
-            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(new ApiResponseDto("Error", e.getMessage(), null));
-        } catch (Exception e) {
-            log.error("BATCH_DELETE_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(new ApiResponseDto("Error", "An unexpected error occurred.", null));
-        }
-    }
-
-
-    @DeleteMapping("/my-request/{requestId}")
-    public ResponseEntity<Void> cancelMyRequest(@RequestHeader("Authorization") String token, @PathVariable Long requestId) {
-        commandService.cancelMyRequest(requestId, jwtUtil.getUserIdFromToken(token));
-        return ResponseEntity.noContent().build();
+    } catch (Exception e) {
+        log.error("Decryption or Mapping failed", e);
+        throw new CustomExceptions.InvalidDataException("Failed to process encrypted payload");
     }
 }
 
+```
+#### Option 2: The Enterprise Fix (Request Body Advice)
+If your *entire* API (or most of it) receives encrypted payloads, you shouldn't rewrite every controller. Instead, create a @ControllerAdvice that intercepts the request, decrypts the body globally, and passes the clean JSON to Jackson.
+**Create a new component:**
+```java
+import org.springframework.core.MethodParameter;
+import org.springframework.http.HttpInputMessage;
+import org.springframework.http.converter.HttpMessageConverter;
+import org.springframework.web.bind.annotation.ControllerAdvice;
+import org.springframework.web.servlet.mvc.method.annotation.RequestBodyAdviceAdapter;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.lang.reflect.Type;
+
+@ControllerAdvice
+public class DecryptionAdvice extends RequestBodyAdviceAdapter {
+
+    @Override
+    public boolean supports(MethodParameter methodParameter, Type targetType, Class<? extends HttpMessageConverter<?>> converterType) {
+        // Return true for endpoints that need decryption. You can use a custom annotation here to be specific.
+        return true; 
+    }
+
+    @Override
+    public HttpInputMessage beforeBodyRead(HttpInputMessage inputMessage, MethodParameter parameter, Type targetType, Class<? extends HttpMessageConverter<?>> converterType) throws IOException {
+        // 1. Read the encrypted raw string from inputMessage.getBody()
+        // 2. Decrypt it into a JSON String
+        // 3. Return a new HttpInputMessage containing the decrypted JSON bytes
+        
+        String decryptedJson = "{ ... }"; // Replace with actual decryption logic
+        
+        return new HttpInputMessage() {
+            @Override
+            public InputStream getBody() throws IOException {
+                return new ByteArrayInputStream(decryptedJson.getBytes());
+            }
+            @Override
+            public HttpHeaders getHeaders() {
+                return inputMessage.getHeaders();
+            }
+        };
+    }
+}
+
+```
+*Note: With this approach, your controller code remains exactly as it is right now.*
+#### Option 3: The Frontend Fix
+If the frontend was actually supposed to send JSON, you need to update the client code (React, Angular, etc.) to decrypt the data *before* making the POST request, or construct a proper JSON payload:
+**Expected JSON payload:**
+```json
+{
+  "batchId": "REQ-12345",
+  "status": "APPROVED",
+  "remarks": "Approved after review",
+  "overrideScheduleLapse": false,
+  "newScheduledTime": "2026-07-08 17:00:00"
+}
+
+```
+### ⚠️ Additional Code Review Note
+In your ProcessVoucherRequestDto, you have a problematic import:
+```java
+import org.apache.htrace.fasterxml.jackson.annotation.JsonIgnoreProperties;
+
+```
+This is pulling from Hadoop's shaded version of Jackson (htrace), which can cause unpredictable behavior in Spring Boot. You should replace it with the standard Jackson import:
+```java
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+
+```
