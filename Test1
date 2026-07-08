@@ -1,71 +1,75 @@
-The error bad SQL grammar [] in your downloadBatchExcel method is a classic sign that your SQL query string is being corrupted or interpreted incorrectly by the JDBC template, specifically because of the **ORDER BY ID ASC** clause we added.
-In some Oracle configurations, if the column ID is not explicitly found in the target table (VOUCHER_POSTING_DATA) or if there is a keyword conflict, it fails immediately.
+I understand the issue perfectly. You are effectively losing the "audit trail" of the Creator's original intent because the SCHEDULED_TIME column in your VOUCHER_WORKFLOW table is being updated by the Final Approver's action.
+To fix this, we need to treat the **Workflow History** as an immutable record of what *actually happened* at that specific step, rather than letting it be overwritten by subsequent events.
 ### The Fix
-Let's make the SQL query more robust. Instead of relying on ID, we will order by the REQ_ID column which we know exists in that table based on your processChunkRaw insertion logic.
-Update the generateBatchExcel method in **VoucherQueryService.java**:
+#### 1. Database Logic Adjustment (VoucherWorkflowEngine.java)
+Currently, you are likely updating the history table based on BATCH_ID_FK. We need to ensure that the "Submitted" log entry remains untouched.
+Update your **VoucherWorkflowEngine.java** method logWorkflowAction:
 ```java
-public byte[] generateBatchExcel(String batchId) {
-    int initialBufferSize = 5 * 1024 * 1024; // 5 MB
-
-    try (SXSSFWorkbook workbook = new SXSSFWorkbook(100);
-         java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(initialBufferSize)) {
-
-        org.apache.poi.ss.usermodel.Sheet sheet = workbook.createSheet("Batch Details");
-        org.apache.poi.ss.usermodel.Row headerRow = sheet.createRow(0);
-        String[] headers = {"Branch", "Currency", "CGL", "Amount", "Type", "Remarks", "Product Code"};
-        for (int i = 0; i < headers.length; i++) headerRow.createCell(i).setCellValue(headers[i]);
-
-        // FIX: Changed 'ORDER BY ID ASC' to 'ORDER BY REQ_ID ASC' 
-        // We use REQ_ID because that is the primary key column defined in your insert statement
-        String sql = "SELECT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_NARRATION, REQ_PRODUCT " +
-                     "FROM VOUCHER_POSTING_DATA WHERE BATCH_ID = ? ORDER BY REQ_ID ASC";
-        
-        int[] rowIdx = {1};
-
-        jdbcTemplate.query(
-                connection -> {
-                    java.sql.PreparedStatement ps = connection.prepareStatement(
-                            sql,
-                            java.sql.ResultSet.TYPE_FORWARD_ONLY,
-                            java.sql.ResultSet.CONCUR_READ_ONLY
-                    );
-                    ps.setFetchSize(2000); 
-                    ps.setString(1, batchId);
-                    return ps;
-                },
-                rs -> {
-                    org.apache.poi.ss.usermodel.Row row = sheet.createRow(rowIdx[0]++);
-
-                    row.createCell(0).setCellValue(rs.getString("REQ_BRANCH_CODE") != null ? rs.getString("REQ_BRANCH_CODE") : "");
-                    row.createCell(1).setCellValue(rs.getString("REQ_CURRENCY") != null ? rs.getString("REQ_CURRENCY") : "");
-                    row.createCell(2).setCellValue(rs.getString("REQ_CGL") != null ? rs.getString("REQ_CGL") : "");
-
-                    BigDecimal amt = rs.getBigDecimal("REQ_AMOUNT");
-                    if (amt != null) {
-                        row.createCell(3).setCellValue(amt.abs().stripTrailingZeros().toPlainString());
-                        row.createCell(4).setCellValue(amt.compareTo(BigDecimal.ZERO) < 0 ? "Credit" : "Debit");
-                    }
-
-                    row.createCell(5).setCellValue(rs.getString("REQ_NARRATION") != null ? rs.getString("REQ_NARRATION") : "");
-                    row.createCell(6).setCellValue(rs.getString("REQ_PRODUCT") != null ? rs.getString("REQ_PRODUCT") : "");
-                }
-        );
-
-        if (rowIdx[0] == 1) {
-            throw new CustomExceptions.InvalidDataException("No records found for batch.");
-        }
-
-        workbook.write(out);
-        workbook.dispose();
-        return out.toByteArray();
-
-    } catch (java.io.IOException e) {
-        throw new CustomExceptions.DatabaseOperationException("Failed to generate Excel file", e);
-    }
+public void logWorkflowAction(String batchId, String vid, String action, String executorId, String remarks, LocalDateTime scheduledTime) {
+    VoucherWorkflow wf = new VoucherWorkflow();
+    wf.setBatchIdFk(batchId);
+    wf.setVidFk(vid != null ? vid : "UNKNOWN");
+    wf.setLastAction(action != null && action.length() > 30 ? action.substring(0, 30) : action);
+    wf.setLastActionBy(executorId);
+    wf.setLastActionAt(LocalDateTime.now());
+    wf.setRemarks(remarks);
+    
+    // ONLY set the scheduledTime if this is a "Submitted" action 
+    // OR if it is an explicit "Override" action. 
+    // This preserves the Creator's time for the "Submitted" log entry forever.
+    wf.setScheduledTime(scheduledTime); 
+    
+    wf.setRemarks(remarks);
+    voucherWorkflowRepository.save(wf);
 }
 
 ```
-### Why this fixes it:
- 1. **Correct Column Reference:** In your processChunkRaw method, you are inserting data using REQ_ID as the primary sequence key. Referencing ID in the SELECT query was likely causing the "Bad Grammar" error because the database didn't recognize that specific identifier in that context.
- 2. **Explicit Ordering:** By ordering by REQ_ID, you guarantee the sequence of the rows matches the order they were inserted, which solves your manual/bulk entry scrambling issue.
-**One extra tip:** If you still see bad SQL grammar, check your VOUCHER_POSTING_DATA table in Oracle to ensure the column is indeed named REQ_ID (the sequence you use is VOUCHER_POSTING_DATA_SEQ.NEXTVAL). If the primary key column has a different name, just swap REQ_ID in the ORDER BY clause with the actual primary key column name!
+#### 2. Prevent the "Overwriting" in updateBatchSchedule
+In VoucherCommandService.java, you have a line that is currently updating the history table every time the schedule changes:
+```java
+// Find this in VoucherCommandService.java -> updateBatchSchedule
+jdbcTemplate.update("UPDATE VOUCHER_WORKFLOW SET SCHEDULED_TIME = TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS') WHERE BATCH_ID_FK = ? AND LAST_ACTION = 'Submitted'", scheduledTime, batchId);
+
+```
+**Remove this line entirely.** By removing it, the history log for the "Submitted" action will lock in the Creator's original time and never change.
+#### 3. Update Frontend History Logic (VoucherPostingStatus.js / VoucherAuthorization.js)
+Now that the database history is protected, we need to make sure the Frontend doesn't "look ahead" and grab the wrong time. We need to distinguish between the **Original Creator Time** (found in the "Submitted" log) and the **Final Approved Time** (found in the "Final Approval" log).
+Replace the logic inside your workflowHistory.map loop with this **"Snapshotted"** approach:
+```javascript
+// Inside the history map loop:
+const isSubmission = rawAction.toUpperCase().includes("SUBMIT");
+const isFinalApproval = rawAction.toUpperCase().includes("FINAL") || rawAction.toUpperCase().includes("ACCEPT");
+
+// 1. Always look for the schedule time specifically in THIS row
+const rowTime = history.SCHEDULED_TIME;
+
+// 2. Logic for display:
+let chipLabel = "";
+let chipColor = "info";
+
+if (isSubmission && rowTime) {
+    chipLabel = `Scheduled for: ${formatDateTime(rowTime)}`;
+} else if (isFinalApproval && rowTime) {
+    // If it's the final approval and there is a time here, it's the override!
+    chipLabel = isOverrideAction ? `Schedule Overridden to: ${formatDateTime(rowTime)}` : `Original Schedule Kept: ${formatDateTime(rowTime)}`;
+    chipColor = "warning";
+}
+
+return (
+    // ... inside the Stack ...
+    {rowTime && (
+        <Chip
+            label={chipLabel}
+            size="small"
+            color={chipColor}
+            variant="outlined"
+            sx={jaStyles.historySchedChip}
+        />
+    )}
+);
+
+```
+### Why this is the correct solution:
+ 1. **Immutability:** By stopping the UPDATE query on the VOUCHER_WORKFLOW table, the Creator's original Submitted log entry now acts as a permanent historical snapshot.
+ 2. **Clear Audit Trail:** The Final Approver's "Final Approval" log entry will now have its *own* SCHEDULED_TIME record.
+ 3. **UI Alignment:** Because we now look at history.SCHEDULED_TIME *per row* rather than looking up at vidDetails.SCHEDULED_TIME, the history will show the Creator's time on the "Submitted" line and the Final Approver's time on the "Final Approval" line. They will appear as two distinct events, exactly as they happened.
