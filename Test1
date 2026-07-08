@@ -1,27 +1,39 @@
-This mismatch happens because of a small gap in the backend logic: when the Creator submits a batch (especially via Bulk Upload), the Java backend sometimes forgets to save the SCHEDULED_TIME into the VOUCHER_WORKFLOW history table for that specific step.
-Because the SCHEDULED_TIME is missing for that specific row in the history list, the frontend assumes it wasn't scheduled and defaults to showing the **"Immediate Execution"** chip.
-We can easily fix this entirely on the frontend! We will tell the code: *"If the history log doesn't have a time, but this is the Submission step and the batch itself has a scheduled time, grab the time from the batch details!"*
-Here is the exact fix for **VoucherPostingStatus.js** (You should also apply this to VoucherAuthorization.js so they match perfectly).
-### The Fix
-Scroll down to the **Workflow History** section, inside the workflowHistory.map((history, idx) => { ... } loop.
-**Find this exact block (around line 721):**
+### 1. The "Is Execution Scheduled?" Header (Issue 1)
+You do not need to change any code for the main header! Your Java backend already handles this perfectly. When the Final Approver overrides the schedule, the backend executes this SQL update:
+UPDATE VOUCHER_POSTING SET SCHEDULED_TIME = ...
+Because your UI header (vidDetails.SCHEDULED_TIME) reads directly from this table, it will **automatically** display the Final Approver's updated time if they override it, or the Creator's original time if they don't.
+### 2. The Workflow History Tags (Issue 2)
+To ensure the history perfectly reflects exactly what the Final Approver did (Kept Original Schedule, Overridden to New Time, or Overridden to Immediate), we can use the exact log strings your Java backend is already generating ((Sch. Override), (Imm. Override), and (Scheduled)).
+Here is the exact replacement for the history loop in both **VoucherPostingStatus.js** and **VoucherAuthorization.js**.
+**Find this block inside the workflowHistory.map (around line 718):**
 ```javascript
+                        // NEW: Strip out the text in parentheses for a cleaner Chip!
+                        const rawAction = history.LAST_ACTION || "System Action";
+                        const cleanAction = rawAction.replace(/\s*\(.*?\)\s*/g, '').trim();
+
                         // Identify if this specific log action belongs to a submission or finalization step
                         const isSubmission = rawAction.toUpperCase().includes("SUBMIT");
                         const isFinalApproval = rawAction.toUpperCase().includes("FINAL") || rawAction.toUpperCase().includes("ACCEPT");
+
+                        const effectiveScheduledTime = history.SCHEDULED_TIME || (isSubmission && vidDetails?.SCHEDULED_TIME ? vidDetails.SCHEDULED_TIME : null);
 
                         return (
 
 ```
 **Replace everything from that point down through the Stack component with this:**
 ```javascript
-                        // Identify if this specific log action belongs to a submission or finalization step
+                        // NEW: Strip out the text in parentheses for a cleaner Chip!
+                        const rawAction = history.LAST_ACTION || "System Action";
+                        const cleanAction = rawAction.replace(/\s*\(.*?\)\s*/g, '').trim();
+
+                        // Identify the exact nature of the action based on backend logs
                         const isSubmission = rawAction.toUpperCase().includes("SUBMIT");
                         const isFinalApproval = rawAction.toUpperCase().includes("FINAL") || rawAction.toUpperCase().includes("ACCEPT");
+                        
+                        const isSchOverride = rawAction.toUpperCase().includes("SCH. OVERRIDE");
+                        const isImmOverride = rawAction.toUpperCase().includes("IMM. OVERRIDE");
+                        const isKeptSchedule = rawAction.toUpperCase().includes("(SCHEDULED)");
 
-                        // --- FIX: SMART FALLBACK FOR SCHEDULED TIME ---
-                        // If the backend forgot to log the time in the history table for the Creator's submit step,
-                        // we dynamically pull the scheduled time from the main batch details!
                         const effectiveScheduledTime = history.SCHEDULED_TIME || (isSubmission && vidDetails?.SCHEDULED_TIME ? vidDetails.SCHEDULED_TIME : null);
 
                         return (
@@ -47,29 +59,25 @@ Scroll down to the **Workflow History** section, inside the workflowHistory.map(
                                   sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold", backgroundColor: isExecutionFail || rawAction.includes("Reject") ? "#fee2e2" : isSystem ? "#f3e8ff" : "#e0e7ff", color: isExecutionFail || rawAction.includes("Reject") ? "#991b1b" : isSystem ? "#7e22ce" : "#3730a3" }}
                                 />
 
-                                {/* --- FIX: USE THE NEW effectiveScheduledTime VARIABLE HERE --- */}
-                                {effectiveScheduledTime ? (
-                                  <Chip
-                                    label={isOverrideAction ? `Schedule Overridden to: ${formatDateTime(effectiveScheduledTime)}` : `Scheduled for: ${formatDateTime(effectiveScheduledTime)}`}
-                                    size="small"
-                                    color={isOverrideAction ? "warning" : "info"}
-                                    variant="outlined"
-                                    sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold" }}
-                                  />
+                                {/* --- FIX: SMART FINAL APPROVER CHIPS --- */}
+                                {isFinalApproval && !isSystem ? (
+                                   isSchOverride && effectiveScheduledTime ? (
+                                       <Chip label={`Schedule Overridden to: ${formatDateTime(effectiveScheduledTime)}`} size="small" color="warning" variant="outlined" sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold" }} />
+                                   ) : isImmOverride ? (
+                                       <Chip label="Overridden to Immediate Execution" size="small" color="warning" variant="outlined" sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold" }} />
+                                   ) : isKeptSchedule && effectiveScheduledTime ? (
+                                       <Chip label={`Original Schedule Kept: ${formatDateTime(effectiveScheduledTime)}`} size="small" color="info" variant="outlined" sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold" }} />
+                                   ) : (
+                                       <Chip label="Immediate Execution" size="small" color="default" variant="outlined" sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold", backgroundColor: "#f1f5f9" }} />
+                                   )
                                 ) : (
-                                  (isSubmission || isFinalApproval) && !isSystem && (
-                                    <Chip
-                                      label="Immediate Execution"
-                                      size="small"
-                                      color="default"
-                                      variant="outlined"
-                                      sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold", backgroundColor: "#f1f5f9" }}
-                                    />
-                                  )
+                                   // Logic for Creator / Other Steps
+                                   effectiveScheduledTime ? (
+                                       <Chip label={`Scheduled for: ${formatDateTime(effectiveScheduledTime)}`} size="small" color="info" variant="outlined" sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold" }} />
+                                   ) : isSubmission && !isSystem ? (
+                                       <Chip label="Immediate Execution" size="small" color="default" variant="outlined" sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold", backgroundColor: "#f1f5f9" }} />
+                                   ) : null
                                 )}
                               </Stack>
 
 ```
-### Why this fixes both issues:
- 1. **The Mismatch is Gone:** By creating the effectiveScheduledTime variable, the first step (the Creator's step) will now look up at the main header's vidDetails.SCHEDULED_TIME. If the header says it's scheduled, the History (1) chip will now perfectly match it and display the date and time instead of "Immediate Execution."
- 2. **Accurate Overrides:** If a Final Approver overrides the time, the history log *does* contain the history.SCHEDULED_TIME for that specific override step. The code prioritizes history.SCHEDULED_TIME first, ensuring that overrides are displayed accurately without being overwritten!
