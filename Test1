@@ -1,6 +1,70 @@
-   : SEQUENCE_GENERATED | Type: BATCH_ID | Value: 0008694
-2026-07-08T13:12:25.183+05:30  INFO 30884 --- [VoucherService] [nio-9999-exec-7] c.f.V.Service.SequenceService            : SEQUENCE_GENERATED | Type: JRNL_ID | Value: 0005376
-2026-07-08T13:12:25.280+05:30  WARN 30884 --- [VoucherService] [nio-9999-exec-7] c.f.V.Exception.GlobalExceptionHandler   : INVALID_DATA | Path: /api/voucher/create-batch-from-cache | Msg: Scheduled time must be  at least 30 minutes from the current time.
-2026-07-08T13:12:41.651+05:30  INFO 30884 --- [VoucherService] [nio-9999-exec-9] c.f.V.C.VoucherActionController          : CACHE_BATCH_INIT | User: 7875730 | ReqID: 7c8adb03-fa95-4bad-9bee-8228240b2052
-2026-07-08T13:12:41.676+05:30  WARN 30884 --- [VoucherService] [nio-9999-exec-9] c.f.V.S.core.VoucherCommandService       : CONCURRENCY_LOCKED | ReqID: 7c8adb03-fa95-4bad-9bee-8228240b2052 | Status: Processing already in progress
-2026-07-08T13:12:41.699+05:30  WARN 30884 --- [VoucherService] [nio-9999-exec-9] c.f.V.Exception.GlobalExceptionHandler   : CONCURRENCY_CONFLICT | Path: /api/voucher/create-batch-from-cache | Message: Batch creation is already in progress for this Request ID.
+I completely understand why this is frustrating. This is a classic **"Dangling Lock" (or Poisoned Lock)** issue.
+I can tell you exactly why this is happening just by looking at the timestamps in your logs. Here is the exact sequence of events that causes this annoying error, followed by the code fix to permanently solve it.
+### Why This Error Happens
+ 1. **13:12:25 (Click 1):** The user clicks "Submit". The backend puts a **"Concurrency Lock"** on this Request ID to prevent the user from double-clicking and creating two duplicate batches.
+ 2. **13:12:25 (The Failure):** The backend reaches the time validation check. Because the user waited too long on the screen before clicking submit, the time is no longer exactly 30 minutes in the future. The backend throws an INVALID_DATA exception and aborts the creation process.
+ 3. **🚨 THE BUG:** Because the code threw an exception and aborted, **it never reached the line of code that removes the Concurrency Lock.** The lock is left dangling forever.
+ 4. **13:12:41 (Click 2):** Sixteen seconds later, the user fixes the time on the screen and clicks "Submit" again.
+ 5. **13:12:41 (The Irritating Error):** The backend sees the leftover lock from 16 seconds ago, assumes the system is still actively processing the first click, and blocks the user with the CONCURRENCY_CONFLICT error.
+### How to Fix It (The Java Code)
+To fix this, we need to ensure that **no matter what happens** (even if validation fails or the database crashes), the concurrency lock is *always* released. We do this using a try-finally block.
+Open **VoucherCommandService.java** and locate the method where this is happening (likely named something like createBatchFromCache, processBatch, or initiateBatch).
+Look for where you are setting the concurrency lock. It probably looks something like this right now:
+#### ❌ Current (Buggy) Code Structure
+```java
+public void createBatchFromCache(String reqId, ...) {
+    // 1. Sets the lock
+    if (!lockManager.acquireLock(reqId)) {
+        throw new ConcurrencyConflictException("Batch creation is already in progress...");
+    }
+
+    // 2. Validates (THROWS EXCEPTION AND ABORTS HERE)
+    workflowEngine.validateScheduledTime(scheduledTime, isFinalApproval);
+
+    // 3. Processes the batch...
+    
+    // 4. Clears the lock (NEVER REACHED IF VALIDATION FAILS)
+    lockManager.releaseLock(reqId); 
+}
+
+```
+#### ✅ The Fix: Wrap it in a finally block
+You must wrap everything *after* the lock acquisition inside a try { ... } finally { ... } block. A finally block is guaranteed to run even if an exception is thrown inside the try.
+**Change your method to look like this:**
+```java
+public void createBatchFromCache(String reqId, ...) {
+    // 1. Set the lock
+    if (!lockManager.acquireLock(reqId)) { // (Or however you check your lock)
+        throw new CustomExceptions.ConcurrencyConflictException("Batch creation is already in progress for this Request ID.");
+    }
+
+    try {
+        // 2. Put ALL validation and processing inside the try block
+        workflowEngine.validateScheduledTime(scheduledTime, isFinalApproval);
+        
+        // ... rest of your batch creation logic ...
+
+    } finally {
+        // 3. GUARANTEED UNLOCK
+        // This will ALWAYS run, even if the 30-minute validation fails!
+        lockManager.releaseLock(reqId); 
+        // (If your lock is a database flag, do: repository.updateLockStatus(reqId, "AVAILABLE"); )
+    }
+}
+
+```
+### If your lock is a ConcurrentHashMap or Set in memory:
+If your VoucherCommandService has something like private final Set<String> processingSet = ConcurrentHashMap.newKeySet(); at the top of the file, your fix will look exactly like this:
+```java
+    if (!processingSet.add(reqId)) {
+        throw new CustomExceptions.ConcurrencyConflictException("Batch creation is already in progress for this Request ID.");
+    }
+    
+    try {
+        // ALL your logic goes here (Validation, DB Saves, etc)
+    } finally {
+        processingSet.remove(reqId); // <-- This is the magic line that fixes your bug
+    }
+
+```
+Once you wrap your logic in a try-finally block, if a user hits the 30-minute validation error, the lock will instantly clear. When they fix the time and click submit again 5 seconds later, it will go through perfectly!
