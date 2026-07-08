@@ -1,58 +1,71 @@
-I understand exactly why this is happening. The issue is in your **VoucherCommandService.java** in the logWorkflowAction call inside the createBatchRequest method.
-Right now, you are passing dto.getScheduledTime() into logWorkflowAction, but your history logic in the UI is not rendering it because it defaults to "Immediate Execution" if it doesn't see a specifically formatted keyword in the action string.
-### The Fix
-#### 1. Update VoucherCommandService.java
-You need to make sure the "Submitted" action string explicitly contains the scheduling information so the history log chip knows to render it.
-Find this line in your createBatchRequest method:
-```java
-workflowEngine.logWorkflowAction(batchId, dto.getVid(), "Submitted", creatorId, dto.getCommonBatchRemarks(), dto.getScheduledTime());
-
-```
-**Change it to this:**
-```java
-// Pass the scheduled time, and ensure the action string hints at the schedule
-String action = (dto.getScheduledTime() != null) ? "Submitted (Scheduled)" : "Submitted";
-workflowEngine.logWorkflowAction(batchId, dto.getVid(), action, creatorId, dto.getCommonBatchRemarks(), dto.getScheduledTime());
-
-```
-#### 2. Update VoucherPostingStatus.jsx (History Map Logic)
-Now, update your history mapping loop one last time. We need to make sure it respects the history.SCHEDULED_TIME for the "Submitted" action.
-Replace your workflowHistory.map logic with this:
+To fix the issue where your Status screen incorrectly shows "Immediate Execution" despite the creator scheduling a time, you need to update the logic in your **VoucherPostingStatus.jsx** file.
+The core of the problem is that your current code is trying to calculate the schedule status on the fly. We need to force it to read the **immutable history row** instead.
+### 1. Update the workflowHistory.map logic in VoucherPostingStatus.jsx
+Find the workflowHistory.map function. Replace the entire block starting from return ( inside the map with this fully updated version. This version uses the rawAction and the history.SCHEDULED_TIME snapshot to ensure the display is correct for both the Creator and the Approver.
 ```javascript
 {workflowHistory.map((history, idx) => {
-    // ... (keep your existing const definitions for userName, initial, etc)
+    const isSystem = history.LAST_ACTION_BY === "SYSTEM";
+    const userName = history.ACTION_USER_NAME || (isSystem ? "Automated System" : "User");
+    const initial = isSystem ? "S" : userName.charAt(0).toUpperCase();
 
+    // 1. Clean the action label
     const rawAction = history.LAST_ACTION || "System Action";
     const cleanAction = rawAction.replace(/\s*\(.*?\)\s*/g, '').trim();
-    
+
+    // 2. Identify action types
     const isSubmission = rawAction.toUpperCase().includes("SUBMIT");
-    const isScheduled = rawAction.toUpperCase().includes("(SCHEDULED)"); // Matches our new string!
+    const isFinalApproval = rawAction.toUpperCase().includes("FINAL") || rawAction.toUpperCase().includes("ACCEPT");
+    
+    // We look for our explicit flags
+    const isSchOverride = rawAction.toUpperCase().includes("SCH. OVERRIDE");
+    const isImmOverride = rawAction.toUpperCase().includes("IMM. OVERRIDE");
+    const isKeptSchedule = rawAction.toUpperCase().includes("(SCHEDULED)");
+
+    // 3. STRICT HISTORICAL SNAPSHOT: Use the time logged for this specific event
+    const historyRowTime = history.SCHEDULED_TIME;
 
     return (
-        // ... inside your Stack ...
-        <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1.5, flexWrap: "wrap", gap: 1 }}>
-            <Chip label={cleanAction} size="small" ... />
+        <Box key={idx} sx={{ display: 'flex', gap: 2, mb: 2 }}>
+            <Box>
+                <Avatar sx={{ bgcolor: isSystem ? 'secondary.main' : 'primary.main', width: 40, height: 40, fontWeight: 'bold' }}>
+                    {initial}
+                </Avatar>
+            </Box>
+            <Box sx={{ flexGrow: 1, backgroundColor: "white", p: 2, borderRadius: 2, border: "1px solid #e2e8f0" }}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+                    <Typography variant="subtitle2" fontWeight="bold">{userName}</Typography>
+                    <Typography variant="caption" color="text.secondary">• {formatDateTime(history.LAST_ACTION_AT)}</Typography>
+                </Box>
+                
+                <Stack direction="row" spacing={1} alignItems="center" sx={{ flexWrap: "wrap", gap: 1 }}>
+                    <Chip label={cleanAction} size="small" />
 
-            {/* If it was submitted as scheduled, show the chip */}
-            {(isSubmission && isScheduled && history.SCHEDULED_TIME) ? (
-                <Chip 
-                    label={`Scheduled for: ${formatDateTime(history.SCHEDULED_TIME)}`} 
-                    size="small" 
-                    color="info" 
-                    variant="outlined" 
-                    sx={jaStyles.historySchedChip} 
-                />
-            ) : isSubmission ? (
-                <Chip label="Immediate Execution" size="small" color="default" variant="outlined" sx={{ ...jaStyles.historySchedChip, backgroundColor: "#f1f5f9" }} />
-            ) : null}
-            
-            {/* ... keep your existing Final Approval logic ... */}
-        </Stack>
+                    {/* --- THE FIX: HISTORICAL LOGIC --- */}
+                    {isSubmission && historyRowTime ? (
+                        <Chip label={`Scheduled for: ${formatDateTime(historyRowTime)}`} size="small" color="info" variant="outlined" />
+                    ) : isFinalApproval && !isSystem ? (
+                        isSchOverride && historyRowTime ? (
+                            <Chip label={`Schedule Overridden to: ${formatDateTime(historyRowTime)}`} size="small" color="warning" variant="outlined" />
+                        ) : isImmOverride ? (
+                            <Chip label="Overridden to Immediate Execution" size="small" color="warning" variant="outlined" />
+                        ) : isKeptSchedule && historyRowTime ? (
+                            <Chip label={`Original Schedule Kept: ${formatDateTime(historyRowTime)}`} size="small" color="info" variant="outlined" />
+                        ) : (
+                            <Chip label="Immediate Execution" size="small" color="default" variant="outlined" />
+                        )
+                    ) : isSubmission ? (
+                        <Chip label="Immediate Execution" size="small" color="default" variant="outlined" />
+                    ) : null}
+                </Stack>
+                <Typography variant="body2" sx={{ mt: 1 }}>{history.REMARKS}</Typography>
+            </Box>
+        </Box>
     );
 })}
 
 ```
-### Why this works:
- 1. **Action String Hint:** By changing the action string to "Submitted (Scheduled)", the React code can now clearly distinguish between a standard submission and a scheduled one.
- 2. **Explicit Data Binding:** By using history.SCHEDULED_TIME (which comes directly from the database row for that history event), it will always show the time the creator selected, and it will **never** be overwritten by a Final Approver's later actions because that history row is immutable.
-Apply these two changes, and your Status screen will correctly display the Creator's scheduled time for the "Submitted" event!
+### 2. Why this solves your problem:
+ * **Audit Trail Integrity:** By using historyRowTime = history.SCHEDULED_TIME, we are now reading the time that was saved in the database **at the exact moment the creator clicked "Submit."**
+ * **Separation of Concerns:** Because this is inside the workflowHistory.map loop, it treats every action as its own event. Even if a Final Approver overrides the time 10 minutes later, the "Submitted" history row will **never change** because it is referencing its own dedicated snapshot in the VOUCHER_WORKFLOW table.
+ * **No Overwriting:** It completely ignores the vidDetails.SCHEDULED_TIME (the current state) when rendering the history logs, so the Final Approver's actions will only appear on the "Final Approval" row, never on the "Submitted" row.
+**Final Check:** Once you apply this code, your "TCS Maker" entry will show its own scheduled time, and the "Final Approval" entry will show its own rescheduling chip, and they will never clash.
