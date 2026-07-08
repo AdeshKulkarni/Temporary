@@ -1,83 +1,56 @@
-### 1. The "Is Execution Scheduled?" Header (Issue 1)
-You do not need to change any code for the main header! Your Java backend already handles this perfectly. When the Final Approver overrides the schedule, the backend executes this SQL update:
-UPDATE VOUCHER_POSTING SET SCHEDULED_TIME = ...
-Because your UI header (vidDetails.SCHEDULED_TIME) reads directly from this table, it will **automatically** display the Final Approver's updated time if they override it, or the Creator's original time if they don't.
-### 2. The Workflow History Tags (Issue 2)
-To ensure the history perfectly reflects exactly what the Final Approver did (Kept Original Schedule, Overridden to New Time, or Overridden to Immediate), we can use the exact log strings your Java backend is already generating ((Sch. Override), (Imm. Override), and (Scheduled)).
-Here is the exact replacement for the history loop in both **VoucherPostingStatus.js** and **VoucherAuthorization.js**.
-**Find this block inside the workflowHistory.map (around line 718):**
-```javascript
-                        // NEW: Strip out the text in parentheses for a cleaner Chip!
-                        const rawAction = history.LAST_ACTION || "System Action";
-                        const cleanAction = rawAction.replace(/\s*\(.*?\)\s*/g, '').trim();
-
-                        // Identify if this specific log action belongs to a submission or finalization step
-                        const isSubmission = rawAction.toUpperCase().includes("SUBMIT");
-                        const isFinalApproval = rawAction.toUpperCase().includes("FINAL") || rawAction.toUpperCase().includes("ACCEPT");
-
-                        const effectiveScheduledTime = history.SCHEDULED_TIME || (isSubmission && vidDetails?.SCHEDULED_TIME ? vidDetails.SCHEDULED_TIME : null);
-
-                        return (
+### 1. Fix Download Authorization in the Backend (VoucherQueryService.java)
+The backend is currently blocking downloads because its security check only verifies if the user is the creator OR the *currently* pending role. Once a batch is rejected or moved past their step, it throws an "unauthorized" error.
+We will update the authorization query to exactly match the viewing rules: If they created it, OR if their role is part of the workflow chain, they are allowed to download it.
+**Find this method in VoucherQueryService.java:**
+```java
+    public boolean isUserAuthorizedForBatch(String batchId, String userId, Integer roleId) {
+        Integer isCreator = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM VOUCHER_POSTING WHERE BATCH_ID = ? AND CREATED_BY = ?", Integer.class, batchId, userId);
+        if (isCreator != null && isCreator > 0) return true;
+        Integer isAuthorized = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM VOUCHER_POSTING vp JOIN WORKFLOW_TRANSITIONS wt ON vp.PENDING_AT = wt.WORKFLOW_ID WHERE vp.BATCH_ID = ? AND wt.ALLOWED_ROLE_ID = ?", Integer.class, batchId, roleId);
+        return isAuthorized != null && isAuthorized > 0;
+    }
 
 ```
-**Replace everything from that point down through the Stack component with this:**
+**Replace it completely with this:**
+```java
+    public boolean isUserAuthorizedForBatch(String batchId, String userId, Integer roleId) {
+        String sql = """
+            SELECT COUNT(*) FROM VOUCHER_POSTING p 
+            WHERE p.BATCH_ID = ? 
+            AND (
+                p.CREATED_BY = ? 
+                OR EXISTS (
+                    SELECT 1 FROM WORKFLOW_TRANSITIONS wt 
+                    WHERE wt.WORKFLOW_CODE = p.WORKFLOW_CODE 
+                    AND wt.ALLOWED_ROLE_ID = ?
+                )
+            )
+        """;
+        Integer isAuthorized = jdbcTemplate.queryForObject(sql, Integer.class, batchId, userId, roleId);
+        return isAuthorized != null && isAuthorized > 0;
+    }
+
+```
+### 2. Hide "Pending Duration" for the System Execution Stage
+We need to tell the frontend to skip rendering the Pending Duration text if the action was performed by the automated backend system.
+Apply this fix to the Stepper loop in **both VoucherPostingStatus.js and VoucherAuthorization.js**.
+**Find this block inside the Stepper (dynamicSteps.map):**
 ```javascript
-                        // NEW: Strip out the text in parentheses for a cleaner Chip!
-                        const rawAction = history.LAST_ACTION || "System Action";
-                        const cleanAction = rawAction.replace(/\s*\(.*?\)\s*/g, '').trim();
-
-                        // Identify the exact nature of the action based on backend logs
-                        const isSubmission = rawAction.toUpperCase().includes("SUBMIT");
-                        const isFinalApproval = rawAction.toUpperCase().includes("FINAL") || rawAction.toUpperCase().includes("ACCEPT");
-                        
-                        const isSchOverride = rawAction.toUpperCase().includes("SCH. OVERRIDE");
-                        const isImmOverride = rawAction.toUpperCase().includes("IMM. OVERRIDE");
-                        const isKeptSchedule = rawAction.toUpperCase().includes("(SCHEDULED)");
-
-                        const effectiveScheduledTime = history.SCHEDULED_TIME || (isSubmission && vidDetails?.SCHEDULED_TIME ? vidDetails.SCHEDULED_TIME : null);
-
-                        return (
-                          <Box key={idx} sx={{ display: 'flex', gap: 2 }}>
-                            <Box>
-                              <Avatar sx={{ bgcolor: isSystem ? 'secondary.main' : 'primary.main', width: 40, height: 40, fontWeight: 'bold', fontSize: '1rem' }}>
-                                {initial}
-                              </Avatar>
-                            </Box>
-                            <Box sx={{ flexGrow: 1, backgroundColor: "white", p: 2.5, borderRadius: 2, border: "1px solid", borderColor: isExecutionFail ? "#d32f2f" : isSystem ? "#9c27b0" : "#e2e8f0", borderLeftWidth: isExecutionFail || isSystem ? "4px" : "1px", boxShadow: "0 1px 2px 0 rgb(0 0 0 / 0.05)" }}>
-
-                              <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1, mb: 1 }}>
-                                <Typography variant="subtitle2" fontWeight="bold" color="text.primary">
-                                  {userName} {isSystem ? "" : `(${history.LAST_ACTION_BY})`}
-                                </Typography>
-                                <Typography variant="caption" color="text.secondary">• {formatDateTime(history.LAST_ACTION_AT)}</Typography>
-                              </Box>
-
-                              <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1.5, flexWrap: "wrap", gap: 1 }}>
-                                <Chip
-                                  label={cleanAction}
-                                  size="small"
-                                  sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold", backgroundColor: isExecutionFail || rawAction.includes("Reject") ? "#fee2e2" : isSystem ? "#f3e8ff" : "#e0e7ff", color: isExecutionFail || rawAction.includes("Reject") ? "#991b1b" : isSystem ? "#7e22ce" : "#3730a3" }}
-                                />
-
-                                {/* --- FIX: SMART FINAL APPROVER CHIPS --- */}
-                                {isFinalApproval && !isSystem ? (
-                                   isSchOverride && effectiveScheduledTime ? (
-                                       <Chip label={`Schedule Overridden to: ${formatDateTime(effectiveScheduledTime)}`} size="small" color="warning" variant="outlined" sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold" }} />
-                                   ) : isImmOverride ? (
-                                       <Chip label="Overridden to Immediate Execution" size="small" color="warning" variant="outlined" sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold" }} />
-                                   ) : isKeptSchedule && effectiveScheduledTime ? (
-                                       <Chip label={`Original Schedule Kept: ${formatDateTime(effectiveScheduledTime)}`} size="small" color="info" variant="outlined" sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold" }} />
-                                   ) : (
-                                       <Chip label="Immediate Execution" size="small" color="default" variant="outlined" sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold", backgroundColor: "#f1f5f9" }} />
-                                   )
-                                ) : (
-                                   // Logic for Creator / Other Steps
-                                   effectiveScheduledTime ? (
-                                       <Chip label={`Scheduled for: ${formatDateTime(effectiveScheduledTime)}`} size="small" color="info" variant="outlined" sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold" }} />
-                                   ) : isSubmission && !isSystem ? (
-                                       <Chip label="Immediate Execution" size="small" color="default" variant="outlined" sx={{ height: 22, fontSize: "0.7rem", fontWeight: "bold", backgroundColor: "#f1f5f9" }} />
-                                   ) : null
+                                {/* 2. SHOW THE PENDING DURATION FOR COMPLETED STAGES */}
+                                {historyItem && historyItem.stageDuration && (
+                                  <Typography variant="caption" display="block" color="text.secondary" sx={{ fontStyle: 'italic', fontSize: '0.65rem' }}>
+                                    Pending Duration: {historyItem.stageDuration}
+                                  </Typography>
                                 )}
-                              </Stack>
+
+```
+**Replace it with this:**
+```javascript
+                                {/* 2. SHOW THE PENDING DURATION FOR COMPLETED STAGES (Except for System Execution) */}
+                                {historyItem && historyItem.stageDuration && historyItem.LAST_ACTION_BY !== "SYSTEM" && (
+                                  <Typography variant="caption" display="block" color="text.secondary" sx={{ fontStyle: 'italic', fontSize: '0.65rem' }}>
+                                    Pending Duration: {historyItem.stageDuration}
+                                  </Typography>
+                                )}
 
 ```
