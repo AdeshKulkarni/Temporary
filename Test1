@@ -1,2 +1,71 @@
-2026-07-08T14:20:45.336+05:30 ERROR 33332 --- [VoucherService] [nio-9999-exec-3] c.f.V.C.VoucherQueryController           : DOWNLOAD_ERROR | Batch: 0008697 | Reason: PreparedStatementCallback; bad SQL grammar []
-2026-07-08T14:20:55.241+05:30 ERROR 33332 --- [VoucherService] [nio-9999-exec-4] c.f.V.C.VoucherQueryController           : DOWNLOAD_ERROR | Batch: 0008697 | Reason: PreparedStatementCallback; bad SQL grammar []
+The error bad SQL grammar [] in your downloadBatchExcel method is a classic sign that your SQL query string is being corrupted or interpreted incorrectly by the JDBC template, specifically because of the **ORDER BY ID ASC** clause we added.
+In some Oracle configurations, if the column ID is not explicitly found in the target table (VOUCHER_POSTING_DATA) or if there is a keyword conflict, it fails immediately.
+### The Fix
+Let's make the SQL query more robust. Instead of relying on ID, we will order by the REQ_ID column which we know exists in that table based on your processChunkRaw insertion logic.
+Update the generateBatchExcel method in **VoucherQueryService.java**:
+```java
+public byte[] generateBatchExcel(String batchId) {
+    int initialBufferSize = 5 * 1024 * 1024; // 5 MB
+
+    try (SXSSFWorkbook workbook = new SXSSFWorkbook(100);
+         java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(initialBufferSize)) {
+
+        org.apache.poi.ss.usermodel.Sheet sheet = workbook.createSheet("Batch Details");
+        org.apache.poi.ss.usermodel.Row headerRow = sheet.createRow(0);
+        String[] headers = {"Branch", "Currency", "CGL", "Amount", "Type", "Remarks", "Product Code"};
+        for (int i = 0; i < headers.length; i++) headerRow.createCell(i).setCellValue(headers[i]);
+
+        // FIX: Changed 'ORDER BY ID ASC' to 'ORDER BY REQ_ID ASC' 
+        // We use REQ_ID because that is the primary key column defined in your insert statement
+        String sql = "SELECT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_NARRATION, REQ_PRODUCT " +
+                     "FROM VOUCHER_POSTING_DATA WHERE BATCH_ID = ? ORDER BY REQ_ID ASC";
+        
+        int[] rowIdx = {1};
+
+        jdbcTemplate.query(
+                connection -> {
+                    java.sql.PreparedStatement ps = connection.prepareStatement(
+                            sql,
+                            java.sql.ResultSet.TYPE_FORWARD_ONLY,
+                            java.sql.ResultSet.CONCUR_READ_ONLY
+                    );
+                    ps.setFetchSize(2000); 
+                    ps.setString(1, batchId);
+                    return ps;
+                },
+                rs -> {
+                    org.apache.poi.ss.usermodel.Row row = sheet.createRow(rowIdx[0]++);
+
+                    row.createCell(0).setCellValue(rs.getString("REQ_BRANCH_CODE") != null ? rs.getString("REQ_BRANCH_CODE") : "");
+                    row.createCell(1).setCellValue(rs.getString("REQ_CURRENCY") != null ? rs.getString("REQ_CURRENCY") : "");
+                    row.createCell(2).setCellValue(rs.getString("REQ_CGL") != null ? rs.getString("REQ_CGL") : "");
+
+                    BigDecimal amt = rs.getBigDecimal("REQ_AMOUNT");
+                    if (amt != null) {
+                        row.createCell(3).setCellValue(amt.abs().stripTrailingZeros().toPlainString());
+                        row.createCell(4).setCellValue(amt.compareTo(BigDecimal.ZERO) < 0 ? "Credit" : "Debit");
+                    }
+
+                    row.createCell(5).setCellValue(rs.getString("REQ_NARRATION") != null ? rs.getString("REQ_NARRATION") : "");
+                    row.createCell(6).setCellValue(rs.getString("REQ_PRODUCT") != null ? rs.getString("REQ_PRODUCT") : "");
+                }
+        );
+
+        if (rowIdx[0] == 1) {
+            throw new CustomExceptions.InvalidDataException("No records found for batch.");
+        }
+
+        workbook.write(out);
+        workbook.dispose();
+        return out.toByteArray();
+
+    } catch (java.io.IOException e) {
+        throw new CustomExceptions.DatabaseOperationException("Failed to generate Excel file", e);
+    }
+}
+
+```
+### Why this fixes it:
+ 1. **Correct Column Reference:** In your processChunkRaw method, you are inserting data using REQ_ID as the primary sequence key. Referencing ID in the SELECT query was likely causing the "Bad Grammar" error because the database didn't recognize that specific identifier in that context.
+ 2. **Explicit Ordering:** By ordering by REQ_ID, you guarantee the sequence of the rows matches the order they were inserted, which solves your manual/bulk entry scrambling issue.
+**One extra tip:** If you still see bad SQL grammar, check your VOUCHER_POSTING_DATA table in Oracle to ensure the column is indeed named REQ_ID (the sequence you use is VOUCHER_POSTING_DATA_SEQ.NEXTVAL). If the primary key column has a different name, just swap REQ_ID in the ORDER BY clause with the actual primary key column name!
