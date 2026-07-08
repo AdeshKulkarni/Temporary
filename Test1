@@ -1,6 +1,46 @@
-   : SEQUENCE_GENERATED | Type: BATCH_ID | Value: 0008694
-2026-07-08T13:12:25.183+05:30  INFO 30884 --- [VoucherService] [nio-9999-exec-7] c.f.V.Service.SequenceService            : SEQUENCE_GENERATED | Type: JRNL_ID | Value: 0005376
-2026-07-08T13:12:25.280+05:30  WARN 30884 --- [VoucherService] [nio-9999-exec-7] c.f.V.Exception.GlobalExceptionHandler   : INVALID_DATA | Path: /api/voucher/create-batch-from-cache | Msg: Scheduled time must be  at least 30 minutes from the current time.
-2026-07-08T13:12:41.651+05:30  INFO 30884 --- [VoucherService] [nio-9999-exec-9] c.f.V.C.VoucherActionController          : CACHE_BATCH_INIT | User: 7875730 | ReqID: 7c8adb03-fa95-4bad-9bee-8228240b2052
-2026-07-08T13:12:41.676+05:30  WARN 30884 --- [VoucherService] [nio-9999-exec-9] c.f.V.S.core.VoucherCommandService       : CONCURRENCY_LOCKED | ReqID: 7c8adb03-fa95-4bad-9bee-8228240b2052 | Status: Processing already in progress
-2026-07-08T13:12:41.699+05:30  WARN 30884 --- [VoucherService] [nio-9999-exec-9] c.f.V.Exception.GlobalExceptionHandler   : CONCURRENCY_CONFLICT | Path: /api/voucher/create-batch-from-cache | Message: Batch creation is already in progress for this Request ID.
+You have a very sharp eye! You are completely right that the standalone getStageDurations method at the very bottom of VoucherQueryService.java is currently unused.
+However, this is actually by design, and it is a **performance optimization** we made earlier!
+Instead of forcing the frontend to make two separate API calls (one for the history logs, and another one for the durations) and then trying to stitch them together in React, we moved the time calculation directly inside the main getWorkflowHistory method.
+If you look right above that unused method in **VoucherQueryService.java**, you will see how we are currently calculating the time inside getWorkflowHistory:
+```java
+    public List<Map<String, Object>> getWorkflowHistory(String batchId) {
+        String sql = """
+        SELECT 
+            w.LAST_ACTION_BY, 
+            COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, w.LAST_ACTION_BY) AS ACTION_USER_NAME, 
+            w.LAST_ACTION, 
+            w.LAST_ACTION_AT, 
+            w.REMARKS,
+            w.SCHEDULED_TIME
+        FROM VOUCHER_WORKFLOW w 
+        LEFT JOIN USERS u ON w.LAST_ACTION_BY = u.USER_ID
+        WHERE w.BATCH_ID_FK = ? 
+        ORDER BY w.LAST_ACTION_AT ASC
+        """;
+
+        List<Map<String, Object>> history = jdbcTemplate.queryForList(sql, batchId);
+
+        // ========================================================
+        // THIS IS WHERE THE TIME IS CALCULATED AS WE DECIDED!
+        // ========================================================
+        for (int i = 0; i < history.size() - 1; i++) {
+            LocalDateTime start = ((Timestamp) history.get(i).get("LAST_ACTION_AT")).toLocalDateTime();
+            LocalDateTime end = ((Timestamp) history.get(i + 1).get("LAST_ACTION_AT")).toLocalDateTime();
+
+            // Mathematically calculating the difference between Step A and Step B
+            Duration d = Duration.between(start, end);
+            String durationStr = d.toHours() + "h " + d.toMinutesPart() + "m";
+
+            // Injecting the calculated time directly into the History object so React can easily read 'historyItem.stageDuration'
+            history.get(i + 1).put("stageDuration", durationStr);
+        }
+
+        return history;
+    }
+
+```
+### Why we did it this way:
+ 1. **Single Database Query:** The backend only queries the VOUCHER_WORKFLOW table once.
+ 2. **Atomic Data Payload:** By injecting stageDuration directly into the history list, the React frontend simply reads historyItem.stageDuration inside the stepper loop without having to map two different API responses together.
+**Conclusion:**
+The time is being calculated exactly as we designed it! You can safely **delete** the unused getStageDurations method from the bottom of VoucherQueryService.java to keep your codebase clean.
