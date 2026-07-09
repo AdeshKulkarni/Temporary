@@ -1,25 +1,10 @@
-The best and most professional approach is **Option 2: Trigger the lock when the user clicks the "Next" button.**
+This is an excellent plan. We will tackle the auto-refresh feature first, and then I will review your complete file to ensure every piece of this architecture is perfectly aligned.
 
-**Do not trigger the lock automatically when they click a row in the table.**
-Here is why: Users frequently click around tables to read descriptions or examine different VIDs before making a final decision. If you trigger the `/lock` API on every row click, you will spam the backend with lock/unlock requests, and if a user clicks row A, then row B, row A might get stuck in a locked state momentarily.
+### 1. The Auto-Refresh Implementation (`handleNext`)
 
-By tying the lock to the **Next** button, you confirm their intent. The exact microsecond they attempt to proceed, you lock the VID. If they click "Previous" to go back, you unlock it.
+To implement the auto-refresh, we will catch the `409 Conflict` error when User B tries to lock a VID that User A just took. When this happens, we will show the error, clear their selection, and instantly re-fetch the list from the database. Because the database query automatically filters out locked/used VIDs, the taken VID will instantly vanish from their screen.
 
-Here is the exact code to seamlessly integrate this microsecond lock/unlock lifecycle into your **`VoucherPosting.jsx`** component.
-
-### 1. Track the Locked VID
-
-At the top of your `VoucherPosting` component, add a `useRef` to track which VID is currently locked. We use a `ref` instead of state so cleanup functions (like unmounting) can instantly access the current value.
-
-```javascript
-  // --- ADD THIS WITH YOUR OTHER REFS ---
-  const lockedVidRef = useRef(null);
-
-```
-
-### 2. Update the `handleNext` Function (The Lock Acquisition)
-
-Replace your existing `handleNext` function with this asynchronous version. It intercepts the user between Step 0 and Step 1, acquires the lock, and blocks them if User A beat them to it.
+Here is the exact updated `handleNext` function to replace your current one:
 
 ```javascript
   const handleNext = async () => {
@@ -38,11 +23,32 @@ Replace your existing `handleNext` function with this asynchronous version. It i
         lockedVidRef.current = vidToLock; // Store the successfully locked VID
         setActiveStep((prevStep) => prevStep + 1); // Proceed to Entry Method
       } catch (error) {
-        // If 409 Conflict is returned, User A already has it.
+        // 1. Show the "Already in Use" message
         const errMsg = error?.response?.data?.message || "This VID is already in use by another user.";
         showSnackBar(errMsg, "warning");
         
-        // Optional: Call fetchInitialData() here to refresh the grid and remove the taken VID
+        // 2. Clear the current selection so it doesn't stay highlighted
+        setSelectedVoucher(null);
+        
+        // 3. Auto-Refresh the Grid
+        try {
+          let actualRoleId = currentRoleId;
+          if (!actualRoleId) {
+             const auth = sessionStorage.getItem("persist:auth") || localStorage.getItem("persist:auth");
+             if (auth) {
+               const user = JSON.parse(JSON.parse(auth).user);
+               actualRoleId = user?.roleId || user?.role || user?.ROLE_ID;
+             }
+          }
+          
+          if (actualRoleId) {
+            const vouchersResponse = await callApi(`/JS/voucher/active?roleId=${actualRoleId}`, null, "GET");
+            const fetchedVouchers = vouchersResponse?.data || vouchersResponse || [];
+            setVoucherList(Array.isArray(fetchedVouchers) ? fetchedVouchers : []);
+          }
+        } catch (refreshErr) {
+          console.error("Failed to auto-refresh voucher list", refreshErr);
+        }
       } finally {
         setIsPageLoading(false);
       }
@@ -54,76 +60,48 @@ Replace your existing `handleNext` function with this asynchronous version. It i
 
 ```
 
-### 3. Build the Microsecond Release Function
+### 2. The Combined Tab-Close Logic
 
-Add this helper function below `handleNext`. It instantly drops the lock.
+Since you already have a `beforeunload` event listener checking if the user abandons Step 3, we need to combine the lock release into that existing block.
 
-```javascript
-  const releaseLock = useCallback(async (vid) => {
-    if (vid) {
-      try {
-        await callApi(`/JS/voucher/unlock/${vid}`, null, "POST");
-        lockedVidRef.current = null; // Clear the ref
-      } catch (e) {
-        console.error("Failed to release VID lock", e);
-      }
-    }
-  }, [callApi]);
-
-```
-
-### 4. Update Navigation Functions (The Unlock Triggers)
-
-Update your `handleBack` and `handleResetWizard` functions so that if a user abandons the form normally, the lock is destroyed in microseconds.
-
-**Update `handleBack`:**
-
-```javascript
-  const handleBack = () => {
-    // If returning from Step 1 back to the Voucher Selection table, release the lock!
-    if (activeStep === 1 && lockedVidRef.current) {
-      releaseLock(lockedVidRef.current);
-    }
-    setActiveStep((prevStep) => prevStep - 1);
-  };
-
-```
-
-**Update `handleResetWizard`:**
-
-```javascript
-  const handleResetWizard = () => {
-    // If the wizard is completely reset/cancelled, release the lock!
-    if (lockedVidRef.current) {
-      releaseLock(lockedVidRef.current);
-    }
-    
-    setSelectedVoucher(null);
-    setEntryMethod("MANUAL");
-    setRows([createNewRow()]);
-    // ... keep the rest of your reset logic ...
-
-```
-
-### 5. The Component Unmount Safety Net
-
-If the user abandons the form by clicking a completely different menu item (e.g., navigating away from the Voucher Entry page entirely via your sidebar), React will unmount the component. Add this `useEffect` to guarantee the unlock API fires during unmount.
+Replace your existing `useEffect` for `beforeunload` with this combined version:
 
 ```javascript
   useEffect(() => {
-    // Cleanup function runs when the component is destroyed
-    return () => {
+    const handleBeforeUnload = (e) => {
+      // 1. THE MICROSECOND RELEASE: If they close the tab, instantly drop the Redis lock via Beacon
       if (lockedVidRef.current) {
-        // Fire and forget unlock on unmount
-        callApi(`/JS/voucher/unlock/${lockedVidRef.current}`, null, "POST").catch(() => {});
+        navigator.sendBeacon(`/api/voucher/unlock/${lockedVidRef.current}`);
+      }
+
+      // 2. THE WARNING: If they are on Step 3 and haven't clicked the final submit button yet
+      if (activeStep === 3 && !isFinalizing) {
+        e.preventDefault();
+        e.returnValue = "You have an unfinalized batch. If you leave, it will not be sent for approval!";
       }
     };
-  }, []); // Empty dependency array ensures this only runs on unmount
+
+    window.addEventListener("beforeunload", handleBeforeUnload);
+
+    return () => {
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+    };
+  }, [activeStep, isFinalizing]); // Dependencies kept updated
 
 ```
 
-*(Note on Tab Closes: If the user forcefully closes the browser tab, React cannot reliably send authenticated API calls. In that extreme scenario, the 30-minute Redis TTL you built on the backend acts as your perfect safety net.)*
+### 3. Regarding `VoucherBulkUpload.jsx`
+
+**You do not need to make any changes to the `VoucherBulkUpload.jsx` file for the locking system.**
+
+Because `VoucherBulkUpload` is a child component rendered inside `VoucherPosting.jsx` (at Step 2), the parent component remains active the entire time.
+
+* If the user clicks "Back" or "Reset" inside the Bulk Upload component, it triggers `handleBack` or `handleResetWizard` in the parent, which releases the lock.
+* If the user successfully submits the bulk upload, the backend automatically transitions the VID to `USED` and drops the lock.
+* If the user closes the browser tab while the Bulk Upload component is visible, the parent's `beforeunload` event listener (the one we just updated above) will still fire and instantly release the lock.
+
+The parent component perfectly shields the child component.
 
 ---
 
-Are there any specific behaviors you'd like to implement if a user encounters the "Already in Use" toast message, such as automatically refreshing the data grid to hide the taken VID?
+Please paste your completely updated `VoucherPosting.jsx` file whenever you are ready, and I will review every line to ensure the architecture is flawless.
