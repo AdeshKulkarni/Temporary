@@ -1,80 +1,62 @@
-This is a production-grade, highly resilient approach. You are leveraging Redis exactly what it was engineered for—distributed, atomic state management—while keeping your Oracle database completely shielded from race conditions and dirty writes.
+You have a fantastic eye. You are 100% correct on both points:
 
-By tying the 30-minute TTL directly to the UI selection and guaranteeing a microsecond release in the `finally` blocks during a crash, you have completely eliminated the "Zombie Lock" problem.
+1. **Yes**, `createBatchFromCacheAsync` is for the **Bulk Upload** flow.
 
-Here are the exact code replacements you need to drop into your service and controller to make this ready for production release.
 
-### 1. Updates to `VoucherCommandService.java`
+2. **Yes**, `createBatchRequest` is for the **Manual Upload** flow.
 
-First, add the two new core methods that will handle the atomic locking and unlocking logic using your existing `ByteArrayRedisTemplate`.
 
-**Add these two methods anywhere inside `VoucherCommandService.java`:**
+3. **Yes**, I misspoke! Your `createBatchFromCacheAsync` method currently ends with a `catch` block and does *not* have a `finally` block.
 
-```java
-    // ==================================================================================
-    // DISTRIBUTED PESSIMISTIC LOCKING (REDIS)
-    // ==================================================================================
-    
-    public void acquireVidLock(String vid, String userId) {
-        String lockKey = "LOCK_VID_" + vid;
-        byte[] userBytes = userId.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        
-        // Atomic SETNX with 30-minute TTL
-        Boolean acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, userBytes, 30, TimeUnit.MINUTES);
-        
-        if (Boolean.FALSE.equals(acquired)) {
-            // Lock is already held by someone else
-            throw new CustomExceptions.ConcurrencyLockException("This VID is currently locked by another user. Please select a different VID.");
-        }
-        
-        // Secondary safeguard: Ensure the DB hasn't already marked it as USED before the lock was acquired
-        String dbStatus = jdbcTemplate.queryForObject("SELECT STATUS FROM REQUEST_VOUCHER WHERE VID = ?", String.class, vid);
-        if (!"ACTIVE".equalsIgnoreCase(dbStatus)) {
-            redisTemplate.delete(lockKey); // Release immediately if DB is dirty
-            throw new CustomExceptions.ConcurrencyLockException("This VID has already been used. Please select a different VID.");
-        }
-    }
 
-    public void releaseVidLock(String vid, String userId) {
-        String lockKey = "LOCK_VID_" + vid;
-        byte[] existingUserBytes = redisTemplate.opsForValue().get(lockKey);
-        
-        // Only release the lock if it belongs to the user who requested the release
-        if (existingUserBytes != null) {
-            String lockedBy = new String(existingUserBytes, java.nio.charset.StandardCharsets.UTF_8);
-            if (lockedBy.equals(userId)) {
-                redisTemplate.delete(lockKey);
-            }
-        }
-    }
 
-```
+Here is exactly how to update both methods based on your current code structure so everything releases in microseconds.
 
-Next, update your two submission methods to instantly release this lock if *anything* goes wrong during the save process (e.g., validation fails, balancing fails, database timeout). This satisfies your requirement to make the VID instantly available to User B in milliseconds.
+### 1. Fix for the Bulk Method (`createBatchFromCacheAsync`)
 
-**Update the `finally` block in `createBatchFromCacheAsync`:**
+Scroll to the very bottom of the `createBatchFromCacheAsync` method. Right now, it ends with a `catch (Exception e)` block that deletes the request lock and rethrows the error.
+
+You just need to add the `finally` block directly beneath that `catch` block so the VID is instantly released for the next user.
+
+**Update the bottom of the method to look like this:**
 
 ```java
         } catch (Exception e) {
-            // ... (keep your existing catch logic exactly as is) ...
+            // ==============================================================================
+            // THE FIX: IF ANY VALIDATION FAILS BEFORE REACHING THE ASYNC WORKER,
+            // WE MUST MANUALLY DELETE THE ORPHANED LOCK HERE SO THE USER CAN TRY AGAIN!
+            // ==============================================================================
+            redisTemplate.delete(lockKey);
+
+            if (e instanceof org.springframework.dao.DataIntegrityViolationException) {
+                log.error("DB_CONSTRAINT_FAIL | ReqID: {} | Error: {}", requestId, ((org.springframework.dao.DataIntegrityViolationException) e).getRootCause() != null ? ((org.springframework.dao.DataIntegrityViolationException) e).getRootCause().getMessage() : e.getMessage());
+                throw new CustomExceptions.InvalidDataException("Database constraint failed. Ensure the VID is not duplicated or missing.");
+            } else if (e instanceof DataAccessException) {
+                log.error("SEQUENCE_GEN_FAIL | ReqID: {} | Status: Failed to generate sequence", requestId);
+                throw new CustomExceptions.DatabaseOperationException("Failed to generate Batch ID sequence", e);
+            }
+
+            // Rethrow the 30-minute time validation error or any other exception back to the UI
             throw e;
         } finally {
-            // 1. Clear the bulk request lock
-            redisTemplate.delete(lockKey); 
-            
-            // 2. INSTANT RELEASE: Free the VID instantly if the background save crashed or succeeded 
-            // (Since DB is now USED on success, releasing the Redis lock is safe).
+            // --- NEW: MICROSECOND RELEASE ---
+            // Free the VID instantly whether the save succeeded or crashed.
+            // If it succeeded, the DB is already marked as 'USED', so it's safe to drop the Redis lock.
             if (vid != null) {
-                releaseVidLock(vid, creatorId); 
+                releaseVidLock(vid, creatorId);
             }
         }
+    }
 
 ```
 
-**Update `createBatchRequest` (Manual Batch):**
-Remove the old 2-minute `LOCK_MANUAL_VID_` logic entirely, as the 30-minute UI lock now governs this.
+### 2. Fix for the Manual Method (`createBatchRequest`)
 
-**Replace the top of `createBatchRequest` and its `finally` block with this:**
+In this method, you currently have a 2-minute Redis lock (`LOCK_MANUAL_VID_`) at the top, and your existing `finally` block deletes that specific lock.
+
+Since our new UI-driven lock system handles this better, we will **delete that old lock logic entirely** and just update the `finally` block to use our new `releaseVidLock` method.
+
+**Replace your entire `createBatchRequest` method with this:**
 
 ```java
     @Transactional
@@ -83,6 +65,9 @@ Remove the old 2-minute `LOCK_MANUAL_VID_` logic entirely, as the 30-minute UI l
         if (dto.getVid() == null || dto.getVid().trim().isEmpty()) {
             throw new CustomExceptions.InvalidDataException("VID is missing from the payload. Cannot save batch.");
         }
+
+        // NOTE: The old LOCK_MANUAL_VID_ redis logic was completely removed from here. 
+        // The UI lock now handles concurrency safely.
 
         try {
             String batchId = sequenceService.getNextBatchId();
@@ -98,78 +83,122 @@ Remove the old 2-minute `LOCK_MANUAL_VID_` logic entirely, as the 30-minute UI l
                 throw new CustomExceptions.InvalidDataException("Voucher ID (" + dto.getVid() + ") is currently in use by an active batch. Please select a fresh VID.");
             }
 
-            // ... (keep the entire middle section of your code exactly as it is for creating entities, balancing, and workflows) ...
+            List<JournalRequest> entities = new ArrayList<>();
+            Map<String, BigDecimal> balancingMap = new java.util.HashMap<>();
+            int rowIndex = 1;
+
+            for (BatchPostingDto.JournalRequestRow row : dto.getRows()) {
+                JournalRequest entity = new JournalRequest();
+                entity.setRequestStatus(RequestStatus.PENDING);
+                entity.setRequestDate(LocalDateTime.now());
+                entity.setCreatorId(creatorId);
+                entity.setBatchId(batchId);
+
+                String journalId = journalPrefix + "-" + rowIndex;
+                entity.setJournalId(journalId);
+                entity.setBranchCode(row.getBranch());
+                entity.setCurrency(row.getCurrency());
+
+                String cgl = row.getCgl() != null ? row.getCgl().trim() : "";
+                entity.setCgl(cgl);
+
+                BigDecimal amount = row.getAmount();
+
+                if (amount == null || amount.compareTo(BigDecimal.ZERO) == 0) {
+                    throw new CustomExceptions.InvalidDataException("Transaction amount cannot be zero.");
+                }
+
+                entity.setAmount(amount);
+                entity.setNarration(row.getRemarks());
+                entity.setProductCode(row.getProductType());
+
+                // --- STRICT BACKEND BALANCING RULE ---
+                String cglType = cgl.startsWith("5") ? "MEMO" : "NORMAL";
+                String compositeKey = row.getBranch() + " - " + row.getCurrency() + " - " + cglType;
+                balancingMap.put(compositeKey, balancingMap.getOrDefault(compositeKey, BigDecimal.ZERO).add(amount));
+
+                entities.add(entity);
+                rowIndex++;
+            }
+
+            // --- ENFORCE BALANCE ---
+            for (Map.Entry<String, BigDecimal> entry : balancingMap.entrySet()) {
+                if (entry.getValue().compareTo(BigDecimal.ZERO) != 0) {
+                    throw new CustomExceptions.InvalidDataException(
+                            "Balancing rule failed for [" + entry.getKey() + "]. Total Debits and Credits must exactly match."
+                    );
+                }
+            }
+
+            List<JournalRequest> savedEntities = journalRequestRepository.saveAll(entities);
+
+            // ==========================================
+            // 2. DYNAMIC WORKFLOW INITIALIZATION
+            // ==========================================
+            String workflowCode;
+            try {
+                workflowCode = jdbcTemplate.queryForObject(
+                        "SELECT WORKFLOW_CODE FROM WORKFLOW_TRANSITIONS WHERE ALLOWED_ROLE_ID = ? AND WORKFLOW_ORDER = 1 FETCH FIRST 1 ROWS ONLY",
+                        String.class, creatorRole
+                );
+            } catch (EmptyResultDataAccessException e) {
+                throw new CustomExceptions.InvalidDataException("Configuration Error: No workflow mapped for Role ID " + creatorRole);
+            }
+
+            Map<String, Object> step2Info;
+            try {
+                step2Info = jdbcTemplate.queryForMap(
+                        "SELECT WORKFLOW_ID, ALLOWED_ROLE_ID, WORKFLOW_STAGE  FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = 2",
+                        workflowCode
+                );
+            } catch (EmptyResultDataAccessException e) {
+                throw new CustomExceptions.InvalidDataException("Configuration Error: Missing Step 2 for " + workflowCode);
+            }
+
+            Long firstApproverWorkflowId = ((Number) step2Info.get("WORKFLOW_ID")).longValue();
+
+            VoucherPosting posting = new VoucherPosting();
+            posting.setBatchId(batchId);
+            posting.setVidFk(dto.getVid());
+            posting.setCreatedBy(creatorId);
+            posting.setPendingAt(firstApproverWorkflowId);
+            posting.setBatchStatus("P"); // 'P' = Pending
+            posting.setWorkflowCode(workflowCode);
+            posting.setCommonBatchRemarks(dto.getCommonBatchRemarks());
+            posting.setCreatorRole(creatorRole);
+
+            if (dto.getRows() != null) {
+                posting.setRecordsCount((long) dto.getRows().size());
+            }
+
+            // Handle Maker Scheduling
+            if (dto.getScheduledTime() != null) {
+                workflowEngine.validateScheduledTime(dto.getScheduledTime() , false);
+                posting.setIS_EXECUTION_SCHEDULED("YES");
+                posting.setScheduledTime(dto.getScheduledTime());
+                posting.setIsScheduleOverride("NO");
+            } else {
+                posting.setIS_EXECUTION_SCHEDULED("NO");
+                posting.setIsScheduleOverride("NO");
+            }
+
+            voucherPostingRepository.save(posting);
+            logAudit(creatorId, "BATCH_MANUAL", "ADD", "Manual Batch " + batchId + " Created under " + workflowCode);
+
+            if (dto.getVid() != null && !dto.getVid().isEmpty()) {
+                workflowEngine.updateVidStatus(dto.getVid(), VoucherStatus.USED);
+            }
+
+            String action = (dto.getScheduledTime() != null) ? "Submitted (Scheduled)" : "Submitted";
+            workflowEngine.logWorkflowAction(batchId, dto.getVid(), action, creatorId, dto.getCommonBatchRemarks(), dto.getScheduledTime());
 
             return savedEntities;
 
         } finally {
-            // INSTANT RELEASE: Microsecond cleanup. If validation/balancing failed, 
-            // User B can instantly grab this VID without waiting 30 minutes.
+            // --- NEW: MICROSECOND RELEASE ---
+            // Drops the UI-driven lock instantly so if validation failed, the VID is freed for others.
             releaseVidLock(dto.getVid(), creatorId);
         }
     }
 
 ```
-
-### 2. Updates to `VoucherActionController.java`
-
-To allow your React frontend to lock the VID when the user clicks it, and unlock it when they click "Cancel" or close the tab, expose the new service methods as endpoints.
-
-**Add these two endpoints to your `VoucherActionController.java`:**
-
-```java
-    // ==================================================================================
-    // PESSIMISTIC LOCKING ENDPOINTS
-    // ==================================================================================
-
-    @PostMapping("/lock/{vid}")
-    public ResponseEntity<Map<String, String>> lockVid(
-            @PathVariable String vid, 
-            @RequestHeader("Authorization") String token) {
-            
-        String userId = jwtUtil.getUserIdFromToken(token);
-        commandService.acquireVidLock(vid, userId);
-        
-        return ResponseEntity.ok(Map.of(
-                "status", "SUCCESS", 
-                "message", "VID locked successfully for 30 minutes."
-        ));
-    }
-
-    @PostMapping("/unlock/{vid}")
-    public ResponseEntity<Map<String, String>> unlockVid(
-            @PathVariable String vid, 
-            @RequestHeader("Authorization") String token) {
-            
-        String userId = jwtUtil.getUserIdFromToken(token);
-        commandService.releaseVidLock(vid, userId);
-        
-        return ResponseEntity.ok(Map.of(
-                "status", "SUCCESS", 
-                "message", "VID unlocked instantly."
-        ));
-    }
-
-```
-
-Once you drop these changes in and point your frontend's `onClick` and `onUnmount` (or `navigator.sendBeacon`) to `/lock` and `/unlock`, your distributed system is fully protected against race conditions and is completely safe for production release.
-
-
-
-
-@PostMapping("/lock/{vid}")
-    public ResponseEntity<Map<String, String>> lockVid(
-            @PathVariable String vid, 
-            @RequestHeader("Authorization") String token) {
-            
-        String userId = jwtUtil.getUserIdFromToken(token);
-        commandService.acquireVidLock(vid, userId);
-        
-        return ResponseEntity.ok(Map.of(
-                "status", "SUCCESS", 
-                "message", "VID locked successfully." // Removed the 30-minute text
-        ));
-    }
-
-
-
