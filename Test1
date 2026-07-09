@@ -1,114 +1,248 @@
-This is a classic environment-specific issue, and you are completely right to suspect the security layer!
-### Why this is happening (and why only in SD)
-In your local environment, your API calls are sent as plain JSON. However, in your SD environment, your useApi hook has a global security feature enabled that automatically **encrypts** POST request payloads.
-Because of this, the frontend takes your JSON object and turns it into an encrypted string (that's the 'V9W13sPAtmzXhIR2...==' you see in the error).
-When this encrypted string hits your backend, your VoucherActionController is strictly looking for a plain JSON @RequestBody ProcessVoucherRequestDto. It has no idea how to convert an encrypted string into a Java object, so it crashes with the JSON_PARSE_ERROR.
-### The Fix: Bypassing Encryption
-As you requested, we will disable the payload encryption for these specific calls so your SD testing can proceed smoothly. We will add them back later once the backend decryption filter is ready.
-Looking at your download-batch API call, your callApi function accepts a 7th parameter (false) to bypass encryption. We need to apply this to all your POST requests.
-Here are the exact replacements you need to make in your frontend files.
-### 1. Update VoucherAuthorization.jsx
-Find the handleSubmitAction function (around line 496) and update the callApi request.
-**Replace this:**
-```javascript
-    try {
-      const response = await callApi(
-        "/JS/voucher/workflow/action",
-        {
-          batchId: viewingBatchId,
-          status: statusToSubmit,
-          remarks: executorRemarks.trim(),
-          overrideScheduleLapse: overrideLapse,
-          newScheduledTime: formattedNewSchedule,
-        },
-        "POST"
+import axios from "axios";
+import { resolveConfig } from "../config/EnvironmentConfig"; // Ensure this path is correct
+import { tokenRefreshed, logoutSuccess } from "../store/slices/authSlice";
+import { parseJwt } from "../utils/EncryptionUtilities";
+import { encryptPayload, decryptPayload } from "../utils/cryptoUtil";
+
+let store; // Will hold the Redux store reference
+
+// Inject store from App.js or index.js to avoid circular dependency
+export const injectStore = (_store) => {
+  store = _store;
+};
+
+// Create a Singleton Axios Instance
+const api = axios.create({
+  baseURL: "", // Base URL
+  withCredentials: true, // IMPORTANT: Allows sending/receiving HttpOnly Cookies
+  headers: {
+    "Content-Type": "application/json",
+  },
+});
+
+// Create a Singleton Axios Instance
+const authClient = axios.create({
+  baseURL: "", // Base URL
+  withCredentials: true, // IMPORTANT: Allows sending/receiving HttpOnly Cookies
+  headers: {
+    "Content-Type": "application/json",
+  },
+});
+
+// --- Request Interceptor ---
+api.interceptors.request.use(
+  async (config) => {
+    // 1. Get Token from Redux Store
+    const state = store?.getState();
+    const token = state?.auth?.token;
+
+    // 2. Attach Authorization Header
+    const isRefreshRequest = config.url?.includes("/auth/refresh-token");
+    if (!isRefreshRequest && token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+
+    // 3. Attach Context Header (X-Request-Type) if passed in config
+    // The hook will pass this in, or defaults to '*'
+    if (!config.headers["X-Request-Type"]) {
+      config.headers["X-Request-Type"] = "*";
+    }
+
+    // 4. Encrypt POST/PUT/PATCH request payloads
+
+    const excludedUrls = [
+      "/auth/refresh-token",
+      "/auth/start-prod",
+      "/auth/login",
+      "/auth/check-user",
+      "/admin-support/admin-execute",
+      "/admin-support/upload-script",
+    ];
+
+    const shouldSkipEncryption = excludedUrls.some((url) =>
+      config.url?.includes(url),
+    );
+
+    if (
+      !shouldSkipEncryption &&
+      ["post", "put", "patch"].includes(config.method?.toLowerCase()) &&
+      config.data &&
+      !(config.data instanceof FormData)
+    ) {
+      const state = store?.getState();
+
+      const sessionKey =
+        state?.auth?.payloadEncryptionKey ||
+        localStorage.getItem("payloadEncryptionKey");
+
+      if (sessionKey) {
+        const encryptedString = await encryptPayload(config.data, sessionKey);
+
+        config.data = encryptedString;
+
+        config.headers["X-Encrypted-Payload"] = "true";
+
+        config.headers["Content-Type"] = "application/json";
+      }
+    }
+    return config;
+  },
+  (error) => Promise.reject(error),
+);
+
+// --- Response Interceptor ---
+let isRefreshing = false;
+let failedQueue = [];
+
+const processQueue = (error, token = null) => {
+  failedQueue.forEach((prom) => {
+    if (error) {
+      prom.reject(error);
+    } else {
+      prom.resolve(token);
+    }
+  });
+  failedQueue = [];
+};
+
+api.interceptors.response.use(
+  async (response) => {
+    const isEncrypted = response.headers["x-encrypted-response"] === "true";
+
+    if (isEncrypted && response.data) {
+      const state = store?.getState();
+
+      const sessionKey =
+        state?.auth?.payloadEncryptionKey ||
+        localStorage.getItem("payloadEncryptionKey");
+
+      if (sessionKey) {
+        try {
+          const decryptedJsonString = await decryptPayload(
+            response.data.encryptedResponse,
+            sessionKey,
+          );
+
+          response.data = JSON.parse(decryptedJsonString);
+          console.log("decrypted reponse:", response.data);
+        } catch (error) {
+          console.error("Failed to decrypt response", error);
+
+          return Promise.reject(error);
+        }
+      }
+    }
+
+    return response;
+  },
+
+  async (error) => {
+    const originalRequest = error.config;
+
+    // Safety check to prevent infinite loops
+    if (!originalRequest || originalRequest._retryCount > 2) {
+      return Promise.reject(error);
+    }
+
+    // Extract Error Details
+    const status = error.response?.status;
+    const errorCode = error.response?.data?.error || error.response?.data?.code;
+
+    // ---------------------------------------------------------
+    // SCENARIO 1: Concurrent Login / Session Invalidated
+    // ---------------------------------------------------------
+    if (
+      status === 401 &&
+      (errorCode === "CONCURRENT_LOGIN" ||
+        errorCode === "SESSION_EXPIRED" ||
+        errorCode === "INVALID_TOKEN")
+    ) {
+      // Do NOT attempt refresh. The session is dead.
+      // We dispatch a custom event that AuthContext listens to for the Dialog
+      window.dispatchEvent(
+        new CustomEvent("auth:session-expired", {
+          detail: { reason: errorCode },
+        }),
       );
 
-```
-**With this:**
-```javascript
-    try {
-      const response = await callApi(
-        "/JS/voucher/workflow/action",
-        {
-          batchId: viewingBatchId,
-          status: statusToSubmit,
-          remarks: executorRemarks.trim(),
-          overrideScheduleLapse: overrideLapse,
-          newScheduledTime: formattedNewSchedule,
-        },
-        "POST",
-        "json", // responseType
-        null,   // customHeaders
-        {},     // customConfig
-        false   // <--- BYPASSES SD ENCRYPTION
-      );
+      // Clear local state immediately
+      store.dispatch(logoutSuccess());
+      return Promise.reject(error);
+    }
 
-```
-### 2. Update VoucherPosting.jsx
-There are three POST requests in this file that need the encryption bypass.
-#### Fix A: handleFinalizeRouting (Bulk Upload)
-Find the callApi inside the entryMethod === "BULK" block (around line 249).
-**Replace this:**
-```javascript
-        const response = await callApi("/JS/voucher/create-batch-from-cache", {
-          requestId: submittedBatchId,
-          postingDate: formattedBackendDate,
-          vid: selectedVoucher.vid,
-          commonBatchRemarks: "Voucher created successfully",
-          scheduledTime: formattedSchedule
-        }, "POST");
-
-```
-**With this:**
-```javascript
-        const response = await callApi("/JS/voucher/create-batch-from-cache", {
-          requestId: submittedBatchId,
-          postingDate: formattedBackendDate,
-          vid: selectedVoucher.vid,
-          commonBatchRemarks: "Voucher created successfully",
-          scheduledTime: formattedSchedule
-        }, "POST", "json", null, {}, false); // <--- BYPASSES SD ENCRYPTION
-
-```
-#### Fix B: handleFinalizeRouting (Manual Update)
-Immediately below the previous fix, in the else block (around line 260).
-**Replace this:**
-```javascript
-      } else {
-        // For Manual, the batch is already created, just update the schedule.
-        await callApi("/JS/voucher/update-schedule", {
-          batchId: submittedBatchId,
-          scheduledTime: formattedSchedule
-        }, "POST");
+    // ---------------------------------------------------------
+    // SCENARIO 2: Access Token Expired (Try Refresh)
+    // ---------------------------------------------------------
+    if (
+      status === 401 &&
+      errorCode === "TOKEN_EXPIRED" &&
+      !originalRequest._retry
+    ) {
+      if (isRefreshing) {
+        // If already refreshing, queue this request
+        return new Promise(function (resolve, reject) {
+          failedQueue.push({
+            resolve: (token) => {
+              originalRequest.headers["Authorization"] = "Bearer " + token;
+              resolve(api(originalRequest));
+            },
+            reject: (err) => {
+              reject(err);
+            },
+          });
+        });
       }
 
-```
-**With this:**
-```javascript
-      } else {
-        // For Manual, the batch is already created, just update the schedule.
-        await callApi("/JS/voucher/update-schedule", {
-          batchId: submittedBatchId,
-          scheduledTime: formattedSchedule
-        }, "POST", "json", null, {}, false); // <--- BYPASSES SD ENCRYPTION
+      originalRequest._retry = true;
+      isRefreshing = true;
+
+      try {
+        // Call Backend Refresh Endpoint
+        // Note: We don't send the refresh token in body; backend reads the Cookie
+        const response = await authClient.post(
+          `${resolveConfig("/LS") || ""}/auth/refresh-token`,
+          {},
+        );
+
+        // const { accessToken } = response?.data?.data || "";
+        const { accessToken, payloadEncryptionKey } =
+          response?.data?.data || {};
+
+        if (payloadEncryptionKey) {
+          localStorage.setItem("payloadEncryptionKey", payloadEncryptionKey);
+        }
+
+        if (accessToken) {
+          // 1. Update Redux
+          const user = parseJwt(accessToken);
+          store.dispatch(tokenRefreshed({ token: accessToken, user }));
+          api.defaults.headers.common.Authorization = `Bearer ${accessToken}`;
+
+          // 2. Process Queue
+          processQueue(null, accessToken);
+
+          // 3. Retry Original Request
+          originalRequest.headers["Authorization"] = "Bearer " + accessToken;
+          return api(originalRequest);
+        } else {
+          throw new Error("No access token returned");
+        }
+      } catch (refreshError) {
+        processQueue(refreshError, null);
+        store.dispatch(logoutSuccess());
+        window.dispatchEvent(
+          new CustomEvent("auth:session-expired", {
+            detail: { reason: "SESSION_EXPIRED" },
+          }),
+        );
+        return Promise.reject(refreshError);
+      } finally {
+        isRefreshing = false;
       }
+    }
 
-```
-#### Fix C: handleValidateClick (Manual Create)
-Find the callApi where the manual batch is created (around line 429).
-**Replace this:**
-```javascript
-    try {
-      const response = await callApi("/JS/voucher/create-batch", finalPayload, "POST");
-      const newBatchId = response?.[0]?.batchId || response?.batchId || "N/A";
+    return Promise.reject(error);
+  },
+);
 
-```
-**With this:**
-```javascript
-    try {
-      const response = await callApi("/JS/voucher/create-batch", finalPayload, "POST", "json", null, {}, false); // <--- BYPASSES SD ENCRYPTION
-      const newBatchId = response?.[0]?.batchId || response?.batchId || "N/A";
-
-```
-Once you apply these changes and deploy to the SD server, the frontend will send standard, unencrypted JSON objects, and the JSON_PARSE_ERROR will be completely resolved. No backend changes are required for this fix!
+export default api;
