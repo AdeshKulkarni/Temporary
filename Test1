@@ -1,248 +1,39 @@
-import axios from "axios";
-import { resolveConfig } from "../config/EnvironmentConfig"; // Ensure this path is correct
-import { tokenRefreshed, logoutSuccess } from "../store/slices/authSlice";
-import { parseJwt } from "../utils/EncryptionUtilities";
-import { encryptPayload, decryptPayload } from "../utils/cryptoUtil";
+Got it. You are completely right—since the final execution step is handled by the automated system behind the scenes, showing a "Pending Since" timer doesn't make sense because there is no human waiting to take action.
 
-let store; // Will hold the Redux store reference
+We can easily hide this timer specifically for the system execution step by checking the role attached to that step.
 
-// Inject store from App.js or index.js to avoid circular dependency
-export const injectStore = (_store) => {
-  store = _store;
-};
+Here is the precise fix for **`VoucherAuthorization.jsx`**.
 
-// Create a Singleton Axios Instance
-const api = axios.create({
-  baseURL: "", // Base URL
-  withCredentials: true, // IMPORTANT: Allows sending/receiving HttpOnly Cookies
-  headers: {
-    "Content-Type": "application/json",
-  },
-});
+### The Fix
 
-// Create a Singleton Axios Instance
-const authClient = axios.create({
-  baseURL: "", // Base URL
-  withCredentials: true, // IMPORTANT: Allows sending/receiving HttpOnly Cookies
-  headers: {
-    "Content-Type": "application/json",
-  },
-});
+Scroll down to the `Stepper` component inside your `isViewModalOpen` Dialog (around line 1250). Look for the block of code that renders the `"Pending Since:"` text and add **`&& step.role !== "System"`** to the condition.
 
-// --- Request Interceptor ---
-api.interceptors.request.use(
-  async (config) => {
-    // 1. Get Token from Redux Store
-    const state = store?.getState();
-    const token = state?.auth?.token;
+**Replace this existing block:**
 
-    // 2. Attach Authorization Header
-    const isRefreshRequest = config.url?.includes("/auth/refresh-token");
-    if (!isRefreshRequest && token) {
-      config.headers.Authorization = `Bearer ${token}`;
-    }
+```javascript
+{/* Keep existing Pending Since logic for the current stage */}
+{isCurrent && viewingBatchState !== "REJECTED" && (
+  <Typography variant="caption" display="block" color={isEscalated ? "warning.main" : "text.secondary"} fontWeight="bold" sx={{ mt: 0.5 }}>
+    Pending Since: {viewingBatch?.timeSinceLastAction || "0h 0m"}
+  </Typography>
+)}
 
-    // 3. Attach Context Header (X-Request-Type) if passed in config
-    // The hook will pass this in, or defaults to '*'
-    if (!config.headers["X-Request-Type"]) {
-      config.headers["X-Request-Type"] = "*";
-    }
+```
 
-    // 4. Encrypt POST/PUT/PATCH request payloads
+**With this updated block:**
 
-    const excludedUrls = [
-      "/auth/refresh-token",
-      "/auth/start-prod",
-      "/auth/login",
-      "/auth/check-user",
-      "/admin-support/admin-execute",
-      "/admin-support/upload-script",
-    ];
+```javascript
+{/* Keep existing Pending Since logic for the current stage (hide for System execution) */}
+{isCurrent && viewingBatchState !== "REJECTED" && step.role !== "System" && (
+  <Typography variant="caption" display="block" color={isEscalated ? "warning.main" : "text.secondary"} fontWeight="bold" sx={{ mt: 0.5 }}>
+    Pending Since: {viewingBatch?.timeSinceLastAction || "0h 0m"}
+  </Typography>
+)}
 
-    const shouldSkipEncryption = excludedUrls.some((url) =>
-      config.url?.includes(url),
-    );
+```
 
-    if (
-      !shouldSkipEncryption &&
-      ["post", "put", "patch"].includes(config.method?.toLowerCase()) &&
-      config.data &&
-      !(config.data instanceof FormData)
-    ) {
-      const state = store?.getState();
+### Why this works:
 
-      const sessionKey =
-        state?.auth?.payloadEncryptionKey ||
-        localStorage.getItem("payloadEncryptionKey");
+Your backend query (`getWorkflowSteps` in `VoucherQueryService`) automatically assigns the string `"System"` to the `role` property for any automated steps (where the `ALLOWED_ROLE_ID` is null).
 
-      if (sessionKey) {
-        const encryptedString = await encryptPayload(config.data, sessionKey);
-
-        config.data = encryptedString;
-
-        config.headers["X-Encrypted-Payload"] = "true";
-
-        config.headers["Content-Type"] = "application/json";
-      }
-    }
-    return config;
-  },
-  (error) => Promise.reject(error),
-);
-
-// --- Response Interceptor ---
-let isRefreshing = false;
-let failedQueue = [];
-
-const processQueue = (error, token = null) => {
-  failedQueue.forEach((prom) => {
-    if (error) {
-      prom.reject(error);
-    } else {
-      prom.resolve(token);
-    }
-  });
-  failedQueue = [];
-};
-
-api.interceptors.response.use(
-  async (response) => {
-    const isEncrypted = response.headers["x-encrypted-response"] === "true";
-
-    if (isEncrypted && response.data) {
-      const state = store?.getState();
-
-      const sessionKey =
-        state?.auth?.payloadEncryptionKey ||
-        localStorage.getItem("payloadEncryptionKey");
-
-      if (sessionKey) {
-        try {
-          const decryptedJsonString = await decryptPayload(
-            response.data.encryptedResponse,
-            sessionKey,
-          );
-
-          response.data = JSON.parse(decryptedJsonString);
-          console.log("decrypted reponse:", response.data);
-        } catch (error) {
-          console.error("Failed to decrypt response", error);
-
-          return Promise.reject(error);
-        }
-      }
-    }
-
-    return response;
-  },
-
-  async (error) => {
-    const originalRequest = error.config;
-
-    // Safety check to prevent infinite loops
-    if (!originalRequest || originalRequest._retryCount > 2) {
-      return Promise.reject(error);
-    }
-
-    // Extract Error Details
-    const status = error.response?.status;
-    const errorCode = error.response?.data?.error || error.response?.data?.code;
-
-    // ---------------------------------------------------------
-    // SCENARIO 1: Concurrent Login / Session Invalidated
-    // ---------------------------------------------------------
-    if (
-      status === 401 &&
-      (errorCode === "CONCURRENT_LOGIN" ||
-        errorCode === "SESSION_EXPIRED" ||
-        errorCode === "INVALID_TOKEN")
-    ) {
-      // Do NOT attempt refresh. The session is dead.
-      // We dispatch a custom event that AuthContext listens to for the Dialog
-      window.dispatchEvent(
-        new CustomEvent("auth:session-expired", {
-          detail: { reason: errorCode },
-        }),
-      );
-
-      // Clear local state immediately
-      store.dispatch(logoutSuccess());
-      return Promise.reject(error);
-    }
-
-    // ---------------------------------------------------------
-    // SCENARIO 2: Access Token Expired (Try Refresh)
-    // ---------------------------------------------------------
-    if (
-      status === 401 &&
-      errorCode === "TOKEN_EXPIRED" &&
-      !originalRequest._retry
-    ) {
-      if (isRefreshing) {
-        // If already refreshing, queue this request
-        return new Promise(function (resolve, reject) {
-          failedQueue.push({
-            resolve: (token) => {
-              originalRequest.headers["Authorization"] = "Bearer " + token;
-              resolve(api(originalRequest));
-            },
-            reject: (err) => {
-              reject(err);
-            },
-          });
-        });
-      }
-
-      originalRequest._retry = true;
-      isRefreshing = true;
-
-      try {
-        // Call Backend Refresh Endpoint
-        // Note: We don't send the refresh token in body; backend reads the Cookie
-        const response = await authClient.post(
-          `${resolveConfig("/LS") || ""}/auth/refresh-token`,
-          {},
-        );
-
-        // const { accessToken } = response?.data?.data || "";
-        const { accessToken, payloadEncryptionKey } =
-          response?.data?.data || {};
-
-        if (payloadEncryptionKey) {
-          localStorage.setItem("payloadEncryptionKey", payloadEncryptionKey);
-        }
-
-        if (accessToken) {
-          // 1. Update Redux
-          const user = parseJwt(accessToken);
-          store.dispatch(tokenRefreshed({ token: accessToken, user }));
-          api.defaults.headers.common.Authorization = `Bearer ${accessToken}`;
-
-          // 2. Process Queue
-          processQueue(null, accessToken);
-
-          // 3. Retry Original Request
-          originalRequest.headers["Authorization"] = "Bearer " + accessToken;
-          return api(originalRequest);
-        } else {
-          throw new Error("No access token returned");
-        }
-      } catch (refreshError) {
-        processQueue(refreshError, null);
-        store.dispatch(logoutSuccess());
-        window.dispatchEvent(
-          new CustomEvent("auth:session-expired", {
-            detail: { reason: "SESSION_EXPIRED" },
-          }),
-        );
-        return Promise.reject(refreshError);
-      } finally {
-        isRefreshing = false;
-      }
-    }
-
-    return Promise.reject(error);
-  },
-);
-
-export default api;
+By adding `step.role !== "System"`, React will render the timer for all human checker stages, but the moment the workflow pointer shifts to the final automated execution stage, the timer will cleanly disappear from the UI.
