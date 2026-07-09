@@ -1,33 +1,69 @@
-const handleNext = async () => {
-    if (activeStep === 0) {
-      if (!selectedVoucher) {
-        showSnackBar("Please select a voucher from the list first.", "warning");
-        return;
-      }
+You have hit on the final piece of the puzzle: **Real-time visibility.** You are absolutely right—relying on a user to click "Next" only to get an error is "reactive" design; we want to be "proactive" so the user doesn't even bother clicking a taken VID.
 
-      // --- ONLY LOCK WHEN THEY CLICK "NEXT" ---
-      const vidToLock = selectedVoucher.vid || selectedVoucher.VID;
-      setIsPageLoading(true);
-      
-      try {
-        await callApi(`/JS/voucher/lock/${vidToLock}`, null, "POST");
-        lockedVidRef.current = vidToLock;
-        setActiveStep((prevStep) => prevStep + 1);
-      } catch (error) {
-        // --- THIS FIXES THE DEADLOCK ---
-        const errMsg = error?.response?.data?.message || "This VID is already in use.";
-        showSnackBar(errMsg, "warning");
+Since you already have a WebSocket-like notification system (indicated by your `NotificationWriterService` and `stringRedisTemplate.convertAndSend` logic), we can use this to create a "Live Grid".
+
+Here is how to implement the auto-refresh for User B the moment User A succeeds:
+
+### 1. The Strategy: Broadcast the "Used" Event
+
+When User A finishes their transaction and the backend status changes to `USED`, your backend should publish a lightweight event to a Redis channel.
+
+**In your `VoucherCommandService.java` (near where you mark the VID as `USED`):**
+
+```java
+// Inside the final step of your submission/approval logic:
+workflowEngine.updateVidStatus(vid, VoucherStatus.USED);
+
+// BROADCAST: Tell all connected clients that this VID is no longer available
+stringRedisTemplate.convertAndSend("notifications:vid-update", vid);
+
+```
+
+### 2. The Frontend "Live Listener"
+
+In your `VoucherPosting.jsx`, you need a `useEffect` that listens to this channel. When it hears the specific VID that User B is looking at, it forces a grid refresh.
+
+**Add this to `VoucherPosting.jsx`:**
+
+```javascript
+  useEffect(() => {
+    // 1. Establish the connection to your existing notification system
+    const handleVidUpdate = (updatedVid) => {
+      // If the VID that just changed is one we have in our list, refresh the grid
+      if (voucherList.some(v => v.vid === updatedVid)) {
+        showSnackBar(`VID ${updatedVid} has just been taken. Refreshing list...`, "info");
         
-        // 1. Clear the selection so they don't think they still have it
-        setSelectedVoucher(null); 
-        
-        // 2. Automatically refresh the table so the VID disappears/updates status
-        const vouchersResponse = await callApi(`/JS/voucher/active?roleId=${currentRoleId}`, null, "GET");
-        setVoucherList(vouchersResponse?.data || vouchersResponse || []);
-      } finally {
-        setIsPageLoading(false);
+        // RE-FETCH the fresh list
+        callApi(`/JS/voucher/active?roleId=${currentRoleId}`, null, "GET")
+          .then(res => setVoucherList(res.data || res || []));
       }
-    } else {
-      setActiveStep((prevStep) => prevStep + 1);
-    }
-  };
+    };
+
+    // 2. Subscribe to the channel (assuming your existing socket/pub-sub setup)
+    // You can hook this into your existing notification subscription logic
+    window.addEventListener("VID_UPDATE_EVENT", (e) => handleVidUpdate(e.detail));
+
+    return () => {
+      window.removeEventListener("VID_UPDATE_EVENT", handleVidUpdate);
+    };
+  }, [voucherList, currentRoleId, callApi, showSnackBar]);
+
+```
+
+### Why this is the best production approach:
+
+* **Zero Polling:** You aren't forcing the frontend to constantly ping the database every 5 seconds. It only refreshes when a change actually happens.
+
+
+* **Instant Visibility:** As soon as User A finishes, User B's grid updates. User B sees the VID disappear from the list *before* they even attempt to click it.
+
+
+* **Zero Conflict:** Because the grid removes the VID, User B is never given the chance to "lock" it, which completely eliminates the 409 Conflict errors and the need for the retry logic in the first place.
+
+
+
+### A Note for your Release
+
+This "Live Refresh" is the gold standard for high-concurrency systems (like booking engines). If your notification infrastructure is already handling `notifications:alerts`, simply adding a `notifications:vid-update` channel is a very low-risk change that will make your application feel incredibly fast and professional.
+
+Does your current notification infrastructure already support broadcasting events to all connected clients, or would you like to see how to trigger the refresh from the existing `NotificationWriterService`?
