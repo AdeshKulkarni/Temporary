@@ -1,20 +1,76 @@
+public Map<String, Object> getPendingBatchesForChecker(Integer userRole, String userId, int page, int size, String batchIdFilter, String vidFilter) {
+    
+    // 1. DYNAMIC WHERE CLAUSE (No functions used on sensitive columns)
+    StringBuilder whereClause = new StringBuilder("""
+        WHERE w.ALLOWED_ROLE_ID = ? AND p.BATCH_STATUS = 'P'
+        AND NOT EXISTS (
+            SELECT 1 FROM VOUCHER_WORKFLOW vw 
+            WHERE vw.BATCH_ID_FK = p.BATCH_ID AND vw.LAST_ACTION_BY = ?
+        )
+    """);
+    
+    List<Object> params = new java.util.ArrayList<>();
+    params.add(userRole);
+    params.add(userId);
 
-2026-07-10T18:03:08.197+05:30 ERROR 38708 --- [VoucherService] [nio-9999-exec-4] c.f.V.Exception.GlobalExceptionHandler   : DATABASE_FAULT | Path: /api/voucher/checker/pending-approvals | ErrorCode: ORA-28094 | Real Message: PreparedStatementCallback; uncategorized SQLException for SQL [SELECT * FROM (
-    SELECT
-        p.BATCH_ID, p.VID_FK AS VID, p.CREATED_BY AS CREATOR_ID, p.CREATED_AT AS REQ_DATE,
-        p.COMMON_BATCH_REMARKS AS BATCH_REMARKS, p.RECORDS_COUNT AS TOTAL_ROWS,
-        p.SCHEDULED_TIME, w.WORKFLOW_STAGE, w.WORKFLOW_CODE, w.ESCALATION_TIME,
-        w.WORKFLOW_ORDER, w.IS_FINAL_APPROVAL,
-        COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME
-    FROM VOUCHER_POSTING p
-    INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
-    LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
-    WHERE w.ALLOWED_ROLE_ID = ? AND p.BATCH_STATUS = 'P'
-    AND NOT EXISTS (
-        SELECT 1 FROM VOUCHER_WORKFLOW vw
-        WHERE vw.BATCH_ID_FK = p.BATCH_ID AND vw.LAST_ACTION_BY = ?
-    )
+    // Dynamic filtering
+    if (batchIdFilter != null && !batchIdFilter.trim().isEmpty()) {
+        whereClause.append(" AND p.BATCH_ID LIKE ? ");
+        params.add("%" + batchIdFilter.trim() + "%");
+    }
+    if (vidFilter != null && !vidFilter.trim().isEmpty()) {
+        whereClause.append(" AND p.VID_FK LIKE ? "); // Removed LOWER() to comply with Redaction
+        params.add("%" + vidFilter.trim() + "%");
+    }
+
+    // 2. Count Query (Flat structure)
+    String countSql = "SELECT COUNT(*) FROM VOUCHER_POSTING p INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID " + whereClause.toString();
+    Long totalElements = jdbcTemplate.queryForObject(countSql, Long.class, params.toArray());
+    
+    // 3. Main Data Query (Flat structure - NO SELECT * FROM (...) wrapper)
+    int offset = page * size;
+    String sql = """
+        SELECT 
+            p.BATCH_ID, p.VID_FK AS VID, p.CREATED_BY AS CREATOR_ID, p.CREATED_AT AS REQ_DATE, 
+            p.COMMON_BATCH_REMARKS AS BATCH_REMARKS, p.RECORDS_COUNT AS TOTAL_ROWS, 
+            p.SCHEDULED_TIME, w.WORKFLOW_STAGE, w.WORKFLOW_CODE, w.ESCALATION_TIME, 
+            w.WORKFLOW_ORDER, w.IS_FINAL_APPROVAL,
+            COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME
+        FROM VOUCHER_POSTING p
+        INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+        LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
+        """ + whereClause.toString() + """
         ORDER BY p.CREATED_AT DESC
-    )
-    OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
-]; SQL state [99999]; error code [28094]; ORA-28094: SQL construct not supported by data redaction
+        OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+    """;
+
+    List<Object> dataParams = new java.util.ArrayList<>(params);
+    dataParams.add(offset);
+    dataParams.add(size);
+
+    List<Map<String, Object>> pendingList = jdbcTemplate.query(sql, (rs, rowNum) -> {
+        Map<String, Object> map = new HashMap<>();
+        map.put("batchId", rs.getString("BATCH_ID"));
+        map.put("vid", rs.getString("VID"));
+        map.put("creatorId", rs.getString("CREATOR_ID"));
+        map.put("creatorName", rs.getString("CREATOR_NAME"));
+        map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+        map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
+        map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+        map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
+        map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
+        map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
+        map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
+        map.put("isFinalApproval", rs.getString("IS_FINAL_APPROVAL"));
+        return map;
+    }, dataParams.toArray());
+
+    for (Map<String, Object> row : pendingList) {
+        row.put("timeSinceLastAction", calculateTimeSinceLastAction((String) row.get("batchId")));
+    }
+
+    Map<String, Object> response = new HashMap<>();
+    response.put("content", pendingList);
+    response.put("totalElements", totalElements != null ? totalElements : 0);
+    return response;
+}
