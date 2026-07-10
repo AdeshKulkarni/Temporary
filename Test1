@@ -1,68 +1,105 @@
- public List<Map<String, Object>> getPendingBatchesForChecker(Integer userRole, String userId) {
-        String sql = """
+To implement the server-side filtering while keeping your existing logic intact, we need to modify the method to accept page, size, batchId, and vid. We will convert the List<Map<String, Object>> return type to a Map<String, Object> so you can return the content (the rows) and the totalElements (for pagination).
+### 1. The Controller Change
+Update your controller to accept the new request parameters:
+```java
+@GetMapping("/checker/pending-approvals")
+public ResponseEntity<Map<String, Object>> getPendingApprovals(
+        @RequestHeader("Authorization") String token,
+        @RequestParam(defaultValue = "0") int page,
+        @RequestParam(defaultValue = "10") int size,
+        @RequestParam(required = false, defaultValue = "") String batchId,
+        @RequestParam(required = false, defaultValue = "") String vid) {
+    
+    Integer userRole = jwtUtil.getUserRoleFromToken(token);
+    String userId = jwtUtil.getUserIdFromToken(token);
+    return ResponseEntity.ok(queryService.getPendingBatchesForChecker(userRole, userId, page, size, batchId, vid));
+}
+
+```
+### 2. The Service Change (getPendingBatchesForChecker)
+We will dynamically build the WHERE clause to support your search filters. Note that I kept your existing AND NOT EXISTS logic exactly as you provided.
+```java
+public Map<String, Object> getPendingBatchesForChecker(Integer userRole, String userId, int page, int size, String batchIdFilter, String vidFilter) {
+    
+    // 1. Build the dynamic WHERE clause
+    StringBuilder whereClause = new StringBuilder("""
+        WHERE w.ALLOWED_ROLE_ID = ? AND p.BATCH_STATUS = 'P'
+        AND NOT EXISTS (
+            SELECT 1 FROM VOUCHER_WORKFLOW vw 
+            WHERE vw.BATCH_ID_FK = p.BATCH_ID AND vw.LAST_ACTION_BY = ?
+        )
+    """);
+    
+    List<Object> params = new java.util.ArrayList<>();
+    params.add(userRole);
+    params.add(userId);
+
+    if (batchIdFilter != null && !batchIdFilter.trim().isEmpty()) {
+        whereClause.append(" AND p.BATCH_ID LIKE ? ");
+        params.add("%" + batchIdFilter.trim() + "%");
+    }
+    if (vidFilter != null && !vidFilter.trim().isEmpty()) {
+        whereClause.append(" AND LOWER(p.VID_FK) LIKE LOWER(?) ");
+        params.add("%" + vidFilter.trim() + "%");
+    }
+
+    // 2. Count for Pagination
+    String countSql = "SELECT COUNT(*) FROM VOUCHER_POSTING p INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID " + whereClause.toString();
+    Long totalElements = jdbcTemplate.queryForObject(countSql, Long.class, params.toArray());
+    
+    // 3. Main Data Query with Pagination
+    int offset = page * size;
+    String sql = """
+        SELECT * FROM (
             SELECT 
-                p.BATCH_ID, 
-                p.VID_FK AS VID, 
-                p.CREATED_BY AS CREATOR_ID, 
-                p.CREATED_AT AS REQ_DATE, 
-                p.COMMON_BATCH_REMARKS AS BATCH_REMARKS,
-                p.RECORDS_COUNT AS TOTAL_ROWS, 
-                p.SCHEDULED_TIME,
-                w.WORKFLOW_STAGE, 
-                w.WORKFLOW_CODE, 
-                w.ESCALATION_TIME, 
-                w.WORKFLOW_ORDER, 
-                w.IS_FINAL_APPROVAL,
+                p.BATCH_ID, p.VID_FK AS VID, p.CREATED_BY AS CREATOR_ID, p.CREATED_AT AS REQ_DATE, 
+                p.COMMON_BATCH_REMARKS AS BATCH_REMARKS, p.RECORDS_COUNT AS TOTAL_ROWS, 
+                p.SCHEDULED_TIME, w.WORKFLOW_STAGE, w.WORKFLOW_CODE, w.ESCALATION_TIME, 
+                w.WORKFLOW_ORDER, w.IS_FINAL_APPROVAL,
                 COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME
             FROM VOUCHER_POSTING p
             INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
             LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
-            WHERE w.ALLOWED_ROLE_ID = ? AND p.BATCH_STATUS = 'P'
-            AND NOT EXISTS (
-                SELECT 1 FROM VOUCHER_WORKFLOW vw 
-                WHERE vw.BATCH_ID_FK = p.BATCH_ID AND vw.LAST_ACTION_BY = ?
-            )
+            """ + whereClause.toString() + """
             ORDER BY p.CREATED_AT DESC
-        """;
+        )
+        OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+    """;
 
-        // 1. Fetch the data from Oracle and store it in a List
-        List<Map<String, Object>> pendingList = jdbcTemplate.query(sql, (rs, rowNum) -> {
-            Map<String, Object> map = new HashMap<>();
-            map.put("batchId", rs.getString("BATCH_ID"));
-            map.put("vid", rs.getString("VID"));
-            map.put("creatorId", rs.getString("CREATOR_ID"));
-            map.put("creatorName", rs.getString("CREATOR_NAME"));
-            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
-            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
-            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
-            map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
-            map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
-            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
-            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
-            map.put("isFinalApproval", rs.getString("IS_FINAL_APPROVAL"));
-            return map;
-        }, userRole, userId);
+    List<Object> dataParams = new java.util.ArrayList<>(params);
+    dataParams.add(offset);
+    dataParams.add(size);
 
-        // 2. Loop through the list, calculate the time, and inject it into the map
-        for (Map<String, Object> row : pendingList) {
-            String batchId = (String) row.get("batchId");
+    List<Map<String, Object>> pendingList = jdbcTemplate.query(sql, (rs, rowNum) -> {
+        Map<String, Object> map = new HashMap<>();
+        map.put("batchId", rs.getString("BATCH_ID"));
+        map.put("vid", rs.getString("VID"));
+        map.put("creatorId", rs.getString("CREATOR_ID"));
+        map.put("creatorName", rs.getString("CREATOR_NAME"));
+        map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+        map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
+        map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+        map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
+        map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
+        map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
+        map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
+        map.put("isFinalApproval", rs.getString("IS_FINAL_APPROVAL"));
+        return map;
+    }, dataParams.toArray());
 
-            // Calls the helper method you already added!
-            String pendingTime = calculateTimeSinceLastAction(batchId);
-
-            // Injects the new string into the JSON response
-            row.put("timeSinceLastAction", pendingTime);
-        }
-
-        // 3. Return the completed list to the Controller
-        return pendingList;
+    for (Map<String, Object> row : pendingList) {
+        row.put("timeSinceLastAction", calculateTimeSinceLastAction((String) row.get("batchId")));
     }
 
-this methods
-    @GetMapping("/checker/pending-approvals")
-    public ResponseEntity<List<Map<String, Object>>> getPendingApprovals(@RequestHeader("Authorization") String token) {
-        Integer userRole = jwtUtil.getUserRoleFromToken(token);
-        String userId = jwtUtil.getUserIdFromToken(token);
-        return ResponseEntity.ok(queryService.getPendingBatchesForChecker(userRole, userId));
-    }
+    // 4. Return as Map for pagination
+    Map<String, Object> response = new HashMap<>();
+    response.put("content", pendingList);
+    response.put("totalElements", totalElements != null ? totalElements : 0);
+    return response;
+}
 
+```
+### Key Changes:
+ 1. **Dynamic Filtering**: The StringBuilder now handles LIKE queries for BATCH_ID and VID automatically based on user input.
+ 2. **Pagination Wrapper**: The service now returns a Map containing content (your rows) and totalElements (required by the frontend DataGrid for paging).
+ 3. **Offset/Fetch**: Added Oracle-specific pagination (OFFSET ... FETCH NEXT ...) so you only load 10 records at a time instead of fetching the entire database into memory.
