@@ -1,25 +1,26 @@
 public Map<String, Object> getPendingBatchesForChecker(Integer userRole, String userId, int page, int size, String batchIdFilter, String vidFilter) {
     
-    // 1. FLATTENED WHERE CLAUSE: We use a LEFT JOIN + IS NULL check to replace NOT EXISTS
+    // 1. FLATTENED WHERE CLAUSE
     StringBuilder whereClause = new StringBuilder("""
         WHERE w.ALLOWED_ROLE_ID = ? AND p.BATCH_STATUS = 'P'
         AND vw_check.BATCH_ID_FK IS NULL
     """);
     
-    List<Object> params = new java.util.ArrayList<>();
-    params.add(userRole);
+    // Separate WHERE parameters so we can inject them in the correct order later
+    List<Object> whereParams = new java.util.ArrayList<>();
+    whereParams.add(userRole);
 
     // Append filters
     if (batchIdFilter != null && !batchIdFilter.trim().isEmpty()) {
         whereClause.append(" AND p.BATCH_ID LIKE ? ");
-        params.add("%" + batchIdFilter.trim() + "%");
+        whereParams.add("%" + batchIdFilter.trim() + "%");
     }
     if (vidFilter != null && !vidFilter.trim().isEmpty()) {
         whereClause.append(" AND p.VID_FK LIKE ? ");
-        params.add("%" + vidFilter.trim() + "%");
+        whereParams.add("%" + vidFilter.trim() + "%");
     }
 
-    // 2. Count Query (Using the LEFT JOIN)
+    // 2. Count Query 
     String countSql = """
         SELECT COUNT(*) 
         FROM VOUCHER_POSTING p 
@@ -27,32 +28,42 @@ public Map<String, Object> getPendingBatchesForChecker(Integer userRole, String 
         LEFT JOIN VOUCHER_WORKFLOW vw_check ON vw_check.BATCH_ID_FK = p.BATCH_ID AND vw_check.LAST_ACTION_BY = ?
         """ + whereClause.toString();
     
-    List<Object> countParams = new java.util.ArrayList<>(params);
+    // CORRECTED BIND ORDER: userId first (for LEFT JOIN), then whereParams
+    List<Object> countParams = new java.util.ArrayList<>();
     countParams.add(userId);
+    countParams.addAll(whereParams);
+    
     Long totalElements = jdbcTemplate.queryForObject(countSql, Long.class, countParams.toArray());
 
-    // 3. Main Data Query (Flat structure)
+    // 3. Main Data Query (Using ROWNUM to bypass ORA-28094 Data Redaction limits)
     int offset = page * size;
+    int endRow = offset + size;
+    
     String sql = """
-        SELECT 
-            p.BATCH_ID, p.VID_FK AS VID, p.CREATED_BY AS CREATOR_ID, p.CREATED_AT AS REQ_DATE, 
-            p.COMMON_BATCH_REMARKS AS BATCH_REMARKS, p.RECORDS_COUNT AS TOTAL_ROWS, 
-            p.SCHEDULED_TIME, w.WORKFLOW_STAGE, w.WORKFLOW_CODE, w.ESCALATION_TIME, 
-            w.WORKFLOW_ORDER, w.IS_FINAL_APPROVAL,
-            COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME
-        FROM VOUCHER_POSTING p
-        INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
-        LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
-        LEFT JOIN VOUCHER_WORKFLOW vw_check ON vw_check.BATCH_ID_FK = p.BATCH_ID AND vw_check.LAST_ACTION_BY = ?
-        """ + whereClause.toString() + """
-        ORDER BY p.CREATED_AT DESC
-        OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+        SELECT * FROM (
+            SELECT a.*, ROWNUM rnum FROM (
+                SELECT 
+                    p.BATCH_ID, p.VID_FK AS VID, p.CREATED_BY AS CREATOR_ID, p.CREATED_AT AS REQ_DATE, 
+                    p.COMMON_BATCH_REMARKS AS BATCH_REMARKS, p.RECORDS_COUNT AS TOTAL_ROWS, 
+                    p.SCHEDULED_TIME, w.WORKFLOW_STAGE, w.WORKFLOW_CODE, w.ESCALATION_TIME, 
+                    w.WORKFLOW_ORDER, w.IS_FINAL_APPROVAL,
+                    COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME
+                FROM VOUCHER_POSTING p
+                INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+                LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
+                LEFT JOIN VOUCHER_WORKFLOW vw_check ON vw_check.BATCH_ID_FK = p.BATCH_ID AND vw_check.LAST_ACTION_BY = ?
+                """ + whereClause.toString() + """
+                ORDER BY p.CREATED_AT DESC
+            ) a WHERE ROWNUM <= ?
+        ) WHERE rnum > ?
     """;
 
-    List<Object> dataParams = new java.util.ArrayList<>(params);
-    dataParams.add(userId); // Add userId for the LEFT JOIN condition
-    dataParams.add(offset);
-    dataParams.add(size);
+    // Build Data Params in strict SQL appearance order
+    List<Object> dataParams = new java.util.ArrayList<>();
+    dataParams.add(userId);         // 1. LEFT JOIN condition
+    dataParams.addAll(whereParams); // 2. WHERE clause conditions
+    dataParams.add(endRow);         // 3. Outer ROWNUM <= ? 
+    dataParams.add(offset);         // 4. Outermost rnum > ?
 
     List<Map<String, Object>> pendingList = jdbcTemplate.query(sql, (rs, rowNum) -> {
         Map<String, Object> map = new HashMap<>();
@@ -80,25 +91,3 @@ public Map<String, Object> getPendingBatchesForChecker(Integer userRole, String 
     response.put("totalElements", totalElements != null ? totalElements : 0);
     return response;
 }
-
-Initializing Servlet 'dispatcherServlet'
-2026-07-10T18:07:36.195+05:30  INFO 23520 --- [VoucherService] [nio-9999-exec-1] o.s.web.servlet.DispatcherServlet        : Completed initialization in 1 ms
-2026-07-10T18:07:36.434+05:30 ERROR 23520 --- [VoucherService] [nio-9999-exec-2] c.f.V.Exception.GlobalExceptionHandler   : DATABASE_FAULT | Path: /api/voucher/checker/pending-approvals | ErrorCode: ORA-28094 | Real Message: PreparedStatementCallback; uncategorized SQLException for SQL [SELECT
-    p.BATCH_ID, p.VID_FK AS VID, p.CREATED_BY AS CREATOR_ID, p.CREATED_AT AS REQ_DATE,
-    p.COMMON_BATCH_REMARKS AS BATCH_REMARKS, p.RECORDS_COUNT AS TOTAL_ROWS,
-    p.SCHEDULED_TIME, w.WORKFLOW_STAGE, w.WORKFLOW_CODE, w.ESCALATION_TIME,
-    w.WORKFLOW_ORDER, w.IS_FINAL_APPROVAL,
-    COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME
-FROM VOUCHER_POSTING p
-INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
-LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
-LEFT JOIN VOUCHER_WORKFLOW vw_check ON vw_check.BATCH_ID_FK = p.BATCH_ID AND vw_check.LAST_ACTION_BY = ?
-    WHERE w.ALLOWED_ROLE_ID = ? AND p.BATCH_STATUS = 'P'
-    AND vw_check.BATCH_ID_FK IS NULL
-    ORDER BY p.CREATED_AT DESC
-    OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
-]; SQL state [99999]; error code [28094]; ORA-28094: SQL construct not supported by data redaction
-
-
-
-
