@@ -1,101 +1,68 @@
-To add server-side searching for **Batch ID** and **VID** to your VoucherAuthorization.jsx file, you need to follow the same pattern we used for the status screen: update the fetchPendingBatches function to use the filterModel and send those parameters to the API.
-Here are the step-by-step changes for VoucherAuthorization.jsx:
-### 1. Add Filter State
-At the top of your component, where your useState hooks are, add:
-```javascript
-  const [paginationModel, setPaginationModel] = useState({ page: 0, pageSize: 10 });
-  const [totalRowCount, setTotalRowCount] = useState(0);
-  const [filterModel, setFilterModel] = useState({ items: [] });
+ public List<Map<String, Object>> getPendingBatchesForChecker(Integer userRole, String userId) {
+        String sql = """
+            SELECT 
+                p.BATCH_ID, 
+                p.VID_FK AS VID, 
+                p.CREATED_BY AS CREATOR_ID, 
+                p.CREATED_AT AS REQ_DATE, 
+                p.COMMON_BATCH_REMARKS AS BATCH_REMARKS,
+                p.RECORDS_COUNT AS TOTAL_ROWS, 
+                p.SCHEDULED_TIME,
+                w.WORKFLOW_STAGE, 
+                w.WORKFLOW_CODE, 
+                w.ESCALATION_TIME, 
+                w.WORKFLOW_ORDER, 
+                w.IS_FINAL_APPROVAL,
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME
+            FROM VOUCHER_POSTING p
+            INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+            LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
+            WHERE w.ALLOWED_ROLE_ID = ? AND p.BATCH_STATUS = 'P'
+            AND NOT EXISTS (
+                SELECT 1 FROM VOUCHER_WORKFLOW vw 
+                WHERE vw.BATCH_ID_FK = p.BATCH_ID AND vw.LAST_ACTION_BY = ?
+            )
+            ORDER BY p.CREATED_AT DESC
+        """;
 
-```
-### 2. Update fetchPendingBatches
-Update this function to include the search parameters in the callApi request.
-```javascript
-  const fetchPendingBatches = useCallback(async (isSilent = false) => {
-    if (!isSilent) setLoading(true);
-    try {
-      // --- EXTRACT SEARCH FILTERS ---
-      let batchIdSearch = "";
-      let vidSearch = "";
-      if (filterModel && filterModel.items) {
-        filterModel.items.forEach(item => {
-          if (item.field === 'batchId' && item.value) batchIdSearch = item.value;
-          if (item.field === 'vid' && item.value) vidSearch = item.value;
-        });
-      }
+        // 1. Fetch the data from Oracle and store it in a List
+        List<Map<String, Object>> pendingList = jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("vid", rs.getString("VID"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("creatorName", rs.getString("CREATOR_NAME"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
+            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+            map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
+            map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
+            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
+            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
+            map.put("isFinalApproval", rs.getString("IS_FINAL_APPROVAL"));
+            return map;
+        }, userRole, userId);
 
-      // --- APPEND FILTERS TO API ---
-      const response = await callApi(
-        `/JS/voucher/checker/pending-approvals?page=${paginationModel.page}&size=${paginationModel.pageSize}&batchId=${encodeURIComponent(batchIdSearch)}&vid=${encodeURIComponent(vidSearch)}`,
-        null,
-        "GET"
-      );
+        // 2. Loop through the list, calculate the time, and inject it into the map
+        for (Map<String, Object> row : pendingList) {
+            String batchId = (String) row.get("batchId");
 
-      // ... (rest of your logic to handle fetchedRows, uniqueWorkflows, and stepsMap) ...
+            // Calls the helper method you already added!
+            String pendingTime = calculateTimeSinceLastAction(batchId);
 
-      if (isMounted.current) {
-        setWorkflowStepsMap(stepsMap);
-        setRows(fetchedRows);
-        setTotalRowCount(response.totalElements || fetchedRows.length);
-      }
-    } catch (err) {
-      if (isMounted.current && err.name !== "CanceledError")
-        showSnackBar("Failed to load requests", "error");
-    } finally {
-      if (isMounted.current) setLoading(false);
+            // Injects the new string into the JSON response
+            row.put("timeSinceLastAction", pendingTime);
+        }
+
+        // 3. Return the completed list to the Controller
+        return pendingList;
     }
-  }, [callApi, showSnackBar, paginationModel, filterModel]);
 
-```
-### 3. Update the DataGrid
-Replace your current <DataGrid/> in the return statement with this:
-```javascript
-        <DataGrid
-          rows={rows}
-          columns={columns}
-          loading={loading}
-          getRowId={(row) => row.batchId}
-          disableRowSelectionOnClick
-          
-          // Pagination & Filtering Server-Side
-          paginationMode="server"
-          rowCount={totalRowCount}
-          paginationModel={paginationModel}
-          onPaginationModelChange={setPaginationModel}
-          
-          filterMode="server"
-          filterModel={filterModel}
-          onFilterModelChange={setFilterModel}
-          
-          disableColumnResize
-          rowHeight={52}
-          slots={{ 
-            noRowsOverlay: CustomNoRowsOverlay,
-            toolbar: GridToolbar 
-          }}
-          sx={styles.dataGridContainer}
-        />
-
-```
-### 4. Backend Requirement
-Remember that your **Spring Boot Controller/Service** for /checker/pending-approvals must also be updated to accept the batchId and vid parameters, just like we did for the all-requests-summary endpoint.
-**Update your Controller:**
-```java
+this methods
     @GetMapping("/checker/pending-approvals")
-    public ResponseEntity<Map<String, Object>> getPendingApprovals(
-            @RequestHeader("Authorization") String token,
-            @RequestParam(defaultValue = "0") int page,
-            @RequestParam(defaultValue = "10") int size,
-            @RequestParam(required = false, defaultValue = "") String batchId,
-            @RequestParam(required = false, defaultValue = "") String vid) {
-        
-        String userId = jwtUtil.getUserIdFromToken(token);
+    public ResponseEntity<List<Map<String, Object>>> getPendingApprovals(@RequestHeader("Authorization") String token) {
         Integer userRole = jwtUtil.getUserRoleFromToken(token);
-        
-        return ResponseEntity.ok(queryService.getPendingApprovals(userId, userRole, page, size, batchId, vid));
+        String userId = jwtUtil.getUserIdFromToken(token);
+        return ResponseEntity.ok(queryService.getPendingBatchesForChecker(userRole, userId));
     }
 
-```
-**Update your Service:**
-Inside your getPendingApprovals method, use the same dynamic StringBuilder whereClause logic we used for the status screen, ensuring you append AND p.BATCH_ID LIKE ? and AND LOWER(p.VID_FK) LIKE LOWER(?) to the SQL query.
-This will give the Authorization screen the exact same powerful, server-side search capability as the Status screen!
