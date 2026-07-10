@@ -1,30 +1,113 @@
-Here are the complete, updated methods for both your Controller and your Service. These replace your existing code to support full server-side filtering for Batch ID and VID.
-### 1. The Controller (VoucherQueryController.java)
-Find your existing getAllRequestsSummary method inside your VoucherQueryController and replace it with this updated version that accepts the new parameters:
+You are absolutely right. Because we set paginationMode="server", the React frontend only has 10 rows in its memory at any given time. MUI's default client-side filter can only search through those 10 rows, which completely breaks the search for older batches.
+To fix this, we need to switch the DataGrid to filterMode="server" and pass the search text all the way back to your Oracle database.
+Here are the exact changes needed on both the Frontend and the Backend.
+### Part 1: Frontend Changes (VoucherPostingStatus.jsx)
+**1. Add the Filter State**
+At the top of your component, right near your paginationModel state, add a new state to track what the user is typing into the filter box.
+```javascript
+  const [paginationModel, setPaginationModel] = useState({ page: 0, pageSize: 10 });
+  const [totalRowCount, setTotalRowCount] = useState(0);
+  
+  // --- ADD THIS NEW STATE ---
+  const [filterModel, setFilterModel] = useState({ items: [] });
+
+```
+**2. Update fetchMyBatches to send the filters**
+Inside your fetchMyBatches function, we need to extract the search text from the filterModel and append it to the API URL.
+```javascript
+  const fetchMyBatches = useCallback(async (isSilent = false) => {
+    if (!isSilent) setLoading(true); 
+    try {
+      let actualRoleId = null;
+      const auth = sessionStorage.getItem("persist:auth") || localStorage.getItem("persist:auth");
+      if (auth) {
+        const user = JSON.parse(JSON.parse(auth).user);
+        actualRoleId = user?.roleId || user?.role || user?.ROLE_ID;
+      }
+
+      // --- EXTRACT SEARCH FILTERS ---
+      let batchIdSearch = "";
+      let vidSearch = "";
+      
+      if (filterModel && filterModel.items) {
+        filterModel.items.forEach(item => {
+          if (item.field === 'batchId' && item.value) batchIdSearch = item.value;
+          if (item.field === 'vid' && item.value) vidSearch = item.value;
+        });
+      }
+
+      // --- APPEND FILTERS TO URL ---
+      const response = await callApi(
+        `/JS/voucher/all-requests-summary?roleId=${actualRoleId}&page=${paginationModel.page}&size=${paginationModel.pageSize}&batchId=${encodeURIComponent(batchIdSearch)}&vid=${encodeURIComponent(vidSearch)}`,
+        null,
+        "GET"
+      );
+
+      // ... rest of the function remains exactly the same ...
+
+```
+*Note: Make sure you add filterModel to the useCallback dependency array at the very bottom of the function: }, [callApi, showSnackBar, paginationModel.page, paginationModel.pageSize, filterModel]);*
+**3. Update the DataGrid Component**
+Tell the grid to stop filtering client-side and trigger our API instead.
+```javascript
+        <DataGrid
+          rows={rows}
+          columns={columns}
+          loading={loading}
+          getRowId={(row) => row.batchId}
+          disableRowSelectionOnClick
+          pageSizeOptions={[5, 10, 25, 50]}
+          disableColumnResize
+          rowHeight={52}
+          
+          paginationMode="server"
+          rowCount={totalRowCount}
+          paginationModel={paginationModel}
+          onPaginationModelChange={setPaginationModel}
+          
+          // --- ADD THESE 3 LINES FOR SERVER-SIDE FILTERING ---
+          filterMode="server"
+          filterModel={filterModel}
+          onFilterModelChange={setFilterModel}
+          // ---------------------------------------------------
+
+          slots={{
+            noRowsOverlay: CustomNoRowsOverlay,
+            toolbar: GridToolbar
+          }}
+          sx={styles.dataGridContainer}
+        />
+
+```
+### Part 2: Backend Changes
+Now we need to update the Spring Boot backend to accept these new search parameters and add them to the Oracle query.
+**1. Update VoucherQueryController.java**
+Find the getAllRequestsSummary method and add the two optional string parameters:
 ```java
     @GetMapping("/all-requests-summary")
     public ResponseEntity<Map<String, Object>> getAllRequestsSummary(
             @RequestHeader("Authorization") String token, 
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "10") int size,
-            @RequestParam(required = false, defaultValue = "") String batchId,
-            @RequestParam(required = false, defaultValue = "") String vid) {
+            @RequestParam(required = false, defaultValue = "") String batchId, // NEW
+            @RequestParam(required = false, defaultValue = "") String vid) {   // NEW
             
         String userId = jwtUtil.getUserIdFromToken(token);
         Integer userRole = jwtUtil.getUserRoleFromToken(token);
         
+        // Pass them to the service
         Map<String, Object> response = queryService.getAllRequestsSummary(userId, userRole, page, size, batchId, vid);
         return ResponseEntity.ok(response);
     }
 
 ```
-### 2. The Service (VoucherQueryService.java)
-Replace your current getAllRequestsSummary method in your VoucherQueryService with this fully updated version. It safely builds the SQL WHERE clause dynamically based on what the user types into the grid.
+**2. Update VoucherQueryService.java**
+Find the getAllRequestsSummary method. We need to dynamically build the SQL WHERE clause if the user types something into the search boxes.
+Replace the top part of the method (before the COUNT query) with this dynamic builder:
 ```java
     public Map<String, Object> getAllRequestsSummary(String userId, Integer roleId, int page, int size, String batchIdFilter, String vidFilter) {
 
         // 1. DYNAMIC WHERE CLAUSE BUILDER
-        // Wrapped the base conditions in parentheses so AND operators apply correctly
         StringBuilder whereClause = new StringBuilder("""
             WHERE (p.CREATED_BY = ? 
                OR EXISTS (
@@ -85,50 +168,16 @@ Replace your current getAllRequestsSummary method in your VoucherQueryService wi
         dataParams.add(size);
 
         List<Map<String, Object>> content = jdbcTemplate.query(dataSql, (rs, rowNum) -> {
+            // ... (keep your existing RowMapper code here exactly as it is) ...
             Map<String, Object> map = new java.util.HashMap<>();
             map.put("batchId", rs.getString("BATCH_ID"));
             map.put("vid", rs.getString("VID_FK"));
-            map.put("creatorId", rs.getString("CREATOR_ID"));
-
-            // JAVA-SIDE FORMATTING: Safely concatenate names in Java memory, not in the SQL engine
-            String fName = rs.getString("FIRST_NAME");
-            String lName = rs.getString("LAST_NAME");
-            String fullName = (fName != null || lName != null)
-                    ? ((fName != null ? fName : "") + " " + (lName != null ? lName : "")).trim()
-                    : rs.getString("CREATOR_ID");
-            map.put("creatorName", fullName);
-
-            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
-            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
-            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
-            map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
-            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
-
-            String bStatus = rs.getString("BATCH_STATUS");
-            map.put("batchStatus", bStatus);
-
-            if ("R".equals(bStatus)) {
-                map.put("currentStatus", "REJECTED");
-            } else if ("A".equals(bStatus) || "C".equals(bStatus)) {
-                map.put("currentStatus", "POSTED");
-            } else if ("Q".equals(bStatus)) {
-                map.put("currentStatus", "QUEUED FOR RETRY");
-            } else {
-                map.put("currentStatus", rs.getString("WORKFLOW_STAGE") != null ? rs.getString("WORKFLOW_STAGE") : "PENDING");
-            }
-
-            map.put("timeSinceLastAction", calculateTimeSinceLastAction(rs.getString("BATCH_ID")));
-
+            // ... rest of your mapper
             return map;
+            
         }, dataParams.toArray()); // <-- Use dataParams here
 
-        // 4. WRAP IN PAGINATION
-        Map<String, Object> response = new java.util.HashMap<>();
-        response.put("content", content);
-        response.put("totalElements", totalElements);
-        response.put("totalPages", (int) Math.ceil((double) totalElements / size));
-
-        return response;
-    }
+        // ... (keep the rest of your pagination wrapping code) ...
 
 ```
+By adding these changes, whenever a user types into the grid filter, MUI will trigger a backend call, the Java server will apply a standard LIKE %search% query to the database, and the correct, filtered data will be returned directly to the UI across all pages.
