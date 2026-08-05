@@ -1,21 +1,114 @@
-2026-08-05T16:00:24.219+05:30  INFO 3952 --- [VoucherService] [    BulkCoord-1] c.f.V.Service.ValidationMasterService    : MASTER_DATA_LOADED | Type: CGLS | Count: 6891 | Duration: 87ms
-2026-08-05T16:00:24.228+05:30  INFO 3952 --- [VoucherService] [    BulkCoord-1] c.f.V.S.v.VoucherBulkValidationService   : VALIDATION_SUCCESS | ReqID: 50b9dc5c-4fce-4174-934e-903961ec0e13 | Duration: 629ms
-2026-08-05T16:00:25.903+05:30  INFO 3952 --- [VoucherService] [io-9999-exec-10] c.f.V.C.VoucherActionController          : CACHE_BATCH_INIT | User: 7875730 | ReqID: 50b9dc5c-4fce-4174-934e-903961ec0e13
-2026-08-05T16:00:26.040+05:30  INFO 3952 --- [VoucherService] [io-9999-exec-10] c.f.V.Service.SequenceService            : SEQUENCE_GENERATED | Type: BATCH_ID | Value: 0008759
-2026-08-05T16:00:26.062+05:30  INFO 3952 --- [VoucherService] [io-9999-exec-10] c.f.V.Service.SequenceService            : SEQUENCE_GENERATED | Type: JRNL_ID | Value: 0005413
-2026-08-05T16:00:26.302+05:30  INFO 3952 --- [VoucherService] [    BulkCoord-2] c.f.V.Service.core.VoucherAsyncWorker    : ASYNC_BATCH_START | Batch: 0008759 | Source: 50b9dc5c-4fce-4174-934e-903961ec0e13
-2026-08-05T16:00:26.449+05:30  INFO 3952 --- [VoucherService] [    BulkCoord-2] c.f.V.Service.core.VoucherAsyncWorker    : BATCH_CREATION_FINISHED | Batch: 0008759 | Rows: 2
-2026-08-05T16:00:26.526+05:30  INFO 3952 --- [VoucherService] [    BulkCoord-2] c.f.V.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 9001 | Ref: 0008759
-2026-08-05T16:00:27.893+05:30  INFO 3952 --- [VoucherService] [nio-9999-exec-7] c.f.V.Service.core.VoucherQueryService   : BATCH_SUMMARY_FETCH | BatchID: 0008759
-2026-08-05T16:00:27.897+05:30  INFO 3952 --- [VoucherService] [nio-9999-exec-6] c.f.V.Service.core.VoucherQueryService   : WORKFLOW_HISTORY_FETCH | BatchID: 0008759
-2026-08-05T16:00:29.274+05:30 ERROR 3952 --- [VoucherService] [nio-9999-exec-9] c.f.V.C.VoucherQueryController           : DOWNLOAD_ERROR | Batch: 0008759 | Reason: Internal Error
+package com.fincore.VoucherService.Service.core;
 
+import com.fincore.VoucherService.Exception.CustomExceptions;
+import com.fincore.VoucherService.Models.JournalRequest;
+import com.fincore.VoucherService.Repository.JournalRequestRepository;
+import com.fincore.VoucherService.Repository.VoucherWorkflowRepository;
+import com.fincore.VoucherService.utils.SecuritySanitizer;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.poi.xssf.streaming.SXSSFWorkbook;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.dao.EmptyResultDataAccessException;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
 
- public byte[] generateBatchExcel(String batchId) {
+import java.math.BigDecimal;
+import java.sql.Timestamp;
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
+@Service
+@Slf4j
+public class VoucherQueryService {
+
+    @Autowired
+    @Qualifier("oracleJdbcTemplate")
+    private JdbcTemplate jdbcTemplate;
+
+    private final JournalRequestRepository journalRequestRepository;
+    private final VoucherWorkflowRepository workflowRepository;
+
+    public VoucherQueryService(JournalRequestRepository journalRequestRepository, VoucherWorkflowRepository workflowRepository) {
+        this.journalRequestRepository = journalRequestRepository;
+        this.workflowRepository = workflowRepository;
+    }
+
+    public long getRequestCountByBatchId(String batchId) {
+        log.info("COUNT_QUERY_START | BatchID: {}", SecuritySanitizer.sanitizeForLog(batchId));
+        String safeBatchId = SecuritySanitizer.sanitizeId(batchId); 
+        
+        String sql = "SELECT COUNT(*) FROM voucher_requests WHERE batch_id = '" + safeBatchId + "'";
+        Long count = jdbcTemplate.queryForObject(sql, Long.class);
+        return count != null ? count : 0L;
+    }
+
+    public List<Map<String, Object>> getWorkflowHistory(String batchId) {
+        log.info("WORKFLOW_HISTORY_FETCH | BatchID: {}", SecuritySanitizer.sanitizeForLog(batchId));
+
+        String sql = """
+        SELECT 
+            w.LAST_ACTION_BY, 
+            COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, w.LAST_ACTION_BY) AS ACTION_USER_NAME, 
+            w.LAST_ACTION, 
+            w.LAST_ACTION_AT, 
+            w.REMARKS,
+            w.SCHEDULED_TIME
+        FROM VOUCHER_WORKFLOW w 
+        LEFT JOIN USERS u ON w.LAST_ACTION_BY = u.USER_ID
+        WHERE w.BATCH_ID_FK = ? 
+        ORDER BY w.LAST_ACTION_AT ASC
+        """;
+
+        List<Map<String, Object>> history = jdbcTemplate.queryForList(sql, batchId);
+
+        for (int i = 0; i < history.size() - 1; i++) {
+            LocalDateTime start = ((Timestamp) history.get(i).get("LAST_ACTION_AT")).toLocalDateTime();
+            LocalDateTime end = ((Timestamp) history.get(i + 1).get("LAST_ACTION_AT")).toLocalDateTime();
+
+            Duration d = Duration.between(start, end);
+            String durationStr = d.toHours() + "h " + d.toMinutesPart() + "m";
+            history.get(i).put("TIME_TAKEN", durationStr);
+        }
+        return history;
+    }
+
+    public Map<String, Object> getBatchSummaryDetails(String batchId) {
+        log.info("BATCH_SUMMARY_FETCH | BatchID: {}", SecuritySanitizer.sanitizeForLog(batchId));
+
+        String sql = """
+            SELECT 
+                vp.BATCH_ID,
+                vp.STATUS,
+                vp.TOTAL_AMOUNT,
+                vp.CREATED_BY,
+                rv.CREATED_BY as VID_CREATED_BY,
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, vp.CREATED_BY) AS BATCH_CREATOR_NAME,
+                COALESCE(vu.FIRST_NAME || ' ' || vu.LAST_NAME, rv.CREATED_BY) AS VID_CREATOR_NAME
+            FROM VOUCHER_POSTING vp
+            LEFT JOIN REQUEST_VOUCHER rv ON vp.VID_FK = rv.VID
+            LEFT JOIN USERS u ON vp.CREATED_BY = u.USER_ID
+            LEFT JOIN USERS vu ON rv.CREATED_BY = vu.USER_ID
+            WHERE vp.BATCH_ID = ?
+        """;
+
+        try {
+            return jdbcTemplate.queryForMap(sql, batchId);
+        } catch (EmptyResultDataAccessException e) {
+            return new HashMap<>();
+        }
+    }
+
+    // =========================================================================
+    // EXCEL DOWNLOAD FIX: Safely executes the query and handles large data loads
+    // =========================================================================
+    public byte[] generateBatchExcel(String batchId) {
+        
         // FORTIFY FIX: Used ONLY for the Excel Sheet Name to prevent invalid sheet characters
         String safeBatchId = SecuritySanitizer.sanitizeId(batchId);
-
         int initialBufferSize = 5 * 1024 * 1024; // 5 MB
 
         try (SXSSFWorkbook workbook = new SXSSFWorkbook(100);
@@ -30,19 +123,28 @@
                 cell.setCellValue(columns[i]);
             }
 
-            // FIX: Replaced the concatenated string with '?' to make PreparedStatement work perfectly.
+            // EXACT ORIGINAL SQL with '?' for Fortify protection.
+            // Removed 'ORDER BY' because an invalid column name will crash the database and cause a 500 error.
             String sql = "SELECT REQ_BRANCH, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_NARRATION, REQ_PRODUCT " +
-                    "FROM voucher_requests WHERE batch_id = ? ORDER BY REQ_ID ASC";
+                    "FROM voucher_requests WHERE batch_id = ?";
 
             int[] rowIdx = {1};
 
-            // FIX: Use the simple Spring JDBC method: query(String sql, RowCallbackHandler rch, Object... args)
+            // Using PreparedStatementCreator to retain your critical setFetchSize(2000) optimization
             jdbcTemplate.query(
-                    sql,
+                    connection -> {
+                        java.sql.PreparedStatement ps = connection.prepareStatement(
+                                sql,
+                                java.sql.ResultSet.TYPE_FORWARD_ONLY,
+                                java.sql.ResultSet.CONCUR_READ_ONLY
+                        );
+                        ps.setFetchSize(2000); // Prevents OutOfMemory on massive batches
+                        ps.setString(1, batchId); // Binds the secure parameter
+                        return ps;
+                    },
                     rs -> {
                         org.apache.poi.ss.usermodel.Row row = sheet.createRow(rowIdx[0]++);
 
-                        // NOTE: I changed REQ_BRANCH_CODE back to REQ_BRANCH because that is what your SQL SELECTs.
                         row.createCell(0).setCellValue(rs.getString("REQ_BRANCH") != null ? rs.getString("REQ_BRANCH") : "");
                         row.createCell(1).setCellValue(rs.getString("REQ_CURRENCY") != null ? rs.getString("REQ_CURRENCY") : "");
                         row.createCell(2).setCellValue(rs.getString("REQ_CGL") != null ? rs.getString("REQ_CGL") : "");
@@ -55,8 +157,7 @@
 
                         row.createCell(5).setCellValue(rs.getString("REQ_NARRATION") != null ? rs.getString("REQ_NARRATION") : "");
                         row.createCell(6).setCellValue(rs.getString("REQ_PRODUCT") != null ? rs.getString("REQ_PRODUCT") : "");
-                    },
-                    batchId // This automatically binds to the '?' in the SQL string!
+                    }
             );
 
             if (rowIdx[0] == 1) {
@@ -72,33 +173,18 @@
         }
     }
 
-  @GetMapping("/download-batch/{batchId}")
-    public ResponseEntity<?> downloadBatchExcel(
-            @PathVariable @Pattern(regexp = "^[0-9]{1,10}$", message = "Invalid Batch ID") String batchId,
-            @RequestHeader("Authorization") String token) {
-        try {
-            if (!queryService.isUserAuthorizedForBatch(batchId, jwtUtil.getUserIdFromToken(token.substring(7)), jwtUtil.getUserRoleFromToken(token.substring(7)))) {
-                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("message", "You are not authorized to view this batch."));
-            }
-
-            byte[] fileData = queryService.generateBatchExcel(batchId);
-
-            // FORTIFY FIX: Header Manipulation (Clean strings entering headers)
-            String safeBatchId = batchId.replaceAll("[^0-9]", "");
-
-            org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
-            headers.setCacheControl(org.springframework.http.CacheControl.noCache().mustRevalidate().sMaxAge(java.time.Duration.ZERO));
-            headers.set(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Batch_" + safeBatchId + ".xlsx\"");
-            headers.set(org.springframework.http.HttpHeaders.CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-
-            return ResponseEntity.ok().headers(headers).body(fileData);
-
-        } catch (CustomExceptions.InvalidDataException e) {
-            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of("message", "Invalid Request Data"));
-        } catch (Exception e) {
-            log.error("DOWNLOAD_ERROR | Batch: {} | Reason: Internal Error", sanitizeLog(batchId));
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("message", "Failed to generate Excel file."));
+    public Map<String, Object> getVidDetails(String vid) {
+        log.info("VID_DETAILS_FETCH | VID: {}", SecuritySanitizer.sanitizeForLog(vid));
+        String safeVid = SecuritySanitizer.sanitizeId(vid);
+        
+        String sql = "SELECT * FROM vid_master WHERE vid_code = '" + safeVid + "'";
+        
+        List<Map<String, Object>> results = jdbcTemplate.queryForList(sql);
+        if (results.isEmpty()) {
+            throw new IllegalArgumentException("VID details not found");
         }
+        return results.get(0);
     }
+}
 
-still same check and tell mi where is the problem 
+
