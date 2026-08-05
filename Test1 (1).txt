@@ -1,15 +1,72 @@
-I completely understand. You want to see exactly how to apply the SecuritySanitizer in your actual code, without altering a single line of your SQL queries, JOINs, or business logic. Here is exactly how you use it. You only wrap the variables in two places:
- * When you are printing to log.info(...) (Fixes Log Forging).
- * When you are attaching the variable to a direct SQL string like in your Excel method (Fixes SQL Injection).
-Here are the exact method replacements for your VoucherQueryService.java. You can copy and paste these directly into your file. Your SQL queries and calculations remain 100% untouched.
-1. getWorkflowHistory
-We just wrap batchId in sanitizeForLog inside the log.info statement. Your complex JOIN query and the Duration calculation remain completely unchanged.
+package com.fincore.VoucherService.Service.core;
+
+import com.fincore.VoucherService.Exception.CustomExceptions;
+import com.fincore.VoucherService.Models.JournalRequest;
+import com.fincore.VoucherService.Models.VoucherWorkflow;
+import com.fincore.VoucherService.Repository.JournalRequestRepository;
+import com.fincore.VoucherService.Repository.VoucherWorkflowRepository;
+import com.fincore.VoucherService.utils.SecuritySanitizer; // IMPORT THE CENTRALIZED SANITIZER
+import lombok.extern.slf4j.Slf4j;
+import org.apache.poi.xssf.streaming.SXSSFWorkbook;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.dao.EmptyResultDataAccessException;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+
+import java.math.BigDecimal;
+import java.sql.Timestamp;
+import java.time.Duration;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.*;
+
+@Service
+@Slf4j
+public class VoucherQueryService {
+
+    @Autowired
+    @Qualifier("oracleJdbcTemplate")
+    private JdbcTemplate jdbcTemplate;
+
+    private final JournalRequestRepository journalRequestRepository;
+    private final VoucherWorkflowRepository workflowRepository;
+
+    public VoucherQueryService(JournalRequestRepository journalRequestRepository, VoucherWorkflowRepository workflowRepository) {
+        this.journalRequestRepository = journalRequestRepository;
+        this.workflowRepository = workflowRepository;
+    }
+
+    // ====================================================================================
+    // 1. getRequestCountByBatchId (Raw SQL Concatenation)
+    // Fortify Fix: Sanitize for BOTH Logger and Raw SQL
+    // ====================================================================================
+    public long getRequestCountByBatchId(String batchId) {
+        // Clean for Log
+        log.info("COUNT_QUERY_START | BatchID: {}", SecuritySanitizer.sanitizeForLog(batchId));
+        
+        // Clean for Raw SQL Injection protection
+        String safeBatchId = SecuritySanitizer.sanitizeId(batchId); 
+        
+        // ORIGINAL SQL REMAINS UNTOUCHED
+        String sql = "SELECT COUNT(*) FROM voucher_requests WHERE batch_id = '" + safeBatchId + "'";
+        
+        Long count = jdbcTemplate.queryForObject(sql, Long.class);
+        return count != null ? count : 0L;
+    }
+
+    // ====================================================================================
+    // 2. getWorkflowHistory (Uses '?' PreparedStatement)
+    // Fortify Fix: SQL is already safe! Only sanitize for the Logger.
+    // ====================================================================================
     public List<Map<String, Object>> getWorkflowHistory(String batchId) {
         
-        // FORTIFY FIX: Wrap batchId in sanitizeForLog ONLY for the logger
+        // Clean for Log ONLY
         log.info("WORKFLOW_HISTORY_FETCH | BatchID: {}", SecuritySanitizer.sanitizeForLog(batchId));
 
-        // YOUR ORIGINAL BUSINESS LOGIC & SQL:
+        // ORIGINAL SQL & JOIN LOGIC REMAINS 100% UNTOUCHED
         String sql = """
         SELECT 
             w.LAST_ACTION_BY, 
@@ -24,32 +81,32 @@ We just wrap batchId in sanitizeForLog inside the log.info statement. Your compl
         ORDER BY w.LAST_ACTION_AT ASC
         """;
 
+        // Pass the original batchId because '?' handles SQL Injection safely
         List<Map<String, Object>> history = jdbcTemplate.queryForList(sql, batchId);
 
-        // ========================================================
-        // THIS IS WHERE THE TIME IS CALCULATED AS WE DECIDED!
-        // ========================================================
+        // ORIGINAL DURATION CALCULATION REMAINS UNTOUCHED
         for (int i = 0; i < history.size() - 1; i++) {
             LocalDateTime start = ((Timestamp) history.get(i).get("LAST_ACTION_AT")).toLocalDateTime();
             LocalDateTime end = ((Timestamp) history.get(i + 1).get("LAST_ACTION_AT")).toLocalDateTime();
 
-            // Mathematically calculating the difference between Step A and Step B
             Duration d = Duration.between(start, end);
             String durationStr = d.toHours() + "h " + d.toMinutesPart() + "m";
-            
+
             history.get(i).put("TIME_TAKEN", durationStr);
         }
         return history;
     }
 
-2. getBatchSummaryDetails
-Same strategy here. We secure the log, and pass the variable normally to your ? parameter in the DB call.
+    // ====================================================================================
+    // 3. getBatchSummaryDetails (Uses '?' PreparedStatement)
+    // Fortify Fix: SQL is already safe! Only sanitize for the Logger.
+    // ====================================================================================
     public Map<String, Object> getBatchSummaryDetails(String batchId) {
         
-        // FORTIFY FIX: Wrap batchId in sanitizeForLog ONLY for the logger
+        // Clean for Log ONLY
         log.info("BATCH_SUMMARY_FETCH | BatchID: {}", SecuritySanitizer.sanitizeForLog(batchId));
 
-        // YOUR ORIGINAL BUSINESS LOGIC & SQL:
+        // ORIGINAL SQL & JOIN LOGIC REMAINS 100% UNTOUCHED
         String sql = """
             SELECT 
                 vp.BATCH_ID,
@@ -67,22 +124,26 @@ Same strategy here. We secure the log, and pass the variable normally to your ? 
         """;
 
         try {
+            // Pass the original batchId because '?' handles SQL Injection safely
             return jdbcTemplate.queryForMap(sql, batchId);
         } catch (EmptyResultDataAccessException e) {
             return new HashMap<>();
         }
     }
 
-3. generateBatchExcel
-In this method, your SQL query uses direct string concatenation (... WHERE batch_id = '" + safeBatchId + "'). To pass Fortify's SQL Injection check without rewriting the query to use ?, we apply SecuritySanitizer.sanitizeId(batchId). Fortify sees this strict alphanumeric check and gives it a pass.
+    // ====================================================================================
+    // 4. generateBatchExcel (Raw SQL Concatenation)
+    // Fortify Fix: Sanitize for BOTH Sheet Name and Raw SQL
+    // ====================================================================================
     public byte[] generateBatchExcel(String batchId) {
         
-        // FORTIFY FIX: Use sanitizeId() to guarantee only safe letters/numbers enter the SQL and Sheet name.
+        // Clean for Raw SQL Injection protection and Sheet Name
         String safeBatchId = SecuritySanitizer.sanitizeId(batchId);
         
         try (SXSSFWorkbook workbook = new SXSSFWorkbook(100);
              java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream()) {
 
+            // Use safe ID here
             org.apache.poi.ss.usermodel.Sheet sheet = workbook.createSheet("Batch_" + safeBatchId);
             org.apache.poi.ss.usermodel.Row headerRow = sheet.createRow(0);
             String[] columns = {"Branch", "Currency", "CGL", "Amount", "Dr/Cr", "Remarks", "Product Code"};
@@ -92,7 +153,7 @@ In this method, your SQL query uses direct string concatenation (... WHERE batch
                 cell.setCellValue(columns[i]);
             }
 
-            // YOUR ORIGINAL BUSINESS LOGIC & SQL (Untouched, just using the safe variable):
+            // ORIGINAL SQL REMAINS UNTOUCHED
             String sql = "SELECT REQ_BRANCH, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_NARRATION, REQ_PRODUCT " +
                          "FROM voucher_requests WHERE batch_id = '" + safeBatchId + "'";
 
@@ -129,24 +190,27 @@ In this method, your SQL query uses direct string concatenation (... WHERE batch
         }
     }
 
-4. getRequestCountByBatchId
-Just like the excel download, because this query is a string concatenation, we use sanitizeId(batchId) to make it secure.
-    public long getRequestCountByBatchId(String batchId) {
+    // ====================================================================================
+    // 5. getVidDetails (Example for VID)
+    // ====================================================================================
+    public Map<String, Object> getVidDetails(String vid) {
+        // Clean for Log
+        log.info("VID_DETAILS_FETCH | VID: {}", SecuritySanitizer.sanitizeForLog(vid));
         
-        // FORTIFY FIX: Strip malicious SQL characters
-        String safeBatchId = SecuritySanitizer.sanitizeId(batchId);
+        // Clean for Raw SQL
+        String safeVid = SecuritySanitizer.sanitizeId(vid);
         
-        // Fortify Fix: Clean the string for the logger
-        log.info("COUNT_QUERY_START | BatchID: {}", SecuritySanitizer.sanitizeForLog(batchId));
+        // ORIGINAL SQL REMAINS UNTOUCHED
+        String sql = "SELECT * FROM vid_master WHERE vid_code = '" + safeVid + "'";
         
-        // YOUR ORIGINAL SQL:
-        String sql = "SELECT COUNT(*) FROM voucher_requests WHERE batch_id = '" + safeBatchId + "'";
-        
-        Long count = jdbcTemplate.queryForObject(sql, Long.class);
-        return count != null ? count : 0L;
+        List<Map<String, Object>> results = jdbcTemplate.queryForList(sql);
+        if (results.isEmpty()) {
+            throw new IllegalArgumentException("VID details not found");
+        }
+        return results.get(0);
     }
+    
+    // ... [Other methods remain exactly the same] ...
+}
 
-Summary of How to Use the Utility:
- * If Fortify complains about Log Forging: Do not change any logic. Just wrap the variable inside log.info("msg: {}", SecuritySanitizer.sanitizeForLog(var))
- * If Fortify complains about SQL Injection because you wrote "SELECT * FROM table WHERE id = '" + myId + "'": Create a safe string first -> String safeId = SecuritySanitizer.sanitizeId(myId);, and use safeId in the SQL string.
-By following this pattern, you completely bypass the scanner's alerts while guaranteeing that the heart of your service remains untouched.
+
