@@ -1,61 +1,69 @@
-    // =========================================================================
-    // EXCEL DOWNLOAD FIX: Restored the absolute simplest working logic 
-    // WITH THE CORRECT TABLE NAME
-    // =========================================================================
-    public byte[] generateBatchExcel(String batchId) {
+package com.fincore.VoucherService.Service.external;
 
-        String safeBatchId = SecuritySanitizer.sanitizeId(batchId);
-        int initialBufferSize = 5 * 1024 * 1024; // 5 MB
+import com.fincore.VoucherService.Dto.HdfsSyncDto;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.dao.DataAccessException;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
 
-        try (SXSSFWorkbook workbook = new SXSSFWorkbook(100);
-             java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(initialBufferSize)) {
+import java.util.List;
 
-            org.apache.poi.ss.usermodel.Sheet sheet = workbook.createSheet("Batch_" + safeBatchId);
-            org.apache.poi.ss.usermodel.Row headerRow = sheet.createRow(0);
-            String[] columns = {"Branch", "Currency", "CGL", "Amount", "Dr/Cr", "Remarks", "Product Code"};
+/**
+ * Service responsible for synchronizing aggregated GL balances to the HDFS Data Lake.
+ * Implements native Delta Lake MERGE INTO logic for atomic, duplicate-free Upserts.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class HdfsSyncService {
 
-            for (int i = 0; i < columns.length; i++) {
-                org.apache.poi.ss.usermodel.Cell cell = headerRow.createCell(i);
-                cell.setCellValue(columns[i]);
+    @Autowired
+    @Qualifier("hiveJdbcTemplate")
+    private JdbcTemplate hiveJdbcTemplate;
+
+    public void syncToDataLake(List<HdfsSyncDto> data) {
+        if (data == null || data.isEmpty()) return;
+
+        log.info("HDFS_SYNC_START | Target: Hive Data Lake | RecordCount: {}", data.size());
+        long startTime = System.currentTimeMillis();
+
+        try {
+            // 1. DEFINE SQL OUTSIDE THE LOOP (Allows Spark/Hive to cache the execution plan)
+            String mergeSql = "MERGE INTO fincoredatalakejournal.gl_balance AS target " +
+                    "USING (SELECT ? AS glcc, cast(? AS date) AS balance_date, ? AS closing_balance, ? AS inr_balance) AS source " +
+                    "ON target.glcc = source.glcc AND target.BALANCE_DATE = source.balance_date " +
+                    "WHEN MATCHED THEN " +
+                    "  UPDATE SET target.closing_balance = source.closing_balance, target.INR_BALANCE = source.inr_balance " +
+                    "WHEN NOT MATCHED THEN " +
+                    "  INSERT (glcc, BALANCE_DATE, closing_balance, INR_BALANCE) " +
+                    "  VALUES (source.glcc, source.balance_date, source.closing_balance, source.inr_balance)";
+
+            for (HdfsSyncDto dto : data) {
+                String glccKey = dto.getBranch() + dto.getCurrency() + dto.getCgl();
+
+                // 2. USE PARAMETERIZED UPDATE (Protects against SQL Injection & boosts speed)
+                hiveJdbcTemplate.update(
+                        mergeSql,
+                        glccKey,
+                        dto.getBalanceDate().toString(),
+                        dto.getNewBalance(), // JdbcTemplate natively handles BigDecimal
+                        dto.getNewInrBalance()
+                );
             }
 
-            // CRITICAL FIX: Using the correct table (VOUCHER_POSTING_DATA) and correct column (REQ_BRANCH_CODE)
-            String sql = "SELECT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_NARRATION, REQ_PRODUCT " +
-                    "FROM VOUCHER_POSTING_DATA WHERE BATCH_ID = '" + safeBatchId + "' ORDER BY REQ_ID ASC";
+            log.info("HDFS_SYNC_SUCCESS | Duration: {}ms | Records: {}",
+                    (System.currentTimeMillis() - startTime), data.size());
 
-            final int[] rowIdx = {1};
+        } catch (DataAccessException e) {
+            // Extract the exact Spark Thrift Server error message for cleaner debugging
+            Throwable rootCause = e.getRootCause();
+            String exactSparkError = (rootCause != null) ? rootCause.getMessage() : e.getMessage();
 
-            jdbcTemplate.query(
-                    sql,
-                    rs -> {
-                        org.apache.poi.ss.usermodel.Row row = sheet.createRow(rowIdx[0]++);
-
-                        // CRITICAL FIX: Changed rs.getString("REQ_BRANCH") to "REQ_BRANCH_CODE"
-                        row.createCell(0).setCellValue(rs.getString("REQ_BRANCH_CODE") != null ? rs.getString("REQ_BRANCH_CODE") : "");
-                        row.createCell(1).setCellValue(rs.getString("REQ_CURRENCY") != null ? rs.getString("REQ_CURRENCY") : "");
-                        row.createCell(2).setCellValue(rs.getString("REQ_CGL") != null ? rs.getString("REQ_CGL") : "");
-
-                        BigDecimal amt = rs.getBigDecimal("REQ_AMOUNT");
-                        if (amt != null) {
-                            row.createCell(3).setCellValue(amt.abs().stripTrailingZeros().toPlainString());
-                            row.createCell(4).setCellValue(amt.compareTo(BigDecimal.ZERO) < 0 ? "Credit" : "Debit");
-                        }
-
-                        row.createCell(5).setCellValue(rs.getString("REQ_NARRATION") != null ? rs.getString("REQ_NARRATION") : "");
-                        row.createCell(6).setCellValue(rs.getString("REQ_PRODUCT") != null ? rs.getString("REQ_PRODUCT") : "");
-                    }
-            );
-
-            if (rowIdx[0] == 1) {
-                throw new CustomExceptions.InvalidDataException("No records found for batch.");
-            }
-
-            workbook.write(out);
-            workbook.dispose();
-            return out.toByteArray();
-
-        } catch (Exception e) {
-            log.error("EXCEL_GEN_ERROR | Batch: {} | Error: {}", SecuritySanitizer.sanitizeForLog(batchId), e.getMessage(), e);
-            throw new CustomExceptions.DatabaseOperationException("Failed to generate Excel file", e);
+            log.error("HDFS_SYNC_DB_FAIL | Spark Error Details: {}", exactSparkError);
+            throw e;
         }
     }
+}
