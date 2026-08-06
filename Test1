@@ -1,69 +1,142 @@
-package com.fincore.VoucherService.Service.external;
+create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
+    p_batch_id      IN VARCHAR2,
+    p_executor_id   IN VARCHAR2,
+    p_remarks       IN VARCHAR2,
+    p_status        IN VARCHAR2,
+    o_cursor        OUT SYS_REFCURSOR
+) AS
+    v_missing_rates NUMBER;
+    v_txn_count     NUMBER; 
+    v_users_date    DATE; -- Store business date from FINCORE_DATE
+BEGIN
+    -- ==============================================================================
+    -- 0. FETCH OPERATIONAL SYSTEM BUSINESS DATE
+    -- ==============================================================================
+    SELECT USERS_DATE INTO v_users_date 
+    FROM FINCORE_DATE 
+    WHERE ROWNUM = 1;
 
-import com.fincore.VoucherService.Dto.HdfsSyncDto;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.dao.DataAccessException;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.stereotype.Service;
+    -- ==============================================================================
+    -- 0.1. PRE-CHECK: EXCHANGE RATE INTEGRITY
+    -- ==============================================================================
+    SELECT COUNT(*) INTO v_missing_rates
+    FROM (
+        SELECT DISTINCT REQ_CURRENCY FROM voucher_posting_data
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+    ) req
+    LEFT JOIN CURRENCY_MASTER cm
+        ON req.REQ_CURRENCY = cm.CURRENCY_CODE AND cm.FLAG = 1
+    WHERE req.REQ_CURRENCY <> 'INR'
+      AND (cm.CURRENCY_RATE IS NULL OR cm.CURRENCY_RATE <= 0);
 
-import java.util.List;
+    IF v_missing_rates > 0 THEN
+        RAISE_APPLICATION_ERROR(-20001, 'EXCHANGE_RATE_MISSING');
+    END IF;
 
-/**
- * Service responsible for synchronizing aggregated GL balances to the HDFS Data Lake.
- * Implements native Delta Lake MERGE INTO logic for atomic, duplicate-free Upserts.
- */
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class HdfsSyncService {
+    -- ==============================================================================
+    -- 0.5. PRE-CALCULATE TRANSACTION COUNT
+    -- ==============================================================================
+    SELECT COUNT(*) INTO v_txn_count
+    FROM voucher_posting_data
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-    @Autowired
-    @Qualifier("hiveJdbcTemplate")
-    private JdbcTemplate hiveJdbcTemplate;
+    -- ==============================================================================
+    -- 1. Insert GL_TRANSACTIONS (FINCORE_DATE -> TRANSACTION_DATE, System -> POST_DATE)
+    -- ==============================================================================
+    INSERT /*+ PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
+        TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
+        BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG, TRANSACTION_COUNT
+    )
+    SELECT /*+ PARALLEL(voucher_posting_data, 8) */
+        GL_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID,
+        v_users_date,                                        -- FIXED: Business date goes here now
+        CAST(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata' AS TIMESTAMP), -- FORCE IST      
+        REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
+        CASE WHEN REQ_AMOUNT > 0 THEN (REQ_AMOUNT * -1)   ELSE 0 END,
+        CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END,
+        'J' ,
+        '1' 
+    FROM voucher_posting_data
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+    
+    
+-- ==============================================================================
+    -- 1. Insert Voucher_transaction (FINCORE_DATE -> TRANSACTION_DATE, System -> POST_DATE)
+    -- ==============================================================================
+    INSERT /*+ PARALLEL(Voucher_TRANSACTIONS, 8) */ INTO VOUCHER_TRANSACTIONS (
+        TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
+        BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG, TRANSACTION_COUNT
+    )
+    SELECT /*+ PARALLEL(voucher_posting_data, 8) */
+        VOUCHER_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID,
+        v_users_date,                                        -- FIXED: Business date goes here now
+        CAST(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata' AS TIMESTAMP), -- FORCE IST      
+        REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
+        CASE WHEN REQ_AMOUNT > 0 THEN (REQ_AMOUNT * -1)   ELSE 0 END,
+        CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END,
+        'J' ,
+        '1' 
+    FROM voucher_posting_data
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+    
+    
 
-    public void syncToDataLake(List<HdfsSyncDto> data) {
-        if (data == null || data.isEmpty()) return;
+    -- ==============================================================================
+    -- 3. Merge GL Balances
+    -- ==============================================================================
+    MERGE INTO GL_BALANCE target
+    USING (
+        SELECT j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL,
+               v_users_date as BAL_DATE, -- Stays anchored to the business day baseline
+               SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
+               CASE WHEN j.REQ_CURRENCY = 'INR' THEN 1 ELSE MAX(c.CURRENCY_RATE) END as EXCH_RATE
+        FROM voucher_posting_data j
+        LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1
+        WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
+        GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL
+    ) source
+    ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE
+        AND target.CURRENCY = source.REQ_CURRENCY
+        AND target.CGL = source.REQ_CGL
+        AND target.BALANCE_DATE = source.BAL_DATE)
+    WHEN MATCHED THEN
+        UPDATE SET
+            target.BALANCE = target.BALANCE + source.TXN_AMOUNT,
+            target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
+    WHEN NOT MATCHED THEN
+        INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
+        VALUES (GL_BALANCE_SEQ.nextval, source.BAL_DATE, source.REQ_BRANCH_CODE,
+                source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT,
+                (source.TXN_AMOUNT * source.EXCH_RATE));
 
-        log.info("HDFS_SYNC_START | Target: Hive Data Lake | RecordCount: {}", data.size());
-        long startTime = System.currentTimeMillis();
+    -- ==============================================================================
+    -- 4. Capture Sync Data for HDFS (Data Lake)
+    -- ==============================================================================
+    OPEN o_cursor FOR
+    SELECT
+        j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL,
+        v_users_date AS BAL_DATE,
+        g.BALANCE AS NEW_BALANCE, g.INR_BALANCE AS NEW_INR_BALANCE
+    FROM (
+        SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL
+        FROM voucher_posting_data WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+    ) j
+    JOIN GL_BALANCE g
+        ON g.BRANCH_CODE = j.REQ_BRANCH_CODE
+        AND g.CURRENCY = j.REQ_CURRENCY
+        AND g.CGL = j.REQ_CGL
+        AND g.BALANCE_DATE = v_users_date;
 
-        try {
-            // 1. DEFINE SQL OUTSIDE THE LOOP (Allows Spark/Hive to cache the execution plan)
-            String mergeSql = "MERGE INTO fincoredatalakejournal.gl_balance AS target " +
-                    "USING (SELECT ? AS glcc, cast(? AS date) AS balance_date, ? AS closing_balance, ? AS inr_balance) AS source " +
-                    "ON target.glcc = source.glcc AND target.BALANCE_DATE = source.balance_date " +
-                    "WHEN MATCHED THEN " +
-                    "  UPDATE SET target.closing_balance = source.closing_balance, target.INR_BALANCE = source.inr_balance " +
-                    "WHEN NOT MATCHED THEN " +
-                    "  INSERT (glcc, BALANCE_DATE, closing_balance, INR_BALANCE) " +
-                    "  VALUES (source.glcc, source.balance_date, source.closing_balance, source.inr_balance)";
+    -- ==============================================================================
+    -- 5. Finalize Batch Status
+    -- ==============================================================================
+    UPDATE voucher_posting_data
+    SET REQ_STATUS = p_status,
+        EXECUTION_DATE =  CAST(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata' AS TIMESTAMP) 
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
 
-            for (HdfsSyncDto dto : data) {
-                String glccKey = dto.getBranch() + dto.getCurrency() + dto.getCgl();
-
-                // 2. USE PARAMETERIZED UPDATE (Protects against SQL Injection & boosts speed)
-                hiveJdbcTemplate.update(
-                        mergeSql,
-                        glccKey,
-                        dto.getBalanceDate().toString(),
-                        dto.getNewBalance(), // JdbcTemplate natively handles BigDecimal
-                        dto.getNewInrBalance()
-                );
-            }
-
-            log.info("HDFS_SYNC_SUCCESS | Duration: {}ms | Records: {}",
-                    (System.currentTimeMillis() - startTime), data.size());
-
-        } catch (DataAccessException e) {
-            // Extract the exact Spark Thrift Server error message for cleaner debugging
-            Throwable rootCause = e.getRootCause();
-            String exactSparkError = (rootCause != null) ? rootCause.getMessage() : e.getMessage();
-
-            log.error("HDFS_SYNC_DB_FAIL | Spark Error Details: {}", exactSparkError);
-            throw e;
-        }
-    }
-}
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;
