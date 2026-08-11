@@ -1,30 +1,31 @@
- @Transactional
+    @Transactional
     public String createBatchFromCacheAsync(String requestId, String commonRemarks, String creatorId, Integer creatorRole, String vid , LocalDateTime scheduledTime) {
 
         // FORTIFY FIX: Clean inputs before they touch Redis or Database
         String safeRequestId = com.fincore.VoucherService.config.SecuritySanitizer.sanitizeId(requestId);
         String safeVid = (vid != null) ? com.fincore.VoucherService.config.SecuritySanitizer.sanitizeId(vid) : null;
 
-        // Log safely
-        String lockKey = "LOCK_REQ_" + requestId;
+        // CRITICAL FIX: We now use safeRequestId here instead of the old requestId
+        String lockKey = "LOCK_REQ_" + safeRequestId;
 
         Boolean acquired;
 
         try {
             acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, new byte[0], 60, TimeUnit.MINUTES);
         } catch (DataAccessException e) {
-            log.error("REDIS_LOCK_FAIL | ReqID: {} | Status: Connection to lock service failed", requestId);
+            // Safe to log the clean ID
+            log.error("REDIS_LOCK_FAIL | ReqID: {} | Status: Connection to lock service failed", safeRequestId);
             throw new CustomExceptions.DatabaseOperationException("Distributed lock service unavailable", e);
         }
 
         if (Boolean.FALSE.equals(acquired)) {
-            log.warn("CONCURRENCY_LOCKED | ReqID: {} | Status: Processing already in progress", requestId);
+            log.warn("CONCURRENCY_LOCKED | ReqID: {} | Status: Processing already in progress", safeRequestId);
             throw new CustomExceptions.ConcurrencyLockException("Batch creation is already in progress for this Request ID.");
         }
 
         try {
-            // FIX 1: Validate VID existence to prevent "null" crashes
-            if (vid == null || vid.trim().isEmpty()) {
+            // FIX 1: Validate safeVid existence to prevent "null" crashes
+            if (safeVid == null || safeVid.trim().isEmpty()) {
                 throw new CustomExceptions.InvalidDataException("VID is missing from the payload. Cannot save batch.");
             }
 
@@ -32,29 +33,29 @@
             String lockSql = "SELECT STATUS FROM REQUEST_VOUCHER WHERE VID = ? FOR UPDATE";
             String vidStatus;
             try {
-                vidStatus = jdbcTemplate.queryForObject(lockSql, String.class, vid);
+                // CRITICAL FIX: Pass safeVid into the database query!
+                vidStatus = jdbcTemplate.queryForObject(lockSql, String.class, safeVid);
             } catch (EmptyResultDataAccessException e) {
-                throw new CustomExceptions.InvalidDataException("VID (" +vid + ") does not exist.");
+                throw new CustomExceptions.InvalidDataException("VID (" + safeVid + ") does not exist.");
             }
 
             if (!"ACTIVE".equals(vidStatus)) {
-                throw new CustomExceptions.InvalidDataException("VID (" + vid + ") is currently in use or locked.");
+                throw new CustomExceptions.InvalidDataException("VID (" + safeVid + ") is currently in use or locked.");
             }
 
-            // Immediately mark as USED
-            workflowEngine.updateVidStatus(vid, VoucherStatus.USED);
+            // Immediately mark as USED (using safeVid)
+            workflowEngine.updateVidStatus(safeVid, VoucherStatus.USED);
 
             // 1. GENERATE IDs
             String batchId = sequenceService.getNextBatchId();
             String journalPrefix = sequenceService.getNextJournalIdPrefix();
 
-            // 2. FETCH ROW COUNT
-            byte[] metaBytes = redisTemplate.opsForValue().get("DATA_META_" + requestId);
+            // 2. FETCH ROW COUNT (using safeRequestId)
+            byte[] metaBytes = redisTemplate.opsForValue().get("DATA_META_" + safeRequestId);
             long totalRows = 0;
             if (metaBytes != null) {
                 try {
-                    Map<String, Object> meta = objectMapper.readValue(metaBytes, new TypeReference<>() {
-                    });
+                    Map<String, Object> meta = objectMapper.readValue(metaBytes, new com.fasterxml.jackson.core.type.TypeReference<>() {});
                     totalRows = ((Number) meta.get("totalRows")).longValue();
                 } catch (Exception ignored) {
                 }
@@ -84,7 +85,7 @@
             // 4. SYNCHRONOUS MASTER RECORD CREATION
             VoucherPosting posting = new VoucherPosting();
             posting.setBatchId(batchId);
-            posting.setVidFk(vid);
+            posting.setVidFk(safeVid); // Use safeVid here
             posting.setCommonBatchRemarks(commonRemarks);
             posting.setCreatorRole(creatorRole);
             posting.setCreatedBy(creatorId);
@@ -107,59 +108,55 @@
 
             voucherPostingRepository.save(posting);
             String action = (scheduledTime != null) ? "Submitted (Scheduled)" : "Submitted";
-            workflowEngine.logWorkflowAction(batchId, vid, action, creatorId, commonRemarks, scheduledTime);
+            workflowEngine.logWorkflowAction(batchId, safeVid, action, creatorId, commonRemarks, scheduledTime); // Use safeVid here
             progressService.sendProgress(batchId, creatorId, 0, "PROCESSING", "Initializing Batch Creation...");
 
             // 6. ASYNC HANDOFF (Pass to background thread ONLY after DB commit is successful)
-            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            TransactionSynchronizationManager.registerSynchronization(new org.springframework.transaction.support.TransactionSynchronization() {
                 @Override
                 public void afterCommit() {
-                    asyncWorker.executeAsyncBatchCreation(batchId, journalPrefix, requestId, commonRemarks, creatorId, creatorRole, vid);
+                    // Pass the safe variables to the async worker
+                    asyncWorker.executeAsyncBatchCreation(batchId, journalPrefix, safeRequestId, commonRemarks, creatorId, creatorRole, safeVid);
                 }
             });
 
             return batchId;
 
-
         } catch (Exception e) {
-            // ==============================================================================
-            // THE FIX: IF ANY VALIDATION FAILS BEFORE REACHING THE ASYNC WORKER,
-            // WE MUST MANUALLY DELETE THE ORPHANED LOCK HERE SO THE USER CAN TRY AGAIN!
-            // ==============================================================================
             redisTemplate.delete(lockKey);
 
             if (e instanceof org.springframework.dao.DataIntegrityViolationException) {
-                log.error("DB_CONSTRAINT_FAIL | ReqID: {} | Error: {}", requestId, ((org.springframework.dao.DataIntegrityViolationException) e).getRootCause() != null ? ((org.springframework.dao.DataIntegrityViolationException) e).getRootCause().getMessage() : e.getMessage());
+                log.error("DB_CONSTRAINT_FAIL | ReqID: {} | Error: {}", safeRequestId, ((org.springframework.dao.DataIntegrityViolationException) e).getRootCause() != null ? ((org.springframework.dao.DataIntegrityViolationException) e).getRootCause().getMessage() : e.getMessage());
                 throw new CustomExceptions.InvalidDataException("Database constraint failed. Ensure the VID is not duplicated or missing.");
             } else if (e instanceof DataAccessException) {
-                log.error("SEQUENCE_GEN_FAIL | ReqID: {} | Status: Failed to generate sequence", requestId);
+                log.error("SEQUENCE_GEN_FAIL | ReqID: {} | Status: Failed to generate sequence", safeRequestId);
                 throw new CustomExceptions.DatabaseOperationException("Failed to generate Batch ID sequence", e);
             }
-
-            // Rethrow the 30-minute time validation error or any other exception back to the UI
             throw e;
         }
         finally {
-            // --- NEW: MICROSECOND RELEASE ---
-            // Free the VID instantly whether the save succeeded or crashed.
-            // If it succeeded, the DB is already marked as 'USED', so it's safe to drop the Redis lock.
-            if (vid != null) {
-                releaseVidLock(vid, creatorId);
+            if (safeVid != null) {
+                releaseVidLock(safeVid, creatorId); // Release the safeVid
             }
         }
     }
 
- // ==================================================================================
+
+    // ==================================================================================
     // 4. BATCH / RECORD DELETION
     // ==================================================================================
     public void deleteBatchRequest(String batchId, String userId) {
-        // 1. Fetch the batch
-        VoucherPosting batch = voucherPostingRepository.findById(batchId)
+        
+        // FORTIFY FIX: Clean the batch ID right at the top
+        String safeBatchId = com.fincore.VoucherService.config.SecuritySanitizer.sanitizeId(batchId);
+
+        // 1. Fetch the batch (Using the safe ID)
+        VoucherPosting batch = voucherPostingRepository.findById(safeBatchId)
                 .orElseThrow(() -> new CustomExceptions.InvalidDataException("Batch not found."));
 
         // 2. SECURITY CHECK: Only the creator can delete it
         if (!batch.getCreatedBy().equalsIgnoreCase(userId)) {
-            log.warn("SECURITY_VIOLATION | User {} attempted to delete batch {} owned by {}", userId, batchId, batch.getCreatedBy());
+            log.warn("SECURITY_VIOLATION | User {} attempted to delete batch {} owned by {}", userId, safeBatchId, batch.getCreatedBy());
             throw new IllegalStateException("You do not have permission to delete this batch.");
         }
 
@@ -177,7 +174,8 @@
         """;
         Integer currentOrder;
         try {
-            currentOrder = jdbcTemplate.queryForObject(orderSql, Integer.class, batchId);
+            // Pass the safe ID to the Database
+            currentOrder = jdbcTemplate.queryForObject(orderSql, Integer.class, safeBatchId);
         } catch (EmptyResultDataAccessException e) {
             currentOrder = -1; // Failsafe
         }
@@ -186,9 +184,8 @@
             throw new IllegalStateException("Batch cannot be deleted as it has already been processed or moved from the initial stage.");
         }
 
-
         // 6. Hand off to the background thread to do the heavy database deletion
-        asyncWorker.executeAsyncBatchCancellation(batchId, userId);
+        // Pass the safe ID here too!
+        asyncWorker.executeAsyncBatchCancellation(safeBatchId, userId);
     }
 
-in this i used the safeid and all still in that below how to use that i dont understand can u tell from this methods what needs be replce with what 
