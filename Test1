@@ -1,206 +1,539 @@
-  public void acquireVidLock(String vid, String userId) {
-        String lockKey = "LOCK_VID_" + vid;
-        byte[] userBytes = userId.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+package com.fincore.VoucherEnquiryService.service;
 
-        // Atomic SETNX with 30-minute TTL
-        Boolean acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, userBytes, 30, TimeUnit.MINUTES);
+import com.fincore.VoucherEnquiryService.dto.VoucherTransactionRequestDTO;
+import com.fincore.VoucherEnquiryService.exception.ExportGenerationException;
+import com.fincore.VoucherEnquiryService.service.utils.BaseStreamingExcelExporter;
+import com.fincore.VoucherEnquiryService.service.utils.ExcelExportUtil;
+import com.fincore.VoucherEnquiryService.service.utils.ExcelStyleUtil;
 
-        if (Boolean.FALSE.equals(acquired)) {
-            // Lock is already held by someone else
-            throw new CustomExceptions.ConcurrencyLockException("This VID is currently locked by another user. Please select a different VID.");
-        }
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.ss.util.CellRangeAddress;
+import org.apache.poi.xssf.streaming.SXSSFSheet;
+import org.apache.poi.xssf.streaming.SXSSFWorkbook;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
 
-        // Secondary safeguard: Ensure the DB hasn't already marked it as USED before the lock was acquired
-        String dbStatus = jdbcTemplate.queryForObject("SELECT STATUS FROM REQUEST_VOUCHER WHERE VID = ?", String.class, vid);
-        if (!"ACTIVE".equalsIgnoreCase(dbStatus)) {
-            redisTemplate.delete(lockKey); // Release immediately if DB is dirty
-            throw new CustomExceptions.ConcurrencyLockException("This VID has already been used. Please select a different VID.");
-        }
-    }
-	
-	
-	 @Transactional
-    public String createBatchFromCacheAsync(String requestId, String commonRemarks, String creatorId, Integer creatorRole, String vid , LocalDateTime scheduledTime) {
-        String lockKey = "LOCK_REQ_" + requestId;
-        Boolean acquired;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.sql.Date;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.concurrent.atomic.AtomicInteger;
 
-        try {
-            acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, new byte[0], 60, TimeUnit.MINUTES);
-        } catch (DataAccessException e) {
-            log.error("REDIS_LOCK_FAIL | ReqID: {} | Status: Connection to lock service failed", requestId);
-            throw new CustomExceptions.DatabaseOperationException("Distributed lock service unavailable", e);
-        }
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class VoucherTransactionStreamingExportService
+                extends BaseStreamingExcelExporter {
 
-        if (Boolean.FALSE.equals(acquired)) {
-            log.warn("CONCURRENCY_LOCKED | ReqID: {} | Status: Processing already in progress", requestId);
-            throw new CustomExceptions.ConcurrencyLockException("Batch creation is already in progress for this Request ID.");
-        }
+        private final JdbcTemplate jdbcTemplate;
 
-        try {
-            // FIX 1: Validate VID existence to prevent "null" crashes
-            if (vid == null || vid.trim().isEmpty()) {
-                throw new CustomExceptions.InvalidDataException("VID is missing from the payload. Cannot save batch.");
-            }
+        public byte[] export(
+                        VoucherTransactionRequestDTO request) {
 
-            // --- ATOMIC LOCK FOR MANUAL POSTING ---
-            String lockSql = "SELECT STATUS FROM REQUEST_VOUCHER WHERE VID = ? FOR UPDATE";
-            String vidStatus;
-            try {
-                vidStatus = jdbcTemplate.queryForObject(lockSql, String.class, vid);
-            } catch (EmptyResultDataAccessException e) {
-                throw new CustomExceptions.InvalidDataException("VID (" +vid + ") does not exist.");
-            }
+                DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd-MM-yyyy");
 
-            if (!"ACTIVE".equals(vidStatus)) {
-                throw new CustomExceptions.InvalidDataException("VID (" + vid + ") is currently in use or locked.");
-            }
+                LocalDate transactionDate = null;
+                LocalDate fromDate = null;
+                LocalDate toDate = null;
 
-            // Immediately mark as USED
-            workflowEngine.updateVidStatus(vid, VoucherStatus.USED);
+                if (request.getTransactionDate() != null
+                                && !request.getTransactionDate().isBlank()) {
 
-            // 1. GENERATE IDs
-            String batchId = sequenceService.getNextBatchId();
-            String journalPrefix = sequenceService.getNextJournalIdPrefix();
+                        transactionDate = LocalDate.parse(
+                                        request.getTransactionDate(),
+                                        formatter);
 
-            // 2. FETCH ROW COUNT
-            byte[] metaBytes = redisTemplate.opsForValue().get("DATA_META_" + requestId);
-            long totalRows = 0;
-            if (metaBytes != null) {
-                try {
-                    Map<String, Object> meta = objectMapper.readValue(metaBytes, new TypeReference<>() {
-                    });
-                    totalRows = ((Number) meta.get("totalRows")).longValue();
-                } catch (Exception ignored) {
+                } else {
+
+                        if (request.getFromDate() != null
+                                        && !request.getFromDate().isBlank()) {
+
+                                fromDate = LocalDate.parse(
+                                                request.getFromDate(),
+                                                formatter);
+                        }
+
+                        if (request.getToDate() != null
+                                        && !request.getToDate().isBlank()) {
+
+                                toDate = LocalDate.parse(
+                                                request.getToDate(),
+                                                formatter);
+                        }
                 }
-            }
 
-            // 3. WORKFLOW ROUTING
-            String workflowCode;
-            try {
-                workflowCode = jdbcTemplate.queryForObject(
-                        "SELECT WORKFLOW_CODE FROM WORKFLOW_TRANSITIONS WHERE ALLOWED_ROLE_ID = ? AND WORKFLOW_ORDER = 1 FETCH FIRST 1 ROWS ONLY",
-                        String.class, creatorRole
-                );
-            } catch (EmptyResultDataAccessException e) {
-                throw new CustomExceptions.InvalidDataException("Configuration Error: No workflow mapped for Role ID " + creatorRole);
-            }
+                final LocalDate finalTransactionDate = transactionDate;
+                final LocalDate finalFromDate = fromDate;
+                final LocalDate finalToDate = toDate;
 
-            Long firstApproverWorkflowId;
-            try {
-                firstApproverWorkflowId = jdbcTemplate.queryForObject(
-                        "SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = 2",
-                        Long.class, workflowCode
-                );
-            } catch (EmptyResultDataAccessException e) {
-                throw new CustomExceptions.InvalidDataException("Configuration Error: Missing Step 2 for " + workflowCode);
-            }
+                try (SXSSFWorkbook workbook = new SXSSFWorkbook(100);
 
-            // 4. SYNCHRONOUS MASTER RECORD CREATION
-            VoucherPosting posting = new VoucherPosting();
-            posting.setBatchId(batchId);
-            posting.setVidFk(vid);
-            posting.setCommonBatchRemarks(commonRemarks);
-            posting.setCreatorRole(creatorRole);
-            posting.setCreatedBy(creatorId);
-            posting.setWorkflowCode(workflowCode);
-            posting.setPendingAt(firstApproverWorkflowId);
-            posting.setBatchStatus("S");
-            posting.setRecordsCount(totalRows);
+                                ByteArrayOutputStream out = new ByteArrayOutputStream()) {
 
-            // Save the schedule directly from Step 3 UI
-            if (scheduledTime != null) {
-                workflowEngine.validateScheduledTime(scheduledTime, false);
-                posting.setIS_EXECUTION_SCHEDULED("YES");
-                posting.setScheduledTime(scheduledTime);
-            } else {
-                posting.setIS_EXECUTION_SCHEDULED("NO");
-                posting.setScheduledTime(null);
-            }
-            posting.setIsScheduleOverride("NO");
-            posting.setRecordsCount(totalRows);
+                        workbook.setCompressTempFiles(true);
 
-            voucherPostingRepository.save(posting);
-            String action = (scheduledTime != null) ? "Submitted (Scheduled)" : "Submitted";
-            workflowEngine.logWorkflowAction(batchId, vid, action, creatorId, commonRemarks, scheduledTime);
-            progressService.sendProgress(batchId, creatorId, 0, "PROCESSING", "Initializing Batch Creation...");
+                        SXSSFSheet sheet = workbook.createSheet(
+                                        "Voucher Transactions");
+                        sheet.setHorizontallyCenter(true);
+                        sheet.setVerticallyCenter(false);
 
-            // 6. ASYNC HANDOFF (Pass to background thread ONLY after DB commit is successful)
-            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-                @Override
-                public void afterCommit() {
-                    asyncWorker.executeAsyncBatchCreation(batchId, journalPrefix, requestId, commonRemarks, creatorId, creatorRole, vid);
+                        PrintSetup printSetup = sheet.getPrintSetup();
+                        printSetup.setLandscape(true);
+
+                        sheet.setFitToPage(true);
+                        printSetup.setFitWidth((short) 1);
+                        printSetup.setFitHeight((short) 0);
+
+                        CellStyle headerStyle = ExcelStyleUtil.createHeaderStyle(
+                                        workbook);
+                        headerStyle.setAlignment(HorizontalAlignment.CENTER);
+                        headerStyle.setVerticalAlignment(VerticalAlignment.CENTER);
+
+                        CellStyle titleStyle = ExcelStyleUtil.createTitleStyle(
+                                        workbook);
+                        titleStyle.setAlignment(HorizontalAlignment.CENTER);
+                        titleStyle.setVerticalAlignment(VerticalAlignment.CENTER);
+
+                        CellStyle amountStyle = ExcelStyleUtil.createAmountStyle(
+                                        workbook);
+                        amountStyle.setAlignment(HorizontalAlignment.CENTER);
+                        amountStyle.setVerticalAlignment(VerticalAlignment.CENTER);
+
+                        CreationHelper creationHelper = workbook.getCreationHelper();
+
+                        CellStyle criteriaValueStyle = workbook.createCellStyle();
+
+                        criteriaValueStyle.cloneStyleFrom(headerStyle);
+                        criteriaValueStyle.setAlignment(HorizontalAlignment.CENTER);
+                        criteriaValueStyle.setVerticalAlignment(VerticalAlignment.CENTER);
+
+                        CellStyle dateStyle = workbook.createCellStyle();
+
+                        dateStyle.setDataFormat(
+                                        creationHelper
+                                                        .createDataFormat()
+                                                        .getFormat("dd-MM-yyyy"));
+                        dateStyle.setAlignment(HorizontalAlignment.CENTER);
+                        dateStyle.setVerticalAlignment(VerticalAlignment.CENTER);
+
+                        CellStyle timestampStyle = workbook.createCellStyle();
+
+                        timestampStyle.setDataFormat(
+                                        creationHelper.createDataFormat().getFormat("dd-MM-yyyy HH:mm:ss"));
+                        timestampStyle.setAlignment(HorizontalAlignment.CENTER);
+                        timestampStyle.setVerticalAlignment(VerticalAlignment.CENTER);
+
+                        CellStyle centerStyle = workbook.createCellStyle();
+
+                        centerStyle.setAlignment(
+                                        HorizontalAlignment.CENTER);
+
+                        AtomicInteger rowNum = new AtomicInteger(0);
+
+                        // ==========================================
+                        // TITLE
+                        // ==========================================
+
+                        Row titleRow = sheet.createRow(
+                                        rowNum.getAndIncrement());
+                        titleRow.setHeightInPoints(30);
+
+                        Cell titleCell = titleRow.createCell(0);
+
+                        titleCell.setCellValue(
+                                        "Voucher Transactions(MIS) Report");
+
+                        titleCell.setCellStyle(
+                                        titleStyle);
+
+                        sheet.addMergedRegion(
+                                        new CellRangeAddress(
+                                                        0,
+                                                        0,
+                                                        0,
+                                                        12));
+
+                        rowNum.incrementAndGet();
+
+                        String acClassificationDesc = "";
+
+                        if (StringUtils.hasText(request.getAcClassification())) {
+
+                                acClassificationDesc = jdbcTemplate.queryForObject(
+                                                """
+                                                                SELECT DESCRIPTION
+                                                                FROM AC_CLASSIFICATION_MASTER
+                                                                WHERE AC_CLASSIFICATION = ?
+                                                                """,
+                                                String.class,
+                                                request.getAcClassification());
+                        }
+
+                        // ==========================================
+                        // SEARCH CRITERIA
+                        // ==========================================
+
+                        Row criteriaHeader = sheet.createRow(rowNum.getAndIncrement());
+                        Row criteriaRow = sheet.createRow(rowNum.getAndIncrement());
+
+                        int col = 0;
+
+                        if (request.getAcClassification() != null && !request.getAcClassification().isBlank()) {
+                                criteriaHeader.createCell(col).setCellValue("Classification");
+                                criteriaHeader.getCell(col).setCellStyle(headerStyle);
+                                Cell cell = criteriaRow.createCell(col++);
+                                cell.setCellValue(acClassificationDesc);
+                                cell.setCellStyle(criteriaValueStyle);
+                        }
+
+                        if (request.getCgl() != null && !request.getCgl().isBlank()) {
+                                criteriaHeader.createCell(col).setCellValue("CGL");
+                                criteriaHeader.getCell(col).setCellStyle(headerStyle);
+                                Cell cell = criteriaRow.createCell(col++);
+                                cell.setCellValue(request.getCgl());
+                                cell.setCellStyle(criteriaValueStyle);
+                        }
+
+                        if (request.getBranchCode() != null && !request.getBranchCode().isBlank()) {
+                                criteriaHeader.createCell(col).setCellValue("Branch");
+                                criteriaHeader.getCell(col).setCellStyle(headerStyle);
+                                Cell cell = criteriaRow.createCell(col++);
+                                cell.setCellValue(request.getBranchCode());
+                                cell.setCellStyle(criteriaValueStyle);
+                        }
+
+                        if (request.getTransactionDate() != null && !request.getTransactionDate().isBlank()) {
+                                criteriaHeader.createCell(col).setCellValue("Transaction Date");
+                                criteriaHeader.getCell(col).setCellStyle(headerStyle);
+                                Cell cell = criteriaRow.createCell(col++);
+                                cell.setCellValue(request.getTransactionDate());
+                                cell.setCellStyle(criteriaValueStyle);
+                        }
+
+                        if (request.getFromDate() != null && !request.getFromDate().isBlank()) {
+                                criteriaHeader.createCell(col).setCellValue("From Date");
+                                criteriaHeader.getCell(col).setCellStyle(headerStyle);
+                                Cell cell = criteriaRow.createCell(col++);
+                                cell.setCellValue(request.getFromDate());
+                                cell.setCellStyle(criteriaValueStyle);
+                        }
+
+                        if (request.getToDate() != null && !request.getToDate().isBlank()) {
+                                criteriaHeader.createCell(col).setCellValue("To Date");
+                                criteriaHeader.getCell(col).setCellStyle(headerStyle);
+                                Cell cell = criteriaRow.createCell(col++);
+                                cell.setCellValue(request.getToDate());
+                                cell.setCellStyle(criteriaValueStyle);
+                        }
+
+                        rowNum.incrementAndGet();
+
+                        // ==========================================
+                        // MAIN HEADER
+                        // ==========================================
+
+                        String[] columns = {
+                                        "Transaction ID",
+                                        "Batch ID",
+                                        "Journal ID",
+                                        "Transaction Date",
+                                        "Post Date",
+                                        "Branch Code",
+                                        "Currency",
+                                        "CGL",
+                                        "Narration",
+                                        "Debit Amount",
+                                        "Credit Amount",
+                                        "Transaction Count",
+                                        "Source Flag"
+                        };
+
+                        Row headerRow = sheet.createRow(
+                                        rowNum.getAndIncrement());
+
+                        for (int i = 0; i < columns.length; i++) {
+
+                                Cell cell = headerRow.createCell(i);
+
+                                cell.setCellValue(
+                                                columns[i]);
+
+                                cell.setCellStyle(
+                                                headerStyle);
+                        }
+                        // ==================================================
+                        // SQL
+                        // ==================================================
+
+                        String sql = """
+                                        SELECT
+                                            TRANSACTION_ID,
+                                            BATCH_ID,
+                                            JOURNAL_ID,
+                                            TRANSACTION_DATE,
+                                            POST_DATE,
+                                            BRANCH_CODE,
+                                            CURRENCY,
+                                            CGL,
+                                            NARRATION,
+                                            DEBIT_AMOUNT,
+                                            CREDIT_AMOUNT,
+                                            TRANSACTION_COUNT,
+                                            SOURCE_FLAG
+                                        FROM VOUCHER_TRANSACTIONS
+                                        WHERE
+                                            (? IS NULL OR CGL = ?)
+
+                                        AND
+                                            (? IS NULL OR BRANCH_CODE = ?)
+
+                                        AND
+                                            (
+                                                ? IS NULL
+                                                OR
+                                                CGL IN (
+                                                    SELECT CGL_NUMBER
+                                                    FROM CGL_MASTER
+                                                    WHERE AC_CLASSIFICATION = ?
+                                                )
+                                            )
+
+                                        AND
+                                            (
+                                                ? IS NULL
+                                                OR TRUNC(TRANSACTION_DATE) = ?
+                                            )
+
+                                        AND
+                                            (
+                                                ? IS NOT NULL
+
+                                                OR
+
+                                                (
+                                                    (? IS NULL OR TRUNC(TRANSACTION_DATE) >= ?)
+                                                    AND
+                                                    (? IS NULL OR TRUNC(TRANSACTION_DATE) <= ?)
+                                                )
+                                            )
+
+                                        ORDER BY TRANSACTION_DATE DESC
+                                        """;
+
+                        jdbcTemplate.setFetchSize(20000);
+
+                        jdbcTemplate.query(connection -> {
+
+                                var ps = connection.prepareStatement(sql);
+
+                                ps.setFetchSize(20000);
+
+                                int index = 1;
+
+                                ps.setString(index++, request.getCgl());
+                                ps.setString(index++, request.getCgl());
+
+                                ps.setString(index++, request.getBranchCode());
+                                ps.setString(index++, request.getBranchCode());
+
+                                ps.setString(index++, request.getAcClassification());
+                                ps.setString(index++, request.getAcClassification());
+
+                                if (finalTransactionDate != null) {
+
+                                        ps.setDate(index++, Date.valueOf(finalTransactionDate));
+                                        ps.setDate(index++, Date.valueOf(finalTransactionDate));
+
+                                } else {
+
+                                        ps.setNull(index++, java.sql.Types.DATE);
+                                        ps.setNull(index++, java.sql.Types.DATE);
+                                }
+
+                                if (finalTransactionDate != null) {
+
+                                        ps.setDate(index++, Date.valueOf(finalTransactionDate));
+
+                                } else {
+
+                                        ps.setNull(index++, java.sql.Types.DATE);
+                                }
+
+                                if (finalFromDate != null) {
+
+                                        ps.setDate(index++, Date.valueOf(finalFromDate));
+                                        ps.setDate(index++, Date.valueOf(finalFromDate));
+
+                                } else {
+
+                                        ps.setNull(index++, java.sql.Types.DATE);
+                                        ps.setNull(index++, java.sql.Types.DATE);
+                                }
+
+                                if (finalToDate != null) {
+
+                                        ps.setDate(index++, Date.valueOf(finalToDate));
+                                        ps.setDate(index++, Date.valueOf(finalToDate));
+
+                                } else {
+
+                                        ps.setNull(index++, java.sql.Types.DATE);
+                                        ps.setNull(index++, java.sql.Types.DATE);
+                                }
+
+                                return ps;
+
+                        }, rs -> {
+
+                                Row row = sheet.createRow(
+                                                rowNum.getAndIncrement());
+
+                                int column = 0;
+
+                                row.createCell(column++)
+                                                .setCellValue(
+                                                                rs.getLong("TRANSACTION_ID"));
+
+                                row.createCell(column++)
+                                                .setCellValue(
+                                                                ExcelExportUtil.safeString(
+                                                                                rs.getString("BATCH_ID")));
+
+                                row.createCell(column++)
+                                                .setCellValue(
+                                                                ExcelExportUtil.safeString(
+                                                                                rs.getString("JOURNAL_ID")));
+
+                                Cell transactionDateCell = row.createCell(column++);
+
+                                if (rs.getTimestamp("TRANSACTION_DATE") != null) {
+
+                                        transactionDateCell.setCellValue(
+                                                        rs.getTimestamp("TRANSACTION_DATE"));
+
+                                        transactionDateCell.setCellStyle(
+                                                        dateStyle);
+                                }
+
+                                Cell postDateCell = row.createCell(column++);
+
+                                if (rs.getTimestamp("POST_DATE") != null) {
+
+                                        postDateCell.setCellValue(
+                                                        rs.getTimestamp("POST_DATE"));
+
+                                        postDateCell.setCellStyle(
+                                                        timestampStyle);
+                                }
+
+                                row.createCell(column++)
+                                                .setCellValue(
+                                                                ExcelExportUtil.safeString(
+                                                                                rs.getString("BRANCH_CODE")));
+
+                                row.createCell(column++)
+                                                .setCellValue(
+                                                                ExcelExportUtil.safeString(
+                                                                                rs.getString("CURRENCY")));
+
+                                row.createCell(column++)
+                                                .setCellValue(
+                                                                ExcelExportUtil.safeString(
+                                                                                rs.getString("CGL")));
+
+                                row.createCell(column++)
+                                                .setCellValue(
+                                                                ExcelExportUtil.safeString(
+                                                                                rs.getString("NARRATION")));
+
+                                Cell debitCell = row.createCell(column++);
+
+                                debitCell.setCellValue(
+                                                rs.getBigDecimal("DEBIT_AMOUNT") == null
+                                                                ? 0
+                                                                : rs.getBigDecimal("DEBIT_AMOUNT").doubleValue());
+
+                                debitCell.setCellStyle(amountStyle);
+
+                                Cell creditCell = row.createCell(column++);
+
+                                creditCell.setCellValue(
+                                                rs.getBigDecimal("CREDIT_AMOUNT") == null
+                                                                ? 0
+                                                                : rs.getBigDecimal("CREDIT_AMOUNT").doubleValue());
+
+                                creditCell.setCellStyle(amountStyle);
+
+                                Cell countCell = row.createCell(column++);
+
+                                countCell.setCellValue(
+                                                rs.getLong("TRANSACTION_COUNT"));
+
+                                countCell.setCellStyle(centerStyle);
+
+                                Cell sourceCell = row.createCell(column++);
+
+                                sourceCell.setCellValue(
+                                                ExcelExportUtil.safeString(
+                                                                rs.getString("SOURCE_FLAG")));
+
+                                sourceCell.setCellStyle(centerStyle);
+
+                                ExcelExportUtil.flushIfNeeded(
+                                                sheet,
+                                                rowNum.get());
+                        });
+                        // ==================================================
+                        // COLUMN WIDTHS
+                        // ==================================================
+
+                        sheet.setColumnWidth(0, 5500); // Transaction ID
+                        sheet.setColumnWidth(1, 5500); // Batch ID
+                        sheet.setColumnWidth(2, 5500); // Journal ID
+                        sheet.setColumnWidth(3, 5000); // Transaction Date
+                        sheet.setColumnWidth(4, 7000); // Post Date
+                        sheet.setColumnWidth(5, 5000); // Branch Code
+                        sheet.setColumnWidth(6, 4500); // Currency
+                        sheet.setColumnWidth(7, 5000); // CGL
+                        sheet.setColumnWidth(8, 15000); // Narration
+                        sheet.setColumnWidth(9, 5500); // Debit Amount
+                        sheet.setColumnWidth(10, 5500); // Credit Amount
+                        sheet.setColumnWidth(11, 6000); // Transaction Count
+                        sheet.setColumnWidth(12, 5000);// Source Flag
+
+                        workbook.write(out);
+
+                        byte[] bytes = out.toByteArray();
+
+                        return bytes;
+
+                } catch (IOException e) {
+
+                        throw new ExportGenerationException(
+                                        "Failed to generate Voucher Transaction export",
+                                        e);
                 }
-            });
-
-            return batchId;
-
-
-        } catch (Exception e) {
-            // ==============================================================================
-            // THE FIX: IF ANY VALIDATION FAILS BEFORE REACHING THE ASYNC WORKER,
-            // WE MUST MANUALLY DELETE THE ORPHANED LOCK HERE SO THE USER CAN TRY AGAIN!
-            // ==============================================================================
-            redisTemplate.delete(lockKey);
-
-            if (e instanceof org.springframework.dao.DataIntegrityViolationException) {
-                log.error("DB_CONSTRAINT_FAIL | ReqID: {} | Error: {}", requestId, ((org.springframework.dao.DataIntegrityViolationException) e).getRootCause() != null ? ((org.springframework.dao.DataIntegrityViolationException) e).getRootCause().getMessage() : e.getMessage());
-                throw new CustomExceptions.InvalidDataException("Database constraint failed. Ensure the VID is not duplicated or missing.");
-            } else if (e instanceof DataAccessException) {
-                log.error("SEQUENCE_GEN_FAIL | ReqID: {} | Status: Failed to generate sequence", requestId);
-                throw new CustomExceptions.DatabaseOperationException("Failed to generate Batch ID sequence", e);
-            }
-
-            // Rethrow the 30-minute time validation error or any other exception back to the UI
-            throw e;
         }
-        finally {
-            // --- NEW: MICROSECOND RELEASE ---
-            // Free the VID instantly whether the save succeeded or crashed.
-            // If it succeeded, the DB is already marked as 'USED', so it's safe to drop the Redis lock.
-            if (vid != null) {
-                releaseVidLock(vid, creatorId);
-            }
-        }
+
+}
+
+ @PostMapping("/export")
+    public ResponseEntity<byte[]> export(
+            @Valid @RequestBody VoucherTransactionRequestDTO request) {
+
+        byte[] file = service.exportTransactions(request);
+
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION,
+                        "attachment; filename=MIS_REPORTS.xlsx")
+                .contentType(MediaType.parseMediaType(
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+                .body(file);
     }
-	
-	
-	 public void deleteBatchRequest(String batchId, String userId) {
-        // 1. Fetch the batch
-        VoucherPosting batch = voucherPostingRepository.findById(batchId)
-                .orElseThrow(() -> new CustomExceptions.InvalidDataException("Batch not found."));
-
-        // 2. SECURITY CHECK: Only the creator can delete it
-        if (!batch.getCreatedBy().equalsIgnoreCase(userId)) {
-            log.warn("SECURITY_VIOLATION | User {} attempted to delete batch {} owned by {}", userId, batchId, batch.getCreatedBy());
-            throw new IllegalStateException("You do not have permission to delete this batch.");
-        }
-
-        // 3. STATE CHECK: Can only delete if it is still PENDING ('P')
-        if (!"P".equalsIgnoreCase(batch.getBatchStatus())) {
-            throw new IllegalStateException("Only Pending batches can be deleted. Current status: " + batch.getBatchStatus());
-        }
-
-        // 4. STRICT WORKFLOW ORDER CHECK: Ensure it is exactly at Order 2
-        String orderSql = """
-            SELECT wt.WORKFLOW_ORDER 
-            FROM VOUCHER_POSTING vp 
-            JOIN WORKFLOW_TRANSITIONS wt ON vp.PENDING_AT = wt.WORKFLOW_ID 
-            WHERE vp.BATCH_ID = ?
-        """;
-        Integer currentOrder;
-        try {
-            currentOrder = jdbcTemplate.queryForObject(orderSql, Integer.class, batchId);
-        } catch (EmptyResultDataAccessException e) {
-            currentOrder = -1; // Failsafe
-        }
-
-        if (currentOrder == null || currentOrder != 2) {
-            throw new IllegalStateException("Batch cannot be deleted as it has already been processed or moved from the initial stage.");
-        }
 
 
-        // 6. Hand off to the background thread to do the heavy database deletion
-        asyncWorker.executeAsyncBatchCancellation(batchId, userId);
-    }
-	
-	this 3 i dont understand 
+same data i want to exprort in the PDF i want diff controller
