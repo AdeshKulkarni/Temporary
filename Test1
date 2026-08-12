@@ -1,191 +1,232 @@
-    @Transactional
-    public String createBatchFromCacheAsync(String requestId, String commonRemarks, String creatorId, Integer creatorRole, String vid , LocalDateTime scheduledTime) {
+# 2. Transform Data
+        df_final = df_gl_balance \
+            .withColumn("glcc", concat(col("BRANCH_CODE"), col("CURRENCY"), col("CGL"))) \
+            .select(
+                col("BALANCE_DATE"),
+                col("glcc"),
+                col("BALANCE").cast(DecimalType(25,4)).alias("BALANCE"),
+                col("INR_BALANCE").cast(DecimalType(25,4))
+            ).limit(50)
 
-        // FORTIFY FIX: Clean inputs before they touch Redis or Database
-        String safeRequestId = com.fincore.VoucherService.config.SecuritySanitizer.sanitizeId(requestId);
-        String safeVid = (vid != null) ? com.fincore.VoucherService.config.SecuritySanitizer.sanitizeId(vid) : null;
 
-        // CRITICAL FIX: We now use safeRequestId here instead of the old requestId
-        String lockKey = "LOCK_REQ_" + safeRequestId;
 
-        Boolean acquired;
+package com.fincore.VoucherService.Service.external;
+
+import com.fincore.VoucherService.Dto.HdfsSyncDto;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.dao.DataAccessException;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+
+/**
+ * Service responsible for synchronizing aggregated GL balances to the HDFS Data Lake.
+ * Implements native Delta Lake MERGE INTO logic for atomic, duplicate-free Upserts.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class HdfsSyncService {
+
+    @Autowired
+    @Qualifier("hiveJdbcTemplate")
+    private JdbcTemplate hiveJdbcTemplate;
+
+    public void syncToDataLake(List<HdfsSyncDto> data) {
+        if (data == null || data.isEmpty()) return;
+
+        log.info("HDFS_SYNC_START | Target: Hive Data Lake | RecordCount: {}", data.size());
+        long startTime = System.currentTimeMillis();
 
         try {
-            acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, new byte[0], 60, TimeUnit.MINUTES);
+            // 1. DEFINE SQL OUTSIDE THE LOOP (Allows Spark/Hive to cache the execution plan)
+//            String mergeSql = "MERGE INTO fincoredatalakevoucher.gl_balance AS target " +
+//                    "USING (SELECT ? AS glcc, cast(? AS date) AS balance_date, ? AS closing_balance, ? AS inr_balance) AS source " +
+//                    "ON target.glcc = source.glcc AND target.BALANCE_DATE = source.balance_date " +
+//                    "WHEN MATCHED THEN " +
+//                    "  UPDATE SET target.closing_balance = balance, target.INR_BALANCE = source.inr_balance " +
+//                    "WHEN NOT MATCHED THEN " +
+//                    "  INSERT (glcc, BALANCE_DATE, closing_balance, INR_BALANCE) " +
+//                    "  VALUES (source.glcc, source.balance_date, source.closing_balance, source.inr_balance)";
+            String mergeSql = "MERGE INTO fincoredatalakevoucher.gl_balance AS target " +
+                    "USING (SELECT ? AS glcc, cast(? AS date) AS BALANCE_DATE, ? AS BALANCE, ? AS INR_BALANCE) AS source " +
+                    "ON target.glcc = source.glcc AND target.BALANCE_DATE = source.BALANCE_DATE " +
+                    "WHEN MATCHED THEN " +
+                    "  UPDATE SET target.BALANCE = source.BALANCE, target.INR_BALANCE = source.INR_BALANCE " +
+                    "WHEN NOT MATCHED THEN " +
+                    "  INSERT (glcc, BALANCE_DATE, BALANCE, INR_BALANCE) " +
+                    "  VALUES (source.glcc, source.BALANCE_DATE, source.BALANCE, source.INR_BALANCE)";
+
+            for (HdfsSyncDto dto : data) {
+                String glccKey = dto.getBranch() + dto.getCurrency() + dto.getCgl();
+
+                // 2. USE PARAMETERIZED UPDATE (Protects against SQL Injection & boosts speed)
+                hiveJdbcTemplate.update(
+                        mergeSql,
+                        glccKey,
+                        dto.getBalanceDate().toString(),
+                        dto.getNewBalance(), // JdbcTemplate natively handles BigDecimal
+                        dto.getNewInrBalance()
+                );
+            }
+
+            log.info("HDFS_SYNC_SUCCESS | Duration: {}ms | Records: {}",
+                    (System.currentTimeMillis() - startTime), data.size());
+
         } catch (DataAccessException e) {
-            // Safe to log the clean ID
-            log.error("REDIS_LOCK_FAIL | ReqID: {} | Status: Connection to lock service failed", safeRequestId);
-            throw new CustomExceptions.DatabaseOperationException("Distributed lock service unavailable", e);
-        }
+            // Extract the exact Spark Thrift Server error message for cleaner debugging
+            Throwable rootCause = e.getRootCause();
+            String exactSparkError = (rootCause != null) ? rootCause.getMessage() : e.getMessage();
 
-        if (Boolean.FALSE.equals(acquired)) {
-            log.warn("CONCURRENCY_LOCKED | ReqID: {} | Status: Processing already in progress", safeRequestId);
-            throw new CustomExceptions.ConcurrencyLockException("Batch creation is already in progress for this Request ID.");
-        }
-
-        try {
-            // FIX 1: Validate safeVid existence to prevent "null" crashes
-            if (safeVid == null || safeVid.trim().isEmpty()) {
-                throw new CustomExceptions.InvalidDataException("VID is missing from the payload. Cannot save batch.");
-            }
-
-            // --- ATOMIC LOCK FOR MANUAL POSTING ---
-            String lockSql = "SELECT STATUS FROM REQUEST_VOUCHER WHERE VID = ? FOR UPDATE";
-            String vidStatus;
-            try {
-                // CRITICAL FIX: Pass safeVid into the database query!
-                vidStatus = jdbcTemplate.queryForObject(lockSql, String.class, safeVid);
-            } catch (EmptyResultDataAccessException e) {
-                throw new CustomExceptions.InvalidDataException("VID (" + safeVid + ") does not exist.");
-            }
-
-            if (!"ACTIVE".equals(vidStatus)) {
-                throw new CustomExceptions.InvalidDataException("VID (" + safeVid + ") is currently in use or locked.");
-            }
-
-            // Immediately mark as USED (using safeVid)
-            workflowEngine.updateVidStatus(safeVid, VoucherStatus.USED);
-
-            // 1. GENERATE IDs
-            String batchId = sequenceService.getNextBatchId();
-            String journalPrefix = sequenceService.getNextJournalIdPrefix();
-
-            // 2. FETCH ROW COUNT (using safeRequestId)
-            byte[] metaBytes = redisTemplate.opsForValue().get("DATA_META_" + safeRequestId);
-            long totalRows = 0;
-            if (metaBytes != null) {
-                try {
-                    Map<String, Object> meta = objectMapper.readValue(metaBytes, new com.fasterxml.jackson.core.type.TypeReference<>() {});
-                    totalRows = ((Number) meta.get("totalRows")).longValue();
-                } catch (Exception ignored) {
-                }
-            }
-
-            // 3. WORKFLOW ROUTING
-            String workflowCode;
-            try {
-                workflowCode = jdbcTemplate.queryForObject(
-                        "SELECT WORKFLOW_CODE FROM WORKFLOW_TRANSITIONS WHERE ALLOWED_ROLE_ID = ? AND WORKFLOW_ORDER = 1 FETCH FIRST 1 ROWS ONLY",
-                        String.class, creatorRole
-                );
-            } catch (EmptyResultDataAccessException e) {
-                throw new CustomExceptions.InvalidDataException("Configuration Error: No workflow mapped for Role ID " + creatorRole);
-            }
-
-            Long firstApproverWorkflowId;
-            try {
-                firstApproverWorkflowId = jdbcTemplate.queryForObject(
-                        "SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = 2",
-                        Long.class, workflowCode
-                );
-            } catch (EmptyResultDataAccessException e) {
-                throw new CustomExceptions.InvalidDataException("Configuration Error: Missing Step 2 for " + workflowCode);
-            }
-
-            // 4. SYNCHRONOUS MASTER RECORD CREATION
-            VoucherPosting posting = new VoucherPosting();
-            posting.setBatchId(batchId);
-            posting.setVidFk(safeVid); // Use safeVid here
-            posting.setCommonBatchRemarks(commonRemarks);
-            posting.setCreatorRole(creatorRole);
-            posting.setCreatedBy(creatorId);
-            posting.setWorkflowCode(workflowCode);
-            posting.setPendingAt(firstApproverWorkflowId);
-            posting.setBatchStatus("S");
-            posting.setRecordsCount(totalRows);
-
-            // Save the schedule directly from Step 3 UI
-            if (scheduledTime != null) {
-                workflowEngine.validateScheduledTime(scheduledTime, false);
-                posting.setIS_EXECUTION_SCHEDULED("YES");
-                posting.setScheduledTime(scheduledTime);
-            } else {
-                posting.setIS_EXECUTION_SCHEDULED("NO");
-                posting.setScheduledTime(null);
-            }
-            posting.setIsScheduleOverride("NO");
-            posting.setRecordsCount(totalRows);
-
-            voucherPostingRepository.save(posting);
-            String action = (scheduledTime != null) ? "Submitted (Scheduled)" : "Submitted";
-            workflowEngine.logWorkflowAction(batchId, safeVid, action, creatorId, commonRemarks, scheduledTime); // Use safeVid here
-            progressService.sendProgress(batchId, creatorId, 0, "PROCESSING", "Initializing Batch Creation...");
-
-            // 6. ASYNC HANDOFF (Pass to background thread ONLY after DB commit is successful)
-            TransactionSynchronizationManager.registerSynchronization(new org.springframework.transaction.support.TransactionSynchronization() {
-                @Override
-                public void afterCommit() {
-                    // Pass the safe variables to the async worker
-                    asyncWorker.executeAsyncBatchCreation(batchId, journalPrefix, safeRequestId, commonRemarks, creatorId, creatorRole, safeVid);
-                }
-            });
-
-            return batchId;
-
-        } catch (Exception e) {
-            redisTemplate.delete(lockKey);
-
-            if (e instanceof org.springframework.dao.DataIntegrityViolationException) {
-                log.error("DB_CONSTRAINT_FAIL | ReqID: {} | Error: {}", safeRequestId, ((org.springframework.dao.DataIntegrityViolationException) e).getRootCause() != null ? ((org.springframework.dao.DataIntegrityViolationException) e).getRootCause().getMessage() : e.getMessage());
-                throw new CustomExceptions.InvalidDataException("Database constraint failed. Ensure the VID is not duplicated or missing.");
-            } else if (e instanceof DataAccessException) {
-                log.error("SEQUENCE_GEN_FAIL | ReqID: {} | Status: Failed to generate sequence", safeRequestId);
-                throw new CustomExceptions.DatabaseOperationException("Failed to generate Batch ID sequence", e);
-            }
+            log.error("HDFS_SYNC_DB_FAIL | Spark Error Details: {}", exactSparkError);
             throw e;
         }
-        finally {
-            if (safeVid != null) {
-                releaseVidLock(safeVid, creatorId); // Release the safeVid
+    }
+}
+
+package com.fincore.VoucherService.Service.schedule;
+
+import com.fincore.VoucherService.Dto.HdfsSyncDto;
+import com.fincore.VoucherService.Exception.CustomExceptions;
+import com.fincore.VoucherService.Service.external.HdfsSyncService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.dao.DataAccessException;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class HdfsRecoveryService {
+
+    private final HdfsSyncService hdfsSyncService;
+    @Autowired
+    @Qualifier("oracleJdbcTemplate")
+    private JdbcTemplate oracleJdbcTemplate;
+
+    // Injecting StringRedisTemplate for Distributed Locking
+    @Autowired
+    private StringRedisTemplate stringRedisTemplate;
+
+    /**
+     * Scheduled task to retry PENDING syncs from the retry queue.
+     * Runs every 5 minutes with fixed delay to prevent overlapping executions.
+     */
+
+    @Scheduled(fixedDelay = 300000)
+    public void retryFailedHdfsSyncs() {
+        String lockKey = "SYSTEM_LOCK_HDFS_RECOVERY";
+        boolean lockAcquired = false;
+
+        try {
+//            Lock TTL extended to 10 mins to prevent race conditions under load
+            Boolean acquired = stringRedisTemplate.opsForValue()
+                    .setIfAbsent(lockKey, "LOCKED", 10, java.util.concurrent.TimeUnit.MINUTES);
+            lockAcquired = Boolean.TRUE.equals(acquired);
+
+            if (!lockAcquired) {
+                log.debug("HDFS_RECOVERY_SKIPPED | Status: Another node is currently processing.");
+                return;
+            }
+
+            String fetchSql = "SELECT BATCH_ID FROM HDFS_SYNC_RETRY_QUEUE WHERE STATUS = 'PENDING' AND RETRY_COUNT < 5";
+            List<String> failedBatches;
+            try {
+                failedBatches = oracleJdbcTemplate.query(fetchSql, (rs, rowNum) -> rs.getString("BATCH_ID"));
+            } catch (DataAccessException e) {
+                log.error("HDFS_RECOVERY_QUERY_FAIL | Error: {}", e.getMessage());
+                return;
+            }
+
+            if (failedBatches.isEmpty()) return;
+
+            log.info("HDFS RECOVERY: Found {} failed batches.", failedBatches.size());
+            for (String batchId : failedBatches) {
+                try {
+                    processRetry(batchId);
+                } catch (DataAccessException | CustomExceptions.DatabaseOperationException e) {
+                    log.error("HDFS_RECOVERY_ERROR | Batch: {} | Error: {}", batchId, e.getMessage());
+                    incrementRetryCount(batchId);
+                }
+            }
+        } catch (org.springframework.data.redis.RedisConnectionFailureException e) {
+            log.error("HDFS_RECOVERY_REDIS_FAIL | Cannot acquire distributed lock.");
+        } finally {
+           // Only release if THIS thread actually acquired it!
+            if (lockAcquired) {
+                try { stringRedisTemplate.delete(lockKey); }
+                catch (Exception e) { log.warn("HDFS_LOCK_RELEASE_FAIL"); }
             }
         }
     }
+    /**
+     * Performs a fresh join between Journal Requests and GL Balances to push
+     * the most current data to HDFS, resolving possible race conditions.
+     */
+    private void processRetry(String batchId) {
+        String freshDataSql = """
+    SELECT 
+        j.REQ_BRANCH_CODE AS BRANCH, 
+        j.REQ_CURRENCY AS CURRENCY, 
+        j.REQ_CGL AS CGL, 
+        f.USERS_DATE AS BAL_DATE,
+        g.BALANCE AS NEW_BALANCE,
+        g.INR_BALANCE AS NEW_INR_BALANCE
+    FROM (
+        -- FIX 1: Use the correct underlying table name
+        -- FIX 2: Remove the missing REQ_CSV_DATE column
+        SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL 
+        FROM VOUCHER_POSTING_DATA 
+        WHERE BATCH_ID = ?
+    ) j
+    -- FIX 3: Cross join to get the system's active posting date
+    CROSS JOIN (SELECT USERS_DATE FROM FINCORE_DATE FETCH FIRST 1 ROWS ONLY) f
+    JOIN GL_BALANCE g ON 
+        g.BRANCH_CODE = j.REQ_BRANCH_CODE AND 
+        g.CURRENCY = j.REQ_CURRENCY AND 
+        g.CGL = j.REQ_CGL AND 
+        g.BALANCE_DATE = f.USERS_DATE
+""";
 
+        List<HdfsSyncDto> freshSyncData = oracleJdbcTemplate.query(freshDataSql,
+                (rs, rowNum) -> new HdfsSyncDto(
+                        rs.getString("BRANCH"),
+                        rs.getString("CURRENCY"),
+                        rs.getString("CGL"),
+                        rs.getDate("BAL_DATE").toLocalDate(),
+                        rs.getBigDecimal("NEW_BALANCE"),
+                        rs.getBigDecimal("NEW_INR_BALANCE")
+                ), batchId);
 
-    // ==================================================================================
-    // 4. BATCH / RECORD DELETION
-    // ==================================================================================
-    public void deleteBatchRequest(String batchId, String userId) {
-        
-        // FORTIFY FIX: Clean the batch ID right at the top
-        String safeBatchId = com.fincore.VoucherService.config.SecuritySanitizer.sanitizeId(batchId);
+        if (!freshSyncData.isEmpty()) {
 
-        // 1. Fetch the batch (Using the safe ID)
-        VoucherPosting batch = voucherPostingRepository.findById(safeBatchId)
-                .orElseThrow(() -> new CustomExceptions.InvalidDataException("Batch not found."));
+            // 3. Push the LATEST/CURRENT balance to HDFS
 
-        // 2. SECURITY CHECK: Only the creator can delete it
-        if (!batch.getCreatedBy().equalsIgnoreCase(userId)) {
-            log.warn("SECURITY_VIOLATION | User {} attempted to delete batch {} owned by {}", userId, safeBatchId, batch.getCreatedBy());
-            throw new IllegalStateException("You do not have permission to delete this batch.");
+            hdfsSyncService.syncToDataLake(freshSyncData);
+            log.info("HDFS RECOVERY: Successfully synced batch {}. Data is now consistent.", batchId);
         }
 
-        // 3. STATE CHECK: Can only delete if it is still PENDING ('P')
-        if (!"P".equalsIgnoreCase(batch.getBatchStatus())) {
-            throw new IllegalStateException("Only Pending batches can be deleted. Current status: " + batch.getBatchStatus());
-        }
-
-        // 4. STRICT WORKFLOW ORDER CHECK: Ensure it is exactly at Order 2
-        String orderSql = """
-            SELECT wt.WORKFLOW_ORDER 
-            FROM VOUCHER_POSTING vp 
-            JOIN WORKFLOW_TRANSITIONS wt ON vp.PENDING_AT = wt.WORKFLOW_ID 
-            WHERE vp.BATCH_ID = ?
-        """;
-        Integer currentOrder;
-        try {
-            // Pass the safe ID to the Database
-            currentOrder = jdbcTemplate.queryForObject(orderSql, Integer.class, safeBatchId);
-        } catch (EmptyResultDataAccessException e) {
-            currentOrder = -1; // Failsafe
-        }
-
-        if (currentOrder == null || currentOrder != 2) {
-            throw new IllegalStateException("Batch cannot be deleted as it has already been processed or moved from the initial stage.");
-        }
-
-        // 6. Hand off to the background thread to do the heavy database deletion
-        // Pass the safe ID here too!
-        asyncWorker.executeAsyncBatchCancellation(safeBatchId, userId);
+        // 4. Mark as Completed
+        oracleJdbcTemplate.update("UPDATE HDFS_SYNC_RETRY_QUEUE SET STATUS = 'COMPLETED' WHERE BATCH_ID = ?", batchId);
     }
+    private void incrementRetryCount(String batchId) {
+        try {
+            oracleJdbcTemplate.update("UPDATE HDFS_SYNC_RETRY_QUEUE SET RETRY_COUNT = RETRY_COUNT + 1 WHERE BATCH_ID = ?", batchId);
+        } catch (DataAccessException e) {
+            log.error("HDFS_RECOVERY_META_UPDATE_FAIL | Batch: {} | Failed to increment retry count", batchId);
+        }
+    }
+}
+
 
