@@ -1,15 +1,3 @@
-# 2. Transform Data
-        df_final = df_gl_balance \
-            .withColumn("glcc", concat(col("BRANCH_CODE"), col("CURRENCY"), col("CGL"))) \
-            .select(
-                col("BALANCE_DATE"),
-                col("glcc"),
-                col("BALANCE").cast(DecimalType(25,4)).alias("BALANCE"),
-                col("INR_BALANCE").cast(DecimalType(25,4))
-            ).limit(50)
-
-
-
 package com.fincore.VoucherService.Service.external;
 
 import com.fincore.VoucherService.Dto.HdfsSyncDto;
@@ -18,9 +6,12 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.dao.DataAccessException;
+import org.springframework.jdbc.core.BatchPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
 import java.util.List;
 
 /**
@@ -43,15 +34,7 @@ public class HdfsSyncService {
         long startTime = System.currentTimeMillis();
 
         try {
-            // 1. DEFINE SQL OUTSIDE THE LOOP (Allows Spark/Hive to cache the execution plan)
-//            String mergeSql = "MERGE INTO fincoredatalakevoucher.gl_balance AS target " +
-//                    "USING (SELECT ? AS glcc, cast(? AS date) AS balance_date, ? AS closing_balance, ? AS inr_balance) AS source " +
-//                    "ON target.glcc = source.glcc AND target.BALANCE_DATE = source.balance_date " +
-//                    "WHEN MATCHED THEN " +
-//                    "  UPDATE SET target.closing_balance = balance, target.INR_BALANCE = source.inr_balance " +
-//                    "WHEN NOT MATCHED THEN " +
-//                    "  INSERT (glcc, BALANCE_DATE, closing_balance, INR_BALANCE) " +
-//                    "  VALUES (source.glcc, source.balance_date, source.closing_balance, source.inr_balance)";
+            // 1. DEFINE SQL OUTSIDE
             String mergeSql = "MERGE INTO fincoredatalakevoucher.gl_balance AS target " +
                     "USING (SELECT ? AS glcc, cast(? AS date) AS BALANCE_DATE, ? AS BALANCE, ? AS INR_BALANCE) AS source " +
                     "ON target.glcc = source.glcc AND target.BALANCE_DATE = source.BALANCE_DATE " +
@@ -61,18 +44,26 @@ public class HdfsSyncService {
                     "  INSERT (glcc, BALANCE_DATE, BALANCE, INR_BALANCE) " +
                     "  VALUES (source.glcc, source.BALANCE_DATE, source.BALANCE, source.INR_BALANCE)";
 
-            for (HdfsSyncDto dto : data) {
-                String glccKey = dto.getBranch() + dto.getCurrency() + dto.getCgl();
+            // 2. CRITICAL FIX: MASSIVE BATCH UPDATE INSTEAD OF A FOR-LOOP
+            // This sends all 50,000+ records to the Data Lake in a single network trip.
+            hiveJdbcTemplate.batchUpdate(mergeSql, new BatchPreparedStatementSetter() {
+                @Override
+                public void setValues(PreparedStatement ps, int i) throws SQLException {
+                    HdfsSyncDto dto = data.get(i);
+                    String glccKey = dto.getBranch() + dto.getCurrency() + dto.getCgl();
 
-                // 2. USE PARAMETERIZED UPDATE (Protects against SQL Injection & boosts speed)
-                hiveJdbcTemplate.update(
-                        mergeSql,
-                        glccKey,
-                        dto.getBalanceDate().toString(),
-                        dto.getNewBalance(), // JdbcTemplate natively handles BigDecimal
-                        dto.getNewInrBalance()
-                );
-            }
+                    // Perfectly aligns with your Python transform logic!
+                    ps.setString(1, glccKey);
+                    ps.setString(2, dto.getBalanceDate().toString());
+                    ps.setBigDecimal(3, dto.getNewBalance());
+                    ps.setBigDecimal(4, dto.getNewInrBalance());
+                }
+
+                @Override
+                public int getBatchSize() {
+                    return data.size();
+                }
+            });
 
             log.info("HDFS_SYNC_SUCCESS | Duration: {}ms | Records: {}",
                     (System.currentTimeMillis() - startTime), data.size());
@@ -87,146 +78,4 @@ public class HdfsSyncService {
         }
     }
 }
-
-package com.fincore.VoucherService.Service.schedule;
-
-import com.fincore.VoucherService.Dto.HdfsSyncDto;
-import com.fincore.VoucherService.Exception.CustomExceptions;
-import com.fincore.VoucherService.Service.external.HdfsSyncService;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.dao.DataAccessException;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.scheduling.annotation.Scheduled;
-import org.springframework.stereotype.Service;
-
-import java.util.List;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class HdfsRecoveryService {
-
-    private final HdfsSyncService hdfsSyncService;
-    @Autowired
-    @Qualifier("oracleJdbcTemplate")
-    private JdbcTemplate oracleJdbcTemplate;
-
-    // Injecting StringRedisTemplate for Distributed Locking
-    @Autowired
-    private StringRedisTemplate stringRedisTemplate;
-
-    /**
-     * Scheduled task to retry PENDING syncs from the retry queue.
-     * Runs every 5 minutes with fixed delay to prevent overlapping executions.
-     */
-
-    @Scheduled(fixedDelay = 300000)
-    public void retryFailedHdfsSyncs() {
-        String lockKey = "SYSTEM_LOCK_HDFS_RECOVERY";
-        boolean lockAcquired = false;
-
-        try {
-//            Lock TTL extended to 10 mins to prevent race conditions under load
-            Boolean acquired = stringRedisTemplate.opsForValue()
-                    .setIfAbsent(lockKey, "LOCKED", 10, java.util.concurrent.TimeUnit.MINUTES);
-            lockAcquired = Boolean.TRUE.equals(acquired);
-
-            if (!lockAcquired) {
-                log.debug("HDFS_RECOVERY_SKIPPED | Status: Another node is currently processing.");
-                return;
-            }
-
-            String fetchSql = "SELECT BATCH_ID FROM HDFS_SYNC_RETRY_QUEUE WHERE STATUS = 'PENDING' AND RETRY_COUNT < 5";
-            List<String> failedBatches;
-            try {
-                failedBatches = oracleJdbcTemplate.query(fetchSql, (rs, rowNum) -> rs.getString("BATCH_ID"));
-            } catch (DataAccessException e) {
-                log.error("HDFS_RECOVERY_QUERY_FAIL | Error: {}", e.getMessage());
-                return;
-            }
-
-            if (failedBatches.isEmpty()) return;
-
-            log.info("HDFS RECOVERY: Found {} failed batches.", failedBatches.size());
-            for (String batchId : failedBatches) {
-                try {
-                    processRetry(batchId);
-                } catch (DataAccessException | CustomExceptions.DatabaseOperationException e) {
-                    log.error("HDFS_RECOVERY_ERROR | Batch: {} | Error: {}", batchId, e.getMessage());
-                    incrementRetryCount(batchId);
-                }
-            }
-        } catch (org.springframework.data.redis.RedisConnectionFailureException e) {
-            log.error("HDFS_RECOVERY_REDIS_FAIL | Cannot acquire distributed lock.");
-        } finally {
-           // Only release if THIS thread actually acquired it!
-            if (lockAcquired) {
-                try { stringRedisTemplate.delete(lockKey); }
-                catch (Exception e) { log.warn("HDFS_LOCK_RELEASE_FAIL"); }
-            }
-        }
-    }
-    /**
-     * Performs a fresh join between Journal Requests and GL Balances to push
-     * the most current data to HDFS, resolving possible race conditions.
-     */
-    private void processRetry(String batchId) {
-        String freshDataSql = """
-    SELECT 
-        j.REQ_BRANCH_CODE AS BRANCH, 
-        j.REQ_CURRENCY AS CURRENCY, 
-        j.REQ_CGL AS CGL, 
-        f.USERS_DATE AS BAL_DATE,
-        g.BALANCE AS NEW_BALANCE,
-        g.INR_BALANCE AS NEW_INR_BALANCE
-    FROM (
-        -- FIX 1: Use the correct underlying table name
-        -- FIX 2: Remove the missing REQ_CSV_DATE column
-        SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL 
-        FROM VOUCHER_POSTING_DATA 
-        WHERE BATCH_ID = ?
-    ) j
-    -- FIX 3: Cross join to get the system's active posting date
-    CROSS JOIN (SELECT USERS_DATE FROM FINCORE_DATE FETCH FIRST 1 ROWS ONLY) f
-    JOIN GL_BALANCE g ON 
-        g.BRANCH_CODE = j.REQ_BRANCH_CODE AND 
-        g.CURRENCY = j.REQ_CURRENCY AND 
-        g.CGL = j.REQ_CGL AND 
-        g.BALANCE_DATE = f.USERS_DATE
-""";
-
-        List<HdfsSyncDto> freshSyncData = oracleJdbcTemplate.query(freshDataSql,
-                (rs, rowNum) -> new HdfsSyncDto(
-                        rs.getString("BRANCH"),
-                        rs.getString("CURRENCY"),
-                        rs.getString("CGL"),
-                        rs.getDate("BAL_DATE").toLocalDate(),
-                        rs.getBigDecimal("NEW_BALANCE"),
-                        rs.getBigDecimal("NEW_INR_BALANCE")
-                ), batchId);
-
-        if (!freshSyncData.isEmpty()) {
-
-            // 3. Push the LATEST/CURRENT balance to HDFS
-
-            hdfsSyncService.syncToDataLake(freshSyncData);
-            log.info("HDFS RECOVERY: Successfully synced batch {}. Data is now consistent.", batchId);
-        }
-
-        // 4. Mark as Completed
-        oracleJdbcTemplate.update("UPDATE HDFS_SYNC_RETRY_QUEUE SET STATUS = 'COMPLETED' WHERE BATCH_ID = ?", batchId);
-    }
-    private void incrementRetryCount(String batchId) {
-        try {
-            oracleJdbcTemplate.update("UPDATE HDFS_SYNC_RETRY_QUEUE SET RETRY_COUNT = RETRY_COUNT + 1 WHERE BATCH_ID = ?", batchId);
-        } catch (DataAccessException e) {
-            log.error("HDFS_RECOVERY_META_UPDATE_FAIL | Batch: {} | Failed to increment retry count", batchId);
-        }
-    }
-}
-
 
