@@ -1,5 +1,6 @@
 package com.fincore.VoucherService.Service.external;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fincore.VoucherService.Dto.HdfsSyncDto;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -10,12 +11,13 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Enterprise-grade Service for synchronizing massive GL balances (150k+ rows) to HDFS.
- * Uses Sequential Massive Chunking (VALUES array) to push gigabytes of data in seconds 
- * WITHOUT triggering Delta Lake ConcurrentAppendExceptions.
+ * Bypasses JDBC query limits and Spark StackOverflows by utilizing JSON Payload execution.
  */
 @Service
 @RequiredArgsConstructor
@@ -26,48 +28,47 @@ public class HdfsSyncService {
     @Qualifier("hiveJdbcTemplate")
     private JdbcTemplate hiveJdbcTemplate;
 
+    // Extremely fast JSON builder
+    private static final ObjectMapper mapper = new ObjectMapper();
+
     public void syncToDataLake(List<HdfsSyncDto> data) {
         if (data == null || data.isEmpty()) return;
 
         log.info("HDFS_SYNC_START | Target: Hive Data Lake | Total Records: {}", data.size());
         long startTime = System.currentTimeMillis();
 
-        // MASSIVE BATCHING: 5,000 records per trip. 
-        // 1.5 Lakhs (150,000) will take exactly 30 network trips to complete.
-        int chunkSize = 5000;
+        // STRATEGY CHANGE: 25,000 records per trip. 
+        // 1.5 Lakhs (150,000) will take exactly 6 fast sequential trips. No database locks!
+        int chunkSize = 25000;
 
         try {
             for (int i = 0; i < data.size(); i += chunkSize) {
                 int endIdx = Math.min(data.size(), i + chunkSize);
                 List<HdfsSyncDto> chunk = data.subList(i, endIdx);
 
-                // 1. USE FLAT VALUES ARRAY (Prevents Spark StackOverflow)
-                StringBuilder usingClause = new StringBuilder("USING (SELECT * FROM VALUES ");
-                List<Object> parameters = new ArrayList<>();
-
-                for (int j = 0; j < chunk.size(); j++) {
-                    HdfsSyncDto dto = chunk.get(j);
-                    // Match Python logic: concat(col("BRANCH_CODE"), col("CURRENCY"), col("CGL"))
-                    String glccKey = dto.getBranch() + dto.getCurrency() + dto.getCgl();
-
-                    if (j > 0) {
-                        usingClause.append(", ");
-                    }
-
-                    // Flat array structure for ultra-fast Spark parsing
-                    usingClause.append("(?, cast(? AS date), CAST(? AS DECIMAL(25,4)), CAST(? AS DECIMAL(25,4)))");
-
-                    parameters.add(glccKey);
-                    parameters.add(dto.getBalanceDate().toString());
-                    parameters.add(dto.getNewBalance());
-                    parameters.add(dto.getNewInrBalance());
+                // 1. Convert 25,000 Java DTOs into a simple Map structure
+                List<Map<String, Object>> jsonRows = new ArrayList<>(chunk.size());
+                for (HdfsSyncDto dto : chunk) {
+                    Map<String, Object> row = new HashMap<>();
+                    row.put("glcc", dto.getBranch() + dto.getCurrency() + dto.getCgl());
+                    row.put("BALANCE_DATE", dto.getBalanceDate().toString());
+                    row.put("BALANCE", dto.getNewBalance());
+                    row.put("INR_BALANCE", dto.getNewInrBalance());
+                    jsonRows.add(row);
                 }
-                
-                usingClause.append(" AS s(glcc, BALANCE_DATE, BALANCE, INR_BALANCE)) AS source ");
 
-                // 2. ATOMIC UPSERT
+                // 2. Convert all 25,000 rows into a single JSON String (~3MB size)
+                String jsonPayload = mapper.writeValueAsString(jsonRows);
+
+                // 3. THE BIG DATA FIX: Let Spark parse the single JSON string natively using 'from_json' and 'explode'.
+                // This completely prevents the Spark "StackOverflow" crash because the SQL Parser only sees ONE parameter (?).
                 String mergeSql = "MERGE INTO fincoredatalakevoucher.gl_balance AS target " +
-                        usingClause.toString() +
+                        "USING ( " +
+                        "  SELECT data.glcc, cast(data.BALANCE_DATE as date) as BALANCE_DATE, " +
+                        "         cast(data.BALANCE as decimal(25,4)) as BALANCE, " +
+                        "         cast(data.INR_BALANCE as decimal(25,4)) as INR_BALANCE " +
+                        "  FROM (SELECT explode(from_json(?, 'array<struct<glcc:string,BALANCE_DATE:string,BALANCE:decimal(25,4),INR_BALANCE:decimal(25,4)>>')) AS data) " +
+                        ") AS source " +
                         "ON target.glcc = source.glcc AND target.BALANCE_DATE = source.BALANCE_DATE " +
                         "WHEN MATCHED THEN " +
                         "  UPDATE SET target.BALANCE = source.BALANCE, target.INR_BALANCE = source.INR_BALANCE " +
@@ -75,20 +76,22 @@ public class HdfsSyncService {
                         "  INSERT (glcc, BALANCE_DATE, BALANCE, INR_BALANCE) " +
                         "  VALUES (source.glcc, source.BALANCE_DATE, source.BALANCE, source.INR_BALANCE)";
 
-                // 3. EXECUTE SEQUENTIALLY (Prevents Delta Lake Concurrency Locks)
-                hiveJdbcTemplate.update(mergeSql, parameters.toArray());
-                
+                // 4. Send the SINGLE string parameter to Spark. 
+                hiveJdbcTemplate.update(mergeSql, jsonPayload);
+
                 log.info("HDFS_SYNC_CHUNK_DONE | Processed records {} to {} out of {}", i, endIdx, data.size());
             }
 
             log.info("HDFS_SYNC_SUCCESS | Total Duration: {}ms | Processed all {} records",
                     (System.currentTimeMillis() - startTime), data.size());
 
-        } catch (DataAccessException e) {
-            Throwable rootCause = e.getRootCause();
-            String exactSparkError = (rootCause != null) ? rootCause.getMessage() : e.getMessage();
+        } catch (Exception e) {
+            String exactSparkError = e.getMessage();
+            if (e instanceof DataAccessException && ((DataAccessException) e).getRootCause() != null) {
+                exactSparkError = ((DataAccessException) e).getRootCause().getMessage();
+            }
             log.error("HDFS_SYNC_DB_FAIL | Spark Error Details: {}", exactSparkError);
-            throw e;
+            throw new RuntimeException("Failed to sync massive batch to Data Lake", e);
         }
     }
 }
