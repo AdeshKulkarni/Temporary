@@ -1,32 +1,195 @@
-  // Replaces anything that is NOT an alphabet, number, or space
-  const REMARKS_REPLACE_REGEX = /[^a-zA-Z0-9 ]/g;
+create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
+    p_batch_id      IN VARCHAR2,
+    p_executor_id   IN VARCHAR2,
+    p_remarks       IN VARCHAR2,
+    p_status        IN VARCHAR2,
+    o_cursor        OUT SYS_REFCURSOR
+) AS
+    v_missing_rates NUMBER;
+    v_txn_count     NUMBER; 
+    v_users_date    DATE; -- Store business date from FINCORE_DATE
+BEGIN
+    -- ==============================================================================
+    -- 0. FETCH OPERATIONAL SYSTEM BUSINESS DATE
+    -- ==============================================================================
+    SELECT USERS_DATE INTO v_users_date 
+    FROM FINCORE_DATE 
+    WHERE ROWNUM = 1;
 
 
 
-
-  const filterAndWarn = (val) => {
-    let filtered = val;
-    let hasError = false;
-    let msg = "Only alphanumeric characters and single spaces are allowed.";
-
-    // 1. Corrected Regex: Allows ONLY Alphanumeric and Spaces
-    const invalidCharRegex = /[^a-zA-Z0-9 ]/g;
-
-
-                    error={commonBatchRemarks.length > 0 && !isCommonRemarksValid(commonBatchRemarks)}
-                    helperText="Allowed 2-30 chars: Alphanumeric and single spaces only"
-                  />
-
+    -- ==============================================================================
+    -- 0.1. PRE-CHECK: EXCHANGE RATE INTEGRITY
+    -- ==============================================================================
+    SELECT COUNT(*) INTO v_missing_rates
+    FROM (
+        SELECT DISTINCT REQ_CURRENCY FROM voucher_posting_data
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+    ) req
+    LEFT JOIN CURRENCY_MASTER cm
+        ON req.REQ_CURRENCY = cm.CURRENCY_CODE AND cm.FLAG = 1
+    WHERE req.REQ_CURRENCY <> 'INR'
+      AND (cm.CURRENCY_RATE IS NULL OR cm.CURRENCY_RATE <= 0);
 
 
 
-                              onChange={(e) => {
-                                const val = filterAndWarn(e.target.value);
-                                if (val.length <= 30) {
-                                  handleRowChange(row.id, "remarks", val);
-                                }
-                              }}
-                              helperText="Allowed 2-30 chars: Alphanumeric and single spaces only"
-                            />
+    IF v_missing_rates > 0 THEN
+        RAISE_APPLICATION_ERROR(-20001, 'EXCHANGE_RATE_MISSING');
+    END IF;
 
 
+
+    -- ==============================================================================
+    -- 0.5. PRE-CALCULATE TRANSACTION COUNT
+    -- ==============================================================================
+    SELECT COUNT(*) INTO v_txn_count
+    FROM voucher_posting_data
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+
+
+
+    -- ==============================================================================
+    -- 1. Insert GL_TRANSACTIONS (Fixed with Subquery for Sequence sorting)
+    -- ==============================================================================
+    INSERT /*+ PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
+        TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
+        BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG, TRANSACTION_COUNT
+    )
+    SELECT 
+        GL_TRANSACTIONS_SEQ.nextval, 
+        ordered_data.BATCH_ID, 
+        ordered_data.JOURNAL_ID, 
+        ordered_data.TRANSACTION_DATE, 
+        ordered_data.POST_DATE,
+        ordered_data.REQ_BRANCH_CODE, 
+        ordered_data.REQ_CURRENCY, 
+        ordered_data.REQ_CGL, 
+        ordered_data.REQ_NARRATION,
+        ordered_data.DEBIT_AMOUNT, 
+        ordered_data.CREDIT_AMOUNT, 
+        ordered_data.SOURCE_FLAG, 
+        ordered_data.TRANSACTION_COUNT
+    FROM (
+        SELECT /*+ PARALLEL(voucher_posting_data, 8) */
+            BATCH_ID, 
+            JOURNAL_ID,
+            v_users_date AS TRANSACTION_DATE,                                        
+            CAST(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata' AS TIMESTAMP) AS POST_DATE,      
+            REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
+            CASE WHEN REQ_AMOUNT > 0 THEN (REQ_AMOUNT * -1)   ELSE 0 END AS DEBIT_AMOUNT,
+            CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END AS CREDIT_AMOUNT,
+            'J' AS SOURCE_FLAG,
+            '1' AS TRANSACTION_COUNT
+        FROM voucher_posting_data
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+        -- Sorting happens HERE inside the safe subquery
+        ORDER BY REQ_CURRENCY, REQ_BRANCH_CODE, REQ_CGL
+    ) ordered_data;
+    
+    
+    -- ==============================================================================
+    -- 2. Insert VOUCHER_TRANSACTIONS (Fixed with Subquery for Sequence sorting)
+    -- ==============================================================================
+    INSERT /*+ PARALLEL(VOUCHER_TRANSACTIONS, 8) */ INTO VOUCHER_TRANSACTIONS (
+        TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
+        BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG, TRANSACTION_COUNT
+    )
+    SELECT 
+        VOUCHER_TRANSACTIONS_SEQ.nextval, 
+        ordered_data.BATCH_ID, 
+        ordered_data.JOURNAL_ID, 
+        ordered_data.TRANSACTION_DATE, 
+        ordered_data.POST_DATE,
+        ordered_data.REQ_BRANCH_CODE, 
+        ordered_data.REQ_CURRENCY, 
+        ordered_data.REQ_CGL, 
+        ordered_data.REQ_NARRATION,
+        ordered_data.DEBIT_AMOUNT, 
+        ordered_data.CREDIT_AMOUNT, 
+        ordered_data.SOURCE_FLAG, 
+        ordered_data.TRANSACTION_COUNT
+    FROM (
+        SELECT /*+ PARALLEL(voucher_posting_data, 8) */
+            BATCH_ID, 
+            JOURNAL_ID,
+            v_users_date AS TRANSACTION_DATE,                                        
+            CAST(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata' AS TIMESTAMP) AS POST_DATE,      
+            REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
+            CASE WHEN REQ_AMOUNT > 0 THEN (REQ_AMOUNT * -1)   ELSE 0 END AS DEBIT_AMOUNT,
+            CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END AS CREDIT_AMOUNT,
+            'J' AS SOURCE_FLAG,
+            '1' AS TRANSACTION_COUNT
+        FROM voucher_posting_data
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+        -- Sorting happens HERE inside the safe subquery
+        ORDER BY REQ_CURRENCY, REQ_BRANCH_CODE, REQ_CGL
+    ) ordered_data;
+    
+
+
+
+    -- ==============================================================================
+    -- 3. Merge GL Balances (Logic stays exactly the same)
+    -- ==============================================================================
+    MERGE INTO GL_BALANCE target
+    USING (
+        SELECT j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL,
+               v_users_date as BAL_DATE, 
+               SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
+               CASE WHEN j.REQ_CURRENCY = 'INR' THEN 1 ELSE MAX(c.CURRENCY_RATE) END as EXCH_RATE
+        FROM voucher_posting_data j
+        LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1
+        WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
+        GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL
+    ) source
+    ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE
+        AND target.CURRENCY = source.REQ_CURRENCY
+        AND target.CGL = source.REQ_CGL
+        AND target.BALANCE_DATE = source.BAL_DATE)
+    WHEN MATCHED THEN
+        UPDATE SET
+            target.BALANCE = target.BALANCE + source.TXN_AMOUNT,
+            target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
+    WHEN NOT MATCHED THEN
+        INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
+        VALUES (GL_BALANCE_SEQ.nextval, source.BAL_DATE, source.REQ_BRANCH_CODE,
+                source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT,
+                (source.TXN_AMOUNT * source.EXCH_RATE));
+
+
+
+    -- ==============================================================================
+    -- 4. Capture Sync Data for HDFS (Data Lake)
+    -- ==============================================================================
+    OPEN o_cursor FOR
+    SELECT
+        j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL,
+        v_users_date AS BAL_DATE,
+        g.BALANCE AS NEW_BALANCE, g.INR_BALANCE AS NEW_INR_BALANCE
+    FROM (
+        SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL
+        FROM voucher_posting_data WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+    ) j
+    JOIN GL_BALANCE g
+        ON g.BRANCH_CODE = j.REQ_BRANCH_CODE
+        AND g.CURRENCY = j.REQ_CURRENCY
+        AND g.CGL = j.REQ_CGL
+        AND g.BALANCE_DATE = v_users_date;
+
+
+
+    -- ==============================================================================
+    -- 5. Finalize Batch Status
+    -- ==============================================================================
+    UPDATE voucher_posting_data
+    SET REQ_STATUS = p_status,
+        EXECUTION_DATE =  CAST(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata' AS TIMESTAMP) 
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+
+
+
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;
