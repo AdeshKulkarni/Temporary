@@ -1,30 +1,153 @@
-```java
-public void frequencyArrayTemplate(String s) {// 1. Create the array
-// Use size 26 for lowercase OR uppercase letters.
-// Use size 128 if the string contains a mix of upper/lower/numbers/symbols.
-int[] freq = new int[26];
+package com.fincore.VoucherService.Service.schedule;
 
-// 2. Add characters to the array (Expanding window)
-for (int i = 0; i < s.length(); i++) {
-    char c = s.charAt(i);
+import com.fincore.VoucherService.Models.enums.RequestStatus;
+import com.fincore.VoucherService.Dto.BulkProcessVoucherPostingDto;
+import com.fincore.VoucherService.Service.core.VoucherCommandService;
+import com.fincore.VoucherService.Service.NotificationWriterService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.EmptyResultDataAccessException;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
 
-    // If string is ONLY lowercase: use c - 'a'
-    // If string is ONLY uppercase: use c - 'A'
-    freq[c - 'A']++;
-}
-// 3. Remove a character (Shrinking window)
-char charToRemove = 'B';
-freq[charToRemove - 'A']--;
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
-// 4. Check the frequency of a specific character
-char charToCheck = 'C';
-int countOfC = freq[charToCheck - 'A'];
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class VoucherExecutionScheduler {
 
-// 5. Find the most frequent character overall
-int maxCount = 0;
-for (int i = 0; i < 26; i++) {
-    if (freq[i] > maxCount) {
-        maxCount = freq[i];
+    private final JdbcTemplate jdbcTemplate;
+    private final StringRedisTemplate stringRedisTemplate;
+    private final VoucherCommandService voucherCommandService;
+    private final NotificationWriterService notificationWriterService;
+
+    private static final int MAX_RETRIES = 5;
+
+    @Scheduled(fixedRate = 60000)
+    public void executeScheduledBatches() {
+        String lockKey = "SYSTEM_LOCK_SCHEDULED_EXECUTION";
+        boolean lockAcquired = false;
+
+        try {
+            Boolean acquired = stringRedisTemplate.opsForValue()
+                    .setIfAbsent(lockKey, "LOCKED", 50, TimeUnit.SECONDS);
+            lockAcquired = Boolean.TRUE.equals(acquired);
+
+            if (!lockAcquired) return;
+
+            // --- STEP 1: HOUSEKEEPING ---
+            String cleanupSql = """
+                        UPDATE SCHEDULED_BATCH_RETRY r 
+                        SET r.STATUS = 'COMPLETED' 
+                        WHERE r.STATUS = 'PENDING' 
+                        AND EXISTS (
+                            SELECT 1 FROM VOUCHER_POSTING p 
+                            WHERE p.BATCH_ID = r.BATCH_ID 
+                            AND p.BATCH_STATUS IN ('A', 'C', 'POSTED')
+                        )
+                    """;
+            jdbcTemplate.update(cleanupSql);
+
+            // --- STEP 2: FETCH DUE BATCHES (Including 'Q' for retries) ---
+            String fetchSql = """
+                        SELECT p.BATCH_ID FROM VOUCHER_POSTING p 
+                        WHERE p.BATCH_STATUS IN ('P', 'Q') 
+                        AND p.IS_EXECUTION_SCHEDULED = 'YES' 
+                        AND p.SCHEDULED_TIME <= ? 
+                        AND EXISTS (
+                            SELECT 1 FROM VOUCHER_WORKFLOW vw 
+                            WHERE vw.BATCH_ID_FK = p.BATCH_ID 
+                            AND vw.LAST_ACTION LIKE 'Final Approval%'
+                        )
+                    """;
+
+            java.sql.Timestamp currentTime = java.sql.Timestamp.valueOf(LocalDateTime.now());
+            List<String> dueBatches = jdbcTemplate.queryForList(fetchSql, String.class, currentTime);
+
+            if (dueBatches.isEmpty()) return;
+
+            log.info("SCHEDULER_WAKEUP | Found {} scheduled batches ready for execution.", dueBatches.size());
+
+            // --- STEP 3: PROCESS WITH RETRY TRACKING ---
+            for (String batchId : dueBatches) {
+                try {
+                    int currentRetries = 0;
+
+                    try {
+                        Map<String, Object> retryData = jdbcTemplate.queryForMap(
+                                "SELECT RETRY_COUNT, STATUS FROM SCHEDULED_BATCH_RETRY WHERE BATCH_ID = ?", batchId);
+                        currentRetries = ((Number) retryData.get("RETRY_COUNT")).intValue();
+                    } catch (EmptyResultDataAccessException e) {
+                        jdbcTemplate.update(
+                                "INSERT INTO SCHEDULED_BATCH_RETRY (BATCH_ID, CREATED_AT, RETRY_COUNT, STATUS) VALUES (?, SYSTIMESTAMP, 0, 'PENDING')",
+                                batchId);
+                    }
+
+                    // --- THE KILL SWITCH: Exhausted Retries ---
+                    if (currentRetries >= MAX_RETRIES) {
+                        log.error("SCHEDULER_EXHAUSTED | Batch {} failed after {} attempts. Halting execution.", batchId, MAX_RETRIES);
+
+                        // 1. Fetch the VID
+                        String vid = null;
+                        try {
+                            vid = jdbcTemplate.queryForObject("SELECT VID_FK FROM VOUCHER_POSTING WHERE BATCH_ID = ?", String.class, batchId);
+                        } catch (EmptyResultDataAccessException ignored) {}
+
+                        // 2. Release the VID back to ACTIVE so it can be reused safely
+                        if (vid != null) {
+                            jdbcTemplate.update("UPDATE REQUEST_VOUCHER SET STATUS = 'ACTIVE' WHERE VID = ?", vid);
+                        }
+
+                        // 3. Mark Tracker as FAILED
+                        jdbcTemplate.update("UPDATE SCHEDULED_BATCH_RETRY SET STATUS = 'FAILED' WHERE BATCH_ID = ?", batchId);
+
+                        // 4. Mark Master Record as ERROR and permanently disable scheduling
+                        jdbcTemplate.update(
+                                "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'ERROR', IS_EXECUTION_SCHEDULED = 'NO' WHERE BATCH_ID = ?",
+                                batchId
+                        );
+
+                        // 5. Notify the Maker that the batch permanently failed
+                        try {
+                            String creatorId = jdbcTemplate.queryForObject("SELECT CREATED_BY FROM VOUCHER_POSTING WHERE BATCH_ID = ?", String.class, batchId);
+                            if (creatorId != null) {
+                                String failMsg = "CRITICAL: Batch " + batchId + " permanently failed execution after " + MAX_RETRIES + " attempts. Please review the data and create a new batch.";
+                                notificationWriterService.createNotification(creatorId, null, failMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
+                            }
+                        } catch (Exception ignored) {}
+
+                        continue;
+                    }
+
+                    jdbcTemplate.update("UPDATE SCHEDULED_BATCH_RETRY SET RETRY_COUNT = RETRY_COUNT + 1 WHERE BATCH_ID = ?", batchId);
+
+                    BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
+                    execDto.setBatchId(batchId);
+                    execDto.setStatus(RequestStatus.ACCEPTED);
+                    execDto.setRemarks("Executed automatically by System Scheduler");
+
+                    voucherCommandService.processBulkRequestsAsync(execDto, "SYSTEM", 9001);
+                    log.info("SCHEDULER_TRIGGERED | Batch: {} processing started (Attempt {}/{}).", batchId, (currentRetries + 1), MAX_RETRIES);
+
+                } catch (Exception e) {
+                    log.error("SCHEDULER_LOOP_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
+                }
+            }
+
+        } catch (Exception e) {
+            log.error("SCHEDULER_CRITICAL_ERROR | {}", e.getMessage());
+        } finally {
+            if (lockAcquired) {
+                stringRedisTemplate.delete(lockKey);
+            }
+        }
     }
 }
-```
+
+this is not working can u check where is the problem
