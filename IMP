@@ -1,13 +1,55 @@
-2026-08-19T15:45:23.477+05:30  INFO 32892 --- [VoucherService] [nio-9999-exec-3] c.f.V.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 7875730 | Ref: 0008798
-2026-08-19T15:45:23.481+05:30  INFO 32892 --- [VoucherService] [nio-9999-exec-3] c.f.V.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 7796007 | Ref: 0008798
-2026-08-19T15:45:23.640+05:30 ERROR 32892 --- [VoucherService] [    BulkCoord-4] c.f.V.Service.core.VoucherAsyncWorker    : PROCEDURE_EXEC_FAIL | Batch: 0008798 | Type: BadSqlGrammarException
-2026-08-19T15:45:23.796+05:30  INFO 32892 --- [VoucherService] [    BulkCoord-4] c.f.V.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 9552557 | Ref: 0008798
-2026-08-19T15:45:23.844+05:30  INFO 32892 --- [VoucherService] [    BulkCoord-4] c.f.V.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 7875730 | Ref: 0008798
-2026-08-19T15:45:57.972+05:30  INFO 32892 --- [VoucherService] [io-9999-exec-10] c.f.V.Service.core.VoucherQueryService   : WORKFLOW_HISTORY_FETCH | BatchID: 0008798
-2026-08-19T15:45:57.972+05:30  INFO 32892 --- [VoucherService] [nio-9999-exec-9] c.f.V.Service.core.VoucherQueryService   : BATCH_SUMMARY_FETCH | BatchID: 0008798
+You did a great job testing that! You actually found a very specific piece of business logic that we need to address.
+The system behaved exactly as it is currently coded. The reason it did not retry is because of how your code handles Manual Execution vs. Scheduled Execution.
+If you look at your handleAsyncApprovalError method, you have this exact code:
+        // 1. Check if this batch is handled by the Auto-Scheduler
+        String scheduleFlag = "NO";
+        // ... fetches from database ...
 
-to test what i did is i write a mistaken procedure to check this is working or not but in this case also it showing this msg 
+        // 2. Route the Status correctly with Exponential Backoff
+        if ("YES".equalsIgnoreCase(scheduleFlag)) {
+             // ... DO THE 5 RETRIES ...
+        } else {
+             // Immediate manual execution logic remains the same
+             jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
+             finalMsg = "Execution failed due to an unexpected database or server timeout. Please check server health.";
+        }
 
-Execution failed due to an unexpected database or server timeout. Please check server health.
- why it is not retrying in this case what if after same time it will up 
-dont u think so 
+Why it didn't retry:
+When you created your test batch, you probably clicked "Approve Now" (Immediate Execution) instead of scheduling it for later.
+Because it was an immediate execution, the database had IS_EXECUTION_SCHEDULED = 'NO'.
+The code fell into the else block, pushed the status back to 'P' (Pending), and sent the final failure message without queueing it for a retry.
+You are absolutely right!
+You asked: "What if after some time it will be up, don't you think so?"
+Yes! Even if a human clicks "Approve Now", if the database drops connection for 2 seconds, the system should be smart enough to wait 5 minutes and try again automatically instead of forcing the human to click it again.
+How to fix it (Make EVERYTHING retry):
+We need to remove that if-else restriction so that every failure (whether manual or scheduled) goes into the automatic retry queue.
+Here is the exact replacement for that section inside your handleAsyncApprovalError method:
+        // REPLACE THE ENTIRE "Route the Status correctly" SECTION WITH THIS:
+
+        // A. Find out how many times it has already failed
+        int retryCount = 0;
+        try {
+            retryCount = jdbcTemplate.queryForObject(
+                    "SELECT RETRY_COUNT FROM SCHEDULED_BATCH_RETRY WHERE BATCH_ID = ?",
+                    Integer.class, batchId
+            );
+        } catch (Exception ignored) {}
+
+        // B. Exponential Backoff Logic
+        int delayMinutes = 5;  // Default for Attempt 1
+        if (retryCount == 2) delayMinutes = 10;
+        else if (retryCount == 3) delayMinutes = 20;
+        else if (retryCount >= 4) delayMinutes = 40;
+
+        // C. Queue it for Retry! (Forces the Scheduler to pick it up even if it was originally manual)
+        jdbcTemplate.update(
+                "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'Q', IS_EXECUTION_SCHEDULED = 'YES', SCHEDULED_TIME = SYSTIMESTAMP + NUMTODSINTERVAL(?, 'MINUTE') WHERE BATCH_ID = ?",
+                delayMinutes, batchId
+        );
+
+        String finalMsg = "Batch execution delayed due to network or database timeout. The system will auto-retry in " + delayMinutes + " minutes (Attempt " + Math.max(1, retryCount + 1) + " of 5). Please wait.";
+        
+        progressService.sendProgress(batchId, executorId, 0, "FAILED", finalMsg);
+
+What this changes:
+Now, if you intentionally write a bad SQL procedure, or if the database goes down, even an "Approve Now" click will automatically flip IS_EXECUTION_SCHEDULED = 'YES' and put the batch into the Q status. The background scheduler will now wake up 5 minutes later and try it again!
