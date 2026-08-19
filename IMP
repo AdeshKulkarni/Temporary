@@ -1,130 +1,66 @@
-This is a brilliant business requirement. You are building a very resilient system!
-Instead of completely killing the batch and forcing the Maker to upload the Excel file all over again, we will gracefully "catch" the final 5th failure, return the batch to the Pending ('P') queue, and ask the Checker to just click "Approve" again.
-To make this twist happen, we must ensure we DO NOT release the VID. If we release the VID, the batch is dead. We want the batch to stay perfectly alive, just waiting in the queue again.
-Here are the exact 2 replacements you need to make.
-1. Fix the Async Worker (The Error Handler)
+You have found a very critical transaction bug, and your testing here is absolutely brilliant!
+Here is exactly why it showed an error after successfully approving:
+The database processed everything perfectly. The PL/SQL procedure worked, and the status was updated to A. BUT, at the very last millisecond, the notificationWriterService tried to send a notification and threw an error. Because that notification was not wrapped in a try-catch block, Spring Boot panicked and rolled back the entire successful database transaction! It undid the approval and sent it to the error handler.
+Secondly, I completely agree with your rule: We should NEVER have an "ERROR" status. The only valid statuses in the system should be A (Approved), R (Rejected), P (Pending), and Q (Queued).
+Here are the exact 2 replacements you need to make to completely lock down this system.
+REPLACEMENT 1: Stop Notifications from Rolling Back Transactions
+We must wrap the success and reject notifications in a try-catch block so that if an email or alert fails, it does NOT reverse the financial transaction!
 File: src/main/java/com/fincore/VoucherService/Service/core/VoucherAsyncWorker.java
-Method: handleAsyncApprovalError
-Delete your entire handleAsyncApprovalError method and replace it with this perfectly updated version:
-    private void handleAsyncApprovalError(String batchId, String executorId, RequestStatus actionStatus, String defaultErrorMsg) {
+Method: executeApprovalInTransaction
+Scroll down to the bottom of the method where the if (RequestStatus.ACCEPTED.equals(dto.getStatus())) and else if (REJECTED) logic is.
+Replace the bottom half of that method with this safe version:
+            // ... (Your PL/SQL execution and HDFS Data Lake logic remains the same) ...
+            
+            try {
+                hdfsSyncService.syncToDataLake(syncData);
+            } catch (Exception hdfsEx) {
+                log.error("HDFS_SYNC_FAIL | Batch: {} | Error: {} | Status: Background recovery queued", batchId, hdfsEx.getClass().getSimpleName());
+                jdbcTemplate.update("INSERT INTO HDFS_SYNC_RETRY_QUEUE (BATCH_ID, STATUS) VALUES (?, 'P')", batchId);
+            }
 
-        int retryCount = 0;
-        try {
-            retryCount = jdbcTemplate.queryForObject(
-                    "SELECT RETRY_COUNT FROM SCHEDULED_BATCH_RETRY WHERE BATCH_ID = ?",
-                    Integer.class, batchId
-            );
-        } catch (Exception ignored) {}
+            // CRITICAL FIX 1: Wrap notifications so they don't roll back the successful approval
+            try {
+                progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Approved Successfully");
+                notificationWriterService.createBatchApprovedNotification(batchId, creatorId, executorId);
+            } catch (Exception notifEx) {
+                log.warn("NOTIFICATION_WARN | Batch: {} | Status: Approved, but failed to send UI notification", batchId);
+            }
 
-        String finalMsg;
-
-        // THE NEW TWIST: If it fails after 5 retries, make it available for approval again!
-        if (retryCount >= 5) {
-            
-            // 1. Put it back to 'P' (Pending) so it appears in the Checker's queue again.
-            // 2. Turn off scheduling so it waits for a human to click it.
-            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P', IS_EXECUTION_SCHEDULED = 'NO' WHERE BATCH_ID = ?", batchId);
-            
-            // 3. Mark the retry cycle as FAILED so it starts fresh next time a human clicks approve.
-            jdbcTemplate.update("UPDATE SCHEDULED_BATCH_RETRY SET STATUS = 'FAILED' WHERE BATCH_ID = ?", batchId);
-            
-            finalMsg = "Execution failed after maximum retries due to server timeout. The request is again available in the queue. Please try to approve it again.";
-            
-        } else {
-            // Exponential Backoff Logic for Retries (Attempts 1 to 4)
-            int delayMinutes = 5;  
-            if (retryCount == 2) delayMinutes = 10;
-            else if (retryCount == 3) delayMinutes = 20;
-            else if (retryCount >= 4) delayMinutes = 40;
+        } else if (RequestStatus.REJECTED.equals(dto.getStatus())) {
 
             jdbcTemplate.update(
-                    "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'Q', IS_EXECUTION_SCHEDULED = 'YES', SCHEDULED_TIME = CAST(SYSTIMESTAMP AT TIME ZONE 'Asia/Kolkata' AS TIMESTAMP) + NUMTODSINTERVAL(?, 'MINUTE') WHERE BATCH_ID = ?",
-                    delayMinutes, batchId
-            );
+                    "UPDATE VOUCHER_POSTING_DATA SET REQ_STATUS = 'R' WHERE BATCH_ID = ? AND REQ_STATUS = 'P'",
+                    batchId);
+            jdbcTemplate.update(
+                    "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'R', EXECUTED_AT = SYSTIMESTAMP, EXECUTOR_ID = ? WHERE BATCH_ID = ?",
+                    executorId, batchId);
 
-            finalMsg = "Batch execution delayed due to network or database timeout. The system will auto-retry in " + delayMinutes + " minutes (Attempt " + Math.max(1, retryCount + 1) + " of 5). Please wait.";
-        }
-
-        progressService.sendProgress(batchId, executorId, 0, "FAILED", finalMsg);
-
-        String vid = null;
-        String creatorId = null;
-
-        try {
-            Map<String, Object> batchInfo = jdbcTemplate.queryForMap(
-                    "SELECT VID_FK, CREATED_BY FROM VOUCHER_POSTING WHERE BATCH_ID = ?", batchId
-            );
-            vid = (String) batchInfo.get("VID_FK");
-            creatorId = (String) batchInfo.get("CREATED_BY");
-        } catch (org.springframework.dao.EmptyResultDataAccessException e) {
-            log.warn("Batch info not found for Batch: {}", batchId);
-        }
-
-        workflowEngine.logWorkflowAction(batchId, vid, "Execution Failed", "SYSTEM", finalMsg, null);
-
-        try {
-            if ("SYSTEM".equalsIgnoreCase(executorId)) {
-                // If the background system triggered it, notify the Maker
-                if (creatorId != null) {
-                    notificationWriterService.createNotification(creatorId, null, finalMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
-                }
-            } else {
-                // If a human triggered it manually
-                String checkerMsg = String.format("Execution alert for Batch '%s': %s", batchId, finalMsg);
-                notificationWriterService.createNotification(executorId, null, checkerMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
-
-                if (creatorId != null && !creatorId.equalsIgnoreCase(executorId)) {
-                    String makerMsg = String.format("Execution alert for your Batch '%s': %s", batchId, finalMsg);
-                    notificationWriterService.createNotification(creatorId, null, makerMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
-                }
+            // CRITICAL FIX 2: Wrap notifications so they don't roll back the successful rejection
+            try {
+                progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Rejected");
+                notificationWriterService.createBatchRejectedNotification(batchId, creatorId, executorId, dto.getRemarks());
+            } catch (Exception notifEx) {
+                log.warn("NOTIFICATION_WARN | Batch: {} | Status: Rejected, but failed to send UI notification", batchId);
             }
-        } catch (Exception e) {
-            log.warn("NOTIFICATION_WARN | Batch: {} | Could not send failure notifications", batchId);
         }
-    }
 
-2. Fix the Scheduler's Kill Switch
-File: src/main/java/com/fincore/VoucherService/Service/schedule/VoucherExecutionScheduler.java
-Method: executeScheduledBatches
-We must also update the scheduler so it doesn't accidentally kill the VID if it hits the 5th retry limit.
-Scroll down inside your for (String batchId : dueBatches) loop and replace the if (currentRetries >= MAX_RETRIES) block.
-                    // -------------------------------------------------------------
-                    // FIND THIS EXISTING "KILL SWITCH" BLOCK AND REPLACE IT ENTIRELY:
-                    // -------------------------------------------------------------
-                    if (currentRetries >= MAX_RETRIES) {
-                        log.error("SCHEDULER_EXHAUSTED | Batch {} failed after {} attempts. Returning to Pending queue.", batchId, MAX_RETRIES);
+REPLACEMENT 2: Completely Eradicate the "ERROR" Status
+To follow your strict rule of only allowing P, Q, A, or R, we need to find the one place where ERROR is still hardcoded and change it to R (Rejected by System).
+File: src/main/java/com/fincore/VoucherService/Service/core/VoucherAsyncWorker.java
+Method: handleAsyncFailure (This is the method that runs if Batch Creation completely crashes).
+        // -------------------------------------------------------------
+        // FIND THIS EXISTING LINE (Around line 175):
+        // -------------------------------------------------------------
+        jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'ERROR' WHERE BATCH_ID = ?", batchId);
 
-                        // THE NEW TWIST: We do NOT update the REQUEST_VOUCHER to ACTIVE here.
-                        // We keep the VID locked because the batch is still alive!
+        // -------------------------------------------------------------
+        // REPLACE IT WITH THIS (Strictly enforces your Status rules):
+        // -------------------------------------------------------------
+        jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'R' WHERE BATCH_ID = ?", batchId);
 
-                        // 1. Mark tracker as failed
-                        jdbcTemplate.update("UPDATE SCHEDULED_BATCH_RETRY SET STATUS = 'FAILED' WHERE BATCH_ID = ?", batchId);
-                        
-                        // 2. Put it back to 'P' (Pending Approval) so it appears in the Checker's UI queue again.
-                        jdbcTemplate.update(
-                                "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P', IS_EXECUTION_SCHEDULED = 'NO' WHERE BATCH_ID = ?",
-                                batchId
-                        );
-
-                        // 3. Notify the Maker that it is back in the queue
-                        try {
-                            String creatorId = jdbcTemplate.queryForObject("SELECT CREATED_BY FROM VOUCHER_POSTING WHERE BATCH_ID = ?", String.class, batchId);
-                            if (creatorId != null) {
-                                String failMsg = "Execution failed after maximum retries due to server timeout. The request is again available in the queue. Please try to approve it again.";
-                                notificationWriterService.createNotification(creatorId, null, failMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
-                                
-                                // Reset the UI screen
-                                progressService.sendProgress(batchId, creatorId, 0, "FAILED", failMsg);
-                            }
-                        } catch (Exception ignored) {}
-
-                        continue;
-                    }
-
-How this flow works now:
- * Network drops during approval.
- * System retries automatically 1st, 2nd, 3rd, 4th time... telling the user to "Please wait".
- * After the 5th failure, it stops trying.
- * It changes the database status directly back to P.
- * Because the status is P, the batch instantly reappears in the Checker's Dashboard. 6. A notification arrives saying: "Execution failed after maximum retries... The request is again available in the queue. Please try to approve it again."
- * The Checker simply clicks "Approve" one more time, and the whole system tries fresh!
+Summary of what this achieves:
+ * No More Rollbacks: If attempt #3 perfectly approves the database records, but the notification fails, it will safely ignore the notification error and the status will happily remain A.
+ * Clean Statuses: The word ERROR is entirely removed from your database.
+   * If it's queued for retry, it's Q.
+   * If it exhausts all 5 retries (from our previous fix), it goes cleanly back to P for a human to try again.
+   * If the initial file upload crashes catastrophically, it marks it as R (Rejected).
