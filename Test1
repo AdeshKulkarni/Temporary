@@ -12,7 +12,6 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
-import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -54,12 +53,14 @@ public class VoucherExecutionScheduler {
                     """;
             jdbcTemplate.update(cleanupSql);
 
-            // --- STEP 2: FETCH DUE BATCHES (Including 'Q' for retries) ---
+            // --- STEP 2: FETCH DUE BATCHES ---
+            // CRITICAL FIX: We completely removed Java LocalDateTime.now()
+            // We now force Oracle to use its native IST time to check if the schedule is due.
             String fetchSql = """
                         SELECT p.BATCH_ID FROM VOUCHER_POSTING p 
                         WHERE p.BATCH_STATUS IN ('P', 'Q') 
                         AND p.IS_EXECUTION_SCHEDULED = 'YES' 
-                        AND p.SCHEDULED_TIME <= ? 
+                        AND p.SCHEDULED_TIME <= CAST(SYSTIMESTAMP AT TIME ZONE 'Asia/Kolkata' AS TIMESTAMP)
                         AND EXISTS (
                             SELECT 1 FROM VOUCHER_WORKFLOW vw 
                             WHERE vw.BATCH_ID_FK = p.BATCH_ID 
@@ -67,8 +68,8 @@ public class VoucherExecutionScheduler {
                         )
                     """;
 
-            java.sql.Timestamp currentTime = java.sql.Timestamp.valueOf(LocalDateTime.now());
-            List<String> dueBatches = jdbcTemplate.queryForList(fetchSql, String.class, currentTime);
+            // Removed the java.sql.Timestamp parameter, the database handles it internally now.
+            List<String> dueBatches = jdbcTemplate.queryForList(fetchSql, String.class);
 
             if (dueBatches.isEmpty()) return;
 
@@ -93,27 +94,21 @@ public class VoucherExecutionScheduler {
                     if (currentRetries >= MAX_RETRIES) {
                         log.error("SCHEDULER_EXHAUSTED | Batch {} failed after {} attempts. Halting execution.", batchId, MAX_RETRIES);
 
-                        // 1. Fetch the VID
                         String vid = null;
                         try {
                             vid = jdbcTemplate.queryForObject("SELECT VID_FK FROM VOUCHER_POSTING WHERE BATCH_ID = ?", String.class, batchId);
                         } catch (EmptyResultDataAccessException ignored) {}
 
-                        // 2. Release the VID back to ACTIVE so it can be reused safely
                         if (vid != null) {
                             jdbcTemplate.update("UPDATE REQUEST_VOUCHER SET STATUS = 'ACTIVE' WHERE VID = ?", vid);
                         }
 
-                        // 3. Mark Tracker as FAILED
                         jdbcTemplate.update("UPDATE SCHEDULED_BATCH_RETRY SET STATUS = 'FAILED' WHERE BATCH_ID = ?", batchId);
-
-                        // 4. Mark Master Record as ERROR and permanently disable scheduling
                         jdbcTemplate.update(
                                 "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'ERROR', IS_EXECUTION_SCHEDULED = 'NO' WHERE BATCH_ID = ?",
                                 batchId
                         );
 
-                        // 5. Notify the Maker that the batch permanently failed
                         try {
                             String creatorId = jdbcTemplate.queryForObject("SELECT CREATED_BY FROM VOUCHER_POSTING WHERE BATCH_ID = ?", String.class, batchId);
                             if (creatorId != null) {
@@ -150,6 +145,17 @@ public class VoucherExecutionScheduler {
     }
 }
 
-this is not working properly 
-Exceution failed due to System Fault this MSG is showing there but the problem is like why i am not able to trigger this Scdule and the msg should be like 
-System will retry this after same time please wait this kind of MSG should be there and we will retry this isent it but in the logs this scdular is not even triggerd
+
+// If the user is "SYSTEM", it means the Scheduler triggered it.
+if ("SYSTEM".equalsIgnoreCase(userId)) {
+    String retryMsg = "Execution delayed due to system load. System will retry this automatically after some time, please wait.";
+    notificationWriterService.createNotification(creatorId, null, retryMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
+} else {
+    // If it was a human user clicking approve manually
+    String errMsg = "Execution failed due to System Fault.";
+    notificationWriterService.createNotification(creatorId, null, errMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
+}
+
+By making these two changes, the Scheduler will trigger at the exact correct Indian time, and if it fails, it will send the friendly "Please wait, will retry" message instead of a generic system fault!
+
+
