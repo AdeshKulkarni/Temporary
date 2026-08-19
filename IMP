@@ -1,77 +1,13 @@
-I have reviewed the VoucherAsyncWorker.java file you provided.
-The file is not completely correct yet regarding the notification messages. It still contains the hardcoded "System fault" text, and it prepends a scary "SYSTEM ERROR:" to the notifications.
-Here are the exact 2 replacements you need to make inside the handleAsyncApprovalError method in that file.
-Replacement 1: Fix the intermediate retry message
-Scroll down to the handleAsyncApprovalError method. Find the part where it calculates the delayMinutes and sets the finalMsg.
-FIND THIS EXISTING CODE (Around line 334):
-            // C. Push the SCHEDULED_TIME into the future so the 1-minute scheduler ignores it until then
-            jdbcTemplate.update(
-                    "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'Q', SCHEDULED_TIME = SYSTIMESTAMP + NUMTODSINTERVAL(?, 'MINUTE') WHERE BATCH_ID = ?",
-                    delayMinutes, batchId
-            );
+2026-08-19T15:45:23.477+05:30  INFO 32892 --- [VoucherService] [nio-9999-exec-3] c.f.V.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 7875730 | Ref: 0008798
+2026-08-19T15:45:23.481+05:30  INFO 32892 --- [VoucherService] [nio-9999-exec-3] c.f.V.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 7796007 | Ref: 0008798
+2026-08-19T15:45:23.640+05:30 ERROR 32892 --- [VoucherService] [    BulkCoord-4] c.f.V.Service.core.VoucherAsyncWorker    : PROCEDURE_EXEC_FAIL | Batch: 0008798 | Type: BadSqlGrammarException
+2026-08-19T15:45:23.796+05:30  INFO 32892 --- [VoucherService] [    BulkCoord-4] c.f.V.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 9552557 | Ref: 0008798
+2026-08-19T15:45:23.844+05:30  INFO 32892 --- [VoucherService] [    BulkCoord-4] c.f.V.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 7875730 | Ref: 0008798
+2026-08-19T15:45:57.972+05:30  INFO 32892 --- [VoucherService] [io-9999-exec-10] c.f.V.Service.core.VoucherQueryService   : WORKFLOW_HISTORY_FETCH | BatchID: 0008798
+2026-08-19T15:45:57.972+05:30  INFO 32892 --- [VoucherService] [nio-9999-exec-9] c.f.V.Service.core.VoucherQueryService   : BATCH_SUMMARY_FETCH | BatchID: 0008798
 
-            finalMsg = "System fault. The system will auto-retry in " + delayMinutes + " minutes (Attempt " + Math.max(1, retryCount + 1) + " of 5).";
+to test what i did is i write a mistaken procedure to check this is working or not but in this case also it showing this msg 
 
-        } else {
-            // Immediate manual execution logic remains the same
-            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
-            finalMsg = "Execution failed due to an unexpected system or database/Server down";
-        }
-
-REPLACE IT WITH THIS:
-            // C. Push the SCHEDULED_TIME into the future so the 1-minute scheduler ignores it until then
-            jdbcTemplate.update(
-                    "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'Q', SCHEDULED_TIME = SYSTIMESTAMP + NUMTODSINTERVAL(?, 'MINUTE') WHERE BATCH_ID = ?",
-                    delayMinutes, batchId
-            );
-
-            finalMsg = "Batch execution delayed due to network or database timeout. The system will auto-retry in " + delayMinutes + " minutes (Attempt " + Math.max(1, retryCount + 1) + " of 5). Please wait.";
-
-        } else {
-            // Immediate manual execution logic remains the same
-            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
-            finalMsg = "Execution failed due to an unexpected database or server timeout. Please check server health.";
-        }
-
-Replacement 2: Stop sending "SYSTEM ERROR" and check who triggered it
-Scroll slightly further down in that same method to the try { ... } block where the notifications are actually sent.
-FIND THIS EXISTING CODE (Around line 364):
-        try {
-            // 5A. Notify the Checker
-            String checkerMsg = String.format("SYSTEM ERROR: Failed to %s voucher Batch '%s'. %s", actionName, batchId, finalMsg);
-            notificationWriterService.createNotification(executorId, null, checkerMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
-
-            // 5B. Notify the Maker
-            if (creatorId != null && !creatorId.equalsIgnoreCase(executorId)) {
-                String makerMsg = String.format("SYSTEM ERROR: Final execution failed for your Batch '%s'. %s", batchId, finalMsg);
-                notificationWriterService.createNotification(creatorId, null, makerMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
-            }
-        } catch (Exception e) {
-            log.warn("NOTIFICATION_WARN | Batch: {} | Could not send failure notifications", batchId);
-        }
-
-REPLACE IT WITH THIS:
-        try {
-            if ("SYSTEM".equalsIgnoreCase(executorId)) {
-                // If the Auto-Scheduler triggered this retry, politely notify ONLY the Maker (Creator)
-                if (creatorId != null) {
-                    notificationWriterService.createNotification(creatorId, null, finalMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
-                }
-            } else {
-                // If a human triggered it, notify both the Checker and the Maker
-                String checkerMsg = String.format("Execution failed for Batch '%s'. %s", batchId, finalMsg);
-                notificationWriterService.createNotification(executorId, null, checkerMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
-
-                if (creatorId != null && !creatorId.equalsIgnoreCase(executorId)) {
-                    String makerMsg = String.format("Execution failed for your Batch '%s'. %s", batchId, finalMsg);
-                    notificationWriterService.createNotification(creatorId, null, makerMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
-                }
-            }
-        } catch (Exception e) {
-            log.warn("NOTIFICATION_WARN | Batch: {} | Could not send failure notifications", batchId);
-        }
-
-Why this is the perfect fix:
- * If the background scheduler (SYSTEM) triggers it and it fails, it will only message the Maker and say: "Batch execution delayed due to network or database timeout. The system will auto-retry... Please wait."
- * It completely removes the scary "SYSTEM ERROR:" prefix.
- * If a real human clicks approve and the database is dead, it just says "Execution failed due to an unexpected database or server timeout. Please check server health." without telling them to do anything confusing.
+Execution failed due to an unexpected database or server timeout. Please check server health.
+ why it is not retrying in this case what if after same time it will up 
+dont u think so 
