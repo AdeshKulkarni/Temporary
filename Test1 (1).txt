@@ -1,64 +1,77 @@
-2026-08-20T14:40:18.993+05:30  INFO 33968 --- [VoucherService] [nio-9999-exec-8] c.f.V.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 7875730 | Ref: 0008805
-2026-08-20T14:40:19.006+05:30  INFO 33968 --- [VoucherService] [nio-9999-exec-8] c.f.V.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 9552557 | Ref: 0008805
-2026-08-20T14:40:19.169+05:30 ERROR 33968 --- [VoucherService] [    BulkCoord-3] c.f.V.Service.core.VoucherAsyncWorker    : PROCEDURE_EXEC_FAIL | Batch: 0008805 | Type: BadSqlGrammarException
-2026-08-20T14:40:19.242+05:30  INFO 33968 --- [VoucherService] [    BulkCoord-3] c.f.V.Service.core.VoucherAsyncWorker    : Workflow state successfully reverted to final approver stage for Batch: 0008805
-2026-08-20T14:40:19.338+05:30  INFO 33968 --- [VoucherService] [    BulkCoord-3] c.f.V.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 9552557 | Ref: 0008805
-2026-08-20T14:40:19.386+05:30  INFO 33968 --- [VoucherService] [    BulkCoord-3] c.f.V.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 7875730 | Ref: 0008805
-2026-08-20T14:41:11.890+05:30  INFO 33968 --- [VoucherService] [nio-9999-exec-1] c.f.V.Service.core.VoucherQueryService   : BATCH_SUMMARY_FETCH | BatchID: 0008805
-2026-08-20T14:41:11.890+05:30  INFO 33968 --- [VoucherService] [nio-9999-exec-2] c.f.V.Service.core.VoucherQueryService   : WORKFLOW_HISTORY_FETCH | BatchID: 0008805
+    private void handleAsyncApprovalError(String batchId, String executorId, RequestStatus actionStatus, String defaultErrorMsg) {
 
+        try {
+            // 1. Fetch WORKFLOW_CODE directly from the main VOUCHER_POSTING table
+            String workflowCode = jdbcTemplate.queryForObject(
+                    "SELECT WORKFLOW_CODE FROM VOUCHER_POSTING WHERE BATCH_ID = ?",
+                    String.class, batchId
+            );
 
-i am getting this still i am not getting the pending at that stage let me explain from table and using the table data what need to be Done there 
+            if (workflowCode != null) {
+                // 2. THE FIX: Find the stage where IS_FINAL_APPROVAL = 'Y'
+                // This guarantees it drops back to step 27 (Approval) instead of step 28 (Execution)!
+                Map<String, Object> finalStepInfo = jdbcTemplate.queryForMap(
+                        "SELECT WORKFLOW_ID FROM (" +
+                        "   SELECT WORKFLOW_ID " +
+                        "   FROM WORKFLOW_TRANSITIONS " +
+                        "   WHERE WORKFLOW_CODE = ? AND IS_FINAL_APPROVAL = 'Y' " +
+                        "   ORDER BY WORKFLOW_ORDER DESC" +
+                        ") WHERE ROWNUM = 1", workflowCode
+                );
 
-data from the Voucher posting 
+                String finalPendingAt = String.valueOf(finalStepInfo.get("WORKFLOW_ID"));
 
-0008805	VID-2608-00013	workflow_3	7875730	20-08-26 02:38:42.540808000 PM	28	NO		NO	20-08-26 02:40:18.887671000 PM	P	4	Voucher created successfully	9001		J	
+                // 3. Revert to Pending ('P') AND restore the correct PENDING_AT column
+                jdbcTemplate.update(
+                        "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P', IS_EXECUTION_SCHEDULED = 'NO', PENDING_AT = ? WHERE BATCH_ID = ?",
+                        finalPendingAt, batchId
+                );
 
-let consider this batch which is failed just as we can see 
-pending at status  -> 28
+                log.info("Workflow state successfully reverted to final approver stage ({}) for Batch: {}", finalPendingAt, batchId);
+            } else {
+                throw new RuntimeException("Workflow Code is null in VOUCHER_POSTING table.");
+            }
 
-and as we know there is onther table which is workflow_transitions
-this are predefined workflows
-workflow_3	9001	N	Y	Creation	0	1	24
-workflow_3	9001	N	N	Verification	45	2	25
-workflow_3	9002	N	N	Review	30	3	26
-workflow_3	9002	Y	Y	Approval	15	4	27
-workflow_3		N	N	Execution	0	5	28
-workflow_4	9003	N	Y	Creation	0	1	30
-workflow_4	9001	N	N	Validation	45	2	31
-workflow_4	9001	N	Y	Verification	30	3	32
-workflow_4	9002	N	N	Review	15	4	33
-workflow_4	9002	Y	Y	Approval	0	5	34
-workflow_4		N	N	Execution	0	6	35
-workflow_7	60	N	Y	Creation	0	1	41
-workflow_7	9001	N	N	Validation	45	2	42
-workflow_7	9001	N	N	Verification	30	3	43
-workflow_7	9002	N	N	Review	15	4	44
-workflow_7	9002	Y	Y	Approval	0	5	45
-workflow_7		N	N	Execution	0	6	46
-workflow_8	130	N	Y	Creation	0	1	47
-workflow_8	9001	N	N	Validation	45	2	48
-workflow_8	9001	N	N	Verification	30	3	49
-workflow_8	9002	N	N	Review	15	4	50
-workflow_8	9002	Y	Y	Approval	0	5	51
-workflow_8		N	N	Execution	0	6	52
+        } catch (Exception e) {
+            log.error("Failed to revert workflow state deeply for Batch: {}. Using fallback.", batchId, e);
+            jdbcTemplate.update(
+                    "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P', IS_EXECUTION_SCHEDULED = 'NO' WHERE BATCH_ID = ?",
+                    batchId
+            );
+        }
 
-as we know this is pending at 28 
-if we join and check 
-workflow_3		N	N	Execution	0	5	28
+        // 4. The exact professional message requested (Removed the confusing "please re-approve" instructions)
+        String finalMsg = "Execution failed due to an unexpected database or server timeout. The transaction could not be completed.";
+        progressService.sendProgress(batchId, executorId, 0, "FAILED", finalMsg);
 
-this is System Approval fail it means we need to make again avalible this entry to the 
-workflow_3	9001	N	Y	Creation	0	1	24
-workflow_3	9001	N	N	Verification	45	2	25
-workflow_3	9002	N	N	Review	30	3	26
-workflow_3	9002	Y	Y	Approval	15	4	27
-workflow_3		N	N	Execution	0	5	28
+        String vid = null;
+        String creatorId = null;
 
-beofre this means at 27 
+        try {
+            Map<String, Object> batchInfo = jdbcTemplate.queryForMap(
+                    "SELECT VID_FK, CREATED_BY FROM VOUCHER_POSTING WHERE BATCH_ID = ?", batchId
+            );
+            vid = (String) batchInfo.get("VID_FK");
+            creatorId = (String) batchInfo.get("CREATED_BY");
+        } catch (org.springframework.dao.EmptyResultDataAccessException e) {
+            log.warn("Batch info not found for Batch: {}", batchId);
+        }
 
-i hope u are getting this 
+        // 5. Log the "Execution Failed" event in Workflow History so the Frontend knows to show the Retry button
+        workflowEngine.logWorkflowAction(batchId, vid, "Execution Failed", executorId, finalMsg, null);
 
-now give mi perfect code for this changes
+        // 6. Send the notification explicitly telling the user about the failure
+        try {
+            String checkerMsg = String.format("Execution alert for Batch '%s': %s", batchId, finalMsg);
+            notificationWriterService.createNotification(executorId, null, checkerMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
 
+            if (creatorId != null && !creatorId.equalsIgnoreCase(executorId)) {
+                String makerMsg = String.format("Execution alert for your Batch '%s': %s", batchId, finalMsg);
+                notificationWriterService.createNotification(creatorId, null, makerMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
+            }
+        } catch (Exception e) {
+            log.warn("NOTIFICATION_WARN | Batch: {} | Could not send failure notifications", batchId);
+        }
+    }
 
 
