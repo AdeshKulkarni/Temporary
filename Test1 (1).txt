@@ -1,78 +1,48 @@
-2026-08-20T14:29:40.334+05:30 ERROR 28572 --- [VoucherService] [    BulkCoord-3] c.f.V.Service.core.VoucherAsyncWorker    : PROCEDURE_EXEC_FAIL | Batch: 0008804 | Type: BadSqlGrammarException
-2026-08-20T14:29:40.458+05:30  WARN 28572 --- [VoucherService] [    BulkCoord-3] c.f.V.Service.core.VoucherAsyncWorker    : Could not find Workflow Code in REQUEST_VOUCHER for VID: VID-2608-00012
-2026-08-20T14:29:40.458+05:30 ERROR 28572 --- [VoucherService] [    BulkCoord-3] c.f.V.Service.core.VoucherAsyncWorker    : Failed to revert workflow state deeply for Batch: 0008804. Using fallback.
-
-java.lang.RuntimeException: Workflow Code resolution failed.
-	at com.fincore.VoucherService.Service.core.VoucherAsyncWorker.handleAsyncApprovalError(VoucherAsyncWorker.java:483) ~[classes/:na]
-	at com.fincore.VoucherService.Service.core.VoucherAsyncWorker.executeAsyncBatchProcessing(VoucherAsyncWorker.java:344) ~[classes/:na]
-	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103) ~[na:na]
-	at java.base/java.lang.reflect.Method.invoke(Method.java:580) ~[na:na]
-	at org.springframework.aop.support.AopUtils.invokeJoinpointUsingReflection(AopUtils.java:359) ~[spring-aop-7.0.8.jar:7.0.8]
-	at org.springframework.aop.framework.ReflectiveMethodInvocation.invokeJoinpoint(ReflectiveMethodInvocation.java:190) ~[spring-aop-7.0.8.jar:7.0.8]
-	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:158) ~[spring-aop-7.0.8.jar:7.0.8]
-	at org.springframework.aop.interceptor.AsyncExecutionInterceptor.lambda$invoke$0(AsyncExecutionInterceptor.java:112) ~[spring-aop-7.0.8.jar:7.0.8]
-	at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:317) ~[na:na]
-	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144) ~[na:na]
-	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642) ~[na:na]
-	at java.base/java.lang.Thread.run(Thread.java:1570) ~[na:na]
-
-2026-08-20T14:29:40.586+05:30  INFO 28572 --- [VoucherService] [    BulkCoord-3] c.f.V.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 9552557 | Ref: 0008804
-2026-08-20T14:29:40.638+05:30  INFO 28572 --- [VoucherService] [    BulkCoord-3] c.f.V.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 7875730 | Ref: 0008804
-2026-08-20T14:31:17.571+05:30  INFO 28572 --- [VoucherService] [nio-9999-exec-9] c.f.V.Service.core.VoucherQueryService   : BATCH_SUMMARY_FETCH | BatchID: 0008804
-2026-08-20T14:31:17.571+05:30  INFO 28572 --- [VoucherService] [nio-9999-exec-8] c.f.V.Service.core.VoucherQueryService   : WORKFLOW_HISTORY_FETCH | BatchID: 0008804
-
-
-private void handleAsyncApprovalError(String batchId, String executorId, RequestStatus actionStatus, String defaultErrorMsg) {
+    private void handleAsyncApprovalError(String batchId, String executorId, RequestStatus actionStatus, String defaultErrorMsg) {
 
         try {
-            // 1. Get the VID_FK to look up the workflow configuration
-            String vidFk = jdbcTemplate.queryForObject("SELECT VID_FK FROM VOUCHER_POSTING WHERE BATCH_ID = ?", String.class, batchId);
-            
-            // 2. Safely get the Workflow Code from REQUEST_VOUCHER (Checking common column names to prevent ORA-00904 errors)
-            String workflowCode = null;
-            try {
-                workflowCode = jdbcTemplate.queryForObject("SELECT APPROVAL_WORKFLOW FROM REQUEST_VOUCHER WHERE VID = ?", String.class, vidFk);
-            } catch (Exception e1) {
-                try {
-                    workflowCode = jdbcTemplate.queryForObject("SELECT WORKFLOW_CODE FROM REQUEST_VOUCHER WHERE VID = ?", String.class, vidFk);
-                } catch (Exception e2) {
-                    log.warn("Could not find Workflow Code in REQUEST_VOUCHER for VID: {}", vidFk);
-                }
-            }
+            // 1. Fetch WORKFLOW_CODE directly from the main VOUCHER_POSTING table 
+            // (No blind lookups to REQUEST_VOUCHER)
+            String workflowCode = jdbcTemplate.queryForObject(
+                "SELECT WORKFLOW_CODE FROM VOUCHER_POSTING WHERE BATCH_ID = ?", 
+                String.class, batchId
+            );
 
-            // 3. Find the Final Step (Highest Order) for this specific workflow
             if (workflowCode != null) {
+                // 2. Find the Final Step (Highest Order) for this specific workflow
                 Map<String, Object> finalStepInfo = jdbcTemplate.queryForMap(
-                    "SELECT WORKFLOW_ID, WORKFLOW_ORDER FROM (" +
-                    "   SELECT WORKFLOW_ID, WORKFLOW_ORDER " +
+                    "SELECT WORKFLOW_ID FROM (" +
+                    "   SELECT WORKFLOW_ID " +
                     "   FROM WORKFLOW_TRANSITIONS " +
                     "   WHERE WORKFLOW_CODE = ? " +
                     "   ORDER BY WORKFLOW_ORDER DESC" +
-                    ") WHERE ROWNUM = 1", workflowCode);
+                    ") WHERE ROWNUM = 1", workflowCode
+                );
                 
                 String finalPendingAt = String.valueOf(finalStepInfo.get("WORKFLOW_ID"));
-                Integer finalOrder = ((Number) finalStepInfo.get("WORKFLOW_ORDER")).intValue();
 
-                // 4. Revert to Pending ('P') AND restore the PENDING_AT and CURRENT_ORDER columns safely
+                // 3. Revert to Pending ('P') AND restore the PENDING_AT column
+                // (Removed CURRENT_ORDER entirely to perfectly match your DB schema)
                 jdbcTemplate.update(
-                    "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P', IS_EXECUTION_SCHEDULED = 'NO', PENDING_AT = ?, CURRENT_ORDER = ? WHERE BATCH_ID = ?",
-                    finalPendingAt, finalOrder, batchId
+                    "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P', IS_EXECUTION_SCHEDULED = 'NO', PENDING_AT = ? WHERE BATCH_ID = ?",
+                    finalPendingAt, batchId
                 );
+                
                 log.info("Workflow state successfully reverted to final approver stage for Batch: {}", batchId);
             } else {
-                throw new RuntimeException("Workflow Code resolution failed.");
+                throw new RuntimeException("Workflow Code is null in VOUCHER_POSTING table.");
             }
 
         } catch (Exception e) {
             log.error("Failed to revert workflow state deeply for Batch: {}. Using fallback.", batchId, e);
-            // Safe fallback just in case the deep lookup fails
+            // Safe fallback
             jdbcTemplate.update(
                 "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P', IS_EXECUTION_SCHEDULED = 'NO' WHERE BATCH_ID = ?",
                 batchId
             );
         }
 
-        // 5. The exact professional message requested
+        // 4. The exact professional message requested
         String finalMsg = "Execution failed due to a database or server timeout. Please retry the approval process.";
         progressService.sendProgress(batchId, executorId, 0, "FAILED", finalMsg);
 
@@ -89,10 +59,10 @@ private void handleAsyncApprovalError(String batchId, String executorId, Request
             log.warn("Batch info not found for Batch: {}", batchId);
         }
 
-        // 6. Log the "Execution Failed" event in Workflow History so the Frontend knows to show the Retry button
+        // 5. Log the "Execution Failed" event in Workflow History so the Frontend knows to show the Retry button
         workflowEngine.logWorkflowAction(batchId, vid, "Execution Failed", executorId, finalMsg, null);
 
-        // 7. Send the notification explicitly telling the user to retry
+        // 6. Send the notification explicitly telling the user to retry
         try {
             String checkerMsg = String.format("Execution alert for Batch '%s': %s", batchId, finalMsg);
             notificationWriterService.createNotification(executorId, null, checkerMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
@@ -105,74 +75,3 @@ private void handleAsyncApprovalError(String batchId, String executorId, Request
             log.warn("NOTIFICATION_WARN | Batch: {} | Could not send failure notifications", batchId);
         }
     }
-
-Voucher posting table 
-
-BATCH_ID	VARCHAR2(50 BYTE)	No		1	
-VID_FK	VARCHAR2(20 BYTE)	No		2	
-WORKFLOW_CODE	VARCHAR2(100 BYTE)	Yes		3	
-CREATED_BY	VARCHAR2(100 BYTE)	Yes		4	
-CREATED_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	5	
-PENDING_AT	NUMBER	Yes		6	
-IS_EXECUTION_SCHEDULED	VARCHAR2(3 BYTE)	Yes		7	
-SCHEDULED_TIME	TIMESTAMP(6)	Yes		8	
-IS_SCHEDULE_OVERRIDE	VARCHAR2(3 BYTE)	Yes		9	
-EXECUTED_AT	TIMESTAMP(6)	Yes		10	
-BATCH_STATUS	VARCHAR2(20 BYTE)	Yes		11	
-RECORDS_COUNT	NUMBER	Yes		12	
-COMMON_BATCH_REMARKS	VARCHAR2(30 CHAR)	Yes		13	
-CREATOR_ROLE	NUMBER(10,0)	Yes		14	
-EXECUTOR_ID	VARCHAR2(10 BYTE)	Yes		15	
-FIX_TYPE	CHAR(1 BYTE)	No	'J' 	16	
-TARGET_DATE	DATE	Yes		17	
-
-dont do things blindly 
-REQUEST_VOUCHER purpose of this table is diff 
-Voucher posting table this is main table 
-
-
-other tables
-workflow transactions
-WORKFLOW_CODE	VARCHAR2(50 BYTE)	No		1	
-ALLOWED_ROLE_ID	NUMBER(10,0)	Yes		2	
-IS_FINAL_APPROVAL	CHAR(1 BYTE)	Yes	"'N'     
-"	3	
-SCHEDULING_ALLOWED	CHAR(1 BYTE)	Yes		4	
-WORKFLOW_STAGE	VARCHAR2(100 BYTE)	Yes		5	
-ESCALATION_TIME	NUMBER(10,0)	Yes		6	
-WORKFLOW_ORDER	NUMBER(3,0)	No		7	
-WORKFLOW_ID	NUMBER	Yes	"FINCORE"."WORKFLOWID_SEQ"."NEXTVAL"	8	
-
-
-voucher workflow 
-WORKFLOW_ID	NUMBER	No	"FINCORE"."ISEQ$$_81239".nextval	1	
-BATCH_ID_FK	VARCHAR2(50 BYTE)	No		2	
-VID_FK	VARCHAR2(20 BYTE)	No		3	
-LAST_ACTION	VARCHAR2(30 BYTE)	Yes		4	
-LAST_ACTION_BY	VARCHAR2(100 BYTE)	Yes		5	
-LAST_ACTION_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	6	
-REMARKS	VARCHAR2(500 BYTE)	Yes		7	
-SCHEDULED_TIME	TIMESTAMP(6)	Yes		8	
-
-
-Voucher posting data
-REQ_STATUS	VARCHAR2(10 CHAR)	No	'P' 	1	Row-level processing status (e.g., P for Pending, A for Approved, R for Rejected).
-REQ_DATE	DATE	No	SYSDATE 	2	The date when maker created the journal
-CREATOR_ID	VARCHAR2(12 CHAR)	No		3	
-EXECUTION_DATE	DATE	Yes		4	Timestamp when this checker acted upon the journal
-BATCH_ID	VARCHAR2(50 CHAR)	Yes		5	Foreign key linking this row to its parent in JOURNAL_BATCH_MASTER.
-JOURNAL_ID	VARCHAR2(50 CHAR)	Yes		6	Unique identifier for the individual request.
-REQ_BRANCH_CODE	VARCHAR2(50 CHAR)	Yes		7	The branch code requested for the transaction.
-REQ_CURRENCY	VARCHAR2(3 BYTE)	Yes		8	The 3-character currency code requested.
-REQ_CGL	VARCHAR2(50 CHAR)	Yes		9	The 10-digit CGL account code requested.
-REQ_AMOUNT	NUMBER(25,4)	Yes		10	Raw requested amount 
-REQ_NARRATION	VARCHAR2(200 CHAR)	Yes		11	remarks from the uploaded file.
-REQ_PRODUCT	VARCHAR2(50 CHAR)	Yes		12	The product  code requested.
-REQ_ID	NUMBER(19,0)	Yes		13	
-IS_CGL_VALID	CHAR(1 BYTE)	Yes		14	
-IS_CURRENCY_VALID	CHAR(1 BYTE)	Yes		15	
-IS_BRANCH_VALID	CHAR(1 BYTE)	Yes		16	
-IS_VALIDATED	CHAR(1 BYTE)	No	'N' 	17	Flag for checking row is checked or not for validation
-
-
-
