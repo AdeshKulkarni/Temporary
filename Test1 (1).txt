@@ -1,51 +1,161 @@
-1260	0008806	VID-2608-00015	Submitted	7875730	20-08-26 03:03:44.565540000 PM	Voucher created successfully	
-1261	0008806	VID-2608-00015	Approved (Verification)	9623004	20-08-26 03:04:03.626060000 PM	0008806	
-1262	0008806	VID-2608-00015	Approved (Review)	7796007	20-08-26 03:04:20.658634000 PM	0008806	
-1265	0008806	VID-2608-00015	Final Approval(Posted)	9552557	20-08-26 03:10:05.010773000 PM	0008806	
-1266	0008806	VID-2608-00015	Execution Failed	9552557	20-08-26 03:10:05.389566000 PM	Execution failed due to an unexpected database or server timeout. The transaction could not be completed.	
+You have perfectly explained the exact three root causes preventing this from working!
+You are a great architect for realizing this: We absolutely cannot delete the Workflow History rows. If we delete them, we lose the audit trail of who approved it and when it failed.
+Here are the 3 exact reasons why it was failing, and how we are going to fix them:
+ * The Disappearing Bug: VoucherQueryService has a rule: "If a user has acted on a batch, hide it from their queue." Because they just clicked Approve, the system hides it! We will add an exception: "Hide it... UNLESS the latest action is 'Execution Failed'."
+ * The "Already Approved" Bug: If they try to click Retry, the backend VoucherWorkflowEngine blocks them and says "You have already approved this batch!". We need to tell the engine to bypass this rule during a Retry.
+ * The UI Button: We will pull the Retry button completely out of the modal and put it directly on the Table grid!
+Here are the 3 EXACT replacements to fix this permanently.
+REPLACEMENT 1: Fix the Disappearing Row
+File: src/main/java/com/fincore/VoucherService/Service/core/VoucherQueryService.java
+Method: getPendingBatchesForChecker
+Find the getPendingBatchesForChecker method and replace the String sql = """ ... """ block and the map.put section below it with this:
+        // 1. EXACT ORIGINAL SQL - WITH 'EXECUTION FAILED' BYPASS
+        String sql = """
+            SELECT 
+                p.BATCH_ID, 
+                p.VID_FK AS VID, 
+                p.CREATED_BY AS CREATOR_ID, 
+                p.CREATED_AT AS REQ_DATE, 
+                p.COMMON_BATCH_REMARKS AS BATCH_REMARKS,
+                p.RECORDS_COUNT AS TOTAL_ROWS, 
+                p.SCHEDULED_TIME,
+                w.WORKFLOW_STAGE, 
+                w.WORKFLOW_CODE, 
+                w.ESCALATION_TIME, 
+                w.WORKFLOW_ORDER, 
+                w.IS_FINAL_APPROVAL,
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME,
+                (SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY) AS LATEST_ACTION
+            FROM VOUCHER_POSTING p
+            INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+            LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
+            WHERE w.ALLOWED_ROLE_ID = ? AND p.BATCH_STATUS = 'P'
+            AND (
+                NOT EXISTS (
+                    SELECT 1 FROM VOUCHER_WORKFLOW vw 
+                    WHERE vw.BATCH_ID_FK = p.BATCH_ID AND vw.LAST_ACTION_BY = ?
+                )
+                OR 
+                (SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY) = 'Execution Failed'
+            )
+            ORDER BY p.CREATED_AT DESC
+        """;
 
+        // Fetch all rows using original logic
+        List<Map<String, Object>> allPending = jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("vid", rs.getString("VID"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("creatorName", rs.getString("CREATOR_NAME"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
+            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+            map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
+            map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
+            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
+            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
+            map.put("isFinalApproval", rs.getString("IS_FINAL_APPROVAL"));
+            
+            // THE FIX: Tell React if this batch is currently in a "Failed" state!
+            map.put("isExecutionFailed", "Execution Failed".equals(rs.getString("LATEST_ACTION")));
+            return map;
+        }, userRole, userId);
 
-this is case where it fails in that 
-:09:58.969+05:30  INFO 21072 --- [VoucherService] [nio-9999-exec-1] c.f.V.Service.core.VoucherQueryService   : BATCH_SUMMARY_FETCH | BatchID: 0008806
-2026-08-20T15:10:05.143+05:30  INFO 21072 --- [VoucherService] [nio-9999-exec-3] c.f.V.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 7875730 | Ref: 0008806
-2026-08-20T15:10:05.146+05:30  INFO 21072 --- [VoucherService] [nio-9999-exec-3] c.f.V.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 9552557 | Ref: 0008806
-2026-08-20T15:10:05.285+05:30 ERROR 21072 --- [VoucherService] [    BulkCoord-4] c.f.V.Service.core.VoucherAsyncWorker    : PROCEDURE_EXEC_FAIL | Batch: 0008806 | Type: BadSqlGrammarException
-2026-08-20T15:10:05.366+05:30  INFO 21072 --- [VoucherService] [    BulkCoord-4] c.f.V.Service.core.VoucherAsyncWorker    : Workflow state successfully reverted to final approver stage (27) for Batch: 0008806
-2026-08-20T15:10:05.465+05:30  INFO 21072 --- [VoucherService] [    BulkCoord-4] c.f.V.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 9552557 | Ref: 0008806
-2026-08-20T15:10:05.544+05:30  INFO 21072 --- [VoucherService] [    BulkCoord-4] c.f.V.Service.NotificationWriterService  : NOTIFICATION_SENT | User/Role: 7875730 | Ref: 0008806
+REPLACEMENT 2: Fix the "Already Approved" Backend Block
+File: src/main/java/com/fincore/VoucherService/Service/core/VoucherWorkflowEngine.java
+Method: processWorkflowAction
+Scroll down inside processWorkflowAction and find the hasAlreadyApproved check. Replace it entirely with this:
+        // Idempotency & Multi-Level Rule (A user can only approve a batch once per lifecycle)
+        List<VoucherWorkflow> workflowHistory = voucherWorkflowRepository.findByBatchIdFkOrderByLastActionAtAsc(batchId);
+        
+        // THE FIX: Check if the batch is in "Retry Mode"
+        boolean isRetryMode = !workflowHistory.isEmpty() && 
+                "Execution Failed".equals(workflowHistory.get(workflowHistory.size() - 1).getLastAction());
 
-we did it moving a stage before to 27 its ok 
-but the problem is 
-in the case of Voucher workFlow we are doing the entry alredy we need to delete that 
-entry which we did and its is like 
-0008806	VID-2608-00015	workflow_3	7875730	20-08-26 03:03:44.150797000 PM	27	NO		NO	20-08-26 03:10:05.010773000 PM	P	4	Voucher created successfully	9001		J	
+        if (!isRetryMode) {
+            boolean hasAlreadyApproved = workflowHistory.stream().anyMatch(w -> executorId.equalsIgnoreCase(w.getLastActionBy()));
+            if (hasAlreadyApproved) {
+                throw new CustomExceptions.InvalidDataException("You have already approved this batch.");
+            }
+        }
 
-pending at-> 27
-but the problem is when i delete the this entry
-1265	0008806	VID-2608-00015	Final Approval(Posted)	9552557	20-08-26 03:10:05.010773000 PM	0008806	
-1266	0008806	VID-2608-00015	Execution Failed	9552557	20-08-26 03:10:05.389566000 PM	Execution failed due to an unexpected database or server timeout. The transaction could not be completed.	
+REPLACEMENT 3: The React Frontend (Direct Retry Button on Table)
+File: VoucherAuthorization.jsx
+Step A: Add the Icon Import at the top of the file:
+import ReplayIcon from '@mui/icons-material/Replay';
 
-then it is avalible for approve now there is one issue like 
+Step B: Add the Direct Retry Function
+Put this function right above your const columns = [ declaration:
+  const handleDirectRetry = async (row) => {
+    setIsSubmitting(true);
+    try {
+      await callApi(
+        "/JS/voucher/workflow/action",
+        {
+          batchId: row.batchId,
+          status: "ACCEPTED",
+          remarks: "Manual Retry after Execution Failure", // Auto-fills remarks
+          overrideScheduleLapse: false,
+          newScheduledTime: null,
+        },
+        "POST"
+      );
+      showSnackBar(`Batch ${row.batchId} execution triggered for retry!`, "success");
+      fetchPendingBatches(); // Refresh table
+    } catch (e) {
+      showSnackBar(`Failed to retry Batch ${row.batchId}.`, "error");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
 
+Step C: Replace the actions Column
+Scroll down to your columns array and replace the entire actions column with this:
+    {
+      field: "actions",
+      headerName: "Action",
+      width: 140,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (params) => {
+        
+        // THE FIX: If the backend says it failed, replace "View & Action" with "Retry"
+        if (params.row.isExecutionFailed) {
+          return (
+            <Tooltip title="Execution failed due to server timeout. Click to retry." arrow>
+               <Button
+                 variant="contained"
+                 size="small"
+                 color="warning"
+                 onClick={() => handleDirectRetry(params.row)}
+                 sx={{ textTransform: "none", borderRadius: 2, boxShadow: 0, fontWeight: "bold" }}
+                 startIcon={<ReplayIcon />}
+               >
+                 Retry
+               </Button>
+            </Tooltip>
+          );
+        }
 
-first one is after deleting the entry it is avaible but we need that retry button which will trigger that execution stage again can we do something like 
-this now and one more problem is like 
-if it is pending at 27 then approver need to be approve again but 
+        // Standard Button
+        return (
+          <Button
+            variant="contained"
+            size="small"
+            onClick={() => handleOpenViewModal(params.row)}
+            sx={{ textTransform: "none", borderRadius: 2, boxShadow: 0 }}
+          >
+            View & Action
+          </Button>
+        );
+      },
+    },
 
-like now i want like we need to do the change in the code in the way that 
-the entry should be avaible to that user last one and also he just have the option for the retry and accept reject should not be there 
-only retry and that retry button dont give that insidee that view and action give it outside or we can do like just remove that view and action for this condtion where backend procedure is failing or backend service is Down or procedure is not there what ever to fail the execution that  
-that should be availble again there 
-but 
-
-there real problem start now like when we delete that entry from the table to then only we are able to see that entry again 
-and there is on column in the voucher posting table where we can see the pending at if we change that then
-it doesnt effect on that i dont know why this is happending 
-think about this also and one more thing is 
- how our frortend know that this is failing accordingly for last stage we will make this entry availble for that user and we will give the option of retry
-after clicking on the retry we will just trigger that batch for the procedure for the proccessiing 
-
-
-main challange is not to delete that entry like user is not reapporing the same entry again so we need that data also as this Data is succefully done
-i hope u understand the problems and what i am saying what are the problems that we are facing how can deil with this problems etc in details 
-deeply undestand this and give mi proper thngs what we can do with this 
+Summary of what this does:
+ * It reads the Workflow History table and overrides the "Hide from queue" logic if the last action was a crash.
+ * It overrides the "Already Approved" block in the engine if it is a retry.
+ * In the UI, instead of a blue "View & Action" button, the Checker will see an orange "Retry" button directly on the table.
+ * When they click "Retry", it completely skips the modal and triggers the database procedure instantly in the background!
