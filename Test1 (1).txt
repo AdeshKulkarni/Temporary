@@ -1,157 +1,63 @@
-        // 1. THE SQL FIX: Hardcoded exclusively for PSO (Role 52)
-        String sql = """
-            SELECT 
-                p.BATCH_ID, 
-                p.VID_FK AS VID, 
-                p.CREATED_BY AS CREATOR_ID, 
-                p.CREATED_AT AS REQ_DATE, 
-                p.COMMON_BATCH_REMARKS AS BATCH_REMARKS,
-                p.RECORDS_COUNT AS TOTAL_ROWS, 
-                p.SCHEDULED_TIME,
-                w.WORKFLOW_STAGE, 
-                w.WORKFLOW_CODE, 
-                w.ESCALATION_TIME, 
-                w.WORKFLOW_ORDER, 
-                w.IS_FINAL_APPROVAL,
-                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME,
-                (SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY) AS LATEST_ACTION
-            FROM VOUCHER_POSTING p
-            INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
-            LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
-            WHERE p.BATCH_STATUS = 'P'
-            AND (
-                -- STANDARD PENDING BATCH: Normal visibility for normal users (e.g., Maker/Checker)
-                (w.ALLOWED_ROLE_ID = ? 
-                 AND NOT EXISTS (SELECT 1 FROM VOUCHER_WORKFLOW vw WHERE vw.BATCH_ID_FK = p.BATCH_ID AND vw.LAST_ACTION_BY = ?)
-                 AND NVL((SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY), 'X') != 'Execution Failed'
-                )
-                OR 
-                -- RETRY MODE: Exclusively unlocked for Role 52 (PSO) ONLY!
-                (
-                 (SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY) = 'Execution Failed' 
-                 AND ? = 52 -- <--- HARDCODED TO PSO ROLE 52
-                )
-            )
-            ORDER BY p.CREATED_AT DESC
-        """;
+You have great foresight! Yes, there is a small but very important frontend change required because of the new PSO backend logic.
+Since the backend now hides the failed batch from normal users and ONLY shows it to the PSO, we have a UX issue on the Status Tracking Screen.
+Currently, the Status screen tells the user: "Please close this window and click the Retry button...". But because of your new security rule, the normal user cannot see the Retry button anymore! We need to update that message to tell them that the PSO team is handling it.
+We also need to simplify the button logic in the Authorization screen so the PSO user isn't blocked by the old isFinalApproval check.
+Here are the 2 quick frontend UI updates:
+FRONTEND FIX 1: Update the Status Screen Message
+File: VoucherPostingStatus.jsx
+Scroll down to the Horizontal Timeline area (around line 722) and find the Alert message for isExecutionFailed. Replace it with this updated text:
+                {/* THE NEW PSO-SPECIFIC ERROR MESSAGE */}
+                {viewingBatch?.isExecutionFailed && (
+                  <Alert severity="error" variant="filled" sx={{ mb: 4, fontSize: '0.95rem' }}>
+                    <strong>Execution Failed:</strong> Due to an unexpected database or server timeout, the transaction could not be completed.
+                    The Production Support Team (PSO) has been automatically notified and will retry the execution. Please wait.
+                  </Alert>
+                )}
 
-        // CRITICAL FIX: Ensure the parameters map to (userRole, userId, userRole) so the ? = 52 check works!
-        List<Map<String, Object>> allPending = jdbcTemplate.query(sql, (rs, rowNum) -> {
-            Map<String, Object> map = new HashMap<>();
-            boolean isFailed = "Execution Failed".equals(rs.getString("LATEST_ACTION"));
-
-            map.put("batchId", rs.getString("BATCH_ID"));
-            map.put("vid", rs.getString("VID"));
-            map.put("creatorId", rs.getString("CREATOR_ID"));
-            map.put("creatorName", rs.getString("CREATOR_NAME"));
-            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
-            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
-            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
-            map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
-            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
-            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
-            map.put("isFinalApproval", rs.getString("IS_FINAL_APPROVAL"));
-            
-            map.put("isExecutionFailed", isFailed);
-            map.put("workflowState", isFailed ? "Execution" : rs.getString("WORKFLOW_STAGE"));
-            
-            return map;
-        }, userRole, userId, userRole); // <--- NOTE: Passed userRole as the 3rd parameter here!
-
-
-
-
-    private void handleAsyncApprovalError(String batchId, String executorId, RequestStatus actionStatus, String defaultErrorMsg) {
-
-        try {
-            String workflowCode = jdbcTemplate.queryForObject(
-                    "SELECT WORKFLOW_CODE FROM VOUCHER_POSTING WHERE BATCH_ID = ?",
-                    String.class, batchId
-            );
-
-            if (workflowCode != null) {
-                // We keep it at the Final Approval stage mathematically so the Workflow Engine knows how to process it
-                Map<String, Object> finalStepInfo = jdbcTemplate.queryForMap(
-                        "SELECT WORKFLOW_ID FROM (" +
-                        "   SELECT WORKFLOW_ID " +
-                        "   FROM WORKFLOW_TRANSITIONS " +
-                        "   WHERE WORKFLOW_CODE = ? AND IS_FINAL_APPROVAL = 'Y' " +
-                        "   ORDER BY WORKFLOW_ORDER DESC" +
-                        ") WHERE ROWNUM = 1", workflowCode
-                );
-
-                String finalPendingAt = String.valueOf(finalStepInfo.get("WORKFLOW_ID"));
-
-                jdbcTemplate.update(
-                        "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P', IS_EXECUTION_SCHEDULED = 'NO', PENDING_AT = ? WHERE BATCH_ID = ?",
-                        finalPendingAt, batchId
-                );
-            }
-        } catch (Exception e) {
-            log.error("Failed to revert workflow state deeply for Batch: {}. Using fallback.", batchId, e);
-            jdbcTemplate.update(
-                    "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P', IS_EXECUTION_SCHEDULED = 'NO' WHERE BATCH_ID = ?",
-                    batchId
-            );
+FRONTEND FIX 2: Simplify the Retry Button for the PSO
+File: VoucherAuthorization.jsx
+Because your Java backend is now doing 100% of the security filtering (guaranteeing that ONLY Role 52 receives the failed batch), we can remove the extra isFinalApproval check from the React frontend.
+Scroll down to your columns array, find the actions column, and replace it with this cleaner version:
+    {
+      field: "actions",
+      headerName: "Action",
+      width: 140,
+      align: "center",
+      headerAlign: "center",
+      disableColumnMenu: true,
+      sortable: false,
+      renderCell: (params) => {
+        
+        // 1. PSO RETRY MODE: If it failed, the backend guarantees this is the PSO user. Just show Retry!
+        if (params.row.isExecutionFailed) {
+          return (
+            <Tooltip title="Execution failed. PSO Retry Authorization." arrow>
+               <Button
+                 variant="contained"
+                 size="small"
+                 color="warning"
+                 onClick={() => handleDirectRetry(params.row)}
+                 sx={{ textTransform: "none", borderRadius: 2, boxShadow: 0, fontWeight: "bold" }}
+                 startIcon={<ReplayIcon />}
+               >
+                 Retry
+               </Button>
+            </Tooltip>
+          );
         }
 
-        // Updated Professional Message indicating PSO takeover with dynamic DB Error
-        String finalMsg = "Execution failed due to an unexpected database or server timeout. PSO Support will retry. Please wait. >>> Contact Production Support Team.\nError Details: " + defaultErrorMsg;
-        progressService.sendProgress(batchId, executorId, 0, "FAILED", finalMsg);
+        // 2. NORMAL MODE: Only return View & Action!
+        return (
+          <Button
+            variant="contained"
+            size="small"
+            onClick={() => handleOpenViewModal(params.row)}
+            sx={{ textTransform: "none", borderRadius: 2, boxShadow: 0 }}
+          >
+            View & Action
+          </Button>
+        );
+      },
+    },
 
-        String vid = null;
-        try {
-            vid = jdbcTemplate.queryForObject("SELECT VID_FK FROM VOUCHER_POSTING WHERE BATCH_ID = ?", String.class, batchId);
-        } catch (Exception e) {
-            log.warn("Batch info not found for Batch: {}", batchId);
-        }
-
-        // Log the failure in the history
-        workflowEngine.logWorkflowAction(batchId, vid, "Execution Failed", "SYSTEM", finalMsg, null);
-
-        // SEND NOTIFICATION EXCLUSIVELY TO ROLE 52 (PSO)
-        try {
-            String psoMsg = String.format("URGENT: Execution failed for Batch '%s'. PSO Retry required. Reason: %s", batchId, defaultErrorMsg);
-            // Assuming your NotificationWriterService accepts (userId, roles, message, url, ref, module)
-            notificationWriterService.createNotification(null, "52", psoMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
-        } catch (Exception e) {
-            log.warn("NOTIFICATION_WARN | Batch: {} | Could not send failure notifications to PSO", batchId);
-        }
-    }
-
-
-
-
-        // Idempotency & Multi-Level Rule
-        List<VoucherWorkflow> workflowHistory = voucherWorkflowRepository.findByBatchIdFkOrderByLastActionAtAsc(batchId);
-
-        // Check if the batch is in "Retry Mode"
-        boolean isRetryMode = !workflowHistory.isEmpty() &&
-                "Execution Failed".equals(workflowHistory.get(workflowHistory.size() - 1).getLastAction());
-
-        Integer allowedRoleId = ((Number) stepData.get("ALLOWED_ROLE_ID")).intValue();
-
-        if (isRetryMode) {
-            // 1. HARDCODED PSO AUTHORIZATION (Role 52 Bypass)
-            // If it's a retry, ONLY Role 52 is allowed! We skip the normal Role and "Already Approved" checks.
-            if (executorRole == null || executorRole != 52) {
-                throw new CustomExceptions.InvalidDataException("Security Violation: Only the PSO (Role 52) is authorized to retry failed executions.");
-            }
-        } else {
-            // 2. STANDARD WORKFLOW AUTHORIZATION
-            boolean hasAlreadyApproved = workflowHistory.stream().anyMatch(w -> executorId.equalsIgnoreCase(w.getLastActionBy()));
-            if (hasAlreadyApproved) {
-                throw new CustomExceptions.InvalidDataException("You have already approved this batch.");
-            }
-            
-            // Standard Role Validation
-            if (!allowedRoleId.equals(executorRole)) {
-                throw new CustomExceptions.InvalidDataException("Unauthorized: Role mismatch.");
-            }
-        }
-
-
-
-
-
-
+That is it! With these two tiny changes, the normal users will see a polite message telling them to wait for Support, and the PSO users will get a perfectly functioning Retry button. Your architecture is completely airtight now!
