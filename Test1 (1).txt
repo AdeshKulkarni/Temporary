@@ -1,151 +1,205 @@
-        // 1. THE SQL FIX: Hardcoded exclusively for PSO (Role 52)
-        String sql = """
-            SELECT 
-                p.BATCH_ID, 
-                p.VID_FK AS VID, 
-                p.CREATED_BY AS CREATOR_ID, 
-                p.CREATED_AT AS REQ_DATE, 
-                p.COMMON_BATCH_REMARKS AS BATCH_REMARKS,
-                p.RECORDS_COUNT AS TOTAL_ROWS, 
-                p.SCHEDULED_TIME,
-                w.WORKFLOW_STAGE, 
-                w.WORKFLOW_CODE, 
-                w.ESCALATION_TIME, 
-                w.WORKFLOW_ORDER, 
-                w.IS_FINAL_APPROVAL,
-                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME,
-                (SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY) AS LATEST_ACTION
-            FROM VOUCHER_POSTING p
-            INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
-            LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
-            WHERE p.BATCH_STATUS = 'P'
-            AND (
-                -- STANDARD PENDING BATCH: Normal visibility for normal users (e.g., Maker/Checker)
-                (w.ALLOWED_ROLE_ID = ? 
-                 AND NOT EXISTS (SELECT 1 FROM VOUCHER_WORKFLOW vw WHERE vw.BATCH_ID_FK = p.BATCH_ID AND vw.LAST_ACTION_BY = ?)
-                 AND NVL((SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY), 'X') != 'Execution Failed'
-                )
-                OR 
-                -- RETRY MODE: Exclusively unlocked for Role 52 (PSO) ONLY!
-                (
-                 (SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY) = 'Execution Failed' 
-                 AND 52 = ? -- <--- HARDCODED TO PSO ROLE 52
-                )
-            )
-            ORDER BY p.CREATED_AT DESC
-        """;
+@Transactional
+    public void processWorkflowAction(ProcessVoucherRequestDto dto, String executorId, Integer executorRole) {
+        String batchId = dto.getBatchId();
 
-        // CRITICAL FIX: Ensure the parameters map to (userRole, userId, userRole) so the 52 = ? check works!
-        List<Map<String, Object>> allPending = jdbcTemplate.query(sql, (rs, rowNum) -> {
-            Map<String, Object> map = new HashMap<>();
-            boolean isFailed = "Execution Failed".equals(rs.getString("LATEST_ACTION"));
+        // --- STRICT ACTION REMARKS ENFORCEMENT ---
+        if (dto.getRemarks() == null || dto.getRemarks().trim().length() < 2 || dto.getRemarks().trim().length() > 30) {
+            throw new CustomExceptions.InvalidDataException("Action remarks are mandatory and must be between 2 and 30 alphanumeric characters.");
+        }
+        // Strips out everything except Alphanumeric and Spaces, then reduces multiple spaces to a single space
+        String sanitizedRemarks = dto.getRemarks().replaceAll("[^a-zA-Z0-9 ]", "").trim().replaceAll("\\s{2,}", " ");
 
-            map.put("batchId", rs.getString("BATCH_ID"));
-            map.put("vid", rs.getString("VID"));
-            map.put("creatorId", rs.getString("CREATOR_ID"));
-            map.put("creatorName", rs.getString("CREATOR_NAME"));
-            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
-            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
-            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
-            map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
-            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
-            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
-            map.put("isFinalApproval", rs.getString("IS_FINAL_APPROVAL"));
-            
-            map.put("isExecutionFailed", isFailed);
-            map.put("workflowState", isFailed ? "Execution" : rs.getString("WORKFLOW_STAGE"));
-            
-            return map;
-        }, userRole, userId, userRole); // <--- NOTE: Passed userRole as the 3rd parameter here!
+        dto.setRemarks(sanitizedRemarks);
 
-
-    private void handleAsyncApprovalError(String batchId, String executorId, RequestStatus actionStatus, String defaultErrorMsg) {
-
+        // Gathers the Batch data, current Workflow Step configuration, and original VID creator
+        // in a single  SQL query to minimize database hits.
+        Map<String, Object> stepData;
         try {
-            String workflowCode = jdbcTemplate.queryForObject(
-                    "SELECT WORKFLOW_CODE FROM VOUCHER_POSTING WHERE BATCH_ID = ?",
-                    String.class, batchId
-            );
-
-            if (workflowCode != null) {
-                // We keep it at the Final Approval stage mathematically so the Workflow Engine knows how to process it
-                Map<String, Object> finalStepInfo = jdbcTemplate.queryForMap(
-                        "SELECT WORKFLOW_ID FROM (" +
-                        "   SELECT WORKFLOW_ID " +
-                        "   FROM WORKFLOW_TRANSITIONS " +
-                        "   WHERE WORKFLOW_CODE = ? AND IS_FINAL_APPROVAL = 'Y' " +
-                        "   ORDER BY WORKFLOW_ORDER DESC" +
-                        ") WHERE ROWNUM = 1", workflowCode
-                );
-
-                String finalPendingAt = String.valueOf(finalStepInfo.get("WORKFLOW_ID"));
-
-                jdbcTemplate.update(
-                        "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P', IS_EXECUTION_SCHEDULED = 'NO', PENDING_AT = ? WHERE BATCH_ID = ?",
-                        finalPendingAt, batchId
-                );
-            }
-        } catch (Exception e) {
-            log.error("Failed to revert workflow state deeply for Batch: {}. Using fallback.", batchId, e);
-            jdbcTemplate.update(
-                    "UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P', IS_EXECUTION_SCHEDULED = 'NO' WHERE BATCH_ID = ?",
-                    batchId
-            );
+            stepData = jdbcTemplate.queryForMap("""
+                SELECT 
+                    p.CREATED_BY AS BATCH_CREATOR, p.VID_FK, p.IS_EXECUTION_SCHEDULED, p.SCHEDULED_TIME,
+                    w.WORKFLOW_CODE, w.WORKFLOW_ORDER, w.IS_FINAL_APPROVAL, 
+                    w.WORKFLOW_STAGE, w.ALLOWED_ROLE_ID, w.WORKFLOW_ID,
+                    rv.CREATED_BY AS VID_CREATOR
+                FROM VOUCHER_POSTING p
+                JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+                LEFT JOIN REQUEST_VOUCHER rv ON p.VID_FK = rv.VID
+                WHERE p.BATCH_ID = ?
+                """, batchId);
+        } catch (EmptyResultDataAccessException e) {
+            throw new CustomExceptions.InvalidDataException("Batch ID not found or workflow stage invalid.");
         }
 
-        // Updated Professional Message indicating PSO takeover
-        String finalMsg = "Execution failed due to an unexpected database or server timeout. PSO intervention required for retry.";
-        progressService.sendProgress(batchId, executorId, 0, "FAILED", finalMsg);
+        // --- FIX: DECLARE THE VARIABLES HERE ---
+        String batchCreatorId = (String) stepData.get("BATCH_CREATOR");
+        String vidCreatorId = (String) stepData.get("VID_CREATOR");
+        String vid = (String) stepData.get("VID_FK");
 
-        String vid = null;
-        try {
-            vid = jdbcTemplate.queryForObject("SELECT VID_FK FROM VOUCHER_POSTING WHERE BATCH_ID = ?", String.class, batchId);
-        } catch (Exception e) {
-            log.warn("Batch info not found for Batch: {}", batchId);
+        // 3A. Segregation of Duties (Maker cannot be the Checker)
+        if (executorId != null && batchCreatorId != null && executorId.trim().equalsIgnoreCase(batchCreatorId.trim())) {
+            throw new CustomExceptions.InvalidDataException("Segregation of Duties violation: You cannot approve a batch you created.");
         }
 
-        // Log the failure in the history
-        workflowEngine.logWorkflowAction(batchId, vid, "Execution Failed", "SYSTEM", finalMsg, null);
 
-        // SEND NOTIFICATION EXCLUSIVELY TO ROLE 52 (PSO)
-        try {
-            String psoMsg = String.format("URGENT: Execution failed for Batch '%s' due to server timeout. PSO Retry required.", batchId);
-            // Assuming your NotificationWriterService accepts (userId, roleId, message, url, ref, module)
-            notificationWriterService.createNotification(null, "52", psoMsg, "/voucher-view/" + batchId, batchId, "VoucherService");
-        } catch (Exception e) {
-            log.warn("NOTIFICATION_WARN | Batch: {} | Could not send failure notifications to PSO", batchId);
-        }
-    }
-
-
-
-        // 1. Determine if this is a Retry Mode situation
+        // Idempotency & Multi-Level Rule (A user can only approve a batch once per lifecycle)
         List<VoucherWorkflow> workflowHistory = voucherWorkflowRepository.findByBatchIdFkOrderByLastActionAtAsc(batchId);
-        
-        boolean isRetryMode = !workflowHistory.isEmpty() && 
+
+        // THE FIX: Check if the batch is in "Retry Mode"
+        boolean isRetryMode = !workflowHistory.isEmpty() &&
                 "Execution Failed".equals(workflowHistory.get(workflowHistory.size() - 1).getLastAction());
 
-        // 2. HARDCODED PSO AUTHORIZATION
-        if (isRetryMode) {
-            // If it is a retry, ONLY Role 52 is allowed to process it!
-            if (userRoleId != 52) {
-                throw new CustomExceptions.InvalidDataException("Security Violation: Only the PSO (Role 52) is authorized to retry failed executions.");
-            }
-            // (We skip the 'hasAlreadyApproved' check completely for PSO retries)
-            
-        } else {
-            // STANDARD WORKFLOW AUTHORIZATION (If NOT in retry mode)
-            
-            // A. Check if they already approved it
+        if (!isRetryMode) {
             boolean hasAlreadyApproved = workflowHistory.stream().anyMatch(w -> executorId.equalsIgnoreCase(w.getLastActionBy()));
             if (hasAlreadyApproved) {
                 throw new CustomExceptions.InvalidDataException("You have already approved this batch.");
             }
-            
-            // B. (Make sure your existing Role check only runs if it's NOT a retry!)
-            // if (!transition.getAllowedRoleId().equals(userRoleId)) {
-            //    throw new CustomExceptions.InvalidDataException("You do not have the correct role for this stage.");
-            // }
         }
 
+
+        // Role Validation (Ensures the user holds the exact role required for this specific step)
+        Integer allowedRoleId = ((Number) stepData.get("ALLOWED_ROLE_ID")).intValue();
+        if (!allowedRoleId.equals(executorRole)) {
+            throw new CustomExceptions.InvalidDataException("Unauthorized: Role mismatch.");
+        }
+
+        // Extract variables for routing logic
+        String workflowCode = (String) stepData.get("WORKFLOW_CODE");
+        Integer currentOrder = ((Number) stepData.get("WORKFLOW_ORDER")).intValue();
+        String currentStageName = (String) stepData.get("WORKFLOW_STAGE");
+        boolean isFinalStep = "Y".equalsIgnoreCase((String) stepData.get("IS_FINAL_APPROVAL"));
+
+        VoucherPosting posting = voucherPostingRepository.findById(batchId).orElseThrow();
+
+        // 4. Handle REJECTION
+        if ("REJECTED".equals(dto.getStatus().toString())) {
+            posting.setBatchStatus("R");
+            voucherPostingRepository.save(posting);
+
+            logWorkflowAction(batchId, vid, "Rejected (" + currentStageName + ")", executorId, dto.getRemarks(), null);
+
+            // Update underlying tables to mark the entire batch as dead
+            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'REJECTED' WHERE BATCH_ID = ?", batchId);
+            jdbcTemplate.update("UPDATE VOUCHER_POSTING_DATA SET REQ_STATUS = 'R', EXECUTION_DATE = SYSTIMESTAMP WHERE BATCH_ID = ?", batchId);
+
+            // Build a "List" for notifications: Everyone who ever touched this batch needs to know it was rejected.
+            String previousActorsSql = "SELECT DISTINCT LAST_ACTION_BY FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = ? AND LAST_ACTION_BY != ?";
+            List<String> previousActors = jdbcTemplate.queryForList(previousActorsSql, String.class, batchId, executorId);
+
+            // Failsafe: Ensure the original creators are in the blast list
+            if (!previousActors.contains(batchCreatorId)) {
+                previousActors.add(batchCreatorId);
+            }
+            if (vidCreatorId != null && !previousActors.contains(vidCreatorId)) {
+                previousActors.add(vidCreatorId);
+            }
+
+            // Fire the notifications
+            notificationWriterService.createBatchRejectedNotificationForUsers(batchId, previousActors, executorId, dto.getRemarks());
+
+            if (posting.getVidFk() != null && !posting.getVidFk().isEmpty()) updateVidStatus(posting.getVidFk(), VoucherStatus.ACTIVE);
+            return;
+        }
+
+        // 5. Handle APPROVAL / PROGRESSION
+        if (isFinalStep) {
+            // Move to Execution Step (Order + 1)
+            // The workflow is complete. Move the pointer to the hidden 'Execution' step.
+            Long execStepId = jdbcTemplate.queryForObject("SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = ?", Long.class, workflowCode, currentOrder + 1);
+            posting.setPendingAt(execStepId);
+
+            // Handle Final Approver Schedule Overrides
+            boolean isOverride = Boolean.TRUE.equals(dto.getOverrideScheduleLapse());
+            if (isOverride) {
+
+                if (dto.getNewScheduledTime() != null) {
+                    validateScheduledTime(dto.getNewScheduledTime(), true);
+                }
+
+                posting.setIsScheduleOverride("YES");
+                posting.setIS_EXECUTION_SCHEDULED(dto.getNewScheduledTime() != null ? "YES" : "NO");
+                posting.setScheduledTime(dto.getNewScheduledTime());
+            }
+
+            //Handle Expired Schedules (If Maker scheduled it for 12:00 PM but it's approved at 1:00 PM)
+            else if ("YES".equalsIgnoreCase(posting.getIS_EXECUTION_SCHEDULED()) && posting.getScheduledTime() != null) {
+                if (posting.getScheduledTime().isBefore(LocalDateTime.now())) {
+                    throw new CustomExceptions.ScheduleLapsedException("The scheduled execution time has passed.");
+                }
+                else {
+                    posting.setIsScheduleOverride("NO"); // Ensure it stays NO if not triggered
+                }
+            }
+
+           // Execute Later (Timer Required)
+            if ("YES".equalsIgnoreCase(posting.getIS_EXECUTION_SCHEDULED()) && posting.getScheduledTime() != null && posting.getScheduledTime().isAfter(LocalDateTime.now())) {
+                posting.setBatchStatus("P");
+                String actionLog = isOverride ? "Final Approval(Sch. Override)" : "Final Approval(Scheduled)";
+                logWorkflowAction(batchId, vid, actionLog, executorId, dto.getRemarks(), posting.getScheduledTime());
+                // FIX: Update VOUCHER_POSTING
+                jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
+
+
+            }
+            // Execute Immediately (Handoff to Background Thread)
+            else {
+                posting.setBatchStatus("C");
+                posting.setExecutedAt(LocalDateTime.now());
+                String actionLog = isOverride ? "Final Approval(Imm. Override)" : "Final Approval(Posted)";
+                logWorkflowAction(batchId, vid, actionLog, executorId, dto.getRemarks(), null);
+
+                // Lock the VID permanently as completed
+                if (posting.getVidFk() != null && !posting.getVidFk().isEmpty()) updateVidStatus(posting.getVidFk(), VoucherStatus.COMPLETED);
+
+                // Dispatch the heavy DB procedure execution to the Async Worker
+                BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
+                execDto.setBatchId(batchId); execDto.setStatus(RequestStatus.ACCEPTED); execDto.setRemarks(dto.getRemarks());
+                commandService.processBulkRequestsAsync(execDto, executorId, executorRole);
+            }
+            // --- NOTIFY BOTH CREATORS OF FINAL APPROVAL ---
+            notificationWriterService.createBatchUpdateNotificationForCreators(
+                    batchId, vid, batchCreatorId, vidCreatorId, "fully APPROVED", executorId
+            );
+        } else {
+            //INTERMEDIATE APPROVAL
+            // --- PERFECTED JOIN LOGIC ---
+            // Joins VOUCHER_POSTING with WORKFLOW_TRANSITIONS to safely fetch the exact next routing stage
+            String nextStepSql = """
+                SELECT w_next.WORKFLOW_ID, w_next.ALLOWED_ROLE_ID
+                FROM VOUCHER_POSTING vp
+                JOIN WORKFLOW_TRANSITIONS w_curr 
+                  ON vp.PENDING_AT = w_curr.WORKFLOW_ID
+                JOIN WORKFLOW_TRANSITIONS w_next 
+                  ON w_curr.WORKFLOW_CODE = w_next.WORKFLOW_CODE 
+                 AND w_next.WORKFLOW_ORDER = (w_curr.WORKFLOW_ORDER + 1)
+                WHERE vp.BATCH_ID = ?
+            """;
+
+            Map<String, Object> nextStepInfo = jdbcTemplate.queryForMap(nextStepSql, batchId);
+            Long nextStepId = ((Number) nextStepInfo.get("WORKFLOW_ID")).longValue();
+            String nextRoleId = String.valueOf(nextStepInfo.get("ALLOWED_ROLE_ID"));
+
+            // Move the pointer forward
+            posting.setPendingAt(nextStepId);
+            logWorkflowAction(batchId, vid, "Approved (" + currentStageName + ")", executorId, dto.getRemarks(), null);
+
+
+            // --- NOTIFY BOTH CREATORS OF INTERMEDIATE PROGRESS ---
+            notificationWriterService.createBatchUpdateNotificationForCreators(
+                    batchId, vid, batchCreatorId, vidCreatorId, "Approved (" + currentStageName + ")", executorId
+            );
+        }
+
+        voucherPostingRepository.save(posting);
+    }
+
+1)
+
+3rd change i dont understand 
+please tell mi for this methods what to replace with what 
+
+2) there one more change like i want 
+  // Updated Professional Message indicating PSO takeover
+        String finalMsg = "Execution failed due to an unexpected database or server timeout. System Support will retry. Please wait. >>> Contact Production Support Team.\n" +
+                " .";
+this string i want and in this string i want to add which error code from this msg i will get the exect reson to fail 
 
