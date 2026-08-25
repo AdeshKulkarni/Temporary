@@ -1,83 +1,245 @@
-workflow transitions
+    public Map<String, Object> getPendingBatchesForChecker(Integer userRole, String userId, int page, int size, String batchIdFilter, String vidFilter) {
 
-WORKFLOW_CODE	VARCHAR2(50 BYTE)	No		1	
-ALLOWED_ROLE_ID	NUMBER(10,0)	Yes		2	
-IS_FINAL_APPROVAL	CHAR(1 BYTE)	Yes	"'N'     
-"	3	
-SCHEDULING_ALLOWED	CHAR(1 BYTE)	Yes		4	
-WORKFLOW_STAGE	VARCHAR2(100 BYTE)	Yes		5	
-ESCALATION_TIME	NUMBER(10,0)	Yes		6	
-WORKFLOW_ORDER	NUMBER(3,0)	No		7	
-WORKFLOW_ID	NUMBER	Yes	"FINCORE"."WORKFLOWID_SEQ"."NEXTVAL"	8	
+        // 1. DYNAMIC EXECUTION ROLE QUERY:
+        // Automatically checks if userRole matches the ALLOWED_ROLE_ID of the 'Execution' stage in WORKFLOW_TRANSITIONS
+        String sql = """
+            SELECT 
+                p.BATCH_ID, 
+                p.VID_FK AS VID, 
+                p.CREATED_BY AS CREATOR_ID, 
+                p.CREATED_AT AS REQ_DATE, 
+                p.COMMON_BATCH_REMARKS AS BATCH_REMARKS,
+                p.RECORDS_COUNT AS TOTAL_ROWS, 
+                p.SCHEDULED_TIME,
+                w.WORKFLOW_STAGE, 
+                w.WORKFLOW_CODE, 
+                w.ESCALATION_TIME, 
+                w.WORKFLOW_ORDER, 
+                w.IS_FINAL_APPROVAL,
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME,
+                (SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY) AS LATEST_ACTION
+            FROM VOUCHER_POSTING p
+            INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+            LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
+            WHERE p.BATCH_STATUS = 'P'
+            AND (
+                -- STANDARD PENDING BATCH: Normal visibility for pending stages
+                (w.ALLOWED_ROLE_ID = ? 
+                 AND NOT EXISTS (SELECT 1 FROM VOUCHER_WORKFLOW vw WHERE vw.BATCH_ID_FK = p.BATCH_ID AND vw.LAST_ACTION_BY = ?)
+                 AND NVL((SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY), 'X') != 'Execution Failed'
+                )
+                OR 
+                -- RETRY MODE: Visible ONLY if the user's role matches the Execution stage role from WORKFLOW_TRANSITIONS
+                (
+                 (SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY) = 'Execution Failed' 
+                 AND EXISTS (
+                     SELECT 1 FROM WORKFLOW_TRANSITIONS wt_exec 
+                     WHERE wt_exec.WORKFLOW_CODE = p.WORKFLOW_CODE 
+                       AND wt_exec.ALLOWED_ROLE_ID = ?
+                       AND (wt_exec.WORKFLOW_STAGE = 'Execution' OR wt_exec.WORKFLOW_ORDER = (
+                           SELECT MAX(WORKFLOW_ORDER) FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = p.WORKFLOW_CODE
+                       ))
+                 )
+                )
+            )
+            ORDER BY p.CREATED_AT DESC
+        """;
 
-Data from this table 
+        List<Map<String, Object>> allPending = jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            boolean isFailed = "Execution Failed".equals(rs.getString("LATEST_ACTION"));
 
-workflow_3	9001	N	Y	Creation	0	1	24
-workflow_3	9001	N	N	Verification	45	2	25
-workflow_3	9002	N	N	Review	30	3	26
-workflow_3	9002	Y	Y	Approval	15	4	27
-workflow_3		N	N	Execution	0	5	28
-workflow_4	9003	N	Y	Creation	0	1	30
-workflow_4	9001	N	N	Validation	45	2	31
-workflow_4	9001	N	Y	Verification	30	3	32
-workflow_4	9002	N	N	Review	15	4	33
-workflow_4	9002	Y	Y	Approval	0	5	34
-workflow_4		N	N	Execution	0	6	35
-workflow_7	60	N	Y	Creation	0	1	41
-workflow_7	9001	N	N	Validation	45	2	42
-workflow_7	9001	N	N	Verification	30	3	43
-workflow_7	9002	N	N	Review	15	4	44
-workflow_7	9002	Y	Y	Approval	0	5	45
-workflow_7		N	N	Execution	0	6	46
-workflow_8	130	N	Y	Creation	0	1	47
-workflow_8	9001	N	N	Validation	45	2	48
-workflow_8	9001	N	N	Verification	30	3	49
-workflow_8	9002	N	N	Review	15	4	50
-workflow_8	9002	Y	Y	Approval	0	5	51
-workflow_8		N	N	Execution	0	6	52
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("vid", rs.getString("VID"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("creatorName", rs.getString("CREATOR_NAME"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
+            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+            map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
+            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
+            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
+            map.put("isFinalApproval", rs.getString("IS_FINAL_APPROVAL"));
+            
+            map.put("isExecutionFailed", isFailed);
+            map.put("workflowState", isFailed ? "Execution" : rs.getString("WORKFLOW_STAGE"));
+            
+            return map;
+        }, userRole, userId, userRole);
 
-as u know this is table in which this are same pre defind data in that table like this are predefined data 
-now there is a change like what ever the Role we are hard code for the executor that role we will take from the this table 
+        // JAVA-SIDE FILTERING
+        List<Map<String, Object>> filteredList = allPending.stream().filter(row -> {
+            boolean matchesBatch = true;
+            boolean matchesVid = true;
+            if (batchIdFilter != null && !batchIdFilter.trim().isEmpty()) {
+                String bId = (String) row.get("batchId");
+                matchesBatch = bId != null && bId.toLowerCase().contains(batchIdFilter.trim().toLowerCase());
+            }
+            if (vidFilter != null && !vidFilter.trim().isEmpty()) {
+                String vId = (String) row.get("vid");
+                matchesVid = vId != null && vId.toLowerCase().contains(vidFilter.trim().toLowerCase());
+            }
+            return matchesBatch && matchesVid;
+        }).toList();
 
-from this table 
-workflow_3	9001	N	Y	Creation	0	1	24
-workflow_3	9001	N	N	Verification	45	2	25
-workflow_3	9002	N	N	Review	30	3	26
-workflow_3	9002	Y	Y	Approval	15	4	27
-workflow_3		N	N	Execution	0	5	28
+        // JAVA-SIDE PAGINATION
+        int totalElements = filteredList.size();
+        int fromIndex = Math.min(page * size, totalElements);
+        int toIndex = Math.min(fromIndex + size, totalElements);
+        List<Map<String, Object>> pagedList = filteredList.subList(fromIndex, toIndex);
 
-we will take this data now we can check that the end there is System Executor which is null curretly but we will take from this table only 
-workflow_3	9001	N	Y	Creation	0	1	24
-workflow_3	9001	N	N	Verification	45	2	25
-workflow_3	9002	N	N	Review	30	3	26
-workflow_3	9002	Y	Y	Approval	15	4	27
-workflow_3	52  	N	Execution	0	5	28
+        for (Map<String, Object> row : pagedList) {
+            row.put("timeSinceLastAction", calculateTimeSinceLastAction((String) row.get("batchId")));
+        }
 
-
-and 2nd change is like 
-
-this change is for the voucher status Screen 
+        Map<String, Object> response = new HashMap<>();
+        response.put("content", pagedList);
+        response.put("totalElements", totalElements);
+        response.put("totalPages", (int) Math.ceil((double) totalElements / size));
+        return response;
+    }
 
 
-as we are showing the failed request to the user 52 which are are hard code take that role from here from this table as well as
-what ever the requests approved by the final approval show every request to the this role 
-as this role can moniter the request after the final approval only
-so create this accordingly 
-even the request is succefully still show him
-for the user which is there 
-workflow_3	52  	N	Execution	0	5	28
+    public Map<String, Object> getPendingBatchesForChecker(Integer userRole, String userId, int page, int size, String batchIdFilter, String vidFilter) {
 
-u can check final approval by using the IS_FINAL_APPROVAL 
+        // 1. DYNAMIC EXECUTION ROLE QUERY:
+        // Automatically checks if userRole matches the ALLOWED_ROLE_ID of the 'Execution' stage in WORKFLOW_TRANSITIONS
+        String sql = """
+            SELECT 
+                p.BATCH_ID, 
+                p.VID_FK AS VID, 
+                p.CREATED_BY AS CREATOR_ID, 
+                p.CREATED_AT AS REQ_DATE, 
+                p.COMMON_BATCH_REMARKS AS BATCH_REMARKS,
+                p.RECORDS_COUNT AS TOTAL_ROWS, 
+                p.SCHEDULED_TIME,
+                w.WORKFLOW_STAGE, 
+                w.WORKFLOW_CODE, 
+                w.ESCALATION_TIME, 
+                w.WORKFLOW_ORDER, 
+                w.IS_FINAL_APPROVAL,
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME,
+                (SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY) AS LATEST_ACTION
+            FROM VOUCHER_POSTING p
+            INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+            LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
+            WHERE p.BATCH_STATUS = 'P'
+            AND (
+                -- STANDARD PENDING BATCH: Normal visibility for pending stages
+                (w.ALLOWED_ROLE_ID = ? 
+                 AND NOT EXISTS (SELECT 1 FROM VOUCHER_WORKFLOW vw WHERE vw.BATCH_ID_FK = p.BATCH_ID AND vw.LAST_ACTION_BY = ?)
+                 AND NVL((SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY), 'X') != 'Execution Failed'
+                )
+                OR 
+                -- RETRY MODE: Visible ONLY if the user's role matches the Execution stage role from WORKFLOW_TRANSITIONS
+                (
+                 (SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY) = 'Execution Failed' 
+                 AND EXISTS (
+                     SELECT 1 FROM WORKFLOW_TRANSITIONS wt_exec 
+                     WHERE wt_exec.WORKFLOW_CODE = p.WORKFLOW_CODE 
+                       AND wt_exec.ALLOWED_ROLE_ID = ?
+                       AND (wt_exec.WORKFLOW_STAGE = 'Execution' OR wt_exec.WORKFLOW_ORDER = (
+                           SELECT MAX(WORKFLOW_ORDER) FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = p.WORKFLOW_CODE
+                       ))
+                 )
+                )
+            )
+            ORDER BY p.CREATED_AT DESC
+        """;
 
-i will summerize the thing
+        List<Map<String, Object>> allPending = jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            boolean isFailed = "Execution Failed".equals(rs.getString("LATEST_ACTION"));
 
-what ever curretly u are showing for the authrization screen like if the request is fail that is good to go but just one change is that we are shoing that using the hardcode
-role that u need to take from this table as i told this
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("vid", rs.getString("VID"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+            map.put("creatorName", rs.getString("CREATOR_NAME"));
+            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
+            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+            map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
+            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
+            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
+            map.put("isFinalApproval", rs.getString("IS_FINAL_APPROVAL"));
+            
+            map.put("isExecutionFailed", isFailed);
+            map.put("workflowState", isFailed ? "Execution" : rs.getString("WORKFLOW_STAGE"));
+            
+            return map;
+        }, userRole, userId, userRole);
 
-and 2nd is 
-in the status screen what ever status u are showing 
-show in the status screen after the final approval is approving the batch then only 
-show in the status screen 
+        // JAVA-SIDE FILTERING
+        List<Map<String, Object>> filteredList = allPending.stream().filter(row -> {
+            boolean matchesBatch = true;
+            boolean matchesVid = true;
+            if (batchIdFilter != null && !batchIdFilter.trim().isEmpty()) {
+                String bId = (String) row.get("batchId");
+                matchesBatch = bId != null && bId.toLowerCase().contains(batchIdFilter.trim().toLowerCase());
+            }
+            if (vidFilter != null && !vidFilter.trim().isEmpty()) {
+                String vId = (String) row.get("vid");
+                matchesVid = vId != null && vId.toLowerCase().contains(vidFilter.trim().toLowerCase());
+            }
+            return matchesBatch && matchesVid;
+        }).toList();
 
+        // JAVA-SIDE PAGINATION
+        int totalElements = filteredList.size();
+        int fromIndex = Math.min(page * size, totalElements);
+        int toIndex = Math.min(fromIndex + size, totalElements);
+        List<Map<String, Object>> pagedList = filteredList.subList(fromIndex, toIndex);
+
+        for (Map<String, Object> row : pagedList) {
+            row.put("timeSinceLastAction", calculateTimeSinceLastAction((String) row.get("batchId")));
+        }
+
+        Map<String, Object> response = new HashMap<>();
+        response.put("content", pagedList);
+        response.put("totalElements", totalElements);
+        response.put("totalPages", (int) Math.ceil((double) totalElements / size));
+        return response;
+    }
+
+
+        // Idempotency & Multi-Level Rule
+        List<VoucherWorkflow> workflowHistory = voucherWorkflowRepository.findByBatchIdFkOrderByLastActionAtAsc(batchId);
+
+        boolean isRetryMode = !workflowHistory.isEmpty() &&
+                "Execution Failed".equals(workflowHistory.get(workflowHistory.size() - 1).getLastAction());
+
+        Integer allowedRoleId = ((Number) stepData.get("ALLOWED_ROLE_ID")).intValue();
+
+        if (isRetryMode) {
+            // DYNAMIC EXECUTION ROLE VALIDATION:
+            // Fetch the ALLOWED_ROLE_ID configured for Execution stage in WORKFLOW_TRANSITIONS for this workflow
+            Integer executionRoleId = null;
+            try {
+                executionRoleId = jdbcTemplate.queryForObject(
+                    "SELECT ALLOWED_ROLE_ID FROM WORKFLOW_TRANSITIONS " +
+                    "WHERE WORKFLOW_CODE = ? AND (WORKFLOW_STAGE = 'Execution' OR WORKFLOW_ORDER = (" +
+                    "   SELECT MAX(WORKFLOW_ORDER) FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ?" +
+                    ")) FETCH FIRST 1 ROWS ONLY",
+                    Integer.class, workflowCode, workflowCode
+                );
+            } catch (Exception e) {
+                log.warn("Could not find Execution role for workflow: {}", workflowCode);
+            }
+
+            if (executorRole == null || (executionRoleId != null && !executionRoleId.equals(executorRole))) {
+                throw new CustomExceptions.InvalidDataException("Security Violation: You are not authorized to retry failed execution for this workflow.");
+            }
+        } else {
+            // STANDARD WORKFLOW AUTHORIZATION
+            boolean hasAlreadyApproved = workflowHistory.stream().anyMatch(w -> executorId.equalsIgnoreCase(w.getLastActionBy()));
+            if (hasAlreadyApproved) {
+                throw new CustomExceptions.InvalidDataException("You have already approved this batch.");
+            }
+            
+            // Standard Role Validation
+            if (!allowedRoleId.equals(executorRole)) {
+                throw new CustomExceptions.InvalidDataException("Unauthorized: Role mismatch.");
+            }
+        }
 
 
