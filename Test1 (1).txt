@@ -1,205 +1,90 @@
-    public Map<String, Object> getPendingBatchesForChecker(Integer userRole, String userId, int page, int size, String batchIdFilter, String vidFilter) {
+package com.fincore.VoucherService.Service.core;
 
-        // 1. DYNAMIC EXECUTION ROLE QUERY:
-        // Automatically checks if userRole matches the ALLOWED_ROLE_ID of the 'Execution' stage in WORKFLOW_TRANSITIONS
-        String sql = """
-            SELECT 
-                p.BATCH_ID, 
-                p.VID_FK AS VID, 
-                p.CREATED_BY AS CREATOR_ID, 
-                p.CREATED_AT AS REQ_DATE, 
-                p.COMMON_BATCH_REMARKS AS BATCH_REMARKS,
-                p.RECORDS_COUNT AS TOTAL_ROWS, 
-                p.SCHEDULED_TIME,
-                w.WORKFLOW_STAGE, 
-                w.WORKFLOW_CODE, 
-                w.ESCALATION_TIME, 
-                w.WORKFLOW_ORDER, 
-                w.IS_FINAL_APPROVAL,
-                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME,
-                (SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY) AS LATEST_ACTION
-            FROM VOUCHER_POSTING p
-            INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
-            LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
-            WHERE p.BATCH_STATUS = 'P'
-            AND (
-                -- STANDARD PENDING BATCH: Normal visibility for pending stages
-                (w.ALLOWED_ROLE_ID = ? 
-                 AND NOT EXISTS (SELECT 1 FROM VOUCHER_WORKFLOW vw WHERE vw.BATCH_ID_FK = p.BATCH_ID AND vw.LAST_ACTION_BY = ?)
-                 AND NVL((SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY), 'X') != 'Execution Failed'
-                )
-                OR 
-                -- RETRY MODE: Visible ONLY if the user's role matches the Execution stage role from WORKFLOW_TRANSITIONS
-                (
-                 (SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY) = 'Execution Failed' 
-                 AND EXISTS (
-                     SELECT 1 FROM WORKFLOW_TRANSITIONS wt_exec 
-                     WHERE wt_exec.WORKFLOW_CODE = p.WORKFLOW_CODE 
-                       AND wt_exec.ALLOWED_ROLE_ID = ?
-                       AND (wt_exec.WORKFLOW_STAGE = 'Execution' OR wt_exec.WORKFLOW_ORDER = (
-                           SELECT MAX(WORKFLOW_ORDER) FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = p.WORKFLOW_CODE
-                       ))
-                 )
-                )
-            )
-            ORDER BY p.CREATED_AT DESC
-        """;
 
-        List<Map<String, Object>> allPending = jdbcTemplate.query(sql, (rs, rowNum) -> {
-            Map<String, Object> map = new HashMap<>();
-            boolean isFailed = "Execution Failed".equals(rs.getString("LATEST_ACTION"));
+import com.fincore.VoucherService.Dto.BulkProcessVoucherPostingDto;
+import com.fincore.VoucherService.Dto.ProcessVoucherRequestDto;
+import com.fincore.VoucherService.Exception.CustomExceptions;
+import com.fincore.VoucherService.Models.VoucherPosting;
+import com.fincore.VoucherService.Models.VoucherWorkflow;
+import com.fincore.VoucherService.Models.enums.RequestStatus;
+import com.fincore.VoucherService.Models.enums.VoucherStatus;
+import com.fincore.VoucherService.Repository.VoucherPostingRepository;
+import com.fincore.VoucherService.Repository.VoucherWorkflowRepository;
+import com.fincore.VoucherService.Service.NotificationWriterService;
+import com.fincore.VoucherService.config.SecuritySanitizer;
+import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.dao.EmptyResultDataAccessException;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
-            map.put("batchId", rs.getString("BATCH_ID"));
-            map.put("vid", rs.getString("VID"));
-            map.put("creatorId", rs.getString("CREATOR_ID"));
-            map.put("creatorName", rs.getString("CREATOR_NAME"));
-            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
-            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
-            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
-            map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
-            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
-            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
-            map.put("isFinalApproval", rs.getString("IS_FINAL_APPROVAL"));
-            
-            map.put("isExecutionFailed", isFailed);
-            map.put("workflowState", isFailed ? "Execution" : rs.getString("WORKFLOW_STAGE"));
-            
-            return map;
-        }, userRole, userId, userRole);
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Map;
 
-        // JAVA-SIDE FILTERING
-        List<Map<String, Object>> filteredList = allPending.stream().filter(row -> {
-            boolean matchesBatch = true;
-            boolean matchesVid = true;
-            if (batchIdFilter != null && !batchIdFilter.trim().isEmpty()) {
-                String bId = (String) row.get("batchId");
-                matchesBatch = bId != null && bId.toLowerCase().contains(batchIdFilter.trim().toLowerCase());
-            }
-            if (vidFilter != null && !vidFilter.trim().isEmpty()) {
-                String vId = (String) row.get("vid");
-                matchesVid = vId != null && vId.toLowerCase().contains(vidFilter.trim().toLowerCase());
-            }
-            return matchesBatch && matchesVid;
-        }).toList();
+@Service
+@RequiredArgsConstructor
+public class VoucherWorkflowEngine {
 
-        // JAVA-SIDE PAGINATION
-        int totalElements = filteredList.size();
-        int fromIndex = Math.min(page * size, totalElements);
-        int toIndex = Math.min(fromIndex + size, totalElements);
-        List<Map<String, Object>> pagedList = filteredList.subList(fromIndex, toIndex);
+    @Autowired
+    @Qualifier("oracleJdbcTemplate")
+    private JdbcTemplate jdbcTemplate;
 
-        for (Map<String, Object> row : pagedList) {
-            row.put("timeSinceLastAction", calculateTimeSinceLastAction((String) row.get("batchId")));
+    private final VoucherPostingRepository voucherPostingRepository;
+    private final VoucherWorkflowRepository voucherWorkflowRepository;
+    private final NotificationWriterService notificationWriterService;
+
+    // Inject the command service to trigger async execution after final approval
+    @Lazy
+    @Autowired
+    private VoucherCommandService commandService;
+
+
+
+    @Transactional
+    public void processWorkflowAction(ProcessVoucherRequestDto dto, String executorId, Integer executorRole) {
+        String batchId = dto.getBatchId();
+
+        // --- STRICT ACTION REMARKS ENFORCEMENT ---
+        if (dto.getRemarks() == null || dto.getRemarks().trim().length() < 2 || dto.getRemarks().trim().length() > 30) {
+            throw new CustomExceptions.InvalidDataException("Action remarks are mandatory and must be between 2 and 30 alphanumeric characters.");
+        }
+        // Strips out everything except Alphanumeric and Spaces, then reduces multiple spaces to a single space
+        String sanitizedRemarks = dto.getRemarks().replaceAll("[^a-zA-Z0-9 ]", "").trim().replaceAll("\\s{2,}", " ");
+
+        dto.setRemarks(sanitizedRemarks);
+
+        // Gathers the Batch data, current Workflow Step configuration, and original VID creator
+        // in a single  SQL query to minimize database hits.
+        Map<String, Object> stepData;
+        try {
+            stepData = jdbcTemplate.queryForMap("""
+                SELECT 
+                    p.CREATED_BY AS BATCH_CREATOR, p.VID_FK, p.IS_EXECUTION_SCHEDULED, p.SCHEDULED_TIME,
+                    w.WORKFLOW_CODE, w.WORKFLOW_ORDER, w.IS_FINAL_APPROVAL, 
+                    w.WORKFLOW_STAGE, w.ALLOWED_ROLE_ID, w.WORKFLOW_ID,
+                    rv.CREATED_BY AS VID_CREATOR
+                FROM VOUCHER_POSTING p
+                JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+                LEFT JOIN REQUEST_VOUCHER rv ON p.VID_FK = rv.VID
+                WHERE p.BATCH_ID = ?
+                """, batchId);
+        } catch (EmptyResultDataAccessException e) {
+            throw new CustomExceptions.InvalidDataException("Batch ID not found or workflow stage invalid.");
         }
 
-        Map<String, Object> response = new HashMap<>();
-        response.put("content", pagedList);
-        response.put("totalElements", totalElements);
-        response.put("totalPages", (int) Math.ceil((double) totalElements / size));
-        return response;
-    }
+        // --- FIX: DECLARE THE VARIABLES HERE ---
+        String batchCreatorId = (String) stepData.get("BATCH_CREATOR");
+        String vidCreatorId = (String) stepData.get("VID_CREATOR");
+        String vid = (String) stepData.get("VID_FK");
 
-
-    public Map<String, Object> getPendingBatchesForChecker(Integer userRole, String userId, int page, int size, String batchIdFilter, String vidFilter) {
-
-        // 1. DYNAMIC EXECUTION ROLE QUERY:
-        // Automatically checks if userRole matches the ALLOWED_ROLE_ID of the 'Execution' stage in WORKFLOW_TRANSITIONS
-        String sql = """
-            SELECT 
-                p.BATCH_ID, 
-                p.VID_FK AS VID, 
-                p.CREATED_BY AS CREATOR_ID, 
-                p.CREATED_AT AS REQ_DATE, 
-                p.COMMON_BATCH_REMARKS AS BATCH_REMARKS,
-                p.RECORDS_COUNT AS TOTAL_ROWS, 
-                p.SCHEDULED_TIME,
-                w.WORKFLOW_STAGE, 
-                w.WORKFLOW_CODE, 
-                w.ESCALATION_TIME, 
-                w.WORKFLOW_ORDER, 
-                w.IS_FINAL_APPROVAL,
-                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME,
-                (SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY) AS LATEST_ACTION
-            FROM VOUCHER_POSTING p
-            INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
-            LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
-            WHERE p.BATCH_STATUS = 'P'
-            AND (
-                -- STANDARD PENDING BATCH: Normal visibility for pending stages
-                (w.ALLOWED_ROLE_ID = ? 
-                 AND NOT EXISTS (SELECT 1 FROM VOUCHER_WORKFLOW vw WHERE vw.BATCH_ID_FK = p.BATCH_ID AND vw.LAST_ACTION_BY = ?)
-                 AND NVL((SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY), 'X') != 'Execution Failed'
-                )
-                OR 
-                -- RETRY MODE: Visible ONLY if the user's role matches the Execution stage role from WORKFLOW_TRANSITIONS
-                (
-                 (SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY) = 'Execution Failed' 
-                 AND EXISTS (
-                     SELECT 1 FROM WORKFLOW_TRANSITIONS wt_exec 
-                     WHERE wt_exec.WORKFLOW_CODE = p.WORKFLOW_CODE 
-                       AND wt_exec.ALLOWED_ROLE_ID = ?
-                       AND (wt_exec.WORKFLOW_STAGE = 'Execution' OR wt_exec.WORKFLOW_ORDER = (
-                           SELECT MAX(WORKFLOW_ORDER) FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = p.WORKFLOW_CODE
-                       ))
-                 )
-                )
-            )
-            ORDER BY p.CREATED_AT DESC
-        """;
-
-        List<Map<String, Object>> allPending = jdbcTemplate.query(sql, (rs, rowNum) -> {
-            Map<String, Object> map = new HashMap<>();
-            boolean isFailed = "Execution Failed".equals(rs.getString("LATEST_ACTION"));
-
-            map.put("batchId", rs.getString("BATCH_ID"));
-            map.put("vid", rs.getString("VID"));
-            map.put("creatorId", rs.getString("CREATOR_ID"));
-            map.put("creatorName", rs.getString("CREATOR_NAME"));
-            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
-            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
-            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
-            map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
-            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
-            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
-            map.put("isFinalApproval", rs.getString("IS_FINAL_APPROVAL"));
-            
-            map.put("isExecutionFailed", isFailed);
-            map.put("workflowState", isFailed ? "Execution" : rs.getString("WORKFLOW_STAGE"));
-            
-            return map;
-        }, userRole, userId, userRole);
-
-        // JAVA-SIDE FILTERING
-        List<Map<String, Object>> filteredList = allPending.stream().filter(row -> {
-            boolean matchesBatch = true;
-            boolean matchesVid = true;
-            if (batchIdFilter != null && !batchIdFilter.trim().isEmpty()) {
-                String bId = (String) row.get("batchId");
-                matchesBatch = bId != null && bId.toLowerCase().contains(batchIdFilter.trim().toLowerCase());
-            }
-            if (vidFilter != null && !vidFilter.trim().isEmpty()) {
-                String vId = (String) row.get("vid");
-                matchesVid = vId != null && vId.toLowerCase().contains(vidFilter.trim().toLowerCase());
-            }
-            return matchesBatch && matchesVid;
-        }).toList();
-
-        // JAVA-SIDE PAGINATION
-        int totalElements = filteredList.size();
-        int fromIndex = Math.min(page * size, totalElements);
-        int toIndex = Math.min(fromIndex + size, totalElements);
-        List<Map<String, Object>> pagedList = filteredList.subList(fromIndex, toIndex);
-
-        for (Map<String, Object> row : pagedList) {
-            row.put("timeSinceLastAction", calculateTimeSinceLastAction((String) row.get("batchId")));
+        // 3A. Segregation of Duties (Maker cannot be the Checker)
+        if (executorId != null && batchCreatorId != null && executorId.trim().equalsIgnoreCase(batchCreatorId.trim())) {
+            throw new CustomExceptions.InvalidDataException("Segregation of Duties violation: You cannot approve a batch you created.");
         }
-
-        Map<String, Object> response = new HashMap<>();
-        response.put("content", pagedList);
-        response.put("totalElements", totalElements);
-        response.put("totalPages", (int) Math.ceil((double) totalElements / size));
-        return response;
-    }
 
 
         // Idempotency & Multi-Level Rule
@@ -216,11 +101,11 @@
             Integer executionRoleId = null;
             try {
                 executionRoleId = jdbcTemplate.queryForObject(
-                    "SELECT ALLOWED_ROLE_ID FROM WORKFLOW_TRANSITIONS " +
-                    "WHERE WORKFLOW_CODE = ? AND (WORKFLOW_STAGE = 'Execution' OR WORKFLOW_ORDER = (" +
-                    "   SELECT MAX(WORKFLOW_ORDER) FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ?" +
-                    ")) FETCH FIRST 1 ROWS ONLY",
-                    Integer.class, workflowCode, workflowCode
+                        "SELECT ALLOWED_ROLE_ID FROM WORKFLOW_TRANSITIONS " +
+                                "WHERE WORKFLOW_CODE = ? AND (WORKFLOW_STAGE = 'Execution' OR WORKFLOW_ORDER = (" +
+                                "   SELECT MAX(WORKFLOW_ORDER) FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ?" +
+                                ")) FETCH FIRST 1 ROWS ONLY",
+                        Integer.class, workflowCode, workflowCode
                 );
             } catch (Exception e) {
                 log.warn("Could not find Execution role for workflow: {}", workflowCode);
@@ -235,11 +120,197 @@
             if (hasAlreadyApproved) {
                 throw new CustomExceptions.InvalidDataException("You have already approved this batch.");
             }
-            
+
             // Standard Role Validation
             if (!allowedRoleId.equals(executorRole)) {
                 throw new CustomExceptions.InvalidDataException("Unauthorized: Role mismatch.");
             }
         }
 
+        // Extract variables for routing logic
+        String workflowCode = (String) stepData.get("WORKFLOW_CODE");
+        Integer currentOrder = ((Number) stepData.get("WORKFLOW_ORDER")).intValue();
+        String currentStageName = (String) stepData.get("WORKFLOW_STAGE");
+        boolean isFinalStep = "Y".equalsIgnoreCase((String) stepData.get("IS_FINAL_APPROVAL"));
 
+        VoucherPosting posting = voucherPostingRepository.findById(batchId).orElseThrow();
+
+        // 4. Handle REJECTION
+        if ("REJECTED".equals(dto.getStatus().toString())) {
+            posting.setBatchStatus("R");
+            voucherPostingRepository.save(posting);
+
+            logWorkflowAction(batchId, vid, "Rejected (" + currentStageName + ")", executorId, dto.getRemarks(), null);
+
+            // Update underlying tables to mark the entire batch as dead
+            jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'REJECTED' WHERE BATCH_ID = ?", batchId);
+            jdbcTemplate.update("UPDATE VOUCHER_POSTING_DATA SET REQ_STATUS = 'R', EXECUTION_DATE = SYSTIMESTAMP WHERE BATCH_ID = ?", batchId);
+
+            // Build a "List" for notifications: Everyone who ever touched this batch needs to know it was rejected.
+            String previousActorsSql = "SELECT DISTINCT LAST_ACTION_BY FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = ? AND LAST_ACTION_BY != ?";
+            List<String> previousActors = jdbcTemplate.queryForList(previousActorsSql, String.class, batchId, executorId);
+
+            // Failsafe: Ensure the original creators are in the blast list
+            if (!previousActors.contains(batchCreatorId)) {
+                previousActors.add(batchCreatorId);
+            }
+            if (vidCreatorId != null && !previousActors.contains(vidCreatorId)) {
+                previousActors.add(vidCreatorId);
+            }
+
+            // Fire the notifications
+            notificationWriterService.createBatchRejectedNotificationForUsers(batchId, previousActors, executorId, dto.getRemarks());
+
+            if (posting.getVidFk() != null && !posting.getVidFk().isEmpty()) updateVidStatus(posting.getVidFk(), VoucherStatus.ACTIVE);
+            return;
+        }
+
+        // 5. Handle APPROVAL / PROGRESSION
+        if (isFinalStep) {
+            // Move to Execution Step (Order + 1)
+            // The workflow is complete. Move the pointer to the hidden 'Execution' step.
+            Long execStepId = jdbcTemplate.queryForObject("SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = ?", Long.class, workflowCode, currentOrder + 1);
+            posting.setPendingAt(execStepId);
+
+            // Handle Final Approver Schedule Overrides
+            boolean isOverride = Boolean.TRUE.equals(dto.getOverrideScheduleLapse());
+            if (isOverride) {
+
+                if (dto.getNewScheduledTime() != null) {
+                    validateScheduledTime(dto.getNewScheduledTime(), true);
+                }
+
+                posting.setIsScheduleOverride("YES");
+                posting.setIS_EXECUTION_SCHEDULED(dto.getNewScheduledTime() != null ? "YES" : "NO");
+                posting.setScheduledTime(dto.getNewScheduledTime());
+            }
+
+            //Handle Expired Schedules (If Maker scheduled it for 12:00 PM but it's approved at 1:00 PM)
+            else if ("YES".equalsIgnoreCase(posting.getIS_EXECUTION_SCHEDULED()) && posting.getScheduledTime() != null) {
+                if (posting.getScheduledTime().isBefore(LocalDateTime.now())) {
+                    throw new CustomExceptions.ScheduleLapsedException("The scheduled execution time has passed.");
+                }
+                else {
+                    posting.setIsScheduleOverride("NO"); // Ensure it stays NO if not triggered
+                }
+            }
+
+           // Execute Later (Timer Required)
+            if ("YES".equalsIgnoreCase(posting.getIS_EXECUTION_SCHEDULED()) && posting.getScheduledTime() != null && posting.getScheduledTime().isAfter(LocalDateTime.now())) {
+                posting.setBatchStatus("P");
+                String actionLog = isOverride ? "Final Approval(Sch. Override)" : "Final Approval(Scheduled)";
+                logWorkflowAction(batchId, vid, actionLog, executorId, dto.getRemarks(), posting.getScheduledTime());
+                // FIX: Update VOUCHER_POSTING
+                jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
+
+
+            }
+            // Execute Immediately (Handoff to Background Thread)
+            else {
+                posting.setBatchStatus("C");
+                posting.setExecutedAt(LocalDateTime.now());
+                String actionLog = isOverride ? "Final Approval(Imm. Override)" : "Final Approval(Posted)";
+                logWorkflowAction(batchId, vid, actionLog, executorId, dto.getRemarks(), null);
+
+                // Lock the VID permanently as completed
+                if (posting.getVidFk() != null && !posting.getVidFk().isEmpty()) updateVidStatus(posting.getVidFk(), VoucherStatus.COMPLETED);
+
+                // Dispatch the heavy DB procedure execution to the Async Worker
+                BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
+                execDto.setBatchId(batchId); execDto.setStatus(RequestStatus.ACCEPTED); execDto.setRemarks(dto.getRemarks());
+                commandService.processBulkRequestsAsync(execDto, executorId, executorRole);
+            }
+            // --- NOTIFY BOTH CREATORS OF FINAL APPROVAL ---
+            notificationWriterService.createBatchUpdateNotificationForCreators(
+                    batchId, vid, batchCreatorId, vidCreatorId, "fully APPROVED", executorId
+            );
+        } else {
+            //INTERMEDIATE APPROVAL
+            // --- PERFECTED JOIN LOGIC ---
+            // Joins VOUCHER_POSTING with WORKFLOW_TRANSITIONS to safely fetch the exact next routing stage
+            String nextStepSql = """
+                SELECT w_next.WORKFLOW_ID, w_next.ALLOWED_ROLE_ID
+                FROM VOUCHER_POSTING vp
+                JOIN WORKFLOW_TRANSITIONS w_curr 
+                  ON vp.PENDING_AT = w_curr.WORKFLOW_ID
+                JOIN WORKFLOW_TRANSITIONS w_next 
+                  ON w_curr.WORKFLOW_CODE = w_next.WORKFLOW_CODE 
+                 AND w_next.WORKFLOW_ORDER = (w_curr.WORKFLOW_ORDER + 1)
+                WHERE vp.BATCH_ID = ?
+            """;
+
+            Map<String, Object> nextStepInfo = jdbcTemplate.queryForMap(nextStepSql, batchId);
+            Long nextStepId = ((Number) nextStepInfo.get("WORKFLOW_ID")).longValue();
+            String nextRoleId = String.valueOf(nextStepInfo.get("ALLOWED_ROLE_ID"));
+
+            // Move the pointer forward
+            posting.setPendingAt(nextStepId);
+            logWorkflowAction(batchId, vid, "Approved (" + currentStageName + ")", executorId, dto.getRemarks(), null);
+
+
+            // --- NOTIFY BOTH CREATORS OF INTERMEDIATE PROGRESS ---
+            notificationWriterService.createBatchUpdateNotificationForCreators(
+                    batchId, vid, batchCreatorId, vidCreatorId, "Approved (" + currentStageName + ")", executorId
+            );
+        }
+
+        voucherPostingRepository.save(posting);
+    }
+
+
+    public void logWorkflowAction(String batchId, String vid, String action, String executorId, String remarks, LocalDateTime scheduledTime) {
+        VoucherWorkflow wf = new VoucherWorkflow();
+        wf.setBatchIdFk(batchId);
+        wf.setVidFk(vid != null ? vid : "UNKNOWN");
+        wf.setLastAction(action != null && action.length() > 30 ? action.substring(0, 30) : action);
+        wf.setLastActionBy(executorId);
+        wf.setLastActionAt(LocalDateTime.now());
+        wf.setRemarks(remarks);
+        wf.setScheduledTime(scheduledTime);
+        voucherWorkflowRepository.save(wf);
+    }
+
+
+    public void validateScheduledTime(LocalDateTime scheduledTime, boolean isFinalApproval) {
+        if (scheduledTime == null) return;
+
+        // 1. Get "now" and strip seconds/nanos to match UI precision
+        LocalDateTime now = LocalDateTime.now().withSecond(0).withNano(0);
+        LocalDateTime maxTime = now.with(java.time.LocalTime.MAX);
+
+        if (isFinalApproval) {
+            // Final Approver: Can't be in the past
+            if (scheduledTime.isBefore(now)) {
+                throw new CustomExceptions.InvalidDataException("Scheduled time cannot be in the past.");
+            }
+        } else {
+            // 2. APPLY 3-MINUTE NETWORK GRACE PERIOD
+            // We calculate "30 minutes from now", but subtract 3 minutes
+            // to allow for network latency/server processing time.
+            // Effectively, we validate that it is at least 27 minutes away.
+            LocalDateTime minAllowedTime = now.plusMinutes(30).minusMinutes(3);
+
+            if (scheduledTime.isBefore(minAllowedTime)) {
+                throw new CustomExceptions.InvalidDataException("Scheduled time must be at least 30 minutes from the current time.");
+            }
+        }
+
+        if (scheduledTime.isAfter(maxTime)) {
+            throw new CustomExceptions.InvalidDataException("Scheduled time cannot exceed today's end of day (11:59 PM).");
+        }
+    }
+
+
+    public void updateVidStatus(String vid, VoucherStatus status) {
+        // FORTIFY FIX: Access Control Database (Clean the VID before hitting the DB)
+        String safeVid = SecuritySanitizer.sanitizeId(vid);
+
+        // Your SQL and execution remain 100% untouched
+        String sql = "UPDATE REQUEST_VOUCHER SET STATUS = ? WHERE VID = ?";
+        jdbcTemplate.update(sql, status.name(), safeVid);
+    }
+
+}
+
+Cannot resolve symbol 'log'
+Cannot resolve symbol 'workflowCode'
