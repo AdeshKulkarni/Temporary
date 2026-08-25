@@ -1,6 +1,5 @@
 package com.fincore.VoucherService.Service.core;
 
-
 import com.fincore.VoucherService.Dto.BulkProcessVoucherPostingDto;
 import com.fincore.VoucherService.Dto.ProcessVoucherRequestDto;
 import com.fincore.VoucherService.Exception.CustomExceptions;
@@ -13,6 +12,7 @@ import com.fincore.VoucherService.Repository.VoucherWorkflowRepository;
 import com.fincore.VoucherService.Service.NotificationWriterService;
 import com.fincore.VoucherService.config.SecuritySanitizer;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Lazy;
@@ -27,6 +27,7 @@ import java.util.Map;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j // <--- FIX 1: This annotation fixes "Cannot resolve symbol 'log'"
 public class VoucherWorkflowEngine {
 
     @Autowired
@@ -42,8 +43,6 @@ public class VoucherWorkflowEngine {
     @Autowired
     private VoucherCommandService commandService;
 
-
-
     @Transactional
     public void processWorkflowAction(ProcessVoucherRequestDto dto, String executorId, Integer executorRole) {
         String batchId = dto.getBatchId();
@@ -54,11 +53,9 @@ public class VoucherWorkflowEngine {
         }
         // Strips out everything except Alphanumeric and Spaces, then reduces multiple spaces to a single space
         String sanitizedRemarks = dto.getRemarks().replaceAll("[^a-zA-Z0-9 ]", "").trim().replaceAll("\\s{2,}", " ");
-
         dto.setRemarks(sanitizedRemarks);
 
         // Gathers the Batch data, current Workflow Step configuration, and original VID creator
-        // in a single  SQL query to minimize database hits.
         Map<String, Object> stepData;
         try {
             stepData = jdbcTemplate.queryForMap("""
@@ -76,16 +73,20 @@ public class VoucherWorkflowEngine {
             throw new CustomExceptions.InvalidDataException("Batch ID not found or workflow stage invalid.");
         }
 
-        // --- FIX: DECLARE THE VARIABLES HERE ---
+        // --- FIX 2: Extracted variables early to fix "Cannot resolve symbol 'workflowCode'"
         String batchCreatorId = (String) stepData.get("BATCH_CREATOR");
         String vidCreatorId = (String) stepData.get("VID_CREATOR");
         String vid = (String) stepData.get("VID_FK");
+        String workflowCode = (String) stepData.get("WORKFLOW_CODE");
+        Integer currentOrder = ((Number) stepData.get("WORKFLOW_ORDER")).intValue();
+        String currentStageName = (String) stepData.get("WORKFLOW_STAGE");
+        boolean isFinalStep = "Y".equalsIgnoreCase((String) stepData.get("IS_FINAL_APPROVAL"));
+        Integer allowedRoleId = ((Number) stepData.get("ALLOWED_ROLE_ID")).intValue();
 
         // 3A. Segregation of Duties (Maker cannot be the Checker)
         if (executorId != null && batchCreatorId != null && executorId.trim().equalsIgnoreCase(batchCreatorId.trim())) {
             throw new CustomExceptions.InvalidDataException("Segregation of Duties violation: You cannot approve a batch you created.");
         }
-
 
         // Idempotency & Multi-Level Rule
         List<VoucherWorkflow> workflowHistory = voucherWorkflowRepository.findByBatchIdFkOrderByLastActionAtAsc(batchId);
@@ -93,11 +94,8 @@ public class VoucherWorkflowEngine {
         boolean isRetryMode = !workflowHistory.isEmpty() &&
                 "Execution Failed".equals(workflowHistory.get(workflowHistory.size() - 1).getLastAction());
 
-        Integer allowedRoleId = ((Number) stepData.get("ALLOWED_ROLE_ID")).intValue();
-
         if (isRetryMode) {
             // DYNAMIC EXECUTION ROLE VALIDATION:
-            // Fetch the ALLOWED_ROLE_ID configured for Execution stage in WORKFLOW_TRANSITIONS for this workflow
             Integer executionRoleId = null;
             try {
                 executionRoleId = jdbcTemplate.queryForObject(
@@ -127,12 +125,6 @@ public class VoucherWorkflowEngine {
             }
         }
 
-        // Extract variables for routing logic
-        String workflowCode = (String) stepData.get("WORKFLOW_CODE");
-        Integer currentOrder = ((Number) stepData.get("WORKFLOW_ORDER")).intValue();
-        String currentStageName = (String) stepData.get("WORKFLOW_STAGE");
-        boolean isFinalStep = "Y".equalsIgnoreCase((String) stepData.get("IS_FINAL_APPROVAL"));
-
         VoucherPosting posting = voucherPostingRepository.findById(batchId).orElseThrow();
 
         // 4. Handle REJECTION
@@ -142,15 +134,12 @@ public class VoucherWorkflowEngine {
 
             logWorkflowAction(batchId, vid, "Rejected (" + currentStageName + ")", executorId, dto.getRemarks(), null);
 
-            // Update underlying tables to mark the entire batch as dead
             jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'REJECTED' WHERE BATCH_ID = ?", batchId);
             jdbcTemplate.update("UPDATE VOUCHER_POSTING_DATA SET REQ_STATUS = 'R', EXECUTION_DATE = SYSTIMESTAMP WHERE BATCH_ID = ?", batchId);
 
-            // Build a "List" for notifications: Everyone who ever touched this batch needs to know it was rejected.
             String previousActorsSql = "SELECT DISTINCT LAST_ACTION_BY FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = ? AND LAST_ACTION_BY != ?";
             List<String> previousActors = jdbcTemplate.queryForList(previousActorsSql, String.class, batchId, executorId);
 
-            // Failsafe: Ensure the original creators are in the blast list
             if (!previousActors.contains(batchCreatorId)) {
                 previousActors.add(batchCreatorId);
             }
@@ -158,7 +147,6 @@ public class VoucherWorkflowEngine {
                 previousActors.add(vidCreatorId);
             }
 
-            // Fire the notifications
             notificationWriterService.createBatchRejectedNotificationForUsers(batchId, previousActors, executorId, dto.getRemarks());
 
             if (posting.getVidFk() != null && !posting.getVidFk().isEmpty()) updateVidStatus(posting.getVidFk(), VoucherStatus.ACTIVE);
@@ -167,96 +155,61 @@ public class VoucherWorkflowEngine {
 
         // 5. Handle APPROVAL / PROGRESSION
         if (isFinalStep) {
-            // Move to Execution Step (Order + 1)
-            // The workflow is complete. Move the pointer to the hidden 'Execution' step.
             Long execStepId = jdbcTemplate.queryForObject("SELECT WORKFLOW_ID FROM WORKFLOW_TRANSITIONS WHERE WORKFLOW_CODE = ? AND WORKFLOW_ORDER = ?", Long.class, workflowCode, currentOrder + 1);
             posting.setPendingAt(execStepId);
 
-            // Handle Final Approver Schedule Overrides
             boolean isOverride = Boolean.TRUE.equals(dto.getOverrideScheduleLapse());
             if (isOverride) {
-
                 if (dto.getNewScheduledTime() != null) {
                     validateScheduledTime(dto.getNewScheduledTime(), true);
                 }
-
                 posting.setIsScheduleOverride("YES");
                 posting.setIS_EXECUTION_SCHEDULED(dto.getNewScheduledTime() != null ? "YES" : "NO");
                 posting.setScheduledTime(dto.getNewScheduledTime());
-            }
-
-            //Handle Expired Schedules (If Maker scheduled it for 12:00 PM but it's approved at 1:00 PM)
-            else if ("YES".equalsIgnoreCase(posting.getIS_EXECUTION_SCHEDULED()) && posting.getScheduledTime() != null) {
+            } else if ("YES".equalsIgnoreCase(posting.getIS_EXECUTION_SCHEDULED()) && posting.getScheduledTime() != null) {
                 if (posting.getScheduledTime().isBefore(LocalDateTime.now())) {
                     throw new CustomExceptions.ScheduleLapsedException("The scheduled execution time has passed.");
-                }
-                else {
-                    posting.setIsScheduleOverride("NO"); // Ensure it stays NO if not triggered
+                } else {
+                    posting.setIsScheduleOverride("NO");
                 }
             }
 
-           // Execute Later (Timer Required)
             if ("YES".equalsIgnoreCase(posting.getIS_EXECUTION_SCHEDULED()) && posting.getScheduledTime() != null && posting.getScheduledTime().isAfter(LocalDateTime.now())) {
                 posting.setBatchStatus("P");
                 String actionLog = isOverride ? "Final Approval(Sch. Override)" : "Final Approval(Scheduled)";
                 logWorkflowAction(batchId, vid, actionLog, executorId, dto.getRemarks(), posting.getScheduledTime());
-                // FIX: Update VOUCHER_POSTING
                 jdbcTemplate.update("UPDATE VOUCHER_POSTING SET BATCH_STATUS = 'P' WHERE BATCH_ID = ?", batchId);
-
-
-            }
-            // Execute Immediately (Handoff to Background Thread)
-            else {
+            } else {
                 posting.setBatchStatus("C");
                 posting.setExecutedAt(LocalDateTime.now());
                 String actionLog = isOverride ? "Final Approval(Imm. Override)" : "Final Approval(Posted)";
                 logWorkflowAction(batchId, vid, actionLog, executorId, dto.getRemarks(), null);
 
-                // Lock the VID permanently as completed
                 if (posting.getVidFk() != null && !posting.getVidFk().isEmpty()) updateVidStatus(posting.getVidFk(), VoucherStatus.COMPLETED);
 
-                // Dispatch the heavy DB procedure execution to the Async Worker
                 BulkProcessVoucherPostingDto execDto = new BulkProcessVoucherPostingDto();
                 execDto.setBatchId(batchId); execDto.setStatus(RequestStatus.ACCEPTED); execDto.setRemarks(dto.getRemarks());
                 commandService.processBulkRequestsAsync(execDto, executorId, executorRole);
             }
-            // --- NOTIFY BOTH CREATORS OF FINAL APPROVAL ---
-            notificationWriterService.createBatchUpdateNotificationForCreators(
-                    batchId, vid, batchCreatorId, vidCreatorId, "fully APPROVED", executorId
-            );
+            notificationWriterService.createBatchUpdateNotificationForCreators(batchId, vid, batchCreatorId, vidCreatorId, "fully APPROVED", executorId);
         } else {
-            //INTERMEDIATE APPROVAL
-            // --- PERFECTED JOIN LOGIC ---
-            // Joins VOUCHER_POSTING with WORKFLOW_TRANSITIONS to safely fetch the exact next routing stage
             String nextStepSql = """
                 SELECT w_next.WORKFLOW_ID, w_next.ALLOWED_ROLE_ID
                 FROM VOUCHER_POSTING vp
-                JOIN WORKFLOW_TRANSITIONS w_curr 
-                  ON vp.PENDING_AT = w_curr.WORKFLOW_ID
-                JOIN WORKFLOW_TRANSITIONS w_next 
-                  ON w_curr.WORKFLOW_CODE = w_next.WORKFLOW_CODE 
-                 AND w_next.WORKFLOW_ORDER = (w_curr.WORKFLOW_ORDER + 1)
+                JOIN WORKFLOW_TRANSITIONS w_curr ON vp.PENDING_AT = w_curr.WORKFLOW_ID
+                JOIN WORKFLOW_TRANSITIONS w_next ON w_curr.WORKFLOW_CODE = w_next.WORKFLOW_CODE AND w_next.WORKFLOW_ORDER = (w_curr.WORKFLOW_ORDER + 1)
                 WHERE vp.BATCH_ID = ?
             """;
-
             Map<String, Object> nextStepInfo = jdbcTemplate.queryForMap(nextStepSql, batchId);
             Long nextStepId = ((Number) nextStepInfo.get("WORKFLOW_ID")).longValue();
-            String nextRoleId = String.valueOf(nextStepInfo.get("ALLOWED_ROLE_ID"));
 
-            // Move the pointer forward
             posting.setPendingAt(nextStepId);
             logWorkflowAction(batchId, vid, "Approved (" + currentStageName + ")", executorId, dto.getRemarks(), null);
-
-
-            // --- NOTIFY BOTH CREATORS OF INTERMEDIATE PROGRESS ---
-            notificationWriterService.createBatchUpdateNotificationForCreators(
-                    batchId, vid, batchCreatorId, vidCreatorId, "Approved (" + currentStageName + ")", executorId
-            );
+            notificationWriterService.createBatchUpdateNotificationForCreators(batchId, vid, batchCreatorId, vidCreatorId, "Approved (" + currentStageName + ")", executorId);
         }
 
         voucherPostingRepository.save(posting);
     }
-
 
     public void logWorkflowAction(String batchId, String vid, String action, String executorId, String remarks, LocalDateTime scheduledTime) {
         VoucherWorkflow wf = new VoucherWorkflow();
@@ -270,47 +223,26 @@ public class VoucherWorkflowEngine {
         voucherWorkflowRepository.save(wf);
     }
 
-
     public void validateScheduledTime(LocalDateTime scheduledTime, boolean isFinalApproval) {
         if (scheduledTime == null) return;
-
-        // 1. Get "now" and strip seconds/nanos to match UI precision
         LocalDateTime now = LocalDateTime.now().withSecond(0).withNano(0);
         LocalDateTime maxTime = now.with(java.time.LocalTime.MAX);
 
         if (isFinalApproval) {
-            // Final Approver: Can't be in the past
-            if (scheduledTime.isBefore(now)) {
-                throw new CustomExceptions.InvalidDataException("Scheduled time cannot be in the past.");
-            }
+            if (scheduledTime.isBefore(now)) throw new CustomExceptions.InvalidDataException("Scheduled time cannot be in the past.");
         } else {
-            // 2. APPLY 3-MINUTE NETWORK GRACE PERIOD
-            // We calculate "30 minutes from now", but subtract 3 minutes
-            // to allow for network latency/server processing time.
-            // Effectively, we validate that it is at least 27 minutes away.
             LocalDateTime minAllowedTime = now.plusMinutes(30).minusMinutes(3);
-
-            if (scheduledTime.isBefore(minAllowedTime)) {
-                throw new CustomExceptions.InvalidDataException("Scheduled time must be at least 30 minutes from the current time.");
-            }
+            if (scheduledTime.isBefore(minAllowedTime)) throw new CustomExceptions.InvalidDataException("Scheduled time must be at least 30 minutes from the current time.");
         }
 
-        if (scheduledTime.isAfter(maxTime)) {
-            throw new CustomExceptions.InvalidDataException("Scheduled time cannot exceed today's end of day (11:59 PM).");
-        }
+        if (scheduledTime.isAfter(maxTime)) throw new CustomExceptions.InvalidDataException("Scheduled time cannot exceed today's end of day (11:59 PM).");
     }
 
-
     public void updateVidStatus(String vid, VoucherStatus status) {
-        // FORTIFY FIX: Access Control Database (Clean the VID before hitting the DB)
         String safeVid = SecuritySanitizer.sanitizeId(vid);
-
-        // Your SQL and execution remain 100% untouched
         String sql = "UPDATE REQUEST_VOUCHER SET STATUS = ? WHERE VID = ?";
         jdbcTemplate.update(sql, status.name(), safeVid);
     }
-
 }
 
-Cannot resolve symbol 'log'
-Cannot resolve symbol 'workflowCode'
+
