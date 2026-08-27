@@ -1,3 +1,293 @@
+
+package com.fincore.VoucherService.Service.validation;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.VoucherService.Dto.ExcelRowData;
+import org.apache.poi.openxml4j.util.ZipSecureFile;
+import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.xssf.streaming.SXSSFWorkbook;
+import org.apache.poi.xssf.usermodel.XSSFRichTextString;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.stereotype.Service;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.regex.Pattern;
+
+@Service
+public class ValidationReportGenerator {
+
+    private static final Pattern PRODUCT_CODE_REGEX = Pattern.compile("^\\d{1,8}$");
+    private static final Pattern CGL_FORMAT_REGEX = Pattern.compile("^\\d{10}$");
+    // ==================================================================================
+    // GLOBAL SECURITY CONFIGURATION (UPDATED FOR 2.5+ LAKH ROWS)
+    // ==================================================================================
+    static {
+        // 1. Lowered the ratio to allow massive compression rates (Common in 2.5+ Lakh row files)
+        ZipSecureFile.setMinInflateRatio(0.0001);
+
+        // 2. INCREASED from 100MB to 500MB to allow massive sheet1.xml extractions!
+        ZipSecureFile.setMaxEntrySize(500L * 1024 * 1024);
+    }
+
+    private static final DateTimeFormatter SYSTEM_DATE_FMT = DateTimeFormatter.ofPattern("ddMMyyyy");
+
+    private final ValidationMasterService validationMasterService;
+    private final ObjectMapper objectMapper;
+
+    @Autowired
+    @Lazy
+    private VoucherBulkValidationService self;
+
+    @Autowired
+    @Qualifier("byteArrayRedisTemplate")
+    private RedisTemplate<String, byte[]> redisTemplate;
+
+    public ValidationReportGenerator(ValidationMasterService validationMasterService, ObjectMapper objectMapper) {
+        this.validationMasterService = validationMasterService;
+        this.objectMapper = objectMapper;
+    }
+
+
+    private String sanitize(String value) {
+        if (value == null) return "";
+        if (value.startsWith("=") || value.startsWith("+") || value.startsWith("-") || value.startsWith("@")) return "'" + value;
+        return value;
+    }
+
+    public byte[] generateErrorExcelFast(List<ExcelRowData> rows, boolean includeProduct) throws IOException {
+        SXSSFWorkbook workbook = new SXSSFWorkbook(100);
+        try {
+            Sheet sheet = workbook.createSheet("Error Report");
+            CellStyle errStyle = workbook.createCellStyle();
+            Font f = workbook.createFont();
+            f.setColor(IndexedColors.RED.getIndex());
+            errStyle.setFont(f);
+
+            Row h = sheet.createRow(0);
+            List<String> headerList = new ArrayList<>(Arrays.asList(
+                    "Branch*", "Currency*", "CGL*", "Amount*", "Type*", "Remarks*", "Product Code", "ERRORS"
+            ));
+
+            for (int i = 0; i < headerList.size(); i++) {
+                h.createCell(i).setCellValue(headerList.get(i));
+            }
+
+            int idx = 1;
+            for (ExcelRowData d : rows) {
+                Row r = sheet.createRow(idx++);
+                int col = 0;
+
+                r.createCell(col++).setCellValue(sanitize(d.branch));
+                r.createCell(col++).setCellValue(sanitize(d.currency));
+                r.createCell(col++).setCellValue(sanitize(d.cgl));
+                r.createCell(col++).setCellValue(d.amount != null ? d.amount.stripTrailingZeros().toPlainString() : "");
+                r.createCell(col++).setCellValue(sanitize(d.txnType));
+                r.createCell(col++).setCellValue(sanitize(d.remarks));
+                r.createCell(col++).setCellValue(sanitize(d.productCode));
+
+                Cell c = r.createCell(col);
+                if (d.hasErrors()) {
+                    c.setCellValue(d.getAllErrors());
+                    c.setCellStyle(errStyle);
+                }
+            }
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            workbook.write(out);
+            return out.toByteArray();
+        } finally {
+            workbook.dispose();
+            workbook.close();
+        }
+    }
+
+
+    public byte[] generateExcelTemplateWithGuidelines() throws IOException {
+        try (Workbook workbook = new XSSFWorkbook()) {
+
+            // ==========================================
+            // 1. DEFINE ALL STYLES AT THE TOP
+            // ==========================================
+            CellStyle headerStyle = workbook.createCellStyle();
+            Font headerFont = workbook.createFont();
+            headerFont.setBold(true);
+            headerFont.setColor(IndexedColors.WHITE.getIndex());
+            headerFont.setFontHeightInPoints((short) 11);
+            headerStyle.setFillForegroundColor(IndexedColors.DARK_BLUE.getIndex());
+            headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+            headerStyle.setFont(headerFont);
+            headerStyle.setAlignment(HorizontalAlignment.LEFT);
+            headerStyle.setVerticalAlignment(VerticalAlignment.CENTER);
+            headerStyle.setBorderBottom(BorderStyle.MEDIUM);
+            headerStyle.setBorderTop(BorderStyle.MEDIUM);
+            headerStyle.setBorderLeft(BorderStyle.MEDIUM);
+            headerStyle.setBorderRight(BorderStyle.MEDIUM);
+
+            CellStyle sampleStyle = workbook.createCellStyle();
+            Font italicFont = workbook.createFont();
+            italicFont.setItalic(true);
+            italicFont.setColor(IndexedColors.GREY_50_PERCENT.getIndex());
+            sampleStyle.setFont(italicFont);
+            sampleStyle.setFillForegroundColor(IndexedColors.LIGHT_YELLOW.getIndex());
+            sampleStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+            CellStyle bodyStyle = workbook.createCellStyle();
+            bodyStyle.setWrapText(true);
+            bodyStyle.setVerticalAlignment(VerticalAlignment.TOP);
+            bodyStyle.setBorderBottom(BorderStyle.THIN);
+            bodyStyle.setBorderTop(BorderStyle.THIN);
+            bodyStyle.setBorderLeft(BorderStyle.THIN);
+            bodyStyle.setBorderRight(BorderStyle.THIN);
+
+
+            // ==========================================
+            // 2. CREATE SHEET 1: VOUCHER TEMPLATE
+            // ==========================================
+            Sheet templateSheet = workbook.createSheet("Voucher Template");
+            templateSheet.createFreezePane(0, 1);
+
+            String[] headers = {"Branch*", "Currency*", "CGL*", "Amount*", "Type*", "Remarks*", "Product Code"};
+            Row templateHeaderRow = templateSheet.createRow(0);
+            templateHeaderRow.setHeightInPoints(24);
+
+            for (int i = 0; i < headers.length; i++) {
+                Cell cell = templateHeaderRow.createCell(i);
+                cell.setCellValue(headers[i]);
+                cell.setCellStyle(headerStyle);
+                templateSheet.setColumnWidth(i, 5500);
+            }
+
+            // Added TWO sample rows to show a balanced transaction (Debit and Credit)
+            Row sampleRow1 = templateSheet.createRow(1);
+            createStyledCell(sampleRow1, 0, "10001", sampleStyle);
+            createStyledCell(sampleRow1, 1, "INR", sampleStyle);
+            createStyledCell(sampleRow1, 2, "1102003001", sampleStyle);
+            Cell amtCell1 = sampleRow1.createCell(3);
+            amtCell1.setCellValue(55000.00);
+            amtCell1.setCellStyle(sampleStyle);
+            createStyledCell(sampleRow1, 4, "Dr", sampleStyle);
+            createStyledCell(sampleRow1, 5, "Sample Remarks", sampleStyle); // Moved Remarks to Index 5
+            createStyledCell(sampleRow1, 6, "12345678", sampleStyle);         // Moved Product Code to Index 6
+
+            Row sampleRow2 = templateSheet.createRow(2);
+            createStyledCell(sampleRow2, 0, "10001", sampleStyle);
+            createStyledCell(sampleRow2, 1, "INR", sampleStyle);
+            createStyledCell(sampleRow2, 2, "1102003002", sampleStyle);
+            Cell amtCell2 = sampleRow2.createCell(3);
+            amtCell2.setCellValue(55000.00);
+            amtCell2.setCellStyle(sampleStyle);
+            createStyledCell(sampleRow2, 4, "Cr", sampleStyle);
+            createStyledCell(sampleRow2, 5, "Sample Remarks", sampleStyle); // Moved Remarks to Index 5
+            createStyledCell(sampleRow2, 6, "12345678", sampleStyle);         // Moved Product Code to Index 6
+
+
+            // ==========================================
+            // 3. CREATE SHEET 2: UPLOAD GUIDELINES
+            // ==========================================
+            Sheet guidelineSheet = workbook.createSheet("Instructions sheet");
+            guidelineSheet.setColumnWidth(0, 10000);
+            guidelineSheet.setColumnWidth(1, 35000);
+
+            Row titleRow = guidelineSheet.createRow(0);
+            titleRow.setHeightInPoints(26);
+            Cell titleCellA = titleRow.createCell(0);
+            Cell titleCellB = titleRow.createCell(1);
+            titleCellA.setCellValue("VALIDATION STAGE");
+            titleCellB.setCellValue("STAGE REQUIREMENTS & COLUMN-WISE FORMAT DETAILS");
+            titleCellA.setCellStyle(headerStyle);
+            titleCellB.setCellStyle(headerStyle);
+
+            Row stage1Row = guidelineSheet.createRow(1);
+            stage1Row.setHeightInPoints(180);
+
+            Cell s1Title = stage1Row.createCell(0);
+            s1Title.setCellValue("Stage 1: Format Validation\n(Pre-Database Check)");
+            s1Title.setCellStyle(bodyStyle);
+
+            String stage1Text =
+                    " • Branch* - Mandatory. valid numeric branch code up to 5 digits (e.g., 10301).\n\n" +
+                            " • Currency* - Mandatory.  3-letters currency code (e.g., INR).\n\n" +
+                            " • CGL* - Mandatory. Valid CGL number exact 10-digits.\n\n" +
+                            " • Amount* - Mandatory. Valid non-zero amount, maximum up to 16 digits and 4 decimals (e.g., 55000.00).\n\n" +
+                            "  in order to enter numeric value exceeding 15 digits use ' before the number\n\n" +
+                            " • Type* - Mandatory. 'Dr' or 'Cr'.\n\n" +
+                            " • Product Code - Optional. Numeric exact 8 digits length.\n\n" +
+                            " • Remarks* - Mandatory. Remarks of Min 2 - Max 30 characters. Allowed only Alphabets and Numbers with single spaces between words";
+
+            Font boldRed = workbook.createFont();
+            boldRed.setBold(true);
+            boldRed.setColor(IndexedColors.DARK_RED.getIndex());
+
+            Font boldGreen = workbook.createFont();
+            boldGreen.setBold(true);
+            boldGreen.setColor(IndexedColors.DARK_GREEN.getIndex());
+
+            Font boldBlue = workbook.createFont();
+            boldBlue.setBold(true);
+            boldBlue.setColor(IndexedColors.DARK_BLUE.getIndex());
+
+            XSSFRichTextString richText = new XSSFRichTextString(stage1Text);
+            applyHighlighting(richText, stage1Text, "Mandatory", boldRed);
+            applyHighlighting(richText, stage1Text, "Optional", boldGreen);
+            applyHighlighting(richText, stage1Text, "Branch*", boldBlue);
+            applyHighlighting(richText, stage1Text, "Currency*", boldBlue);
+            applyHighlighting(richText, stage1Text, "CGL*", boldBlue);
+            applyHighlighting(richText, stage1Text, "Amount*", boldBlue);
+            applyHighlighting(richText, stage1Text, "Type*", boldBlue);
+            applyHighlighting(richText, stage1Text, "Product Code", boldBlue);
+            applyHighlighting(richText, stage1Text, "Remarks*", boldBlue);
+
+            Cell s1Desc = stage1Row.createCell(1);
+            s1Desc.setCellValue(richText);
+            s1Desc.setCellStyle(bodyStyle);
+
+            Row stage2Row = guidelineSheet.createRow(2);
+            stage2Row.setHeightInPoints(40);
+            createStyledCell(stage2Row, 0, "Stage 2: Database Integrity Check", bodyStyle);
+            createStyledCell(stage2Row, 1, "Cross-references record fields against active system reference masters. Validates that the requested Branch Code, Currency Identifier, and CGL exist and are active in the database.", bodyStyle);
+
+            Row stage3Row = guidelineSheet.createRow(3);
+            stage3Row.setHeightInPoints(40);
+            createStyledCell(stage3Row, 0, "Stage 3: Balance Verification", bodyStyle);
+            createStyledCell(stage3Row, 1, "Aggregates values row-by-row ensuring total Debits equal to total Credits.", bodyStyle);
+
+            // ==========================================
+            // 4. WRITE TO STREAM AT THE END
+            // ==========================================
+            // This is moved to the absolute bottom so both sheets are included in the file
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            workbook.write(bos);
+
+            return bos.toByteArray();
+        }
+    }
+
+    private void applyHighlighting(XSSFRichTextString richText, String fullText, String targetWord, Font font) {
+        int index = 0;
+        while ((index = fullText.indexOf(targetWord, index)) != -1) {
+            richText.applyFont(index, index + targetWord.length(), font);
+            index += targetWord.length();
+        }
+    }
+
+    private void createStyledCell(Row row, int column, String value, CellStyle style) {
+        Cell cell = row.createCell(column);
+        cell.setCellValue(value);
+        cell.setCellStyle(style);
+    }
+}
+
+
+
+
 package com.fincore.VoucherService.Service.validation;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
