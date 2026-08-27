@@ -1,135 +1,342 @@
-import random
-import csv
+package com.fincore.VoucherService.Service.validation;
 
-# =====================================================================
-# 1. PASTE YOUR RAW DATA HERE (NO QUOTES OR COMMAS NEEDED!)
-# =====================================================================
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.VoucherService.Dto.BulkUploadStateDto;
+import com.fincore.VoucherService.Dto.ExcelRowData;
+import com.fincore.VoucherService.Exception.CustomExceptions;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.dao.DataAccessException;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
 
-RAW_BRANCH_LIST = """
-10400
-10001
-10002
-"""
+import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.time.LocalDate;
+import java.time.format.DateTimeParseException;
+import java.util.*;
+import java.util.stream.Collectors;
+import com.fincore.VoucherService.Dto.ParsingResult;
 
-RAW_OPPOSITE_CGL_LIST = """
-5051030601
-5051240801
-1102003001
-"""
+/**
+ * Handles high-performance streaming parsing and multi-stage validation.
+ * Optimized to prevent OOM errors by offloading large datasets to Redis with GZIP compression.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class VoucherBulkValidationService {
 
-# =====================================================================
-# 2. FIXED CURRENCY LIST
-# =====================================================================
-FIXED_CURRENCIES = [
-    "USD", "AUD", "CAD", "CHF", "SGD", "HKD", 
-    "NZD", "EUR", "GBP", "JPY", "DKK", "SEK", "INR"
-]
+    private VoucherRuleValidator voucherRuleValidator;
 
-# =====================================================================
-# 3. FIXED CGL LIST (I = Income/Cr | E = Expense/Dr)
-# =====================================================================
-FIXED_CGLS = [
-    {"cgl": "7016500301", "type": "I"}, {"cgl": "7016500401", "type": "I"},
-    {"cgl": "7016500501", "type": "I"}, {"cgl": "7016501101", "type": "I"},
-    {"cgl": "7016500101", "type": "I"}, {"cgl": "7049500101", "type": "I"},
-    {"cgl": "7049500301", "type": "I"}, {"cgl": "7049500501", "type": "I"},
-    {"cgl": "7049501101", "type": "I"}, {"cgl": "7049501501", "type": "I"},
-    {"cgl": "7913505001", "type": "I"}, {"cgl": "7914505001", "type": "I"},
-    
-    {"cgl": "8041080670", "type": "E"}, {"cgl": "8041080680", "type": "E"},
-    {"cgl": "8051080670", "type": "E"}, {"cgl": "8051080690", "type": "E"},
-    {"cgl": "8051500170", "type": "E"}, {"cgl": "8051501170", "type": "E"},
-    {"cgl": "8001500160", "type": "E"}, {"cgl": "8001500560", "type": "E"},
-    {"cgl": "8041070660", "type": "E"}, {"cgl": "8057070601", "type": "E"},
-    {"cgl": "8972505001", "type": "E"}, {"cgl": "8972030601", "type": "E"},
-    {"cgl": "8972070601", "type": "E"}
-]
+    private final ExcelStreamingParser excelParser;
+    private final VoucherRuleValidator ruleValidator;
+    private final ValidationStateManager stateManager;
+    private final ValidationReportGenerator reportGenerator;
+    private final ObjectMapper objectMapper;
 
-# =====================================================================
-# 4. CONFIGURATION
-# =====================================================================
-PRODUCT_CODE = "12345678"
-REMARKS = "Bulk Script Entry"
+    // ==================================================================================
+    // GLOBAL SECURITY CONFIGURATION (UPDATED FOR 2.5+ LAKH ROWS)
+    // ==================================================================================
+    static {
+        // 1. Lowered the ratio to allow massive compression rates (Common in 2.5+ Lakh row files)
+        org.apache.poi.openxml4j.util.ZipSecureFile.setMinInflateRatio(0.0001);
 
-# =====================================================================
-# 5. DATA GENERATION LOGIC
-# =====================================================================
-def generate_data():
-    print("\n--- Voucher Bulk Data Generator ---")
-    
-    # Ask the user exactly how many rows they want
-    try:
-        user_input = input("Enter the total number of rows you want to generate (e.g., 100): ")
-        total_rows = int(user_input.strip())
-    except ValueError:
-        print("Invalid number. Defaulting to 100 rows.")
-        total_rows = 100
-        
-    # Since we need balanced pairs, divide by 2
-    total_pairs = total_rows // 2
-    if total_pairs == 0:
-        total_pairs = 1
+        // 2. INCREASED from 100MB to 500MB to allow massive sheet1.xml extractions!
+        org.apache.poi.openxml4j.util.ZipSecureFile.setMaxEntrySize(500L * 1024 * 1024); 
+    }
 
-    print("\nParsing raw input lists...")
-    branch_list = [b.strip() for b in RAW_BRANCH_LIST.splitlines() if b.strip()]
-    opposite_cgl_list = [c.strip() for c in RAW_OPPOSITE_CGL_LIST.splitlines() if c.strip()]
-    
-    if not branch_list:
-        print("ERROR: Please paste at least one Branch into the RAW_BRANCH_LIST.")
-        return
-    if not opposite_cgl_list:
-        print("ERROR: Please paste at least one CGL into the RAW_OPPOSITE_CGL_LIST.")
-        return
+    @Autowired
+    @Qualifier("byteArrayRedisTemplate")
+    private RedisTemplate<String, byte[]> redisTemplate;
 
-    print(f"Generating {total_pairs * 2} rows of perfectly balanced entries...")
-    rows = []
+    @Autowired
+    @Lazy
+    private VoucherBulkValidationService self;
 
-    for i in range(total_pairs):
-        branch = random.choice(branch_list)
-        currency = random.choice(FIXED_CURRENCIES)
-        amount = random.randint(10, 999) * 100  
-        
-        fixed_item = random.choice(FIXED_CGLS)
-        opposite_cgl = random.choice(opposite_cgl_list)
-        
-        if fixed_item["type"] == "I":
-            fixed_leg_type = "Cr"
-            opposite_leg_type = "Dr"
-        else:
-            fixed_leg_type = "Dr"
-            opposite_leg_type = "Cr"
-            
-        row1 = {
-            "Branch*": branch, "Currency*": currency, "CGL*": fixed_item["cgl"],
-            "Amount*": amount, "Type*": fixed_leg_type, "Remarks*": f"{REMARKS} {i+1}",
-            "Product Code": PRODUCT_CODE
+    private BulkUploadStateDto getStatusFromRedis(String reqId) {
+        try {
+            byte[] json = redisTemplate.opsForValue().get("BULK_STATUS_" + reqId);
+            if (json == null) return null;
+            return objectMapper.readValue(json, BulkUploadStateDto.class);
+        } catch (IOException | DataAccessException e) {
+            log.error("REDIS_READ_FAIL | ReqID: {} | Type: {}", reqId, e.getClass().getSimpleName());
+            return null;
         }
-        
-        row2 = {
-            "Branch*": branch, "Currency*": currency, "CGL*": opposite_cgl,
-            "Amount*": amount, "Type*": opposite_leg_type, "Remarks*": f"{REMARKS} {i+1}",
-            "Product Code": PRODUCT_CODE
+    }
+
+    // ==================================================================================
+    // 2. UPLOAD INITIALIZATION (Security & Storage)
+    // ==================================================================================
+
+    public String initiateValidation(org.springframework.web.multipart.MultipartFile file, LocalDate postingDate) throws IOException {
+
+        String filename = file.getOriginalFilename();
+        long fileSize = file.getSize();
+
+        // Lower the minimum size to 1 KB (allows small templates to pass)
+        if (fileSize < 1024) {
+            log.error("UPLOAD_SECURITY_DENIED | Status: File too small (Size: {} bytes)", fileSize);
+            throw new CustomExceptions.FileProcessingException("File is too small. Minimum allowed size is 1 KB.");
         }
-        
-        rows.append(row1)
-        rows.append(row2)
 
-    # =====================================================================
-    # 6. WRITE TO CSV (Native Python, No external libraries needed)
-    # =====================================================================
-    output_filename = f"Voucher_Upload_{total_pairs * 2}_Rows.csv"
-    print(f"Writing to CSV ({output_filename})...")
-    
-    # Extract headers from the first dictionary keys
-    headers = ["Branch*", "Currency*", "CGL*", "Amount*", "Type*", "Remarks*", "Product Code"]
-    
-    with open(output_filename, mode='w', newline='', encoding='utf-8') as file:
-        writer = csv.DictWriter(file, fieldnames=headers)
-        writer.writeheader()
-        writer.writerows(rows)
-        
-    print(f"\nSUCCESS! Created {output_filename} with {len(rows)} rows.")
-    print("NOTE: Download this CSV, open it in Excel, and 'Save As' an .xlsx file before uploading to the backend!")
+        if (fileSize > 50 * 1024 * 1024) {
+            log.error("UPLOAD_SECURITY_DENIED | Status: File size out of bounds (Size: {} bytes)", fileSize);
+            throw new CustomExceptions.FileProcessingException("File size cannot exceed 50MB.");
+        }
 
-if __name__ == "__main__":
-    generate_data()
+        if (filename == null || filename.isBlank()) {
+            throw new CustomExceptions.FileProcessingException("Filename cannot be empty.");
+        }
+
+        if (filename.length() > 35) {
+            log.error("UPLOAD_SECURITY_DENIED | Status: Filename exceeds 35 characters");
+            throw new CustomExceptions.FileProcessingException("File name length cannot exceed 35 characters.");
+        }
+
+        if (filename.indexOf('.') != filename.lastIndexOf('.')) {
+            log.error("UPLOAD_SECURITY_DENIED | Status: Multiple extensions detected");
+            throw new CustomExceptions.FileProcessingException("Files with multiple extensions are strictly prohibited.");
+        }
+
+        // Add \\s (spaces) and \\(\\) (parentheses) to the regex so it accepts 'Template (1).xlsx'
+        if (!filename.matches("^[a-zA-Z0-9_\\-\\s\\(\\)]+\\.(xlsx|xls)$")) {
+            log.error("UPLOAD_SECURITY_DENIED | Status: Invalid characters or extension in filename");
+            throw new CustomExceptions.FileProcessingException("Invalid file name. Only .xls and .xlsx files with alphanumeric characters, spaces, hyphens, underscores, and parentheses are allowed.");
+        }
+
+
+        String mimeType = file.getContentType();
+        // Add generic fallback MIME types. Sometimes Windows/Browsers send octet-stream or zip for Excel files.
+        if (mimeType == null || (
+                !"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".equals(mimeType) &&
+                        !"application/vnd.ms-excel".equals(mimeType) &&
+                        !"application/octet-stream".equals(mimeType) &&
+                        !"application/zip".equals(mimeType))) {
+            log.error("UPLOAD_SECURITY_DENIED | Status: Invalid MIME Type: {}", mimeType);
+            throw new CustomExceptions.FileProcessingException("Invalid file format. Detected MIME type does not match Excel.");
+        }
+
+        String requestId = UUID.randomUUID().toString();
+
+        // EXPLICIT SECURE FILE PERMISSIONS
+        Path tempFile;
+        try {
+            // Check if running on Linux/Unix to apply strict POSIX permissions (rw-------)
+            if (java.nio.file.FileSystems.getDefault().supportedFileAttributeViews().contains("posix")) {
+                java.nio.file.attribute.FileAttribute<java.util.Set<java.nio.file.attribute.PosixFilePermission>> attr =
+                        java.nio.file.attribute.PosixFilePermissions.asFileAttribute(java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+                tempFile = Files.createTempFile("UPLOAD_" + requestId + "_", ".tmp", attr);
+            } else {
+                // Fallback for Windows environments
+                tempFile = Files.createTempFile("UPLOAD_" + requestId + "_", ".tmp");
+                tempFile.toFile().setReadable(true, true);
+                tempFile.toFile().setWritable(true, true);
+                tempFile.toFile().setExecutable(false);
+            }
+        } catch (IOException e) {
+            throw new CustomExceptions.FileProcessingException("Failed to allocate secure storage for upload.");
+        }
+
+        // The variable is renamed to uploadStream to guarantee no naming collisions
+        try (InputStream uploadStream = file.getInputStream()) {
+            Files.copy(uploadStream, tempFile, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException e) {
+            log.error("TEMP_FILE_CREATE_FAIL | ReqID: {} | Status: Disk IO failure", requestId);
+            throw new CustomExceptions.FileProcessingException("Failed to secure uploaded file on disk.");
+        }
+
+        BulkUploadStateDto state = new BulkUploadStateDto();
+        state.setRequestId(requestId);
+        state.setStatus("PROCESSING");
+        state.setCurrentStage(1);
+        state.setMessage("Initializing Upload...");
+        state.setTotalRows(0);
+        stateManager.saveStatusToRedis(requestId, state);
+
+        log.info("VALIDATION_INIT | ReqID: {} | Status: Temporary storage allocated", requestId);
+        self.processAsync(requestId, tempFile.toString(), filename, postingDate);
+        return requestId;
+    }
+
+
+    // ==================================================================================
+    // 3. ORCHESTRATION ENGINE (The Async Loop)
+    // ==================================================================================
+
+    @Async("bulkExecutor")
+    public void processAsync(String requestId, String tempFilePath, String filename, LocalDate postingDate) {
+        MDC.put("requestId", requestId);
+        long startTime = System.currentTimeMillis();
+        File tempFile = new File(tempFilePath);
+
+        try {
+            stateManager.updateState(requestId, s -> s.setMessage("Parsing File..."));
+            ParsingResult parsingResult;
+
+            try (InputStream is = new FileInputStream(tempFile)) {
+                // Directly parse as Excel
+                parsingResult = excelParser.parseExcelStream(is, postingDate);
+            }
+
+            List<ExcelRowData> parsedRows = parsingResult.rows;
+            if (parsedRows == null || parsedRows.isEmpty()) {
+                throw new CustomExceptions.InvalidDataException("File data is empty. No transaction rows found.");
+            }
+
+            stateManager.updateState(requestId, s -> {
+                s.setTotalRows(parsedRows.size());
+                s.setMessage("Validating Formats...");
+            });
+
+            // DELEGATE: Stage 1 (Format Check)
+            ruleValidator.runFormatCheck(parsedRows);
+            if (parsedRows.stream().anyMatch(ExcelRowData::hasErrors)) {
+                failRequest(requestId, parsedRows, "Format Validation Failed", 1, parsingResult.hasProductColumn);
+                return;
+            }
+
+            // DELEGATE: Stage 2 (Database Check)
+            stateManager.updateState(requestId, s -> {
+                s.setCurrentStage(2);
+                s.setMessage("Checking Database...");
+            });
+            ruleValidator.runDbCheck(parsedRows);
+            if (parsedRows.stream().anyMatch(ExcelRowData::hasErrors)) {
+                failRequest(requestId, parsedRows, "Database Validation Failed", 2, parsingResult.hasProductColumn);
+                return;
+            }
+
+            // DELEGATE: Stage 3 (Balance Check)
+            stateManager.updateState(requestId, s -> {
+                s.setCurrentStage(3);
+                s.setMessage("Checking Balances...");
+            });
+            ruleValidator.runBalanceCheck(parsedRows);
+            if (parsedRows.stream().anyMatch(ExcelRowData::hasErrors)) {
+                failRequest(requestId, parsedRows, "Debit/Credit Balance Mismatch", 3, parsingResult.hasProductColumn);
+                return;
+            }
+
+
+            log.info("VALIDATION_SUCCESS | ReqID: {} | Duration: {}ms", requestId, (System.currentTimeMillis() - startTime));
+
+            // Removed isCsv flag from the method call
+            completeRequest(requestId, parsedRows, postingDate, parsingResult.hasProductColumn);
+
+        }
+        // --- ALL ORIGINAL CATCH BLOCKS RESTORED EXACTLY ---
+        catch (CustomExceptions.InvalidDataException e) {
+            log.warn("EMPTY_DATA_REJECTED | ReqID: {} | Reason: {}", requestId, e.getMessage());
+            handleAsyncCrash(requestId, e.getMessage());
+        }
+        catch (FileNotFoundException e) {
+            handleAsyncCrash(requestId, "System Error: File not found in temporary storage.");
+        } catch (IOException e) {
+            handleAsyncCrash(requestId, "System Error: Failed to read file content.");
+        } catch (DateTimeParseException e) {
+            log.error("DATE_PARSING_FAIL | ReqID: {} | Status: Invalid row date format", requestId);
+            handleAsyncCrash(requestId, "Validation Failed: Incorrect date format detected in rows.");
+        } catch (NumberFormatException e) {
+            log.error("AMOUNT_PARSING_FAIL | ReqID: {} | Status: Numeric format error", requestId);
+            handleAsyncCrash(requestId, "Validation Failed: Non-numeric values found in amount column.");
+        } catch (DataAccessException e) {
+            log.error("REDIS_OR_DB_UNAVAILABLE | ReqID: {} | Status: Backend connection failure", requestId);
+            handleAsyncCrash(requestId, "System temporarily unavailable. Please try again later.");
+        } catch (NullPointerException | ArrayIndexOutOfBoundsException e) {
+            log.error("INTERNAL_LOGIC_ERROR | ReqID: {} | Type: {}", requestId, e.getClass().getSimpleName());
+            handleAsyncCrash(requestId, "Internal system failure during processing.");
+        }
+        catch (Throwable t) {
+            log.error("FATAL_SYSTEM_ERROR | ReqID: {} | Type: {}", requestId, t.getClass().getSimpleName(), t);
+            handleAsyncCrash(requestId, "A critical system error occurred during processing.");
+        }
+        finally {
+            if (tempFile.exists() && !tempFile.delete()) {
+                log.warn("CLEANUP_WARN | Path: {} | Status: Temp file purge failed", tempFilePath);
+            }
+            MDC.clear();
+        }
+    }
+
+
+    // ==================================================================================
+    // 4. COMPLETION & ERROR DELEGATION
+    // ==================================================================================
+    private void failRequest(String reqId, List<ExcelRowData> rows, String msg, int stage, boolean hasProductColumn) throws IOException {
+        log.warn("VALIDATION_FAILED | ReqID: {} | Reason: {}", reqId, msg);
+
+        // Let the Report Generator build the Excel
+        byte[] excel = reportGenerator.generateErrorExcelFast(rows, hasProductColumn);
+
+        // Let the State Manager save it to Redis
+        stateManager.saveErrorFileToRedis(reqId, excel);
+
+        stateManager.updateState(reqId, s -> {
+            s.setStatus("ERROR");
+            s.setMessage(msg);
+            s.setCurrentStage(stage);
+            s.setErrorCount(rows.stream().filter(ExcelRowData::hasErrors).count());
+            s.setHasErrorFile(true);
+        });
+    }
+
+    private void completeRequest(String reqId, List<ExcelRowData> rows, LocalDate pDate, boolean hasProductColumn) throws IOException {
+        stateManager.saveRowsToRedis(reqId, rows);
+
+        List<Map<String, Object>> preview = rows.stream().limit(2000).map(this::mapToPreview).collect(Collectors.toList());
+
+        stateManager.updateState(reqId, s -> {
+            s.setCurrentStage(4);
+            s.setStatus("SUCCESS");
+            s.setMessage("Validation Successful");
+            s.setHasSuccessFile(false);
+            s.setHasProductColumn(hasProductColumn);
+            try {
+                s.setPreviewDataJson(objectMapper.writeValueAsString(preview));
+            } catch (JsonProcessingException ignored) {}
+        });
+    }
+
+
+    private void handleAsyncCrash(String requestId, String message) {
+        log.error("ASYNC_PROCESS_CRASH | ReqID: {} | Reason: {}", requestId, message);
+        stateManager.updateState(requestId, s -> {
+            s.setStatus("ERROR");
+            s.setMessage(message);
+            s.setHasErrorFile(false);
+        });
+    }
+
+    private Map<String, Object> mapToPreview(ExcelRowData r) {
+        Map<String, Object> m = new java.util.HashMap<>();
+        m.put("id", r.rowIndex);
+        m.put("branch", r.branch);
+        m.put("currency", r.currency);
+        m.put("cgl", r.cgl);
+        m.put("amount", r.amount != null ? r.amount.toString() : "");
+        m.put("txnType", r.txnType);
+        m.put("remarks", r.remarks);
+        m.put("productCode", r.productCode);
+        return m;
+    }
+
+
+    // Pass-through methods for Controllers
+    public BulkUploadStateDto getState(String reqId) {
+        return stateManager.getStatusFromRedis(reqId);
+    }
+
+    public byte[] getFileBytes(String reqId, String type) {
+        return stateManager.getFileBytes(reqId, type);
+    }
+
+}
