@@ -1,23 +1,682 @@
-5. Module 3: Voucher Authorization Workflow (Roles: TCS GLIF Checkers, SBI GLIF Approvers)
-5.1 The Workflow Explained The voucher posting process requires multiple checks. First, a "Maker" creates and submits a voucher batch. Then, it goes to one or more "Checkers" to review. Finally, an "Approver" gives the final approval, and the system executes the transaction.
-5.2 Reviewing Pending Requests Go to the "Voucher Authorization" screen from the main menu. Here, you will see a table listing all the voucher batches that are currently waiting for your approval. You will only see batches assigned to your role.
-5.3 Using the "View & Action" Button To see more information about a pending request, click the "View & Action" button next to it in the table. This opens a detailed screen.
-￼ 5.3.1 Reviewing Batch and Voucher Details: At the top of the screen, you can check the Voucher ID (VID), description, category, creator name, total number of entries, and the date it was created.
-￼ 5.3.2 Downloading the Data Extract: If you want to check the exact journal entries, click the "Download Batch" button. This will download an Excel file containing all the data rows for that batch.
-￼ 5.3.3 Tracking Workflow Progress & History: Scroll down to see the visual timeline. It shows which stages are completed, pending, or rejected. Below that, the "Workflow History" section shows exactly who took action, at what time, and what remarks they left.
-5.4 Executing an Authorization Decision Once you have checked the details, click the "Proceed to Action" button at the bottom of the screen to make your decision.
-￼ 5.4.1 Approving a Request: Click the green "Approve Request" option to move the batch forward to the next stage.
-￼ 5.4.2 Rejecting a Request: Click the red "Reject Request" option if the data is wrong. This will terminate the workflow and send it back to the creator.
-￼ 5.4.3 Providing Action Remarks: Before you click Submit, you must type a reason in the "Action Remarks" box. Remarks must be between 2 and 30 characters long and can only contain letters, numbers, spaces, and basic symbols.
-5.5 Final Approver Privileges & Schedule Overrides If you are the final approver, you have special scheduling options before you submit.
-￼ You can select "Keep Original Routing" to run the batch at the exact time chosen by the Maker.
-￼ Or, you can select "Override Schedule" to pick a brand new execution time for today. Note: If the Maker's scheduled time has already passed, you will be forced to pick a new time.
-6. Module 4: Voucher Posting Status & Tracking (For all roles involved in the voucher flow)
-6.1 Searching and Filtering Batches Go to the "Voucher Posting Status" screen. You can quickly find any batch by typing the Batch ID or the VID into the search boxes at the top of the table columns.
-6.2 Understanding Batch Statuses The progress column shows the current status of your batch:
-￼ Pending: The batch is currently waiting for someone to approve it.
-￼ Completed / Posted: The batch was fully approved and successfully executed by the system.
-￼ Rejected: The batch was denied by an approver and stopped.
-￼ Escalated: The batch has been waiting at an approval stage for too long without action.
-￼ Execution Failed: The system tried to process the batch but encountered a server error. (The Production Support Team is automatically notified to retry it).
-6.3 Cancelling a Draft/Submitted Batch (Maker Only) If you are the Maker who created the batch, you can delete it only if it is still at the very first pending stage. Click "View & Action" on your batch, scroll to the very bottom, and click the red "Cancel Voucher Batch" button to permanently delete it.
+package com.fincore.VoucherService.Controllers;
+
+import com.fincore.VoucherService.Exception.CustomExceptions;
+import com.fincore.VoucherService.Models.RequestVoucher;
+import com.fincore.VoucherService.Service.JsEodMasterService;
+import com.fincore.VoucherService.Service.RequestVoucherService;
+import com.fincore.VoucherService.Service.core.VoucherQueryService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import com.fincore.VoucherService.Dto.*;
+import com.fincore.VoucherService.Models.JournalRequest;
+import com.fincore.commonutilities.jwt.JwtUtil;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.validation.annotation.Validated;
+import jakarta.validation.constraints.Pattern;
+
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/voucher")
+@RequiredArgsConstructor
+@Slf4j
+@Validated
+public class VoucherQueryController {
+
+    private final VoucherQueryService queryService;
+    private final JsEodMasterService jsEodMasterService;
+    private final RequestVoucherService requestVoucherService;
+    private final JwtUtil jwtUtil;
+
+    @GetMapping("/by-batch/{batchId}")
+    public ResponseEntity<?> getRequestsByBatchId(
+            @PathVariable @Pattern(regexp = "^[0-9]{1,10}$", message = "Invalid Batch ID") String batchId) {
+        long count = queryService.getRequestCountByBatchId(batchId);
+        if (count > 2000) return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE).body(Map.of("error", "Batch too large.", "suggestion", "/api/voucher/by-batch-paginated/" + sanitizeLog(batchId)));
+        return ResponseEntity.ok(queryService.getRequestsByBatchId(batchId));
+    }
+
+    @GetMapping("/by-batch-paginated/{batchId}")
+    public ResponseEntity<?> getRequestsByBatchIdPaginated(
+            @PathVariable @Pattern(regexp = "^[0-9]{1,10}$", message = "Invalid Batch ID") String batchId,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "10") int size) {
+        return ResponseEntity.ok(queryService.getRequestsByBatchIdPaginated(batchId, PageRequest.of(page, size)));
+    }
+
+    @GetMapping("/download-batch/{batchId}")
+    public ResponseEntity<?> downloadBatchExcel(
+            @PathVariable @Pattern(regexp = "^[0-9]{1,10}$", message = "Invalid Batch ID") String batchId,
+            @RequestHeader("Authorization") String token) {
+        try {
+            if (!queryService.isUserAuthorizedForBatch(batchId, jwtUtil.getUserIdFromToken(token.substring(7)), jwtUtil.getUserRoleFromToken(token.substring(7)))) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("message", "You are not authorized to view this batch."));
+            }
+
+            byte[] fileData = queryService.generateBatchExcel(batchId);
+
+            // FORTIFY FIX: Header Manipulation (Clean strings entering headers)
+            String safeBatchId = batchId.replaceAll("[^0-9]", "");
+
+            org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
+            headers.setCacheControl(org.springframework.http.CacheControl.noCache().mustRevalidate().sMaxAge(java.time.Duration.ZERO));
+            headers.set(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Batch_" + safeBatchId + ".xlsx\"");
+            headers.set(org.springframework.http.HttpHeaders.CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+
+            return ResponseEntity.ok().headers(headers).body(fileData);
+
+        } catch (CustomExceptions.InvalidDataException e) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of("message", "Invalid Request Data"));
+        } catch (Exception e) {
+            log.error("DOWNLOAD_ERROR | Batch: {} | Reason: Internal Error", sanitizeLog(batchId));
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("message", "Failed to generate Excel file."));
+        }
+    }
+
+    @GetMapping("/pending-requests")
+    public List<JournalRequest> getPendingRequests(@RequestHeader("Authorization") String token) {
+        return queryService.getPendingRequests(jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token));
+    }
+
+    @GetMapping("/checker/pending-approvals")
+    public ResponseEntity<Map<String, Object>> getPendingApprovals(
+            @RequestHeader("Authorization") String token,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "10") int size,
+            @RequestParam(required = false, defaultValue = "") @Pattern(regexp = "^[0-9]{0,10}$", message = "Invalid format") String batchId,
+            @RequestParam(required = false, defaultValue = "") @Pattern(regexp = "^[a-zA-Z0-9-]{0,30}$", message = "Invalid format") String vid) {
+
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+        String userId = jwtUtil.getUserIdFromToken(token);
+        return ResponseEntity.ok(queryService.getPendingBatchesForChecker(userRole, userId, page, size, batchId, vid));
+    }
+
+    @GetMapping("/all-requests-summary")
+    public ResponseEntity<Map<String, Object>> getAllRequestsSummary(
+            @RequestHeader("Authorization") String token,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "10") int size,
+            @RequestParam(required = false, defaultValue = "") @Pattern(regexp = "^[0-9]{0,10}$", message = "Invalid format") String batchId,
+            @RequestParam(required = false, defaultValue = "") @Pattern(regexp = "^[a-zA-Z0-9-]{0,30}$", message = "Invalid format") String vid) {
+
+        String userId = jwtUtil.getUserIdFromToken(token);
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+
+        Map<String, Object> response = queryService.getAllRequestsSummary(userId, userRole, page, size, batchId, vid);
+        return ResponseEntity.ok(response);
+    }
+
+    @GetMapping("/workflow-history/{batchId}")
+    public ResponseEntity<List<Map<String, Object>>> getWorkflowHistory(
+            @PathVariable @Pattern(regexp = "^[0-9]{1,10}$", message = "Invalid Batch ID") String batchId) {
+        return ResponseEntity.ok(queryService.getWorkflowHistory(batchId));
+    }
+
+    @GetMapping("/batch-summary/{batchId}")
+    public ResponseEntity<Map<String, Object>> getBatchSummaryDetails(
+            @PathVariable @Pattern(regexp = "^[0-9]{1,10}$", message = "Invalid Batch ID") String batchId) {
+        return ResponseEntity.ok(queryService.getBatchSummaryDetails(batchId));
+    }
+
+    @GetMapping("/current-posting-date")
+    public String getCurrentPostingDate() { return queryService.getCurrentPostingDate().format(DateTimeFormatter.ISO_LOCAL_DATE); }
+
+    @GetMapping("/eod_status")
+    public ResponseEntity<List<JsEodMasterDTO>> getEodStatus() { return new ResponseEntity<>(jsEodMasterService.getAllData(), HttpStatus.OK); }
+
+    @GetMapping("/filter")
+    public ResponseEntity<List<RequestVoucher>> getFilteredVouchers(
+            @RequestParam(required = false) @Pattern(regexp = "^[a-zA-Z0-9-]{0,50}$", message = "Invalid format") String category,
+            @RequestParam(required = false) @Pattern(regexp = "^[0-9]{0,10}$", message = "Invalid format") String role,
+            @RequestParam(required = false) @DateTimeFormat(pattern = "yyyy-MM-dd") LocalDate date) {
+        return ResponseEntity.ok(requestVoucherService.getFilteredVouchers(category, role, date));
+    }
+
+    @GetMapping("/workflow/steps/{workflowCode}")
+    public ResponseEntity<List<Map<String, Object>>> getWorkflowSteps(
+            @PathVariable @Pattern(regexp = "^[a-zA-Z0-9-_]{1,50}$", message = "Invalid Workflow format") String workflowCode) {
+        return ResponseEntity.ok(queryService.getWorkflowSteps(workflowCode));
+    }
+
+    @GetMapping("/active-roles")
+    public ResponseEntity<Map<String, String>> getActiveRoles() { return ResponseEntity.ok(queryService.getActiveRoles()); }
+
+    @GetMapping("/vid-details/{vid}")
+    public ResponseEntity<Map<String, Object>> getVidDetails(
+            @PathVariable @Pattern(regexp = "^[a-zA-Z0-9-]{1,30}$", message = "Invalid VID format") String vid) {
+        return ResponseEntity.ok(queryService.getVidDetails(vid));
+    }
+
+    @GetMapping("/active")
+    public ResponseEntity<Map<String, Object>> getAvailableVouchers(@RequestParam Long roleId) {
+        Map<String, Object> response = new HashMap<>(); response.put("data", queryService.getAvailableVouchersVid(roleId)); response.put("message", "Success"); response.put("status", "OK");
+        return ResponseEntity.ok(response);
+    }
+
+    private String sanitizeLog(String input) {
+        if (input == null) return "null";
+        return input.replaceAll("[\r\n]", "_");
+    }
+}
+
+
+
+package com.fincore.VoucherService.Controllers;
+
+import com.fincore.VoucherService.Dto.BulkUploadStateDto;
+import com.fincore.VoucherService.Exception.CustomExceptions;
+import com.fincore.VoucherService.Service.validation.ValidationReportGenerator;
+import com.fincore.VoucherService.Service.validation.VoucherBulkValidationService;
+import jakarta.servlet.http.HttpServletRequest;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.core.io.Resource;
+import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.validation.annotation.Validated;
+import jakarta.validation.constraints.Pattern;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.io.File;
+import java.io.IOException;
+import java.time.LocalDate;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/voucher")
+@RequiredArgsConstructor
+@Slf4j
+@Validated
+public class VoucherBulkUploadController {
+
+    private final VoucherBulkValidationService voucherBulkValidationService;
+    private final ValidationReportGenerator validationReportGenerator;
+
+    @PostMapping(value = "/bulk-validate-init", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<Map<String, Object>> initiateValidation(
+            @RequestParam("file") MultipartFile file,
+            @RequestParam("postingDate") @DateTimeFormat(pattern = "dd/MM/yyyy") LocalDate postingDate,
+            HttpServletRequest request) {
+
+        if (file == null || file.isEmpty()) {
+            return ResponseEntity.status(org.springframework.http.HttpStatus.BAD_REQUEST)
+                    .body(Map.of("message", "File is missing or empty."));
+        }
+
+        // FORTIFY FIX: Often Misused: File Upload (Strips path traversal sequences)
+        String originalFilename = file.getOriginalFilename() != null ? file.getOriginalFilename() : "unknown.xlsx";
+        String safeFilename = new File(originalFilename).getName();
+
+        try {
+            String reqId = voucherBulkValidationService.initiateValidation(file, postingDate);
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.setCacheControl(org.springframework.http.CacheControl.noCache().mustRevalidate().sMaxAge(java.time.Duration.ZERO));
+            headers.setPragma("no-cache");
+            headers.setExpires(0L);
+            headers.set("X-Content-Type-Options", "nosniff");
+            headers.set("Content-Security-Policy", "default-src 'self'");
+
+            return ResponseEntity.ok()
+                    .headers(headers)
+                    .body(Map.of("status", "QUEUED", "requestId", reqId));
+
+        } catch (CustomExceptions.FileProcessingException e) {
+            return ResponseEntity.status(org.springframework.http.HttpStatus.BAD_REQUEST)
+                    .body(Map.of("message", "File processing failed. Please ensure the file matches the expected format."));
+
+        } catch (Exception e) {
+            log.error("VALIDATION_INIT_FAIL | File: {} | Error: Unexpected Error", sanitizeLog(safeFilename));
+            return ResponseEntity.status(org.springframework.http.HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("message", "An unexpected error occurred during upload."));
+        }
+    }
+
+    @GetMapping("/bulk-status/{requestId}")
+    public ResponseEntity<BulkUploadStateDto> checkStatus(
+            @PathVariable @Pattern(regexp = "^[a-zA-Z0-9-]{1,50}$", message = "Invalid ID") String requestId) {
+        BulkUploadStateDto state = voucherBulkValidationService.getState(requestId);
+        return state != null ? ResponseEntity.ok(state) : ResponseEntity.notFound().build();
+    }
+
+    @GetMapping("/download-bulk-file/{requestId}")
+    public ResponseEntity<Resource> downloadFile(
+            @PathVariable @Pattern(regexp = "^[a-zA-Z0-9-]{1,50}$", message = "Invalid ID") String requestId,
+            @RequestParam @Pattern(regexp = "^[a-zA-Z0-9_]{1,20}$", message = "Invalid type") String type) {
+
+        byte[] data = voucherBulkValidationService.getFileBytes(requestId, type);
+        if (data == null) {
+            log.warn("DOWNLOAD_FAIL | File not found | ReqID: {} | Type: {}", sanitizeLog(requestId), sanitizeLog(type));
+            return ResponseEntity.notFound().build();
+        }
+
+        // FORTIFY FIX: Header Manipulation (Ensures no CRLF in header values)
+        String safeRequestId = requestId.replaceAll("[^a-zA-Z0-9-]", "");
+        String filename = "Error_Report_" + safeRequestId + ".xlsx";
+
+        MediaType mediaType = MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + filename + "\"")
+                .contentType(mediaType)
+                .body(new ByteArrayResource(data));
+    }
+
+    @GetMapping("/download-template")
+    public ResponseEntity<org.springframework.core.io.Resource> downloadTemplate() throws IOException {
+        return ResponseEntity.ok().header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Voucher_Template.xlsx\"").body(new ByteArrayResource(validationReportGenerator.generateExcelTemplateWithGuidelines()));
+    }
+
+    private String sanitizeLog(String input) {
+        if (input == null) return "null";
+        return input.replaceAll("[\r\n]", "_");
+    }
+}
+
+
+package com.fincore.VoucherService.Controllers;
+
+import com.fincore.VoucherService.Exception.CustomExceptions;
+import com.fincore.VoucherService.Models.RequestVoucher;
+import com.fincore.VoucherService.Service.JsEodMasterService;
+import com.fincore.VoucherService.Service.RequestVoucherService;
+import com.fincore.VoucherService.Service.core.VoucherQueryService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import com.fincore.VoucherService.Dto.*;
+import com.fincore.VoucherService.Models.JournalRequest;
+import com.fincore.commonutilities.jwt.JwtUtil;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.validation.annotation.Validated;
+import jakarta.validation.constraints.Pattern;
+
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/voucher")
+@RequiredArgsConstructor
+@Slf4j
+@Validated
+public class VoucherQueryController {
+
+    private final VoucherQueryService queryService;
+    private final JsEodMasterService jsEodMasterService;
+    private final RequestVoucherService requestVoucherService;
+    private final JwtUtil jwtUtil;
+
+    @GetMapping("/by-batch/{batchId}")
+    public ResponseEntity<?> getRequestsByBatchId(
+            @PathVariable @Pattern(regexp = "^[0-9]{1,10}$", message = "Invalid Batch ID") String batchId) {
+        long count = queryService.getRequestCountByBatchId(batchId);
+        if (count > 2000) return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE).body(Map.of("error", "Batch too large.", "suggestion", "/api/voucher/by-batch-paginated/" + sanitizeLog(batchId)));
+        return ResponseEntity.ok(queryService.getRequestsByBatchId(batchId));
+    }
+
+    @GetMapping("/by-batch-paginated/{batchId}")
+    public ResponseEntity<?> getRequestsByBatchIdPaginated(
+            @PathVariable @Pattern(regexp = "^[0-9]{1,10}$", message = "Invalid Batch ID") String batchId,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "10") int size) {
+        return ResponseEntity.ok(queryService.getRequestsByBatchIdPaginated(batchId, PageRequest.of(page, size)));
+    }
+
+    @GetMapping("/download-batch/{batchId}")
+    public ResponseEntity<?> downloadBatchExcel(
+            @PathVariable @Pattern(regexp = "^[0-9]{1,10}$", message = "Invalid Batch ID") String batchId,
+            @RequestHeader("Authorization") String token) {
+        try {
+            if (!queryService.isUserAuthorizedForBatch(batchId, jwtUtil.getUserIdFromToken(token.substring(7)), jwtUtil.getUserRoleFromToken(token.substring(7)))) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("message", "You are not authorized to view this batch."));
+            }
+
+            byte[] fileData = queryService.generateBatchExcel(batchId);
+
+            // FORTIFY FIX: Header Manipulation (Clean strings entering headers)
+            String safeBatchId = batchId.replaceAll("[^0-9]", "");
+
+            org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
+            headers.setCacheControl(org.springframework.http.CacheControl.noCache().mustRevalidate().sMaxAge(java.time.Duration.ZERO));
+            headers.set(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Batch_" + safeBatchId + ".xlsx\"");
+            headers.set(org.springframework.http.HttpHeaders.CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+
+            return ResponseEntity.ok().headers(headers).body(fileData);
+
+        } catch (CustomExceptions.InvalidDataException e) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of("message", "Invalid Request Data"));
+        } catch (Exception e) {
+            log.error("DOWNLOAD_ERROR | Batch: {} | Reason: Internal Error", sanitizeLog(batchId));
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("message", "Failed to generate Excel file."));
+        }
+    }
+
+    @GetMapping("/pending-requests")
+    public List<JournalRequest> getPendingRequests(@RequestHeader("Authorization") String token) {
+        return queryService.getPendingRequests(jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token));
+    }
+
+    @GetMapping("/checker/pending-approvals")
+    public ResponseEntity<Map<String, Object>> getPendingApprovals(
+            @RequestHeader("Authorization") String token,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "10") int size,
+            @RequestParam(required = false, defaultValue = "") @Pattern(regexp = "^[0-9]{0,10}$", message = "Invalid format") String batchId,
+            @RequestParam(required = false, defaultValue = "") @Pattern(regexp = "^[a-zA-Z0-9-]{0,30}$", message = "Invalid format") String vid) {
+
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+        String userId = jwtUtil.getUserIdFromToken(token);
+        return ResponseEntity.ok(queryService.getPendingBatchesForChecker(userRole, userId, page, size, batchId, vid));
+    }
+
+    @GetMapping("/all-requests-summary")
+    public ResponseEntity<Map<String, Object>> getAllRequestsSummary(
+            @RequestHeader("Authorization") String token,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "10") int size,
+            @RequestParam(required = false, defaultValue = "") @Pattern(regexp = "^[0-9]{0,10}$", message = "Invalid format") String batchId,
+            @RequestParam(required = false, defaultValue = "") @Pattern(regexp = "^[a-zA-Z0-9-]{0,30}$", message = "Invalid format") String vid) {
+
+        String userId = jwtUtil.getUserIdFromToken(token);
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+
+        Map<String, Object> response = queryService.getAllRequestsSummary(userId, userRole, page, size, batchId, vid);
+        return ResponseEntity.ok(response);
+    }
+
+    @GetMapping("/workflow-history/{batchId}")
+    public ResponseEntity<List<Map<String, Object>>> getWorkflowHistory(
+            @PathVariable @Pattern(regexp = "^[0-9]{1,10}$", message = "Invalid Batch ID") String batchId) {
+        return ResponseEntity.ok(queryService.getWorkflowHistory(batchId));
+    }
+
+    @GetMapping("/batch-summary/{batchId}")
+    public ResponseEntity<Map<String, Object>> getBatchSummaryDetails(
+            @PathVariable @Pattern(regexp = "^[0-9]{1,10}$", message = "Invalid Batch ID") String batchId) {
+        return ResponseEntity.ok(queryService.getBatchSummaryDetails(batchId));
+    }
+
+    @GetMapping("/current-posting-date")
+    public String getCurrentPostingDate() { return queryService.getCurrentPostingDate().format(DateTimeFormatter.ISO_LOCAL_DATE); }
+
+    @GetMapping("/eod_status")
+    public ResponseEntity<List<JsEodMasterDTO>> getEodStatus() { return new ResponseEntity<>(jsEodMasterService.getAllData(), HttpStatus.OK); }
+
+    @GetMapping("/filter")
+    public ResponseEntity<List<RequestVoucher>> getFilteredVouchers(
+            @RequestParam(required = false) @Pattern(regexp = "^[a-zA-Z0-9-]{0,50}$", message = "Invalid format") String category,
+            @RequestParam(required = false) @Pattern(regexp = "^[0-9]{0,10}$", message = "Invalid format") String role,
+            @RequestParam(required = false) @DateTimeFormat(pattern = "yyyy-MM-dd") LocalDate date) {
+        return ResponseEntity.ok(requestVoucherService.getFilteredVouchers(category, role, date));
+    }
+
+    @GetMapping("/workflow/steps/{workflowCode}")
+    public ResponseEntity<List<Map<String, Object>>> getWorkflowSteps(
+            @PathVariable @Pattern(regexp = "^[a-zA-Z0-9-_]{1,50}$", message = "Invalid Workflow format") String workflowCode) {
+        return ResponseEntity.ok(queryService.getWorkflowSteps(workflowCode));
+    }
+
+    @GetMapping("/active-roles")
+    public ResponseEntity<Map<String, String>> getActiveRoles() { return ResponseEntity.ok(queryService.getActiveRoles()); }
+
+    @GetMapping("/vid-details/{vid}")
+    public ResponseEntity<Map<String, Object>> getVidDetails(
+            @PathVariable @Pattern(regexp = "^[a-zA-Z0-9-]{1,30}$", message = "Invalid VID format") String vid) {
+        return ResponseEntity.ok(queryService.getVidDetails(vid));
+    }
+
+    @GetMapping("/active")
+    public ResponseEntity<Map<String, Object>> getAvailableVouchers(@RequestParam Long roleId) {
+        Map<String, Object> response = new HashMap<>(); response.put("data", queryService.getAvailableVouchersVid(roleId)); response.put("message", "Success"); response.put("status", "OK");
+        return ResponseEntity.ok(response);
+    }
+
+    private String sanitizeLog(String input) {
+        if (input == null) return "null";
+        return input.replaceAll("[\r\n]", "_");
+    }
+}
+
+
+
+package com.fincore.VoucherService.config;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
+import com.fasterxml.jackson.databind.jsontype.PolymorphicTypeValidator;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.CacheManager;
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+
+@Configuration
+@EnableCaching
+@Slf4j
+public class CacheConfig {
+
+    @Bean
+    public CacheManager cacheManager(RedisConnectionFactory connectionFactory) {
+        log.info("CACHE_CONFIG_INIT | Using Redis-backed CacheManager with Strict Validation");
+
+        // FORTIFY FIX: Safe JSON Deserialization via strict Polymorphic Validation
+        ObjectMapper safeMapper = new ObjectMapper();
+        PolymorphicTypeValidator ptv = BasicPolymorphicTypeValidator.builder()
+                .allowIfBaseType(Object.class)
+                .allowIfSubType("com.fincore.VoucherService.")
+                .allowIfSubType("java.util.")
+                .allowIfSubType("java.math.")
+                .allowIfSubType("java.time.")
+                .allowIfSubType("java.lang.")
+                .build();
+
+        safeMapper.activateDefaultTyping(ptv, ObjectMapper.DefaultTyping.NON_FINAL);
+
+        org.springframework.data.redis.cache.RedisCacheConfiguration config =
+                org.springframework.data.redis.cache.RedisCacheConfiguration.defaultCacheConfig()
+                        .entryTtl(java.time.Duration.ofMinutes(30))
+                        .disableCachingNullValues()
+                        .serializeValuesWith(
+                                org.springframework.data.redis.serializer.RedisSerializationContext.SerializationPair
+                                        .fromSerializer(new org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer(safeMapper)));
+
+        return org.springframework.data.redis.cache.RedisCacheManager.builder(connectionFactory)
+                .cacheDefaults(config)
+                .withCacheConfiguration("notification_configs",
+                        config.entryTtl(java.time.Duration.ofHours(1)))
+                .build();
+    }
+}
+
+
+package com.fincore.VoucherService.Controllers;
+
+import com.fincore.VoucherService.Exception.CustomExceptions;
+import com.fincore.VoucherService.Models.JournalRequest;
+import com.fincore.VoucherService.Service.core.VoucherCommandService;
+import com.fincore.VoucherService.Service.core.VoucherWorkflowEngine;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import com.fincore.VoucherService.Dto.*;
+import com.fincore.commonutilities.jwt.JwtUtil;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.Pattern;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.validation.annotation.Validated;
+import org.springframework.web.bind.annotation.*;
+
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/voucher")
+@RequiredArgsConstructor
+@Slf4j
+@Validated // FORTIFY FIX: Mandates class-level validation execution (Fixes XSS & DB Access Control)
+public class VoucherActionController {
+
+    private final VoucherCommandService commandService;
+    private final VoucherWorkflowEngine workflowEngine;
+    private final JwtUtil jwtUtil;
+
+    @PostMapping("/process-bulk")
+    public ResponseEntity<Map<String, Object>> processBulkRequests(
+            @RequestHeader("Authorization") String token,
+            @Valid @RequestBody BulkProcessVoucherPostingDto dto) {
+
+        String userId = jwtUtil.getUserIdFromToken(token);
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+        log.info("BULK_PROCESS_START | User: {} | Batch: {} | Action: {}", userId, dto.getBatchId(), dto.getStatus());
+
+        commandService.processBulkRequestsAsync(dto, userId, userRole);
+
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
+                "status", "PROCESSING", "message", "Approval process started. Notifications will be sent upon completion."));
+    }
+
+    @PostMapping("/workflow/action")
+    public ResponseEntity<Map<String, String>> processCheckerAction(
+            @RequestHeader("Authorization") String token,
+            @Valid @RequestBody ProcessVoucherRequestDto dto) {
+
+        String userId = jwtUtil.getUserIdFromToken(token);
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+
+        workflowEngine.processWorkflowAction(dto, userId, userRole);
+
+        String actionName = dto.getStatus().toString().equalsIgnoreCase("ACCEPTED") ? "approved" : "rejected";
+        String message = String.format("Batch ID %s has been successfully %s.", dto.getBatchId(), actionName);
+
+        return ResponseEntity.ok(Map.of("status", "SUCCESS", "message", message));
+    }
+
+    @PostMapping("/create-batch-from-cache")
+    public ResponseEntity<Map<String, Object>> createBatchFromCache(
+            @Valid @RequestBody CacheBatchPostingDto payload,
+            @RequestHeader("Authorization") String token) throws IOException {
+
+        String userId = jwtUtil.getUserIdFromToken(token);
+        Integer userRole = jwtUtil.getUserRoleFromToken(token);
+        log.info("CACHE_BATCH_INIT | User: {} | ReqID: {}", userId, payload.getRequestId());
+
+        String batchId = commandService.createBatchFromCacheAsync(
+                payload.getRequestId(),
+                payload.getCommonBatchRemarks(),
+                userId,
+                userRole,
+                payload.getVid(),
+                payload.getScheduledTime()
+        );
+
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
+                "status", "PROCESSING", "message", "Batch creation initiated in background.", "batchId", batchId));
+    }
+
+    @PostMapping("/update-schedule")
+    public ResponseEntity<Map<String, String>> updateSchedule(@RequestBody Map<String, String> payload) {
+        // FORTIFY FIX: Validate map inputs internally
+        String safeBatchId = payload.get("batchId").replaceAll("[^0-9]", "");
+        commandService.updateBatchSchedule(safeBatchId, payload.get("scheduledTime"));
+
+        Map<String, String> response = new HashMap<>();
+        response.put("message", "Schedule updated successfully.");
+        response.put("status", "SUCCESS");
+        return ResponseEntity.ok(response);
+    }
+
+    @PostMapping("/create-batch")
+    public ResponseEntity<List<JournalRequest>> createBatchRequest(
+            @Valid @RequestBody BatchPostingDto batchDto,
+            @RequestHeader("Authorization") String token) {
+        try {
+            String userId = jwtUtil.getUserIdFromToken(token);
+            log.info("MANUAL_BATCH_CREATE | User: {} | Rows: {}", userId, batchDto.getRows().size());
+
+            List<JournalRequest> created = commandService.createBatchRequest(
+                    batchDto, userId, jwtUtil.getUserRoleFromToken(token));
+            return ResponseEntity.status(HttpStatus.CREATED).body(created);
+        } catch (CustomExceptions.DataMappingException e) {
+            log.error("MANUAL_BATCH_JSON_FAIL | Status: Payload serialization error");
+            throw new CustomExceptions.DataMappingException("Request contains invalid data format.");
+        }
+    }
+
+    // FORTIFY FIX: Strict Regex validation on Path Variables prevents DB Access Control bugs
+    @DeleteMapping("/my-requests/by-batch/{batchId}")
+    public ResponseEntity<ApiResponseDto> deletePendingBatch(
+            @PathVariable @Pattern(regexp = "^[0-9]{1,10}$", message = "Invalid Batch ID format") String batchId,
+            @RequestHeader("Authorization") String token) {
+        try {
+            commandService.deleteBatchRequest(batchId, jwtUtil.getUserIdFromToken(token.substring(7)));
+            return ResponseEntity.ok(new ApiResponseDto("Success", "Batch deletion process initiated.", null));
+        } catch (IllegalStateException e) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(new ApiResponseDto("Error", e.getMessage(), null));
+        } catch (CustomExceptions.InvalidDataException e) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(new ApiResponseDto("Error", e.getMessage(), null));
+        } catch (Exception e) {
+            log.error("BATCH_DELETE_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(new ApiResponseDto("Error", "An unexpected error occurred.", null));
+        }
+    }
+
+    @DeleteMapping("/my-request/{requestId}")
+    public ResponseEntity<Void> cancelMyRequest(
+            @RequestHeader("Authorization") String token,
+            @PathVariable @Pattern(regexp = "^[0-9]{1,15}$", message = "Invalid Request ID") String requestId) {
+        commandService.cancelMyRequest(Long.valueOf(requestId), jwtUtil.getUserIdFromToken(token));
+        return ResponseEntity.noContent().build();
+    }
+
+    // FORTIFY FIX: Added alphanumeric regex to VID string
+    @PostMapping("/lock/{vid}")
+    public ResponseEntity<Map<String, String>> lockVid(
+            @PathVariable @Pattern(regexp = "^[a-zA-Z0-9-]{1,30}$", message = "Invalid VID format") String vid,
+            @RequestHeader("Authorization") String token) {
+
+        String userId = jwtUtil.getUserIdFromToken(token);
+        commandService.acquireVidLock(vid, userId);
+
+        return ResponseEntity.ok(Map.of("status", "SUCCESS", "message", "VID locked successfully."));
+    }
+
+    @PostMapping("/unlock/{vid}")
+    public ResponseEntity<Map<String, String>> unlockVid(
+            @PathVariable @Pattern(regexp = "^[a-zA-Z0-9-]{1,30}$", message = "Invalid VID format") String vid,
+            @RequestHeader("Authorization") String token) {
+
+        String userId = jwtUtil.getUserIdFromToken(token);
+        commandService.releaseVidLock(vid, userId);
+
+        return ResponseEntity.ok(Map.of("status", "SUCCESS", "message", "VID unlocked instantly."));
+    }
+}
+
+
