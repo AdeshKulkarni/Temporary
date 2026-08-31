@@ -1,120 +1,345 @@
-This is a classic Enterprise SAST (Static Application Security Testing) report. You do not need to change your entire backend system design!
-What JFrog/Fortify is doing is called Taint Analysis. It tracks a variable (like batchId) from the moment it enters your Controller (the "Source") all the way down to where it is used (the "Sink"). If it sees that the variable is used unsafely anywhere in that journey, it flags the Controller line.
-Here is the exact breakdown of why these 4 errors happened and exactly what to replace to pass the security gate.
-1. SQL Injection (Critical)
-The Problem: The scanner points to VoucherQueryController.java, but the actual vulnerability is inside your VoucherQueryService.java. In methods like generateBatchExcel, getRequestCountByBatchId, and getVidDetails, you are using string concatenation (e.g., "... WHERE BATCH_ID = '" + safeBatchId + "'"). Even if you sanitized it, SAST tools will always flag string concatenation in SQL as a Critical SQL Injection.
-The Fix: Use parameterized queries (?) for those specific methods in VoucherQueryService.java.
-Open VoucherQueryService.java and replace these 3 methods:
-A. Replace getRequestCountByBatchId:
-    public long getRequestCountByBatchId(String batchId) {
-        log.info("COUNT_QUERY_START | BatchID: {}", SecuritySanitizer.sanitizeForLog(batchId));
-        String safeBatchId = SecuritySanitizer.sanitizeId(batchId);
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>4.1.0</version>
+        <relativePath/>
+    </parent>
 
-        // FIX: Use '?' instead of String concatenation
-        String sql = "SELECT COUNT(*) FROM REQUEST_VOUCHER WHERE batch_id = ?";
-        Long count = jdbcTemplate.queryForObject(sql, Long.class, safeBatchId);
-        return count != null ? count : 0L;
-    }
+    <groupId>com.fincore</groupId>
+    <artifactId>VoucherService</artifactId>
+    <version>0.0.0</version>
+    <name>voucher-service</name>
+    <description>Creating and posting Voucher</description>
 
-B. Replace getVidDetails:
-    public Map<String, Object> getVidDetails(String vid) {
-        log.info("VID_DETAILS_FETCH | VID: {}", SecuritySanitizer.sanitizeForLog(vid));
-        String safeVid = SecuritySanitizer.sanitizeId(vid);
+    <properties>
+        <java.version>21</java.version>
+        <tomcat.version>11.0.25</tomcat.version>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
+        <jackson-bom.version>3.2.2</jackson-bom.version>
+        <jackson-2-bom.version>2.22.2</jackson-2-bom.version>
 
-        // FIX: Use '?' instead of String concatenation
-        String sql = "SELECT * FROM vid_master WHERE vid_code = ?";
-        List<Map<String, Object>> results = jdbcTemplate.queryForList(sql, safeVid);
-        
-        if (results.isEmpty()) {
-            throw new IllegalArgumentException("VID details not found");
-        }
-        return results.get(0);
-    }
+    </properties>
 
-C. Replace the SQL inside generateBatchExcel:
-            // Inside generateBatchExcel() ...
-            
-            // FIX: Use '?' parameter instead of String concatenation
-            String sql = "SELECT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_NARRATION, REQ_PRODUCT " +
-                    "FROM VOUCHER_POSTING_DATA WHERE BATCH_ID = ? ORDER BY REQ_ID ASC";
+    <dependencyManagement>
+        <dependencies>
+            <!-- 1. Jackson BOM -->
+<!--            <dependency>-->
+<!--                <groupId>com.fasterxml.jackson</groupId>-->
+<!--                <artifactId>jackson-bom</artifactId>-->
+<!--                <version>2.21.4</version>-->
+<!--                <type>pom</type>-->
+<!--                <scope>import</scope>-->
+<!--            </dependency>-->
 
-            final int[] rowIdx = {1};
+            <!-- 2. Netty BOM (RESTORED TO 4.2.16.Final to fix Redis/Lettuce Startup Crash) -->
+            <dependency>
+                <groupId>io.netty</groupId>
+                <artifactId>netty-bom</artifactId>
+                <version>4.2.17.Final</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
 
-            jdbcTemplate.query(
-                    sql,
-                    rs -> {
-                        // ... your existing rs mapping logic stays exactly the same ...
-                        org.apache.poi.ss.usermodel.Row row = sheet.createRow(rowIdx[0]++);
-                        row.createCell(0).setCellValue(rs.getString("REQ_BRANCH_CODE") != null ? rs.getString("REQ_BRANCH_CODE") : "");
-                        // ...
-                    },
-                    safeBatchId // <--- Pass the parameter here!
-            );
+            <!-- 3. CedarSoftware json-io  -->
+            <dependency>
+                <groupId>com.cedarsoftware</groupId>
+                <artifactId>json-io</artifactId>
+                <version>4.14.3</version>
+            </dependency>
 
-2. Path Manipulation (Critical)
-The Problem: In VoucherBulkUploadController.java, you used new File(originalFilename).getName(). SAST tools flag new File(...) when dealing with user uploads because it touches the Operating System's file API with untrusted data, risking Directory Traversal attacks (e.g., ../../../etc/passwd).
-The Fix: Use Spring's safe string-based path cleaner instead.
-Open VoucherBulkUploadController.java and replace lines 35-37:
-REPLACE THIS:
-        // FORTIFY FIX: Often Misused: File Upload (Strips path traversal sequences)
-        String originalFilename = file.getOriginalFilename() != null ? file.getOriginalFilename() : "unknown.xlsx";
-        String safeFilename = new File(originalFilename).getName();
+            <!-- 4. Explicit Gson Override -->
+            <dependency>
+                <groupId>com.google.code.gson</groupId>
+                <artifactId>gson</artifactId>
+                <version>2.10.1</version>
+            </dependency>
 
-WITH THIS:
-        // FORTIFY FIX: Path Manipulation - Use Spring's string-based cleaner instead of OS-level File APIs
-        String originalFilename = file.getOriginalFilename() != null ? file.getOriginalFilename() : "unknown.xlsx";
-        String safeFilename = org.springframework.util.StringUtils.cleanPath(originalFilename);
+            <!-- ================================================================= -->
+            <!-- STANDARD OVERRIDES FROM PREVIOUS FIXES                            -->
+            <!-- ================================================================= -->
+<!--            <dependency>-->
+<!--                <groupId>org.apache.tomcat.embed</groupId>-->
+<!--                <artifactId>tomcat-embed-core</artifactId>-->
+<!--                <version>11.0.25</version>-->
+<!--            </dependency>-->
+            <dependency>
+                <groupId>io.airlift</groupId>
+                <artifactId>aircompressor</artifactId>
+                <version>2.0.3</version>
+            </dependency>
+            <dependency>
+                <groupId>org.xerial.snappy</groupId>
+                <artifactId>snappy-java</artifactId>
+                <version>1.1.10.5</version>
+            </dependency>
+            <dependency>
+                <groupId>com.google.guava</groupId>
+                <artifactId>guava</artifactId>
+                <version>32.0.1-jre</version>
+            </dependency>
+            <dependency>
+                <groupId>com.google.protobuf</groupId>
+                <artifactId>protobuf-java</artifactId>
+                <version>4.28.2</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.httpcomponents.core5</groupId>
+                <artifactId>httpcore5</artifactId>
+                <version>5.4.3</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.httpcomponents.core5</groupId>
+                <artifactId>httpcore5-h2</artifactId>
+                <version>5.4.3</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.hadoop</groupId>
+                <artifactId>hadoop-hdfs</artifactId>
+                <version>3.3.6</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.hadoop</groupId>
+                <artifactId>hadoop-yarn-server-common</artifactId>
+                <version>3.3.6</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.zookeeper</groupId>
+                <artifactId>zookeeper</artifactId>
+                <version>3.9.5</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.thrift</groupId>
+                <artifactId>libthrift</artifactId>
+                <version>0.24.0</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.avro</groupId>
+                <artifactId>avro</artifactId>
+                <version>1.11.4</version>
+            </dependency>
+            <dependency>
+                <groupId>org.codehaus.jettison</groupId>
+                <artifactId>jettison</artifactId>
+                <version>1.5.4</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.ant</groupId>
+                <artifactId>ant</artifactId>
+                <version>1.10.9</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.kerby</groupId>
+                <artifactId>kerb-server</artifactId>
+                <version>2.1.2</version>
+            </dependency>
+            <dependency>
+                <groupId>com.fasterxml.woodstox</groupId>
+                <artifactId>woodstox-core</artifactId>
+                <version>6.4.0</version>
+            </dependency>
+            <dependency>
+                <groupId>dnsjava</groupId>
+                <artifactId>dnsjava</artifactId>
+                <version>3.6.0</version>
+            </dependency>
+            <dependency>
+                <groupId>com.nimbusds</groupId>
+                <artifactId>nimbus-jose-jwt</artifactId>
+                <version>9.37.2</version>
+            </dependency>
+            <dependency>
+                <groupId>net.minidev</groupId>
+                <artifactId>json-smart</artifactId>
+                <version>2.4.9</version>
+            </dependency>
+            <dependency>
+                <groupId>commons-beanutils</groupId>
+                <artifactId>commons-beanutils</artifactId>
+                <version>1.11.0</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
 
-3. Dynamic Code Evaluation (Critical)
-The Problem: In CacheConfig.java, you used .allowIfBaseType(Object.class). JFrog flags this because allowing Object.class defeats the purpose of the Polymorphic Validator. If any object is allowed as a base, attackers can still inject malicious payloads for Remote Code Execution (RCE) during Redis deserialization.
-The Fix: Remove the overly broad Object.class rule and restrict the base types.
-Open CacheConfig.java and replace the PolymorphicTypeValidator block (around lines 23-31):
-REPLACE THIS:
-        PolymorphicTypeValidator ptv = BasicPolymorphicTypeValidator.builder()
-                .allowIfBaseType(Object.class)
-                .allowIfSubType("com.fincore.VoucherService.")
-                .allowIfSubType("java.util.")
-                .allowIfSubType("java.math.")
-                .allowIfSubType("java.time.")
-                .allowIfSubType("java.lang.")
-                .build();
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
 
-WITH THIS:
-        // FORTIFY FIX: Dynamic Code Evaluation - Removed broad Object.class and restricted to strict subtypes
-        PolymorphicTypeValidator ptv = BasicPolymorphicTypeValidator.builder()
-                .allowIfSubType("com.fincore.VoucherService.")
-                .allowIfSubType("java.util.")
-                .allowIfSubType("java.math.")
-                .allowIfSubType("java.time.")
-                .allowIfSubType("java.lang.String")
-                .allowIfSubType("java.lang.Number")
-                .allowIfSubType("java.lang.Boolean")
-                .build();
+        <!-- Force full Netty suite and Redis to top-level to prevent runtime drop-offs -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-all</artifactId>
+        </dependency>
 
-4. Cross-Site Scripting (XSS) (High)
-The Problem: In VoucherActionController.java, you are returning e.getMessage() directly into your JSON API response (e.g., new ApiResponseDto("Error", e.getMessage(), null)). If the exception message contains user input (like a malicious batch ID: <script>alert(1)</script>), and a browser renders it, it causes Reflected XSS.
-The Fix: Sanitize the exception message by stripping out HTML characters before sending it back in the JSON body.
-Open VoucherActionController.java and replace the catch blocks in deletePendingBatch (around lines 100-108):
-REPLACE THIS:
-        } catch (IllegalStateException e) {
-            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(new ApiResponseDto("Error", e.getMessage(), null));
-        } catch (CustomExceptions.InvalidDataException e) {
-            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(new ApiResponseDto("Error", e.getMessage(), null));
-        } catch (Exception e) {
-            log.error("BATCH_DELETE_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(new ApiResponseDto("Error", "An unexpected error occurred.", null));
-        }
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-cache</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
 
-WITH THIS:
-        } catch (IllegalStateException e) {
-            // FORTIFY FIX: XSS - Strip HTML brackets to prevent Reflected XSS in JSON responses
-            String safeMsg = e.getMessage() != null ? e.getMessage().replaceAll("[<>\"'&]", "") : "Forbidden";
-            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(new ApiResponseDto("Error", safeMsg, null));
-        } catch (CustomExceptions.InvalidDataException e) {
-            String safeMsg = e.getMessage() != null ? e.getMessage().replaceAll("[<>\"'&]", "") : "Invalid Data";
-            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(new ApiResponseDto("Error", safeMsg, null));
-        } catch (Exception e) {
-            log.error("BATCH_DELETE_FAIL | Batch: {} | Error: {}", batchId, e.getMessage());
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(new ApiResponseDto("Error", "An unexpected error occurred.", null));
-        }
+        <dependency>
+            <groupId>net.logstash.logback</groupId>
+            <artifactId>logstash-logback-encoder</artifactId>
+            <version>7.4</version>
+        </dependency>
 
+        <dependency>
+            <groupId>com.oracle.database.jdbc</groupId>
+            <artifactId>ojdbc11</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>com.fincore</groupId>
+            <artifactId>common-utilities</artifactId>
+            <version>0.0.1-SNAPSHOT</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.poi</groupId>
+            <artifactId>poi-ooxml</artifactId>
+            <version>5.2.5</version>
+        </dependency>
+        <dependency>
+            <groupId>com.monitorjbl</groupId>
+            <artifactId>xlsx-streamer</artifactId>
+            <version>2.2.0</version>
+        </dependency>
+        <dependency>
+            <groupId>com.github.pjfanning</groupId>
+            <artifactId>excel-streaming-reader</artifactId>
+            <version>4.0.5</version>
+        </dependency>
+        <dependency>
+            <groupId>com.github.pjfanning</groupId>
+            <artifactId>poi-shared-strings</artifactId>
+            <version>2.7.1</version>
+        </dependency>
+
+        <!-- Hive and Hadoop Drivers with Deep Security Exclusions -->
+        <dependency>
+            <groupId>org.apache.hive</groupId>
+            <artifactId>hive-jdbc</artifactId>
+            <version>3.1.3</version>
+            <exclusions>
+                <exclusion><groupId>org.slf4j</groupId><artifactId>slf4j-log4j12</artifactId></exclusion>
+                <exclusion><groupId>org.slf4j</groupId><artifactId>slf4j-reload4j</artifactId></exclusion>
+                <exclusion><groupId>log4j</groupId><artifactId>log4j</artifactId></exclusion>
+                <exclusion><groupId>ch.qos.reload4j</groupId><artifactId>reload4j</artifactId></exclusion>
+                <exclusion><groupId>javax.servlet</groupId><artifactId>*</artifactId></exclusion>
+                <exclusion><groupId>org.eclipse.jetty.aggregate</groupId><artifactId>*</artifactId></exclusion>
+                <exclusion><groupId>org.eclipse.jetty</groupId><artifactId>*</artifactId></exclusion>
+                <exclusion><groupId>org.codehaus.jackson</groupId><artifactId>jackson-mapper-asl</artifactId></exclusion>
+                <exclusion><groupId>org.codehaus.jackson</groupId><artifactId>jackson-core-asl</artifactId></exclusion>
+                <exclusion><groupId>org.apache.derby</groupId><artifactId>derby</artifactId></exclusion>
+
+                <exclusion><groupId>org.apache.htrace</groupId><artifactId>htrace-core</artifactId></exclusion>
+                <exclusion><groupId>org.apache.htrace</groupId><artifactId>htrace-core4</artifactId></exclusion>
+                <exclusion><groupId>xerces</groupId><artifactId>xercesImpl</artifactId></exclusion>
+                <exclusion><groupId>io.netty</groupId><artifactId>netty</artifactId></exclusion>
+
+                <exclusion><groupId>org.apache.hbase.thirdparty</groupId><artifactId>hbase-shaded-netty</artifactId></exclusion>
+                <exclusion><groupId>org.apache.hbase.thirdparty</groupId><artifactId>hbase-shaded-protobuf</artifactId></exclusion>
+                <exclusion><groupId>org.apache.hbase.thirdparty</groupId><artifactId>hbase-shaded-miscellaneous</artifactId></exclusion>
+                <exclusion><groupId>org.apache.hadoop.thirdparty</groupId><artifactId>hadoop-shaded-protobuf_3_7</artifactId></exclusion>
+                <exclusion><groupId>org.apache.hadoop.thirdparty</groupId><artifactId>hadoop-shaded-guava</artifactId></exclusion>
+            </exclusions>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-common</artifactId>
+            <version>3.3.4</version>
+            <exclusions>
+                <exclusion><groupId>org.slf4j</groupId><artifactId>slf4j-log4j12</artifactId></exclusion>
+                <exclusion><groupId>org.slf4j</groupId><artifactId>slf4j-reload4j</artifactId></exclusion>
+                <exclusion><groupId>log4j</groupId><artifactId>log4j</artifactId></exclusion>
+                <exclusion><groupId>ch.qos.reload4j</groupId><artifactId>reload4j</artifactId></exclusion>
+                <exclusion><groupId>javax.servlet</groupId><artifactId>*</artifactId></exclusion>
+                <exclusion><groupId>org.eclipse.jetty</groupId><artifactId>*</artifactId></exclusion>
+                <exclusion><groupId>org.codehaus.jackson</groupId><artifactId>jackson-mapper-asl</artifactId></exclusion>
+                <exclusion><groupId>org.codehaus.jackson</groupId><artifactId>jackson-core-asl</artifactId></exclusion>
+
+                <exclusion><groupId>org.apache.htrace</groupId><artifactId>htrace-core</artifactId></exclusion>
+                <exclusion><groupId>org.apache.htrace</groupId><artifactId>htrace-core4</artifactId></exclusion>
+                <exclusion><groupId>io.netty</groupId><artifactId>netty</artifactId></exclusion>
+
+                <exclusion><groupId>org.apache.hbase.thirdparty</groupId><artifactId>hbase-shaded-netty</artifactId></exclusion>
+                <exclusion><groupId>org.apache.hbase.thirdparty</groupId><artifactId>hbase-shaded-protobuf</artifactId></exclusion>
+                <exclusion><groupId>org.apache.hbase.thirdparty</groupId><artifactId>hbase-shaded-miscellaneous</artifactId></exclusion>
+                <exclusion><groupId>org.apache.hadoop.thirdparty</groupId><artifactId>hadoop-shaded-protobuf_3_7</artifactId></exclusion>
+                <exclusion><groupId>org.apache.hadoop.thirdparty</groupId><artifactId>hadoop-shaded-guava</artifactId></exclusion>
+            </exclusions>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <excludes>
+                        <exclude>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+
+
++----------------+------------+---------------------------+---------+---------------------------+-----------+----------+-------+
+| CVE            | SEVERITY   | DIRECT                    | DIRECT  | AFFECTED                  | AFFECTED  | FIXED    | TYPE  |
+|                |            | PACKAGE                   | PACKAGE | COMPONENT                 | COMPONENT | VERSIONS |       |
+|                |            |                           | VERSION | NAME                      | VERSION   |          |       |
++----------------+------------+---------------------------+---------+---------------------------+-----------+----------+-------+
+| CVE-2026-59313 | 💀Critical | org.springframework:sprin | 7.0.8   | org.springframework:sprin | 7.0.8     | [7.0.9]  | Maven |
+|                |            | g-webmvc                  |         | g-webmvc                  |           |          |       |
++----------------+------------+---------------------------+---------+---------------------------+-----------+----------+-------+
+
+how to fix in the pom
