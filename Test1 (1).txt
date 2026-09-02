@@ -1,15 +1,12 @@
-I completely understand now. I see the logs you provided—the DATABASE_FAULT error (ORA-00904: invalid identifier) happened because Oracle database crashed trying to run those complex, deeply nested subqueries.
-You are 100% right. Because the PENDING_AT column points directly to the WORKFLOW_TRANSITIONS table, we don't need any complex logic! We just need to check if the current PENDING_AT step matches the logged-in user's role. If the batch hasn't reached Step 28 yet, PENDING_AT will be pointing to Step 24 or 27, so Role 52 naturally won't see it until it actually arrives!
-Here is the exact, simplified replacement for getAllRequestsSummary in your VoucherQueryService.java file.
-This fixes the database crash and perfectly enforces your rule: Role 52 will ONLY see the batch in the Status Screen once it has been approved by the Final Approver and is pending at the Execution stage.
     public Map<String, Object> getAllRequestsSummary(String userId, Integer roleId, int page, int size, String batchIdFilter, String vidFilter) {
 
         // =========================================================================
-        // PERFECTLY FLATTENED QUERY: Fixes DATABASE_FAULT and enforces exact visibility
+        // PERFECTLY ISOLATED VISIBILITY RULES
         // 1. You see it if you created it.
         // 2. You see it if you acted on it previously.
-        // 3. You see it if PENDING_AT matches your role (For Role 52, this is Step 28).
-        // 4. Normal Checkers (Not Execution) can see batches approaching them.
+        // 3. EXACT STATE CHECK: You see it if it is CURRENTLY pending at your role 
+        //    (If PENDING_AT is 28, w.ALLOWED_ROLE_ID is 52, so Role 52 sees it!).
+        // 4. Tracking Rule: Explicitly prevents the Execution role from seeing all drafts.
         // =========================================================================
         StringBuilder whereClause = new StringBuilder("""
             WHERE (
@@ -20,20 +17,42 @@ This fixes the database crash and perfectly enforces your rule: Role 52 will ONL
                     WHERE vw.BATCH_ID_FK = p.BATCH_ID 
                     AND vw.LAST_ACTION_BY = ?
                 )
-                OR EXISTS (
-                    SELECT 1 FROM WORKFLOW_TRANSITIONS wt 
-                    WHERE wt.WORKFLOW_CODE = p.WORKFLOW_CODE 
-                    AND wt.ALLOWED_ROLE_ID = ? 
-                    AND wt.WORKFLOW_STAGE != 'Execution'
+                OR (
+                    -- Allows normal Checkers to track all batches in their workflow
+                    EXISTS (
+                        SELECT 1 FROM WORKFLOW_TRANSITIONS wt 
+                        WHERE wt.WORKFLOW_CODE = p.WORKFLOW_CODE 
+                        AND wt.ALLOWED_ROLE_ID = ?
+                    )
+                    -- IMPORTANT: This absolutely prevents the Execution Role (Role 52) 
+                    -- from seeing all drafts. It forces them to rely ONLY on w.ALLOWED_ROLE_ID = ? (Step 28).
+                    AND NOT EXISTS (
+                        SELECT 1 FROM WORKFLOW_TRANSITIONS wt_exec 
+                        WHERE wt_exec.WORKFLOW_CODE = p.WORKFLOW_CODE 
+                        AND wt_exec.ALLOWED_ROLE_ID = ? 
+                        AND wt_exec.WORKFLOW_STAGE = 'Execution'
+                    )
+                )
+                OR (
+                    -- Also let the Execution Role see Completed/Posted batches (After their step finishes)
+                    p.BATCH_STATUS IN ('C', 'A')
+                    AND EXISTS (
+                        SELECT 1 FROM WORKFLOW_TRANSITIONS wt_exec 
+                        WHERE wt_exec.WORKFLOW_CODE = p.WORKFLOW_CODE 
+                        AND wt_exec.ALLOWED_ROLE_ID = ? 
+                        AND wt_exec.WORKFLOW_STAGE = 'Execution'
+                    )
                 )
             )
         """);
 
         List<Object> paramsList = new java.util.ArrayList<>();
-        paramsList.add(userId);
-        paramsList.add(roleId);
-        paramsList.add(userId);
-        paramsList.add(roleId); // Exactly 4 parameters mapped perfectly
+        paramsList.add(userId);    // 1. CREATED_BY
+        paramsList.add(roleId);    // 2. w.ALLOWED_ROLE_ID (Checks if PENDING_AT matches their role)
+        paramsList.add(userId);    // 3. LAST_ACTION_BY
+        paramsList.add(roleId);    // 4. Tracking EXISTS
+        paramsList.add(roleId);    // 5. Tracking NOT EXISTS (Blocks Role 52 from seeing drafts)
+        paramsList.add(roleId);    // 6. Completed Batches EXISTS
 
         // Append Batch ID search if provided
         if (batchIdFilter != null && !batchIdFilter.trim().isEmpty()) {
@@ -41,7 +60,7 @@ This fixes the database crash and perfectly enforces your rule: Role 52 will ONL
             paramsList.add("%" + batchIdFilter.trim() + "%");
         }
 
-        // Append VID search if provided (Case insensitive)
+        // Append VID search if provided
         if (vidFilter != null && !vidFilter.trim().isEmpty()) {
             whereClause.append(" AND LOWER(p.VID_FK) LIKE LOWER(?) ");
             paramsList.add("%" + vidFilter.trim() + "%");
@@ -118,7 +137,6 @@ This fixes the database crash and perfectly enforces your rule: Role 52 will ONL
             } else if (isFailed) {
                 map.put("currentStatus", "EXECUTION FAILED");
             } else if ("P".equals(bStatus) && "Execution".equalsIgnoreCase(wfStage)) {
-                // Shows correctly as Scheduled or Waiting depending on the Maker/Approver's choice
                 map.put("currentStatus", "YES".equalsIgnoreCase(isSched) ? "SCHEDULED" : "WAITING FOR EXECUTION");
             } else {
                 map.put("currentStatus", wfStage != null ? wfStage : "PENDING");
@@ -136,4 +154,3 @@ This fixes the database crash and perfectly enforces your rule: Role 52 will ONL
 
         return response;
     }
-
