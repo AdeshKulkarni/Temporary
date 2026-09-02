@@ -1,130 +1,9 @@
-This is a perfect refinement of the business logic. Instead of hardcoding Role 52 or locking it to the exact user, we will make the database dynamically lookup the ALLOWED_ROLE_ID where the WORKFLOW_STAGE = 'Execution'.
-This completely removes the hardcoded checks and ensures the PSO role effortlessly sees:
- * Failed Batches (to click retry).
- * Scheduled Batches (waiting for the scheduler to trigger after passing Final Approval).
-Here are the exact 2 method replacements for your VoucherQueryService.java file.
-REPLACEMENT 1: Update getPendingBatchesForChecker
-This updates the Authorization screen's query. It completely removes the IS_FINAL_APPROVAL hack and dynamically matches the Execution Role, showing them both Failed and Scheduled batches.
-Replace your entire getPendingBatchesForChecker method with this:
-    public Map<String, Object> getPendingBatchesForChecker(Integer userRole, String userId, int page, int size, String batchIdFilter, String vidFilter) {
+2026-09-02T12:35:37.738+05:30 ERROR 55040 --- [VoucherService] [nio-9999-exec-6] c.f.V.Exception.GlobalExceptionHandler   : DATABASE_FAULT | Path: /api/voucher/all-requests-summary
+2026-09-02T12:36:16.525+05:30 ERROR 55040 --- [VoucherService] [nio-9999-exec-8] c.f.V.Exception.GlobalExceptionHandler   : DATABASE_FAULT | Path: /api/voucher/all-requests-summary
 
-        // DYNAMIC EXECUTION ROLE QUERY:
-        // Automatically checks if userRole matches the ALLOWED_ROLE_ID of the 'Execution' stage in WORKFLOW_TRANSITIONS
-        // Shows Failed Executions OR Scheduled Executions (waiting for scheduler) ONLY to the Execution Role (PSO).
-        String sql = """
-            SELECT 
-                p.BATCH_ID, 
-                p.VID_FK AS VID, 
-                p.CREATED_BY AS CREATOR_ID, 
-                p.CREATED_AT AS REQ_DATE, 
-                p.COMMON_BATCH_REMARKS AS BATCH_REMARKS,
-                p.RECORDS_COUNT AS TOTAL_ROWS, 
-                p.SCHEDULED_TIME,
-                w.WORKFLOW_STAGE, 
-                w.WORKFLOW_CODE, 
-                w.ESCALATION_TIME, 
-                w.WORKFLOW_ORDER, 
-                w.IS_FINAL_APPROVAL,
-                p.IS_EXECUTION_SCHEDULED,
-                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME,
-                (SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY) AS LATEST_ACTION
-            FROM VOUCHER_POSTING p
-            INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
-            LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
-            WHERE p.BATCH_STATUS = 'P'
-            AND (
-                -- 1. STANDARD PENDING BATCH: Normal visibility (Excludes Scheduled and Failed batches)
-                (w.ALLOWED_ROLE_ID = ? 
-                 AND NOT EXISTS (SELECT 1 FROM VOUCHER_WORKFLOW vw WHERE vw.BATCH_ID_FK = p.BATCH_ID AND vw.LAST_ACTION_BY = ?)
-                 AND NVL((SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY), 'X') != 'Execution Failed'
-                 AND NVL(p.IS_EXECUTION_SCHEDULED, 'NO') = 'NO'
-                )
-                OR 
-                -- 2. EXECUTION ROLE (PSO): Shows Failed Executions OR Scheduled Executions waiting for the scheduler
-                (
-                 EXISTS (
-                     SELECT 1 FROM WORKFLOW_TRANSITIONS wt_exec 
-                     WHERE wt_exec.WORKFLOW_CODE = p.WORKFLOW_CODE 
-                       AND wt_exec.ALLOWED_ROLE_ID = ?
-                       AND wt_exec.WORKFLOW_STAGE = 'Execution'
-                 )
-                 AND (
-                     (SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY) = 'Execution Failed' 
-                     OR 
-                     (NVL(p.IS_EXECUTION_SCHEDULED, 'NO') = 'YES' AND w.WORKFLOW_STAGE = 'Execution')
-                 )
-                )
-            )
-            ORDER BY p.CREATED_AT DESC
-        """;
 
-        List<Map<String, Object>> allPending = jdbcTemplate.query(sql, (rs, rowNum) -> {
-            Map<String, Object> map = new HashMap<>();
-            boolean isFailed = "Execution Failed".equals(rs.getString("LATEST_ACTION"));
-            boolean isScheduled = "YES".equalsIgnoreCase(rs.getString("IS_EXECUTION_SCHEDULED")) && "Execution".equalsIgnoreCase(rs.getString("WORKFLOW_STAGE"));
 
-            map.put("batchId", rs.getString("BATCH_ID"));
-            map.put("vid", rs.getString("VID"));
-            map.put("creatorId", rs.getString("CREATOR_ID"));
-            map.put("creatorName", rs.getString("CREATOR_NAME"));
-            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
-            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
-            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
-            map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
-            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
-            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
-            map.put("isFinalApproval", rs.getString("IS_FINAL_APPROVAL"));
-
-            map.put("isExecutionFailed", isFailed);
-            
-            // Custom UI Workflow State formatting so the Frontend knows exactly what it's looking at
-            if (isFailed) {
-                map.put("workflowState", "Execution");
-            } else if (isScheduled) {
-                map.put("workflowState", "Scheduled");
-            } else {
-                map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
-            }
-
-            return map;
-        }, userRole, userId, userRole);
-
-        // JAVA-SIDE FILTERING
-        List<Map<String, Object>> filteredList = allPending.stream().filter(row -> {
-            boolean matchesBatch = true;
-            boolean matchesVid = true;
-            if (batchIdFilter != null && !batchIdFilter.trim().isEmpty()) {
-                String bId = (String) row.get("batchId");
-                matchesBatch = bId != null && bId.toLowerCase().contains(batchIdFilter.trim().toLowerCase());
-            }
-            if (vidFilter != null && !vidFilter.trim().isEmpty()) {
-                String vId = (String) row.get("vid");
-                matchesVid = vId != null && vId.toLowerCase().contains(vidFilter.trim().toLowerCase());
-            }
-            return matchesBatch && matchesVid;
-        }).toList();
-
-        // JAVA-SIDE PAGINATION
-        int totalElements = filteredList.size();
-        int fromIndex = Math.min(page * size, totalElements);
-        int toIndex = Math.min(fromIndex + size, totalElements);
-        List<Map<String, Object>> pagedList = filteredList.subList(fromIndex, toIndex);
-
-        for (Map<String, Object> row : pagedList) {
-            row.put("timeSinceLastAction", calculateTimeSinceLastAction((String) row.get("batchId")));
-        }
-
-        Map<String, Object> response = new HashMap<>();
-        response.put("content", pagedList);
-        response.put("totalElements", totalElements);
-        response.put("totalPages", (int) Math.ceil((double) totalElements / size));
-        return response;
-    }
-
-REPLACEMENT 2: Update getAllRequestsSummary (Status Screen Query)
-This updates the top portion of getAllRequestsSummary where the SQL string is built. It dynamically gives the Execution Role the right to monitor ALL batches that have safely reached or passed the final approval stage (Completed, Failed, or Scheduled).
-Find the whereClause builder in getAllRequestsSummary and replace the StringBuilder and paramsList block with this:
-    public Map<String, Object> getAllRequestsSummary(String userId, Integer roleId, int page, int size, String batchIdFilter, String vidFilter) {
+public Map<String, Object> getAllRequestsSummary(String userId, Integer roleId, int page, int size, String batchIdFilter, String vidFilter) {
 
         StringBuilder whereClause = new StringBuilder("""
             WHERE (
@@ -167,6 +46,120 @@ Find the whereClause builder in getAllRequestsSummary and replace the StringBuil
             paramsList.add("%" + vidFilter.trim() + "%");
         }
 
-        // ... (The rest of your method remains exactly the same starting from countSql)
+        // 2. FAST COUNT QUERY
+        String countSql = "SELECT COUNT(*) FROM VOUCHER_POSTING p " + whereClause.toString();
+        Long totalElements = jdbcTemplate.queryForObject(countSql, Long.class, paramsList.toArray());
+        if (totalElements == null) totalElements = 0L;
 
-With these two query updates, the backend dynamically resolves the correct user entirely from the WORKFLOW_TRANSITIONS table. The frontend needs zero changes because your frontend is perfectly designed to map whatever the backend tells it!
+           // 3. PAGINATED DATA QUERY
+        int offset = page * size;
+        String dataSql = """
+            SELECT 
+                p.BATCH_ID, 
+                p.VID_FK,
+                p.CREATED_BY AS CREATOR_ID, 
+                u.FIRST_NAME,
+                u.LAST_NAME,
+                p.CREATED_AT AS REQ_DATE, 
+                p.RECORDS_COUNT AS TOTAL_ROWS, 
+                p.BATCH_STATUS, 
+                w.WORKFLOW_STAGE, 
+                w.WORKFLOW_CODE,
+                w.WORKFLOW_ORDER,
+                -- ADDED THIS LINE TO FETCH THE LATEST WORKFLOW ACTION
+                (SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY) AS LATEST_ACTION
+            FROM VOUCHER_POSTING p
+            LEFT JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
+            LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
+            """ + whereClause.toString() + """
+            ORDER BY p.CREATED_AT DESC, p.BATCH_ID DESC
+            OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+        """;
+
+        // Add the pagination parameters to the END of the params list
+        List<Object> dataParams = new ArrayList<>(paramsList);
+        dataParams.add(offset);
+        dataParams.add(size);
+
+        List<Map<String, Object>> content = jdbcTemplate.query(dataSql, (rs, rowNum) -> {
+            Map<String, Object> map = new java.util.HashMap<>();
+            map.put("batchId", rs.getString("BATCH_ID"));
+            map.put("vid", rs.getString("VID_FK"));
+            map.put("creatorId", rs.getString("CREATOR_ID"));
+
+            // JAVA-SIDE FORMATTING: Safely concatenate names in Java memory, not in the SQL engine
+            String fName = rs.getString("FIRST_NAME");
+            String lName = rs.getString("LAST_NAME");
+            String fullName = (fName != null || lName != null)
+                    ? ((fName != null ? fName : "") + " " + (lName != null ? lName : "")).trim()
+                    : rs.getString("CREATOR_ID");
+            map.put("creatorName", fullName);
+
+             map.put("requestDate", rs.getTimestamp("REQ_DATE"));
+            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
+            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
+            map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
+            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
+
+            String bStatus = rs.getString("BATCH_STATUS");
+            map.put("batchStatus", bStatus);
+
+            // ADDED THESE TWO LINES: Check if it failed and send to frontend
+            boolean isFailed = "Execution Failed".equals(rs.getString("LATEST_ACTION"));
+            map.put("isExecutionFailed", isFailed);
+
+            if ("R".equals(bStatus)) {
+                map.put("currentStatus", "REJECTED");
+            } else if ("A".equals(bStatus) || "C".equals(bStatus)) {
+                map.put("currentStatus", "POSTED");
+            } else if ("Q".equals(bStatus)) {
+                map.put("currentStatus", "QUEUED FOR RETRY");
+            } else {
+                map.put("currentStatus", rs.getString("WORKFLOW_STAGE") != null ? rs.getString("WORKFLOW_STAGE") : "PENDING");
+            }
+
+            map.put("timeSinceLastAction", calculateTimeSinceLastAction(rs.getString("BATCH_ID")));
+
+            return map;
+        }, dataParams.toArray()); // <-- Use dataParams here
+
+        // 4. WRAP IN PAGINATION
+        Map<String, Object> response = new java.util.HashMap<>();
+        response.put("content", content);
+        response.put("totalElements", totalElements);
+        response.put("totalPages", (int) Math.ceil((double) totalElements / size));
+
+        return response;
+    }
+
+
+i think from the voucher posting table
+BATCH_ID	VARCHAR2(50 BYTE)	No		1	
+VID_FK	VARCHAR2(20 BYTE)	No		2	
+WORKFLOW_CODE	VARCHAR2(100 BYTE)	Yes		3	
+CREATED_BY	VARCHAR2(100 BYTE)	Yes		4	
+CREATED_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	5	
+PENDING_AT	NUMBER	Yes		6	
+IS_EXECUTION_SCHEDULED	VARCHAR2(3 BYTE)	Yes		7	
+SCHEDULED_TIME	TIMESTAMP(6)	Yes		8	
+IS_SCHEDULE_OVERRIDE	VARCHAR2(3 BYTE)	Yes		9	
+EXECUTED_AT	TIMESTAMP(6)	Yes		10	
+BATCH_STATUS	VARCHAR2(20 BYTE)	Yes		11	
+RECORDS_COUNT	NUMBER	Yes		12	
+COMMON_BATCH_REMARKS	VARCHAR2(30 CHAR)	Yes		13	
+CREATOR_ROLE	NUMBER(10,0)	Yes		14	
+EXECUTOR_ID	VARCHAR2(10 BYTE)	Yes		15	
+FIX_TYPE	CHAR(1 BYTE)	No	'J' 	16	
+TARGET_DATE	DATE	Yes		17	
+
+from this table for that Batch check is that Batch id PENDING_AT is 28 
+
+i took this from the table workflow transtions
+
+workflow_3	9001	N	Y	Creation	0	1	24
+workflow_3	9001	N	N	Verification	45	2	25
+workflow_3	9002	N	N	Review	30	3	26
+workflow_3	9002	Y	Y	Approval	15	4	27
+workflow_3	52	N	N	Execution	0	5	28
+
+
