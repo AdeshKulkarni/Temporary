@@ -1,101 +1,81 @@
-    public Map<String, Object> getPendingBatchesForChecker(Integer userRole, String userId, int page, int size, String batchIdFilter, String vidFilter) {
+You are completely right. I accidentally bundled "SCHEDULED" and "WAITING FOR EXECUTION" into the isFullyDone logic, which falsely pushed the stepper past the end and colored everything green (Completed).
+If a batch is waiting for the scheduler, the timeline should pause on the final node (Execution) and mark it as ACTIVE (Orange/Waiting), not Completed!
+Here are the exact two blocks to replace in your VoucherPostingStatus.jsx file to fix this perfectly. No backend changes are needed for this!
+REPLACEMENT 1: Fix the Mini Stepper (In the DataGrid Table)
+Find the columns array, specifically the currentStatus column. Locate the activeStep logic (around line 720 in your file) and replace it with this perfectly separated logic:
+REPLACE THIS:
+        let activeStep = params.row.currentOrder ? params.row.currentOrder - 1 : 0;
 
-        // DYNAMIC EXECUTION ROLE QUERY:
-        // Automatically uses PENDING_AT to join WORKFLOW_TRANSITIONS (w). 
-        // 1. Normal users see pending batches they haven't acted on yet.
-        // 2. The Execution Role (PSO) ONLY sees batches that have FAILED execution, requiring a manual Retry.
-        // (Scheduled batches waiting for the system timer are hidden from this actionable screen).
-        String sql = """
-            SELECT 
-                p.BATCH_ID, 
-                p.VID_FK AS VID, 
-                p.CREATED_BY AS CREATOR_ID, 
-                p.CREATED_AT AS REQ_DATE, 
-                p.COMMON_BATCH_REMARKS AS BATCH_REMARKS,
-                p.RECORDS_COUNT AS TOTAL_ROWS, 
-                p.SCHEDULED_TIME,
-                w.WORKFLOW_STAGE, 
-                w.WORKFLOW_CODE, 
-                w.ESCALATION_TIME, 
-                w.WORKFLOW_ORDER, 
-                w.IS_FINAL_APPROVAL,
-                p.IS_EXECUTION_SCHEDULED,
-                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, p.CREATED_BY) AS CREATOR_NAME,
-                (SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY) AS LATEST_ACTION
-            FROM VOUCHER_POSTING p
-            INNER JOIN WORKFLOW_TRANSITIONS w ON p.PENDING_AT = w.WORKFLOW_ID
-            LEFT JOIN USERS u ON p.CREATED_BY = u.USER_ID
-            WHERE p.BATCH_STATUS = 'P'
-            AND w.ALLOWED_ROLE_ID = ?
-            AND (
-                -- 1. STANDARD PENDING BATCH: Normal visibility (Not Execution stage)
-                (w.WORKFLOW_STAGE != 'Execution'
-                 AND NOT EXISTS (SELECT 1 FROM VOUCHER_WORKFLOW vw WHERE vw.BATCH_ID_FK = p.BATCH_ID AND vw.LAST_ACTION_BY = ?)
-                )
-                OR 
-                -- 2. EXECUTION ROLE (PSO): Shows ONLY Failed executions for Retry action!
-                (w.WORKFLOW_STAGE = 'Execution'
-                 AND (SELECT LAST_ACTION FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p.BATCH_ID ORDER BY LAST_ACTION_AT DESC FETCH FIRST 1 ROWS ONLY) = 'Execution Failed' 
-                )
-            )
-            ORDER BY p.CREATED_AT DESC
-        """;
-
-        List<Map<String, Object>> allPending = jdbcTemplate.query(sql, (rs, rowNum) -> {
-            Map<String, Object> map = new HashMap<>();
-            boolean isFailed = "Execution Failed".equals(rs.getString("LATEST_ACTION"));
-
-            map.put("batchId", rs.getString("BATCH_ID"));
-            map.put("vid", rs.getString("VID"));
-            map.put("creatorId", rs.getString("CREATOR_ID"));
-            map.put("creatorName", rs.getString("CREATOR_NAME"));
-            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
-            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
-            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
-            map.put("escalationTime", rs.getLong("ESCALATION_TIME"));
-            map.put("approvalWorkflow", rs.getString("WORKFLOW_CODE"));
-            map.put("currentOrder", rs.getObject("WORKFLOW_ORDER"));
-            map.put("isFinalApproval", rs.getString("IS_FINAL_APPROVAL"));
-
-            map.put("isExecutionFailed", isFailed);
-            
-            if (isFailed) {
-                map.put("workflowState", "Execution");
-            } else {
-                map.put("workflowState", rs.getString("WORKFLOW_STAGE"));
-            }
-
-            return map;
-        }, userRole, userId); 
-
-        // JAVA-SIDE FILTERING
-        List<Map<String, Object>> filteredList = allPending.stream().filter(row -> {
-            boolean matchesBatch = true;
-            boolean matchesVid = true;
-            if (batchIdFilter != null && !batchIdFilter.trim().isEmpty()) {
-                String bId = (String) row.get("batchId");
-                matchesBatch = bId != null && bId.toLowerCase().contains(batchIdFilter.trim().toLowerCase());
-            }
-            if (vidFilter != null && !vidFilter.trim().isEmpty()) {
-                String vId = (String) row.get("vid");
-                matchesVid = vId != null && vId.toLowerCase().contains(vidFilter.trim().toLowerCase());
-            }
-            return matchesBatch && matchesVid;
-        }).toList();
-
-        // JAVA-SIDE PAGINATION
-        int totalElements = filteredList.size();
-        int fromIndex = Math.min(page * size, totalElements);
-        int toIndex = Math.min(fromIndex + size, totalElements);
-        List<Map<String, Object>> pagedList = filteredList.subList(fromIndex, toIndex);
-
-        for (Map<String, Object> row : pagedList) {
-            row.put("timeSinceLastAction", calculateTimeSinceLastAction((String) row.get("batchId")));
+        // NEW FIX: Force the UI to push the active step to the final Execution step if it failed!
+        if (params.row.isExecutionFailed) {
+          activeStep = steps.length - 1;
+        } else if (!isRejected && (state === "POSTED" || state === "SCHEDULED" || state === "C" || state === "S" || params.row.currentStatus === "POSTED")) {
+          activeStep = steps.length;
         }
+        if (activeStep === -1) activeStep = 0;
 
-        Map<String, Object> response = new HashMap<>();
-        response.put("content", pagedList);
-        response.put("totalElements", totalElements);
-        response.put("totalPages", (int) Math.ceil((double) totalElements / size));
-        return response;
-    }
+WITH THIS:
+        let activeStep = params.row.currentOrder ? params.row.currentOrder - 1 : 0;
+
+        // PERFECTED STEPPER LOGIC:
+        if (params.row.isExecutionFailed) {
+          activeStep = steps.length - 1;
+        } else if (!isRejected && (state === "POSTED" || state === "C" || params.row.currentStatus === "POSTED")) {
+          // 1. ONLY push past the end (All Green) if it is fully completed and posted
+          activeStep = steps.length;
+        } else if (!isRejected && (state === "SCHEDULED" || state === "WAITING FOR EXECUTION" || state === "APPROVED")) {
+          // 2. If it is waiting for the scheduler, PAUSE on the final Execution step!
+          activeStep = steps.length - 1; 
+        }
+        
+        if (activeStep === -1) activeStep = 0;
+
+REPLACEMENT 2: Fix the Big Stepper (Inside "View & Action" Modal)
+Scroll down to the {/* --- HORIZONTAL TIMELINE --- */} section inside your Dialog (around line 935). Replace the <Stepper> tag and the first few lines of the .map loop with this fixed logic:
+REPLACE THIS:
+                  <Stepper
+                    activeStep={
+                      viewingBatch?.isExecutionFailed
+                        ? dynamicSteps.length - 1 // Force to final Execution step if failed
+                        : (viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED" || viewingBatchState === "APPROVED" || viewingBatchState === "C" || viewingBatchState === "S")
+                          ? dynamicSteps.length
+                          : viewingBatchOrder - 1
+                    }
+                    alternativeLabel
+                    connector={<BigConnector />}
+                  >
+                    {dynamicSteps.map((step, index) => {
+                      const isFullyDone = viewingBatchState === "POSTED" || viewingBatchState === "SCHEDULED" || viewingBatchState === "APPROVED" || viewingBatchState === "C" || viewingBatchState === "S";
+
+                      let activeStepIndex = isFullyDone ? dynamicSteps.length : viewingBatchOrder - 1;
+                      if (viewingBatch?.isExecutionFailed) {
+                        activeStepIndex = dynamicSteps.length - 1; // Force active index to final step
+                      }
+
+WITH THIS:
+                  <Stepper
+                    activeStep={(() => {
+                      if (viewingBatch?.isExecutionFailed) return dynamicSteps.length - 1;
+                      if (viewingBatchState === "POSTED" || viewingBatchState === "C") return dynamicSteps.length;
+                      if (viewingBatchState === "SCHEDULED" || viewingBatchState === "WAITING FOR EXECUTION" || viewingBatchState === "APPROVED") return dynamicSteps.length - 1;
+                      return viewingBatchOrder - 1;
+                    })()}
+                    alternativeLabel
+                    connector={<BigConnector />}
+                  >
+                    {dynamicSteps.map((step, index) => {
+                      // 1. ONLY mark as fully done if physically posted to the ledger
+                      const isFullyDone = viewingBatchState === "POSTED" || viewingBatchState === "C";
+                      
+                      let activeStepIndex = isFullyDone ? dynamicSteps.length : viewingBatchOrder - 1;
+                      
+                      // 2. Pause on the final step if Scheduled/Waiting
+                      if (viewingBatchState === "SCHEDULED" || viewingBatchState === "WAITING FOR EXECUTION" || viewingBatchState === "APPROVED") {
+                         activeStepIndex = dynamicSteps.length - 1; 
+                      } else if (viewingBatch?.isExecutionFailed) {
+                         activeStepIndex = dynamicSteps.length - 1; 
+                      }
+
+Why this fixes the visual mismatch perfectly:
+By splitting SCHEDULED out from POSTED, the timeline mathematically calculates that the Execution step is isCurrent = true but isCompleted = false.
+Because of this, the React component will paint the final Execution node with the Orange Active Border, indicating that the system is currently "working on it / waiting" instead of the green checkmark!
