@@ -1,31 +1,379 @@
-class Solution {
+package com.fincore.VoucherService.Service.validation;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.dao.DataAccessException;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
 
-    public int Helper(TreeNode root, int currentSum) {
-        
-        // Base Case: If we hit a null gap, return 0 sum
-        if (root == null) {
-            return 0;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+/**
+ * Loads active master records into memory-efficient HashSets for O(1) validation lookups.
+ * Utilizes optimized JDBC fetch sizes to handle high-volume data transfers from Oracle.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class ValidationMasterService {
+
+    @Autowired
+    @Qualifier("oracleJdbcTemplate")
+    private JdbcTemplate jdbcTemplate;
+
+    /**
+     * Fetches all active branch codes.
+     * Uses a fetchSize of 5000 to minimize network round-trips for large branch networks.
+     */
+    public Set<String> getAllActiveBranches() {
+        long start = System.currentTimeMillis();
+        String sql = "SELECT CODE FROM BRANCH_MASTER WHERE STATUS = 1";
+
+        try {
+            List<String> list = jdbcTemplate.query(con -> {
+                var ps = con.prepareStatement(sql);
+                ps.setFetchSize(5000);
+                return ps;
+            }, (rs, rowNum) -> rs.getString(1));
+
+            log.info("MASTER_DATA_LOADED | Type: BRANCHES | Count: {} | Duration: {}ms", list.size(), System.currentTimeMillis() - start);
+            return new HashSet<>(list);
+
+        } catch (DataAccessException e) {
+            log.error("MASTER_DATA_FETCH_FAIL | Type: BRANCHES | Reason: {}", e.getMessage());
+            return new HashSet<>(); // Returning empty set to trigger validation failure safely
         }
-        
-        // 1. Update the sum using Binary Math (Multiply by 2)
-        currentSum = (currentSum * 2) + root.val;   
-
-        // 2. If it's a leaf node, this path is finished! Return the final number.
-        if (root.left == null && root.right == null) {
-            return currentSum;
-        }
-
-        // 3. Otherwise, pass the updated 'currentSum' down BOTH branches
-        // so the children remember the story so far.
-        int leftSum = Helper(root.left, currentSum);
-        int rightSum = Helper(root.right, currentSum);
-
-        // 4. Send the total of both branches back up the tree
-        return leftSum + rightSum;
     }
 
-    public int sumRootToLeaf(TreeNode root) {
-        // We pass 0 here because the Root node starts with no history.
-        return Helper(root, 0);
+    /**
+     * Fetches all active currency codes.
+     * Uses a fetchSize of 1000 for standard currency volume.
+     */
+    public Set<String> getAllActiveCurrencies() {
+        long start = System.currentTimeMillis();
+        String sql = "SELECT CURRENCY_CODE FROM CURRENCY_MASTER WHERE FLAG = 1";
+
+        try {
+            List<String> list = jdbcTemplate.query(con -> {
+                var ps = con.prepareStatement(sql);
+                ps.setFetchSize(1000);
+                return ps;
+            }, (rs, rowNum) -> rs.getString(1));
+
+            log.info("MASTER_DATA_LOADED | Type: CURRENCIES | Count: {} | Duration: {}ms", list.size(), System.currentTimeMillis() - start);
+            return new HashSet<>(list);
+
+        } catch (DataAccessException e) {
+            log.error("MASTER_DATA_FETCH_FAIL | Type: CURRENCIES | Reason: {}", e.getMessage());
+            return new HashSet<>();
+        }
+    }
+
+    /**
+     * Fetches all active CGL numbers.
+     * Uses a fetchSize of 2000 to balance memory and speed for ledger data.
+     */
+    public Set<String> getAllActiveCgls() {
+        long start = System.currentTimeMillis();
+        String sql = "SELECT CGL_NUMBER FROM CGL_MASTER WHERE STATUS = 1";
+
+        try {
+            List<String> list = jdbcTemplate.query(con -> {
+                var ps = con.prepareStatement(sql);
+                ps.setFetchSize(2000);
+                return ps;
+            }, (rs, rowNum) -> rs.getString(1));
+
+            log.info("MASTER_DATA_LOADED | Type: CGLS | Count: {} | Duration: {}ms", list.size(), System.currentTimeMillis() - start);
+            return new HashSet<>(list);
+
+        } catch (DataAccessException e) {
+            log.error("MASTER_DATA_FETCH_FAIL | Type: CGLS | Reason: {}", e.getMessage());
+            return new HashSet<>();
+        }
+    }
+}
+
+
+package com.fincore.VoucherService.Controllers;
+
+import com.fincore.VoucherService.Dto.BranchDto;
+import com.fincore.VoucherService.Service.BranchService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
+import org.springframework.validation.annotation.Validated;
+import jakarta.validation.constraints.Pattern;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/branches-journal")
+@RequiredArgsConstructor
+@Slf4j
+@Validated // FORTIFY FIX: Enable method-level validation to sanitize input
+public class BranchController {
+
+    private final BranchService branchService;
+
+    @GetMapping("/map")
+    public ResponseEntity<Map<String, String>> getBranchMap() {
+        log.info("BRANCH_CONTROLLER_MAP_REQUEST | Action: Fetching all active branch mappings");
+        Map<String, String> branchMap = branchService.getBranchCodeAndNameMap();
+        return ResponseEntity.ok(branchMap);
+    }
+
+    @GetMapping("/search")
+    public ResponseEntity<List<BranchDto>> searchBranches(
+            // FORTIFY FIX: Restrict search strings to alphanumeric inputs to defeat DB access injection
+            @RequestParam @Pattern(regexp = "^[a-zA-Z0-9]{1,20}$", message = "Invalid search query") String query) {
+
+        log.info("BRANCH_CONTROLLER_PREFIX_SEARCH | Query: {}", query);
+
+        if (query == null || query.trim().isEmpty()) {
+            return ResponseEntity.ok(Collections.emptyList());
+        }
+
+        List<BranchDto> results = branchService.searchBranches(query.trim());
+        return ResponseEntity.ok(results);
+    }
+}
+
+package com.fincore.VoucherService.Controllers;
+
+import com.fincore.VoucherService.Dto.CglDto;
+import com.fincore.VoucherService.Service.CglService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
+import org.springframework.validation.annotation.Validated;
+import jakarta.validation.constraints.Pattern;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.util.Collections;
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/cgl-journal")
+@RequiredArgsConstructor
+@Slf4j
+@Validated // FORTIFY FIX: Enable method-level validation
+public class CglController {
+
+    private final CglService cglService;
+
+    @GetMapping("/search")
+    public ResponseEntity<List<CglDto>> searchCgl(
+            // FORTIFY FIX: Restrict search strings to alphanumeric inputs to defeat DB access injection
+            @RequestParam(value = "query", required = false, defaultValue = "")
+            @Pattern(regexp = "^[a-zA-Z0-9]{0,20}$", message = "Invalid search query") String query) {
+
+        if (query == null || query.trim().isEmpty()) {
+            return ResponseEntity.ok(Collections.emptyList());
+        }
+
+        log.info("CGL_CONTROLLER_PREFIX_SEARCH | Action: Filtering CGLs starting with: {}", query);
+
+        List<CglDto> results = cglService.searchCgls(query.trim());
+        return ResponseEntity.ok(results);
+    }
+}
+
+
+package com.fincore.VoucherService.Controllers;
+
+
+import com.fincore.VoucherService.Service.validation.ValidationMasterService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.util.Set;
+
+@RestController
+@RequestMapping("/api/voucher")
+@RequiredArgsConstructor
+public class CurrencyController {
+
+    private final ValidationMasterService validationMasterService;
+
+    /**
+     * Purpose: Returns a list of only the active CURRENCY_CODEs.
+     */
+    @GetMapping("/currencies")
+    public ResponseEntity<Set<String>> getActiveCurrencies() {
+        // Reuses your existing high-performance JDBC method
+        Set<String> currencies = validationMasterService.getAllActiveCurrencies();
+
+        return ResponseEntity.ok(currencies);
+    }
+}
+
+
+package com.fincore.VoucherService.Service;
+
+import com.fincore.VoucherService.Dto.BranchDto;
+import com.fincore.VoucherService.Models.BranchMaster;
+import com.fincore.VoucherService.Repository.BranchMasterRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataAccessException;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.stereotype.Service;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+/**
+ * Provides functionality for retrieving branch mapping and performing targeted searches.
+ * Implements specific exception handling for database access and secure logging practices.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class BranchService {
+
+    private final BranchMasterRepository branchMasterRepository;
+
+    /**
+     * Retrieves a mapping of branch codes to branch names.
+     * Useful for dropdown population or lookup optimization.
+     * * @return A Map containing branch codes as keys and names as values.
+     * @throws org.springframework.dao.DataAccessException if the database retrieval fails.
+     */
+    public Map<String, String> getBranchCodeAndNameMap() {
+        try {
+            List<BranchMaster> branches = branchMasterRepository.findAll();
+
+            log.info("BRANCH_MAP_LOADED | Count: {}", branches.size());
+
+            return branches.stream()
+                    .collect(Collectors.toMap(BranchMaster::getCode, BranchMaster::getName, (existing, replacement) -> existing));
+
+        } catch (DataAccessException e) {
+            log.error("BRANCH_MAP_FETCH_FAIL | Type: {}", e.getClass().getSimpleName());
+            return Collections.emptyMap();
+        }
+    }
+
+    /**
+     * Performs a paginated search for branches by name or code.
+     * Limits results to the first 50 matches to ensure high system responsiveness.[span_0](end_span)
+     * * @param query The search string (branch name or code).
+     * @return A list of matching BranchDto objects.
+     */
+    public List<BranchDto> searchBranches(String query) {
+        log.info("BRANCH_SEARCH_INIT | QueryLength: {}", (query != null ? query.length() : 0)); //
+
+        if (query == null || query.trim().isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        try {
+            // Preserving the exact pagination and search logic
+            Pageable limit = PageRequest.of(0, 50);
+
+
+            List<BranchMaster> results = branchMasterRepository
+                    .findByNameContainingIgnoreCaseOrCodeContainingIgnoreCase(query, query, limit);
+
+            log.info("BRANCH_SEARCH_SUCCESS | ResultsFound: {}", results.size());
+
+            return results.stream()
+                    .map(branch -> new BranchDto(branch.getCode(), branch.getName()))
+                    .collect(Collectors.toList());
+
+        } catch (DataAccessException e) {
+            log.error("BRANCH_SEARCH_FAIL | Query: [REDACTED] | Error: {}", e.getMessage());
+            return Collections.emptyList();
+        }
+    }
+}
+package com.fincore.VoucherService.Service;
+
+import com.fincore.VoucherService.Dto.CglDto;
+import com.fincore.VoucherService.Models.CglMaster;
+import com.fincore.VoucherService.Repository.CglMasterRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataAccessException;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+
+
+import java.util.Collections;
+import java.util.List;
+import java.util.stream.Collectors;
+
+/**
+ * Provides targeted search capabilities for ledger master data.
+ * Implements specific exception handling for database access and secure logging practices.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class CglService {
+
+    private final CglMasterRepository cglMasterRepository;
+    private final Integer ACTIVE_CGL_STATUS=1;
+
+    /**
+     * Maps a CglMaster entity to a CglDto for API transmission.
+     */
+    private CglDto convertToDto(CglMaster cgl) {
+        return new CglDto(cgl.getCglNumber(), cgl.getDescription());
+    }
+
+    /**
+     * Performs a paginated search for CGLs by ledger number or description.
+     * Preserves the exact search and 50-record limiting logic for system responsiveness.
+     * * @param query The search string (CGL number or description text).
+     * @return A list of matching CglDto objects.
+     */
+    public List<CglDto> searchCgls(String query) {
+        // Log the search attempt metadata without logging potentially sensitive query values
+        log.info("CGL_SEARCH_INIT | QueryProvided: {}", StringUtils.hasText(query));
+
+        if (!StringUtils.hasText(query)) {
+            return Collections.emptyList();
+        }
+
+        try {
+            // Preserving exact pagination logic: Page 0, Size 50
+            Pageable limit = PageRequest.of(0, 50);
+
+            List<CglMaster> results = cglMasterRepository
+                    .findByCglNumberContainingIgnoreCaseOrDescriptionContainingIgnoreCaseAndStatusEquals(query, query,ACTIVE_CGL_STATUS, limit);
+
+            log.info("CGL_SEARCH_SUCCESS | ResultsFound: {}", results.size());
+
+            return results.stream()
+                    .map(this::convertToDto)
+                    .collect(Collectors.toList());
+
+        } catch (DataAccessException e) {
+            // Specifically catching Spring's database abstraction errors
+            log.error("CGL_SEARCH_FAIL | Reason: Database access error: {}", e.getMessage());
+            return Collections.emptyList();
+        }
     }
 }
