@@ -1,218 +1,150 @@
-This is a fantastic addition. Backdated posting is a crucial compliance feature in enterprise banking.
-To support this in the backend, we need to do two things:
- * Update the Voucher Query to return IS_BACK_DATED and BACK_DATE when fetching the VIDs.
- * Update the Search API endpoints (Branch, CGL, and Currency) to accept a backDate parameter and dynamically filter the database so it only returns records that were actually active on that specific historical date.
-Here are the exact backend file replacements.
-1. Update VoucherQueryService.java (To send Backdate flags to the UI)
-Find the getAvailableVouchersVid method in your VoucherQueryService.java file. Replace the SQL query and the (rs, rowNum) mapper logic with this updated version:
-REPLACE THIS:
-        String sql = """
-            SELECT 
-                rv.ID,
-                rv.VID,
-                rv.DESCRIPTION,
-                c.CATEGORY_NAME,
-                rv.CREATED_BY AS CREATOR_ID,
-                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, rv.CREATED_BY) AS CREATOR_NAME,
-                rv.CREATED_AT
-            FROM REQUEST_VOUCHER rv
+package com.fincore.VoucherService.Service.validation;
 
-(and the matching map.put logic...)
-WITH THIS:
-        // ADDED IS_BACK_DATED AND BACK_DATE TO THE SELECTION
-        String sql = """
-            SELECT 
-                rv.ID,
-                rv.VID,
-                rv.DESCRIPTION,
-                c.CATEGORY_NAME,
-                rv.CREATED_BY AS CREATOR_ID,
-                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, rv.CREATED_BY) AS CREATOR_NAME,
-                rv.CREATED_AT,
-                rv.IS_BACK_DATED,
-                rv.BACK_DATE
-            FROM REQUEST_VOUCHER rv
-            LEFT JOIN VOUCHER_CATEGORY c ON rv.CATEGORY_ID = c.ID
-            LEFT JOIN USERS u ON rv.CREATED_BY = u.USER_ID
-            WHERE rv.ALLOWED_ROLE = ? AND rv.STATUS = 'ACTIVE'
-            AND NOT EXISTS (
-                SELECT 1 FROM VOUCHER_POSTING vp 
-                WHERE vp.VID_FK = rv.VID 
-                AND vp.BATCH_STATUS NOT IN ('R', 'REJECTED', 'ERROR')
-            )
-            ORDER BY rv.CREATED_AT DESC
-        """;
 
-        List<Map<String, Object>> vouchers = jdbcTemplate.query(sql, (rs, rowNum) -> {
-            Map<String, Object> map = new HashMap<>();
-            map.put("id", rs.getLong("ID"));
-            map.put("vid", rs.getString("VID"));
-            map.put("description", rs.getString("DESCRIPTION"));
-            map.put("categoryName", rs.getString("CATEGORY_NAME"));
-            map.put("createdBy", rs.getString("CREATOR_ID"));
-            map.put("createdByName", rs.getString("CREATOR_NAME"));
+import com.fincore.VoucherService.Dto.ExcelRowData;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
 
-            java.sql.Timestamp ts = rs.getTimestamp("CREATED_AT");
-            map.put("createdAt", ts != null ? ts.toInstant().toString() : null);
-            
-            // --- BACKDATED DATA MAPPING ---
-            map.put("isBackDated", rs.getInt("IS_BACK_DATED"));
-            java.sql.Date bd = rs.getDate("BACK_DATE");
-            map.put("backDate", bd != null ? bd.toLocalDate().toString() : null);
-            
-            return map;
-        }, roleId);
+import java.math.BigDecimal;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 
-2. Update BranchController.java & BranchService.java
-We need to add the backDate filter to the dropdown search. Because your previous service used Spring JPA, we will add JdbcTemplate to execute the native Oracle Date logic safely.
-A. In BranchController.java, replace the searchBranches method:
-    @GetMapping("/search")
-    public ResponseEntity<List<BranchDto>> searchBranches(
-            @RequestParam @Pattern(regexp = "^[a-zA-Z0-9]{1,20}$", message = "Invalid search query") String query,
-            @RequestParam(required = false) @org.springframework.format.annotation.DateTimeFormat(iso = org.springframework.format.annotation.DateTimeFormat.ISO.DATE) java.time.LocalDate backDate) {
+@Service
+public class VoucherRuleValidator {
 
-        log.info("BRANCH_CONTROLLER_PREFIX_SEARCH | Query: {} | BackDate: {}", query, backDate);
+    @Autowired
+    private final ValidationMasterService validationMasterService;
 
-        if (query == null || query.trim().isEmpty()) {
-            return ResponseEntity.ok(java.util.Collections.emptyList());
-        }
-
-        List<BranchDto> results = branchService.searchBranches(query.trim(), backDate);
-        return ResponseEntity.ok(results);
+    public VoucherRuleValidator(ValidationMasterService validationMasterService) {
+        this.validationMasterService = validationMasterService;
     }
 
-B. In BranchService.java, add JdbcTemplate and replace searchBranches:
-    @org.springframework.beans.factory.annotation.Autowired
-    @org.springframework.beans.factory.annotation.Qualifier("oracleJdbcTemplate")
-    private org.springframework.jdbc.core.JdbcTemplate jdbcTemplate;
 
-    public List<BranchDto> searchBranches(String query, java.time.LocalDate backDate) {
-        log.info("BRANCH_SEARCH_INIT | QueryLength: {} | BackDate: {}", (query != null ? query.length() : 0), backDate);
+    // ==================================================================================
+    // 4. VALIDATION STAGES
+    // ==================================================================================
+    public void runFormatCheck(List<ExcelRowData> rows) {
+        rows.parallelStream().forEach(d -> {
 
-        if (query == null || query.trim().isEmpty()) {
-            return Collections.emptyList();
-        }
+            // 1. Safely grab the value, remove all spaces, and make it uppercase
+            String rawType = (d.txnType != null) ? d.txnType.trim().toUpperCase() : "";
 
-        try {
-            String sql = "SELECT CODE, NAME FROM BRANCH_MASTER WHERE (LOWER(CODE) LIKE LOWER(?) OR LOWER(NAME) LIKE LOWER(?))";
-            List<Object> params = new java.util.ArrayList<>();
-            params.add("%" + query + "%");
-            params.add("%" + query + "%");
-
-            // IF BACKDATED: Must be open before the date, and NOT closed before the date
-            if (backDate != null) {
-                sql += " AND TRUNC(OPEN_DATE) <= ? AND (CLOSE_DATE IS NULL OR TRUNC(CLOSE_DATE) >= ?)";
-                params.add(java.sql.Date.valueOf(backDate));
-                params.add(java.sql.Date.valueOf(backDate));
-            } else {
-                sql += " AND STATUS = 1"; // Normal live fetch
+            // 2. Check the cleaned value and instantly standardize it to full words
+            if (rawType.equals("CR") || rawType.equals("CREDIT")) {
+                d.txnType = "Credit";
             }
-            sql += " FETCH FIRST 50 ROWS ONLY";
-
-            return jdbcTemplate.query(sql, (rs, rowNum) -> new BranchDto(rs.getString("CODE"), rs.getString("NAME")), params.toArray());
-
-        } catch (DataAccessException e) {
-            log.error("BRANCH_SEARCH_FAIL | Error: {}", e.getMessage());
-            return Collections.emptyList();
-        }
-    }
-
-3. Update CglController.java & CglService.java
-A. In CglController.java, replace the searchCgl method:
-    @GetMapping("/search")
-    public ResponseEntity<List<CglDto>> searchCgl(
-            @RequestParam(value = "query", required = false, defaultValue = "")
-            @Pattern(regexp = "^[a-zA-Z0-9]{0,20}$", message = "Invalid search query") String query,
-            @RequestParam(required = false) @org.springframework.format.annotation.DateTimeFormat(iso = org.springframework.format.annotation.DateTimeFormat.ISO.DATE) java.time.LocalDate backDate) {
-
-        if (query == null || query.trim().isEmpty()) {
-            return ResponseEntity.ok(java.util.Collections.emptyList());
-        }
-
-        log.info("CGL_CONTROLLER_PREFIX_SEARCH | Action: Filtering CGLs starting with: {} | BackDate: {}", query, backDate);
-
-        List<CglDto> results = cglService.searchCgls(query.trim(), backDate);
-        return ResponseEntity.ok(results);
-    }
-
-B. In CglService.java, add JdbcTemplate and replace searchCgls:
-    @org.springframework.beans.factory.annotation.Autowired
-    @org.springframework.beans.factory.annotation.Qualifier("oracleJdbcTemplate")
-    private org.springframework.jdbc.core.JdbcTemplate jdbcTemplate;
-
-    public List<CglDto> searchCgls(String query, java.time.LocalDate backDate) {
-        log.info("CGL_SEARCH_INIT | QueryProvided: {} | BackDate: {}", org.springframework.util.StringUtils.hasText(query), backDate);
-
-        if (!org.springframework.util.StringUtils.hasText(query)) {
-            return Collections.emptyList();
-        }
-
-        try {
-            String sql = "SELECT CGL_NUMBER, DESCRIPTION FROM CGL_MASTER WHERE (LOWER(CGL_NUMBER) LIKE LOWER(?) OR LOWER(DESCRIPTION) LIKE LOWER(?))";
-            List<Object> params = new java.util.ArrayList<>();
-            params.add("%" + query.trim() + "%");
-            params.add("%" + query.trim() + "%");
-
-            if (backDate != null) {
-                sql += " AND TRUNC(OPEN_DATE) <= ? AND (CLOSE_DATE IS NULL OR TRUNC(CLOSE_DATE) >= ?)";
-                params.add(java.sql.Date.valueOf(backDate));
-                params.add(java.sql.Date.valueOf(backDate));
-            } else {
-                sql += " AND STATUS = 1";
+            else if (rawType.equals("DR") || rawType.equals("DEBIT")) {
+                d.txnType = "Debit";
             }
-            sql += " FETCH FIRST 50 ROWS ONLY";
+            else {
+                d.formatErrors.add("The transaction type must be 'CR', 'DR', 'Debit', or 'Credit' (case-insensitive)");
+            }
 
-            return jdbcTemplate.query(sql, (rs, rowNum) -> new CglDto(rs.getString("CGL_NUMBER"), rs.getString("DESCRIPTION")), params.toArray());
+            // Amount
+            if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) <= 0) {
+                d.formatErrors.add("Amount must be greater than 0.");
+            } else if (d.amount.precision() > 20 || d.amount.scale() > 4) {
+                d.formatErrors.add("Exceeded maximum 16 digits or 4 decimal places.");
+            }
 
-        } catch (DataAccessException e) {
-            log.error("CGL_SEARCH_FAIL | Reason: Database access error: {}", e.getMessage());
-            return Collections.emptyList();
-        }
+            // Product Code
+            if (d.productCode != null && !d.productCode.isEmpty() && !d.productCode.equals("A") && !d.productCode.matches("^[0-9]{1,8}$")) {
+                d.formatErrors.add("Product code must be up to 8 digits or left blank.");
+            }
+
+
+            // Remarks (Alphanumeric and single spaces only)
+            if (d.remarks == null || d.remarks.trim().length() < 2 || d.remarks.trim().length() > 30) {
+                d.formatErrors.add("Remarks must be 2-30 characters.");
+            } else if (!d.remarks.matches("^[a-zA-Z0-9]+(?: [a-zA-Z0-9]+)*$")) {
+                d.formatErrors.add("Remarks must contain only alphanumeric characters and single spaces between words.");
+            }
+
+            // Currency
+            if (d.currency == null || d.currency.length() != 3) {
+                d.formatErrors.add("Currency code must be exactly 3 characters.");
+            }
+
+            // CGL (Strictly 10 digits)
+            if (d.cgl == null || d.cgl.isEmpty()) {
+                d.formatErrors.add("CGL is mandatory.");
+            } else if (!d.cgl.matches("^[0-9]{10}$")) {
+                d.formatErrors.add("CGL must be exactly 10 digits.");
+            }
+
+            // Branch (Strictly 5 alphanumeric characters)
+            if (d.branch == null || d.branch.trim().isEmpty()) {
+                d.formatErrors.add("Branch code is mandatory.");
+            } else if (!d.branch.matches("^[a-zA-Z0-9]{5}$")) {
+                d.formatErrors.add("Branch code must be exactly 5 alphanumeric characters.");
+            }
+        });
     }
 
-4. Update CurrencyController.java & ValidationMasterService.java
-A. In CurrencyController.java, replace getActiveCurrencies:
-    @GetMapping("/currencies")
-    public ResponseEntity<java.util.Set<String>> getActiveCurrencies(
-            @RequestParam(required = false) @org.springframework.format.annotation.DateTimeFormat(iso = org.springframework.format.annotation.DateTimeFormat.ISO.DATE) java.time.LocalDate backDate) {
-        
-        Set<String> currencies = validationMasterService.getAllActiveCurrencies(backDate);
-        return ResponseEntity.ok(currencies);
+    public void runDbCheck(List<ExcelRowData> rows) {
+        Set<String> validBranches = validationMasterService.getAllActiveBranches();
+        Set<String> validCurrs = validationMasterService.getAllActiveCurrencies();
+        Set<String> validCgls = validationMasterService.getAllActiveCgls();
+
+        rows.parallelStream().forEach(d -> {
+            if (d.branch != null && !d.branch.isEmpty() && !validBranches.contains(d.branch))
+                d.dbErrors.add("Branch is inactive or not found: " + d.branch);
+            if (d.currency != null && !d.currency.isEmpty() && !validCurrs.contains(d.currency))
+                d.dbErrors.add("Currency is inactive or not found: " + d.currency);
+            if (d.cgl != null && !d.cgl.isEmpty() && !validCgls.contains(d.cgl))
+                d.dbErrors.add("CGL is inactive or not found: " + d.cgl);
+        });
     }
 
-B. In ValidationMasterService.java, replace getAllActiveCurrencies:
-    public Set<String> getAllActiveCurrencies(java.time.LocalDate backDate) {
-        long start = System.currentTimeMillis();
-        String sql;
-        List<Object> params = new java.util.ArrayList<>();
 
-        // Ensure we only show currencies created AT OR BEFORE the backdate
-        if (backDate != null) {
-            sql = "SELECT CURRENCY_CODE FROM CURRENCY_MASTER WHERE TRUNC(CREATED_AT) <= ?";
-            params.add(java.sql.Date.valueOf(backDate));
-        } else {
-            sql = "SELECT CURRENCY_CODE FROM CURRENCY_MASTER WHERE FLAG = 1";
-        }
+    /**
+     * Rule 5: Balance Integrity Logic.
+     * Uses LongAdder with 10^4 scale shift to perform precise integer arithmetic
+     * on parallel streams, preventing floating-point drift in large batches.
+     */
+    public void runBalanceCheck(List<ExcelRowData> rows) {
+        ConcurrentHashMap<String, AtomicReference<BigDecimal>> balanceMap = new ConcurrentHashMap<>();
+        ConcurrentHashMap<String, Boolean> branchHasDebit = new ConcurrentHashMap<>();
+        ConcurrentHashMap<String, Boolean> branchHasCredit = new ConcurrentHashMap<>();
 
-        try {
-            List<String> list = jdbcTemplate.query(con -> {
-                var ps = con.prepareStatement(sql);
-                ps.setFetchSize(1000);
-                for (int i = 0; i < params.size(); i++) {
-                    ps.setObject(i + 1, params.get(i));
+        // Pass 1: Aggregate totals and check for presence
+        rows.parallelStream().forEach(d -> {
+            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
+
+            // Track Debit/Credit Presence per Branch
+            if ("Debit".equalsIgnoreCase(d.txnType)) branchHasDebit.put(d.branch, true);
+            if ("Credit".equalsIgnoreCase(d.txnType)) branchHasCredit.put(d.branch, true);
+
+            // Calculate Balance Groupings
+            boolean isCredit = "Credit".equalsIgnoreCase(d.txnType);
+            BigDecimal finalVal = isCredit ? d.amount.negate() : d.amount;
+
+            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
+            String balKey = d.branch + "_" + d.currency + "_" + type;
+
+            // Thread-safe BigDecimal addition without scaling or overflow risks
+            balanceMap.computeIfAbsent(balKey, k -> new AtomicReference<>(BigDecimal.ZERO))
+                    .updateAndGet(curr -> curr.add(finalVal));
+        });
+
+        // Pass 2: Apply the simple, generic error messages to the rows
+        rows.parallelStream().forEach(d -> {
+            if (d.branch == null || d.currency == null || d.cgl == null || d.amount == null || d.txnType == null) return;
+
+            String type = d.cgl.startsWith("5") ? "MEMO" : "NORMAL";
+            String balKey = d.branch + "_" + d.currency + "_" + type;
+            AtomicReference<BigDecimal> adder = balanceMap.get(balKey);
+
+            // Strict check: If there is ANY entry for this specific ledger type, the sum MUST equal exactly 0.0000
+            if (adder != null && adder.get().compareTo(BigDecimal.ZERO) != 0) {
+                if (!d.balErrors.contains("Debit and Credit totals must match exactly for " + type + " entries.")) {
+                    d.balErrors.add("Debit and Credit totals must match exactly for " + type + " entries.");
                 }
-                return ps;
-            }, (rs, rowNum) -> rs.getString(1));
-
-            log.info("MASTER_DATA_LOADED | Type: CURRENCIES | Count: {} | Duration: {}ms", list.size(), System.currentTimeMillis() - start);
-            return new HashSet<>(list);
-
-        } catch (DataAccessException e) {
-            log.error("MASTER_DATA_FETCH_FAIL | Type: CURRENCIES | Reason: {}", e.getMessage());
-            return new HashSet<>();
-        }
+            }
+        });
     }
+}
 
-Summary of Changes
-These backend updates ensure that if the frontend passes the ?backDate=2024-01-01 URL parameter into the search requests, Oracle perfectly filters out the Branches and CGLs that were closed before that date, or were created after that date.
-Once you have these compiled and running, let me know, and I will give you the exact React frontend updates to pass the Back Date down to these dropdowns!
+here also we need to do changesExpected 1 argument but found 0
