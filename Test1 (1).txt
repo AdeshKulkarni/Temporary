@@ -1,9 +1,218 @@
-class Pair {
-    TreeNode node;
-    int index;
-    
-    Pair(TreeNode node, int index) {
-        this.node = node;
-        this.index = index;
+This is a fantastic addition. Backdated posting is a crucial compliance feature in enterprise banking.
+To support this in the backend, we need to do two things:
+ * Update the Voucher Query to return IS_BACK_DATED and BACK_DATE when fetching the VIDs.
+ * Update the Search API endpoints (Branch, CGL, and Currency) to accept a backDate parameter and dynamically filter the database so it only returns records that were actually active on that specific historical date.
+Here are the exact backend file replacements.
+1. Update VoucherQueryService.java (To send Backdate flags to the UI)
+Find the getAvailableVouchersVid method in your VoucherQueryService.java file. Replace the SQL query and the (rs, rowNum) mapper logic with this updated version:
+REPLACE THIS:
+        String sql = """
+            SELECT 
+                rv.ID,
+                rv.VID,
+                rv.DESCRIPTION,
+                c.CATEGORY_NAME,
+                rv.CREATED_BY AS CREATOR_ID,
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, rv.CREATED_BY) AS CREATOR_NAME,
+                rv.CREATED_AT
+            FROM REQUEST_VOUCHER rv
+
+(and the matching map.put logic...)
+WITH THIS:
+        // ADDED IS_BACK_DATED AND BACK_DATE TO THE SELECTION
+        String sql = """
+            SELECT 
+                rv.ID,
+                rv.VID,
+                rv.DESCRIPTION,
+                c.CATEGORY_NAME,
+                rv.CREATED_BY AS CREATOR_ID,
+                COALESCE(u.FIRST_NAME || ' ' || u.LAST_NAME, rv.CREATED_BY) AS CREATOR_NAME,
+                rv.CREATED_AT,
+                rv.IS_BACK_DATED,
+                rv.BACK_DATE
+            FROM REQUEST_VOUCHER rv
+            LEFT JOIN VOUCHER_CATEGORY c ON rv.CATEGORY_ID = c.ID
+            LEFT JOIN USERS u ON rv.CREATED_BY = u.USER_ID
+            WHERE rv.ALLOWED_ROLE = ? AND rv.STATUS = 'ACTIVE'
+            AND NOT EXISTS (
+                SELECT 1 FROM VOUCHER_POSTING vp 
+                WHERE vp.VID_FK = rv.VID 
+                AND vp.BATCH_STATUS NOT IN ('R', 'REJECTED', 'ERROR')
+            )
+            ORDER BY rv.CREATED_AT DESC
+        """;
+
+        List<Map<String, Object>> vouchers = jdbcTemplate.query(sql, (rs, rowNum) -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("id", rs.getLong("ID"));
+            map.put("vid", rs.getString("VID"));
+            map.put("description", rs.getString("DESCRIPTION"));
+            map.put("categoryName", rs.getString("CATEGORY_NAME"));
+            map.put("createdBy", rs.getString("CREATOR_ID"));
+            map.put("createdByName", rs.getString("CREATOR_NAME"));
+
+            java.sql.Timestamp ts = rs.getTimestamp("CREATED_AT");
+            map.put("createdAt", ts != null ? ts.toInstant().toString() : null);
+            
+            // --- BACKDATED DATA MAPPING ---
+            map.put("isBackDated", rs.getInt("IS_BACK_DATED"));
+            java.sql.Date bd = rs.getDate("BACK_DATE");
+            map.put("backDate", bd != null ? bd.toLocalDate().toString() : null);
+            
+            return map;
+        }, roleId);
+
+2. Update BranchController.java & BranchService.java
+We need to add the backDate filter to the dropdown search. Because your previous service used Spring JPA, we will add JdbcTemplate to execute the native Oracle Date logic safely.
+A. In BranchController.java, replace the searchBranches method:
+    @GetMapping("/search")
+    public ResponseEntity<List<BranchDto>> searchBranches(
+            @RequestParam @Pattern(regexp = "^[a-zA-Z0-9]{1,20}$", message = "Invalid search query") String query,
+            @RequestParam(required = false) @org.springframework.format.annotation.DateTimeFormat(iso = org.springframework.format.annotation.DateTimeFormat.ISO.DATE) java.time.LocalDate backDate) {
+
+        log.info("BRANCH_CONTROLLER_PREFIX_SEARCH | Query: {} | BackDate: {}", query, backDate);
+
+        if (query == null || query.trim().isEmpty()) {
+            return ResponseEntity.ok(java.util.Collections.emptyList());
+        }
+
+        List<BranchDto> results = branchService.searchBranches(query.trim(), backDate);
+        return ResponseEntity.ok(results);
     }
-}
+
+B. In BranchService.java, add JdbcTemplate and replace searchBranches:
+    @org.springframework.beans.factory.annotation.Autowired
+    @org.springframework.beans.factory.annotation.Qualifier("oracleJdbcTemplate")
+    private org.springframework.jdbc.core.JdbcTemplate jdbcTemplate;
+
+    public List<BranchDto> searchBranches(String query, java.time.LocalDate backDate) {
+        log.info("BRANCH_SEARCH_INIT | QueryLength: {} | BackDate: {}", (query != null ? query.length() : 0), backDate);
+
+        if (query == null || query.trim().isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        try {
+            String sql = "SELECT CODE, NAME FROM BRANCH_MASTER WHERE (LOWER(CODE) LIKE LOWER(?) OR LOWER(NAME) LIKE LOWER(?))";
+            List<Object> params = new java.util.ArrayList<>();
+            params.add("%" + query + "%");
+            params.add("%" + query + "%");
+
+            // IF BACKDATED: Must be open before the date, and NOT closed before the date
+            if (backDate != null) {
+                sql += " AND TRUNC(OPEN_DATE) <= ? AND (CLOSE_DATE IS NULL OR TRUNC(CLOSE_DATE) >= ?)";
+                params.add(java.sql.Date.valueOf(backDate));
+                params.add(java.sql.Date.valueOf(backDate));
+            } else {
+                sql += " AND STATUS = 1"; // Normal live fetch
+            }
+            sql += " FETCH FIRST 50 ROWS ONLY";
+
+            return jdbcTemplate.query(sql, (rs, rowNum) -> new BranchDto(rs.getString("CODE"), rs.getString("NAME")), params.toArray());
+
+        } catch (DataAccessException e) {
+            log.error("BRANCH_SEARCH_FAIL | Error: {}", e.getMessage());
+            return Collections.emptyList();
+        }
+    }
+
+3. Update CglController.java & CglService.java
+A. In CglController.java, replace the searchCgl method:
+    @GetMapping("/search")
+    public ResponseEntity<List<CglDto>> searchCgl(
+            @RequestParam(value = "query", required = false, defaultValue = "")
+            @Pattern(regexp = "^[a-zA-Z0-9]{0,20}$", message = "Invalid search query") String query,
+            @RequestParam(required = false) @org.springframework.format.annotation.DateTimeFormat(iso = org.springframework.format.annotation.DateTimeFormat.ISO.DATE) java.time.LocalDate backDate) {
+
+        if (query == null || query.trim().isEmpty()) {
+            return ResponseEntity.ok(java.util.Collections.emptyList());
+        }
+
+        log.info("CGL_CONTROLLER_PREFIX_SEARCH | Action: Filtering CGLs starting with: {} | BackDate: {}", query, backDate);
+
+        List<CglDto> results = cglService.searchCgls(query.trim(), backDate);
+        return ResponseEntity.ok(results);
+    }
+
+B. In CglService.java, add JdbcTemplate and replace searchCgls:
+    @org.springframework.beans.factory.annotation.Autowired
+    @org.springframework.beans.factory.annotation.Qualifier("oracleJdbcTemplate")
+    private org.springframework.jdbc.core.JdbcTemplate jdbcTemplate;
+
+    public List<CglDto> searchCgls(String query, java.time.LocalDate backDate) {
+        log.info("CGL_SEARCH_INIT | QueryProvided: {} | BackDate: {}", org.springframework.util.StringUtils.hasText(query), backDate);
+
+        if (!org.springframework.util.StringUtils.hasText(query)) {
+            return Collections.emptyList();
+        }
+
+        try {
+            String sql = "SELECT CGL_NUMBER, DESCRIPTION FROM CGL_MASTER WHERE (LOWER(CGL_NUMBER) LIKE LOWER(?) OR LOWER(DESCRIPTION) LIKE LOWER(?))";
+            List<Object> params = new java.util.ArrayList<>();
+            params.add("%" + query.trim() + "%");
+            params.add("%" + query.trim() + "%");
+
+            if (backDate != null) {
+                sql += " AND TRUNC(OPEN_DATE) <= ? AND (CLOSE_DATE IS NULL OR TRUNC(CLOSE_DATE) >= ?)";
+                params.add(java.sql.Date.valueOf(backDate));
+                params.add(java.sql.Date.valueOf(backDate));
+            } else {
+                sql += " AND STATUS = 1";
+            }
+            sql += " FETCH FIRST 50 ROWS ONLY";
+
+            return jdbcTemplate.query(sql, (rs, rowNum) -> new CglDto(rs.getString("CGL_NUMBER"), rs.getString("DESCRIPTION")), params.toArray());
+
+        } catch (DataAccessException e) {
+            log.error("CGL_SEARCH_FAIL | Reason: Database access error: {}", e.getMessage());
+            return Collections.emptyList();
+        }
+    }
+
+4. Update CurrencyController.java & ValidationMasterService.java
+A. In CurrencyController.java, replace getActiveCurrencies:
+    @GetMapping("/currencies")
+    public ResponseEntity<java.util.Set<String>> getActiveCurrencies(
+            @RequestParam(required = false) @org.springframework.format.annotation.DateTimeFormat(iso = org.springframework.format.annotation.DateTimeFormat.ISO.DATE) java.time.LocalDate backDate) {
+        
+        Set<String> currencies = validationMasterService.getAllActiveCurrencies(backDate);
+        return ResponseEntity.ok(currencies);
+    }
+
+B. In ValidationMasterService.java, replace getAllActiveCurrencies:
+    public Set<String> getAllActiveCurrencies(java.time.LocalDate backDate) {
+        long start = System.currentTimeMillis();
+        String sql;
+        List<Object> params = new java.util.ArrayList<>();
+
+        // Ensure we only show currencies created AT OR BEFORE the backdate
+        if (backDate != null) {
+            sql = "SELECT CURRENCY_CODE FROM CURRENCY_MASTER WHERE TRUNC(CREATED_AT) <= ?";
+            params.add(java.sql.Date.valueOf(backDate));
+        } else {
+            sql = "SELECT CURRENCY_CODE FROM CURRENCY_MASTER WHERE FLAG = 1";
+        }
+
+        try {
+            List<String> list = jdbcTemplate.query(con -> {
+                var ps = con.prepareStatement(sql);
+                ps.setFetchSize(1000);
+                for (int i = 0; i < params.size(); i++) {
+                    ps.setObject(i + 1, params.get(i));
+                }
+                return ps;
+            }, (rs, rowNum) -> rs.getString(1));
+
+            log.info("MASTER_DATA_LOADED | Type: CURRENCIES | Count: {} | Duration: {}ms", list.size(), System.currentTimeMillis() - start);
+            return new HashSet<>(list);
+
+        } catch (DataAccessException e) {
+            log.error("MASTER_DATA_FETCH_FAIL | Type: CURRENCIES | Reason: {}", e.getMessage());
+            return new HashSet<>();
+        }
+    }
+
+Summary of Changes
+These backend updates ensure that if the frontend passes the ?backDate=2024-01-01 URL parameter into the search requests, Oracle perfectly filters out the Branches and CGLs that were closed before that date, or were created after that date.
+Once you have these compiled and running, let me know, and I will give you the exact React frontend updates to pass the Back Date down to these dropdowns!
