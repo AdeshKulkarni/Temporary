@@ -1,19 +1,38 @@
-  const handleDownloadFile = async (type, reqId = requestId) => {
-    if (type === "ERROR") showSnackBar("Downloading error report...", "info");
-    
-    // FIX: Highly readable timestamp format separated by underscores
-    // Example output: Error_Report_28_09_2026_18_16.xlsx
-    const cleanTimestamp = dayjs().format("DD_MM_YYYY_HH_mm");
-    const targetFilename = type === "ERROR" ? `Error_Report_${cleanTimestamp}.xlsx` : "";
+You have hit on a classic "Ghost Session" problem!
+Because the computer crashed or the tab closed unexpectedly, the lock stayed in Redis. When the same user logs back in 5 minutes later, the system blocks them because it thinks "someone" is using it, not realizing it is the exact same person trying to reclaim their own work!
+To fix this, we need to make the backend lock "Re-entrant" (or Reclaimable).
+We will change the backend logic so that if Redis sees the VID is locked, it checks WHO locked it. If the userId in Redis matches the userId of the person logging back in, the system will let them in and just reset the 60-minute timer.
+The Backend Fix (VoucherCommandService.java)
+You need to update the acquireVidLock method inside your VoucherCommandService.java.
+Find your acquireVidLock method. It currently looks something like this, using setIfAbsent:
+REPLACE YOUR CURRENT acquireVidLock METHOD WITH THIS:
+    public void acquireVidLock(String vid, String userId) {
+        String safeVid = com.fincore.VoucherService.config.SecuritySanitizer.sanitizeId(vid);
+        String lockKey = "LOCK_VID_" + safeVid;
 
-    const success = await downloadFileHelper(
-      `/JS/voucher/download-bulk-file/${reqId}?type=${type}`,
-      targetFilename
-    );
-    
-    if (success && type === "SUCCESS") showSnackBar("Downloaded successfully.", "success");
-    if (success && type === "ERROR") {
-      setDownloadMsg("Error report downloaded.");
-      setIsErrorDownloaded(true);
+        // 1. Check if the lock already exists in Redis
+        String existingLockUser = (String) redisTemplate.opsForValue().get(lockKey);
+
+        if (existingLockUser != null) {
+            // 2. If it's locked by the SAME user logging back in, let them reclaim it!
+            if (existingLockUser.equalsIgnoreCase(userId)) {
+                log.info("VID_LOCK_RECLAIMED | VID: {} | User: {}", safeVid, userId);
+                // Refresh their 60-minute timer and allow them to proceed
+                redisTemplate.expire(lockKey, 60, java.util.concurrent.TimeUnit.MINUTES);
+                return; 
+            } else {
+                // 3. It is locked by someone else
+                log.warn("VID_LOCK_DENIED | VID: {} | Blocked User: {} | Active User: {}", safeVid, userId, existingLockUser);
+                throw new CustomExceptions.InvalidDataException("This VID is currently locked and being used by user: " + existingLockUser);
+            }
+        }
+
+        // 4. If no lock exists, create a brand new one for 60 minutes
+        redisTemplate.opsForValue().set(lockKey, userId, 60, java.util.concurrent.TimeUnit.MINUTES);
+        log.info("VID_LOCKED | VID: {} | User: {}", safeVid, userId);
     }
-  };
+
+Why this solves your exact problem:
+ * The Reconnect Scenario: If Maker A selects a VID, their PC restarts, and they log back in 5 minutes later, they can select the exact same VID. The backend will see it belongs to them, say "Welcome back!", and refresh the timer to 60 minutes.
+ * The Security Scenario: If Maker B tries to select it while Maker A's PC is restarting, the backend sees Maker B does not match the lock owner, and rejects Maker B.
+ * Logout: Your frontend already uses navigator.sendBeacon to unlock the VID if they close the tab nicely. But if they click a "Logout" button, you can simply call the /api/voucher/unlock/{vid} API right before clearing the local storage!
