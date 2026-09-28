@@ -1,38 +1,41 @@
-You have hit on a classic "Ghost Session" problem!
-Because the computer crashed or the tab closed unexpectedly, the lock stayed in Redis. When the same user logs back in 5 minutes later, the system blocks them because it thinks "someone" is using it, not realizing it is the exact same person trying to reclaim their own work!
-To fix this, we need to make the backend lock "Re-entrant" (or Reclaimable).
-We will change the backend logic so that if Redis sees the VID is locked, it checks WHO locked it. If the userId in Redis matches the userId of the person logging back in, the system will let them in and just reset the 60-minute timer.
-The Backend Fix (VoucherCommandService.java)
-You need to update the acquireVidLock method inside your VoucherCommandService.java.
-Find your acquireVidLock method. It currently looks something like this, using setIfAbsent:
-REPLACE YOUR CURRENT acquireVidLock METHOD WITH THIS:
-    public void acquireVidLock(String vid, String userId) {
+ public void acquireVidLock(String vid, String userId) {
+
+        String safeVid = SecuritySanitizer.sanitizeId(vid);
+        String lockKey = "LOCK_VID_" + safeVid;
+        byte[] userBytes = userId.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+        // Atomic SETNX with 30-minute TTL
+        Boolean acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, userBytes, 30, TimeUnit.MINUTES);
+
+        if (Boolean.FALSE.equals(acquired)) {
+            throw new CustomExceptions.ConcurrencyLockException("This VID is currently being processed by another user.");
+        }
+
+        // Secondary safeguard: Ensure the DB hasn't already marked it as USED before the lock was acquired
+        String dbStatus = jdbcTemplate.queryForObject("SELECT STATUS FROM REQUEST_VOUCHER WHERE VID = ?", String.class, vid);
+        if (!"ACTIVE".equalsIgnoreCase(dbStatus)) {
+            redisTemplate.delete(lockKey); // Release immediately if DB is dirty
+            throw new CustomExceptions.ConcurrencyLockException("This VID has already been used. Please select a different VID.");
+        }
+    }
+
+    public void releaseVidLock(String vid, String userId) {
+        // FORTIFY FIX: Access Control Database
         String safeVid = com.fincore.VoucherService.config.SecuritySanitizer.sanitizeId(vid);
         String lockKey = "LOCK_VID_" + safeVid;
 
-        // 1. Check if the lock already exists in Redis
-        String existingLockUser = (String) redisTemplate.opsForValue().get(lockKey);
+        byte[] existingUserBytes = redisTemplate.opsForValue().get(lockKey);
 
-        if (existingLockUser != null) {
-            // 2. If it's locked by the SAME user logging back in, let them reclaim it!
-            if (existingLockUser.equalsIgnoreCase(userId)) {
-                log.info("VID_LOCK_RECLAIMED | VID: {} | User: {}", safeVid, userId);
-                // Refresh their 60-minute timer and allow them to proceed
-                redisTemplate.expire(lockKey, 60, java.util.concurrent.TimeUnit.MINUTES);
-                return; 
-            } else {
-                // 3. It is locked by someone else
-                log.warn("VID_LOCK_DENIED | VID: {} | Blocked User: {} | Active User: {}", safeVid, userId, existingLockUser);
-                throw new CustomExceptions.InvalidDataException("This VID is currently locked and being used by user: " + existingLockUser);
+        if (existingUserBytes != null) {
+            String lockedBy = new String(existingUserBytes);
+            if (lockedBy.equals(userId)) {
+                redisTemplate.delete(lockKey);
             }
         }
-
-        // 4. If no lock exists, create a brand new one for 60 minutes
-        redisTemplate.opsForValue().set(lockKey, userId, 60, java.util.concurrent.TimeUnit.MINUTES);
-        log.info("VID_LOCKED | VID: {} | User: {}", safeVid, userId);
     }
 
-Why this solves your exact problem:
- * The Reconnect Scenario: If Maker A selects a VID, their PC restarts, and they log back in 5 minutes later, they can select the exact same VID. The backend will see it belongs to them, say "Welcome back!", and refresh the timer to 60 minutes.
- * The Security Scenario: If Maker B tries to select it while Maker A's PC is restarting, the backend sees Maker B does not match the lock owner, and rejects Maker B.
- * Logout: Your frontend already uses navigator.sendBeacon to unlock the VID if they close the tab nicely. But if they click a "Logout" button, you can simply call the /api/voucher/unlock/{vid} API right before clearing the local storage!
+CHECK this 2 methods and tell mi it is correct or not 
+ // Atomic SETNX with 30-minute TTL
+        Boolean acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, userBytes, 30, TimeUnit.MINUTES);
+
+what is this lock about 
