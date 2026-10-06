@@ -75,3 +75,236 @@ public class JwtDecoderConfig {
         }
     }
 }
+
+
+package com.fincore.gateway.Config;
+
+import lombok.extern.slf4j.Slf4j;
+
+import java.nio.charset.StandardCharsets;
+import java.security.KeyFactory;
+import java.security.NoSuchAlgorithmException;
+import java.security.PrivateKey;
+import java.security.interfaces.RSAPublicKey;
+import java.security.spec.InvalidKeySpecException;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.security.spec.X509EncodedKeySpec;
+import java.util.Base64;
+import javax.crypto.Cipher;
+
+/**
+ * Utility class for handling cryptographic keys, specifically for parsing
+ * PEM-formatted RSA public keys into Java's {@link RSAPublicKey} object format.
+ */
+@Slf4j
+public class KeyUtils {
+
+    
+    public static RSAPublicKey parseRsaPublicKey(String pem) {
+        try {
+            // Remove PEM headers, footers, and all whitespace
+            String clean = pem
+                    .replace("-----BEGIN PUBLIC KEY-----", "")
+                    .replace("-----END PUBLIC KEY-----", "")
+                    .replaceAll("\\s", "");
+
+            // Decode the Base64 content into raw bytes
+            byte[] decoded = Base64.getDecoder().decode(clean);
+
+            // Define the key specification using X509 encoding (standard for public keys)
+            X509EncodedKeySpec spec = new X509EncodedKeySpec(decoded);
+
+            // Get an instance of the RSA KeyFactory and generate the public key
+            KeyFactory kf = KeyFactory.getInstance("RSA");
+            return (RSAPublicKey) kf.generatePublic(spec);
+
+        } catch (NoSuchAlgorithmException e) {
+            // RSA algorithm is expected to be present in standard JVMs
+            throw new IllegalStateException("RSA algorithm not available in the runtime environment", e);
+        } catch (InvalidKeySpecException e) {
+            // Thrown if the decoded bytes do not form a valid RSA public key structure
+            throw new IllegalArgumentException("Invalid RSA public key specification provided in PEM string", e);
+        }
+    }
+
+    /**
+     * Parses a PKCS#8 PEM formatted private key.
+     */
+    public static PrivateKey parseRsaPrivateKey(String pem) {
+        try {
+            String clean = pem.replace("-----BEGIN PRIVATE KEY-----", "")
+                    .replace("-----END PRIVATE KEY-----", "")
+                    .replaceAll("\\s", "");
+            byte[] decoded = Base64.getDecoder().decode(clean);
+            PKCS8EncodedKeySpec spec = new PKCS8EncodedKeySpec(decoded);
+            KeyFactory kf = KeyFactory.getInstance("RSA");
+            return kf.generatePrivate(spec);
+        } catch (NoSuchAlgorithmException | InvalidKeySpecException e) {
+            log.error("Failed to parse RSA Private Key. Check configuration format.");
+            throw new IllegalArgumentException("Invalid RSA private key", e);
+        }
+    }
+
+    /**
+     * Decrypts the Base64 encoded RSA ciphertext.
+     */
+    public static String decryptRsaPassword(String encryptedBase64, String privateKeyPem) {
+        if (encryptedBase64 == null || encryptedBase64.isBlank()) {
+            return "";
+        }
+        try {
+            PrivateKey privateKey = parseRsaPrivateKey(privateKeyPem);
+            // PKCS1Padding aligns with standard frontend JSEncrypt libraries
+            Cipher cipher = Cipher.getInstance("RSA/ECB/PKCS1Padding");
+            cipher.init(Cipher.DECRYPT_MODE, privateKey);
+
+            byte[] decodedBytes = Base64.getDecoder().decode(encryptedBase64);
+            byte[] decryptedBytes = cipher.doFinal(decodedBytes);
+
+            return new String(decryptedBytes, StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            // PROD SECURITY: Never log the exact cryptographic failure reason to prevent Padding Oracle attacks.
+            log.warn("Payload decryption failed. Invalid ciphertext provided.");
+            throw new SecurityException("Invalid encrypted payload");
+        }
+    }
+}
+
+
+package com.fincore.gateway.Config;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.ResourceLoader;
+import org.springframework.ldap.core.LdapTemplate;
+import org.springframework.ldap.core.support.LdapContextSource;
+
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.URI;
+import java.util.HashMap;
+import java.util.Map;
+
+@Slf4j
+@Configuration
+public class LdapConfig {
+
+    private final ResourceLoader resourceLoader;
+
+    @Value("${spring.ldap.urls:ldaps://uatrootdc1.uatad.sbi:3269}")
+    private String ldapUrls; // Note: Can be space-separated
+
+    @Value("${spring.ldap.base:DC=UATAD,DC=SBI}")
+    private String ldapBaseDn;
+
+    @Value("${spring.ldap.username:}")
+    private String ldapUsername;
+
+    @Value("${spring.ldap.password:}")
+    private String ldapPassword;
+
+    @Value("${security.ldap.truststore-path:}")
+    private String trustStorePath;
+
+    @Value("${security.ldap.truststore-password:changeit}")
+    private String trustStorePassword;
+
+    public LdapConfig(ResourceLoader resourceLoader) {
+        this.resourceLoader = resourceLoader;
+    }
+
+    @Bean
+    public LdapContextSource contextSource() {
+        log.info("===================================================");
+        log.info("INITIALIZING LDAP CONTEXT SOURCE");
+        log.info("Configured URLs: {}", ldapUrls);
+
+        // 0. DIAGNOSTIC: Print DNS Resolution for all configured URLs
+        printDnsResolution(ldapUrls);
+
+        // 1. SSL TRUSTSTORE SETUP
+        if (ldapUrls.toLowerCase().contains("ldaps") && trustStorePath != null && !trustStorePath.isBlank()) {
+            try {
+                Resource trustStore = resourceLoader.getResource(trustStorePath);
+                if (trustStore.exists()) {
+                    String absolutePath = trustStore.getFile().getAbsolutePath();
+                    log.info("Loading External Truststore from: {}", absolutePath);
+                    System.setProperty("javax.net.ssl.trustStore", absolutePath);
+                    System.setProperty("javax.net.ssl.trustStorePassword", trustStorePassword);
+                } else {
+                    log.error("CRITICAL: Truststore configured at '{}' but FILE NOT FOUND.", trustStorePath);
+                }
+            } catch (IOException e) {
+                log.error("Error loading truststore file", e);
+            }
+        }
+
+        // 2. CONFIGURE CONNECTION
+        LdapContextSource contextSource = new LdapContextSource();
+        // Spring natively parses space-separated URLs for High Availability
+        contextSource.setUrls(ldapUrls.split("\\s+"));
+        contextSource.setBase(ldapBaseDn);
+
+        // 3. SET BIND CREDENTIALS
+        if (ldapUsername != null && !ldapUsername.isBlank()) {
+            log.info("Setting LDAP Bind User (Service Account): {}", ldapUsername);
+            contextSource.setUserDn(ldapUsername);
+            contextSource.setPassword(ldapPassword);
+        }
+
+        // 4. TIMEOUTS & PROTOCOL SETTINGS
+        Map<String, Object> baseEnv = new HashMap<>();
+        if (ldapUrls.toLowerCase().contains("ldaps")) {
+            baseEnv.put("java.naming.security.protocol", "ssl");
+        }
+
+        // 10 Second Timeouts as requested
+        baseEnv.put("com.sun.jndi.ldap.connect.timeout", "2000");
+        baseEnv.put("com.sun.jndi.ldap.read.timeout", "5000");
+
+        // Follow referrals across PR/DR
+        baseEnv.put("java.naming.referral", "follow");
+
+        // Native pooling enabled (Fallback since commons-pool2 is missing)
+        contextSource.setPooled(true);
+        contextSource.setBaseEnvironmentProperties(baseEnv);
+
+        log.info("===================================================");
+        return contextSource;
+    }
+
+    @Bean
+    public LdapTemplate ldapTemplate() {
+        LdapTemplate template = new LdapTemplate(contextSource());
+        template.setIgnorePartialResultException(true);
+        template.setIgnoreNameNotFoundException(true);
+        return template;
+    }
+
+    /**
+     * Utility method to print the exact IP addresses the JVM resolves
+     * at startup to diagnose DNS Round-Robin blind spots.
+     */
+    private void printDnsResolution(String urls) {
+        String[] urlArray = urls.split("\\s+");
+        for (String url : urlArray) {
+            try {
+                URI uri = new URI(url);
+                String host = uri.getHost();
+                if (host != null) {
+                    InetAddress[] addresses = InetAddress.getAllByName(host);
+                    log.info("DNS Lookup for Host [{}]:", host);
+                    for (InetAddress addr : addresses) {
+                        log.info("  -> Resolved IP: {}", addr.getHostAddress());
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("  -> Failed to resolve DNS for URL: {}", url, e);
+            }
+        }
+    }
+}
+
