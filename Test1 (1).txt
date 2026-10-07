@@ -1,3985 +1,620 @@
-package com.fincore.gateway.Config;
-
-import jakarta.annotation.PostConstruct;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.security.oauth2.jwt.NimbusReactiveJwtDecoder;
-import org.springframework.security.oauth2.jwt.ReactiveJwtDecoder;
-
-import javax.crypto.SecretKey;
-import javax.crypto.spec.SecretKeySpec;
-import java.security.interfaces.RSAPublicKey;
-import java.util.Base64;
-
-
-@Configuration
-public class JwtDecoderConfig {
-
-    /**
-     * The configured JWT mode (e.g., "hmac" or "rsa"). Defaults to "hmac".
-     */
-    @Value("${security.jwt.mode:hmac}")
-    private String mode;
-
-    /**
-     * The Base64 encoded secret used for HMAC verification. Required if mode is "hmac".
-     */
-    @Value("${security.jwt.hmac-base64-secret:}")
-    private String hmacBase64Secret;
-
-    /**
-     * The PEM-encoded RSA public key used for RSA verification. Required if mode is "rsa".
-     */
-    @Value("${security.jwt.rsa-public:}")
-    private String rsaPublicPem;
-
-    /**
-     * Performs sanity checks on the configuration properties after injection is complete.
-     * Ensures that the necessary properties for the selected {@code mode} are present and valid,
-     * throwing an {@link IllegalStateException} if configuration is invalid.
-     */
-    @PostConstruct
-    void sanity() {
-        if ("hmac".equalsIgnoreCase(mode)) {
-            if (hmacBase64Secret == null || hmacBase64Secret.isBlank()) {
-                throw new IllegalStateException("HMAC mode selected but security.jwt.hmac-base64-secret is empty");
-            }
-        } else if ("rsa".equalsIgnoreCase(mode)) {
-            if (rsaPublicPem == null || rsaPublicPem.isBlank()) {
-                throw new IllegalStateException("RSA mode selected but security.jwt.rsa-public is empty");
-            }
-        } else {
-            // Catches any mode that is neither 'hmac' nor 'rsa'
-            throw new IllegalStateException("Unsupported security.jwt.mode: " + mode + " (use 'hmac' or 'rsa')");
-        }
-    }
-
-    /**
-     * Configures and provides a {@link ReactiveJwtDecoder} bean based on the application's
-     * configured {@code security.jwt.mode}.
-     *
-     * @return A {@link NimbusReactiveJwtDecoder} configured with the appropriate verification key (HMAC secret or RSA public key).
-     */
-    @Bean
-    public ReactiveJwtDecoder jwtDecoder() {
-        if ("hmac".equalsIgnoreCase(mode)) {
-            // Decode base64 secret to raw bytes and create a SecretKey for HS256 verification
-            byte[] secretBytes = Base64.getDecoder().decode(hmacBase64Secret);
-            SecretKey key = new SecretKeySpec(secretBytes, "HmacSHA256");
-            return NimbusReactiveJwtDecoder.withSecretKey(key).build();
-        } else {
-            // Parse RSA public key from PEM format for RS256 verification
-            RSAPublicKey publicKey = KeyUtils.parseRsaPublicKey(rsaPublicPem);
-            return NimbusReactiveJwtDecoder.withPublicKey(publicKey).build();
-        }
-    }
-}
-
-
-package com.fincore.gateway.Config;
-
-import lombok.extern.slf4j.Slf4j;
-
-import java.nio.charset.StandardCharsets;
-import java.security.KeyFactory;
-import java.security.NoSuchAlgorithmException;
-import java.security.PrivateKey;
-import java.security.interfaces.RSAPublicKey;
-import java.security.spec.InvalidKeySpecException;
-import java.security.spec.PKCS8EncodedKeySpec;
-import java.security.spec.X509EncodedKeySpec;
-import java.util.Base64;
-import javax.crypto.Cipher;
-
-/**
- * Utility class for handling cryptographic keys, specifically for parsing
- * PEM-formatted RSA public keys into Java's {@link RSAPublicKey} object format.
- */
-@Slf4j
-public class KeyUtils {
-
-    
-    public static RSAPublicKey parseRsaPublicKey(String pem) {
-        try {
-            // Remove PEM headers, footers, and all whitespace
-            String clean = pem
-                    .replace("-----BEGIN PUBLIC KEY-----", "")
-                    .replace("-----END PUBLIC KEY-----", "")
-                    .replaceAll("\\s", "");
-
-            // Decode the Base64 content into raw bytes
-            byte[] decoded = Base64.getDecoder().decode(clean);
-
-            // Define the key specification using X509 encoding (standard for public keys)
-            X509EncodedKeySpec spec = new X509EncodedKeySpec(decoded);
-
-            // Get an instance of the RSA KeyFactory and generate the public key
-            KeyFactory kf = KeyFactory.getInstance("RSA");
-            return (RSAPublicKey) kf.generatePublic(spec);
-
-        } catch (NoSuchAlgorithmException e) {
-            // RSA algorithm is expected to be present in standard JVMs
-            throw new IllegalStateException("RSA algorithm not available in the runtime environment", e);
-        } catch (InvalidKeySpecException e) {
-            // Thrown if the decoded bytes do not form a valid RSA public key structure
-            throw new IllegalArgumentException("Invalid RSA public key specification provided in PEM string", e);
-        }
-    }
-
-    /**
-     * Parses a PKCS#8 PEM formatted private key.
-     */
-    public static PrivateKey parseRsaPrivateKey(String pem) {
-        try {
-            String clean = pem.replace("-----BEGIN PRIVATE KEY-----", "")
-                    .replace("-----END PRIVATE KEY-----", "")
-                    .replaceAll("\\s", "");
-            byte[] decoded = Base64.getDecoder().decode(clean);
-            PKCS8EncodedKeySpec spec = new PKCS8EncodedKeySpec(decoded);
-            KeyFactory kf = KeyFactory.getInstance("RSA");
-            return kf.generatePrivate(spec);
-        } catch (NoSuchAlgorithmException | InvalidKeySpecException e) {
-            log.error("Failed to parse RSA Private Key. Check configuration format.");
-            throw new IllegalArgumentException("Invalid RSA private key", e);
-        }
-    }
-
-    /**
-     * Decrypts the Base64 encoded RSA ciphertext.
-     */
-    public static String decryptRsaPassword(String encryptedBase64, String privateKeyPem) {
-        if (encryptedBase64 == null || encryptedBase64.isBlank()) {
-            return "";
-        }
-        try {
-            PrivateKey privateKey = parseRsaPrivateKey(privateKeyPem);
-            // PKCS1Padding aligns with standard frontend JSEncrypt libraries
-            Cipher cipher = Cipher.getInstance("RSA/ECB/PKCS1Padding");
-            cipher.init(Cipher.DECRYPT_MODE, privateKey);
-
-            byte[] decodedBytes = Base64.getDecoder().decode(encryptedBase64);
-            byte[] decryptedBytes = cipher.doFinal(decodedBytes);
-
-            return new String(decryptedBytes, StandardCharsets.UTF_8);
-        } catch (Exception e) {
-            // PROD SECURITY: Never log the exact cryptographic failure reason to prevent Padding Oracle attacks.
-            log.warn("Payload decryption failed. Invalid ciphertext provided.");
-            throw new SecurityException("Invalid encrypted payload");
-        }
-    }
-}
-
-
-package com.fincore.gateway.Config;
-
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.core.io.Resource;
-import org.springframework.core.io.ResourceLoader;
-import org.springframework.ldap.core.LdapTemplate;
-import org.springframework.ldap.core.support.LdapContextSource;
-
-import java.io.IOException;
-import java.net.InetAddress;
-import java.net.URI;
-import java.util.HashMap;
-import java.util.Map;
-
-@Slf4j
-@Configuration
-public class LdapConfig {
-
-    private final ResourceLoader resourceLoader;
-
-    @Value("${spring.ldap.urls:ldaps://uatrootdc1.uatad.sbi:3269}")
-    private String ldapUrls; // Note: Can be space-separated
-
-    @Value("${spring.ldap.base:DC=UATAD,DC=SBI}")
-    private String ldapBaseDn;
-
-    @Value("${spring.ldap.username:}")
-    private String ldapUsername;
-
-    @Value("${spring.ldap.password:}")
-    private String ldapPassword;
-
-    @Value("${security.ldap.truststore-path:}")
-    private String trustStorePath;
-
-    @Value("${security.ldap.truststore-password:changeit}")
-    private String trustStorePassword;
-
-    public LdapConfig(ResourceLoader resourceLoader) {
-        this.resourceLoader = resourceLoader;
-    }
-
-    @Bean
-    public LdapContextSource contextSource() {
-        log.info("===================================================");
-        log.info("INITIALIZING LDAP CONTEXT SOURCE");
-        log.info("Configured URLs: {}", ldapUrls);
-
-        // 0. DIAGNOSTIC: Print DNS Resolution for all configured URLs
-        printDnsResolution(ldapUrls);
-
-        // 1. SSL TRUSTSTORE SETUP
-        if (ldapUrls.toLowerCase().contains("ldaps") && trustStorePath != null && !trustStorePath.isBlank()) {
-            try {
-                Resource trustStore = resourceLoader.getResource(trustStorePath);
-                if (trustStore.exists()) {
-                    String absolutePath = trustStore.getFile().getAbsolutePath();
-                    log.info("Loading External Truststore from: {}", absolutePath);
-                    System.setProperty("javax.net.ssl.trustStore", absolutePath);
-                    System.setProperty("javax.net.ssl.trustStorePassword", trustStorePassword);
-                } else {
-                    log.error("CRITICAL: Truststore configured at '{}' but FILE NOT FOUND.", trustStorePath);
-                }
-            } catch (IOException e) {
-                log.error("Error loading truststore file", e);
-            }
-        }
-
-        // 2. CONFIGURE CONNECTION
-        LdapContextSource contextSource = new LdapContextSource();
-        // Spring natively parses space-separated URLs for High Availability
-        contextSource.setUrls(ldapUrls.split("\\s+"));
-        contextSource.setBase(ldapBaseDn);
-
-        // 3. SET BIND CREDENTIALS
-        if (ldapUsername != null && !ldapUsername.isBlank()) {
-            log.info("Setting LDAP Bind User (Service Account): {}", ldapUsername);
-            contextSource.setUserDn(ldapUsername);
-            contextSource.setPassword(ldapPassword);
-        }
-
-        // 4. TIMEOUTS & PROTOCOL SETTINGS
-        Map<String, Object> baseEnv = new HashMap<>();
-        if (ldapUrls.toLowerCase().contains("ldaps")) {
-            baseEnv.put("java.naming.security.protocol", "ssl");
-        }
-
-        // 10 Second Timeouts as requested
-        baseEnv.put("com.sun.jndi.ldap.connect.timeout", "2000");
-        baseEnv.put("com.sun.jndi.ldap.read.timeout", "5000");
-
-        // Follow referrals across PR/DR
-        baseEnv.put("java.naming.referral", "follow");
-
-        // Native pooling enabled (Fallback since commons-pool2 is missing)
-        contextSource.setPooled(true);
-        contextSource.setBaseEnvironmentProperties(baseEnv);
-
-        log.info("===================================================");
-        return contextSource;
-    }
-
-    @Bean
-    public LdapTemplate ldapTemplate() {
-        LdapTemplate template = new LdapTemplate(contextSource());
-        template.setIgnorePartialResultException(true);
-        template.setIgnoreNameNotFoundException(true);
-        return template;
-    }
-
-    /**
-     * Utility method to print the exact IP addresses the JVM resolves
-     * at startup to diagnose DNS Round-Robin blind spots.
-     */
-    private void printDnsResolution(String urls) {
-        String[] urlArray = urls.split("\\s+");
-        for (String url : urlArray) {
-            try {
-                URI uri = new URI(url);
-                String host = uri.getHost();
-                if (host != null) {
-                    InetAddress[] addresses = InetAddress.getAllByName(host);
-                    log.info("DNS Lookup for Host [{}]:", host);
-                    for (InetAddress addr : addresses) {
-                        log.info("  -> Resolved IP: {}", addr.getHostAddress());
-                    }
-                }
-            } catch (Exception e) {
-                log.warn("  -> Failed to resolve DNS for URL: {}", url, e);
-            }
-        }
-    }
-}
-
-
-
-
-package com.fincore.gateway.Controller;
-
-import com.fincore.commonutilities.util.AesEncryptionUtil;
-import com.fincore.gateway.JwtUtil.HmacJwtUtil;
-import com.fincore.gateway.Service.LaunchService;
-import com.fincore.gateway.Service.LoginService;
-import com.fincore.gateway.Service.TokenSessionValidator;
-import com.fincore.gateway.dto.*;
-import com.fincore.gateway.utility.Constants;
-import com.fincore.gateway.utility.LoginUtility;
-import io.jsonwebtoken.Claims;
-import io.jsonwebtoken.ExpiredJwtException;
-import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.security.Keys;
-import jakarta.validation.Valid;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseCookie;
-import org.springframework.http.ResponseEntity;
-import org.springframework.http.server.reactive.ServerHttpRequest;
-import org.springframework.http.server.reactive.ServerHttpResponse;
-import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
-import org.springframework.web.bind.annotation.*;
-import org.springframework.web.server.ResponseStatusException;
-import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Schedulers;
-import tools.jackson.core.type.TypeReference;
-import tools.jackson.databind.ObjectMapper;
-
-import java.time.Duration;
-import java.util.Arrays;
-import java.util.Base64;
-import java.util.List;
-import java.util.Map;
-
-/**
- * REST controller for managing authentication workflows in a reactive Spring WebFlux application.
- *
- * <p>This controller provides endpoints for:
- * <ul>
- *   <li>User login with credential validation</li>
- *   <li>Token refresh using refresh tokens</li>
- *   <li>Logout with token invalidation</li>
- *   <li>Checking current user session status</li>
- *   <li>Password Update</li>
- *   <li>Returns public key to client to encrypt login payload with check user</li>
- * </ul>
- *
- * <p>All endpoints return a standardized {@link ApiResponse} structure to ensure consistent
- * client-side handling. Security is implemented using JWT-based stateless authentication,
- * integrated with Spring Security's reactive stack.
- *
-
-@Slf4j
-@RestController
-@RequestMapping("/api/auth")
-@RequiredArgsConstructor
-public class AuthController {
-
-    private static final String USER_PREFIX = "USR:";
-    private static final String AES_KEY_PREFIX = "AES:USR:";
-
-    private final TokenSessionValidator validator;
-    private final ReactiveStringRedisTemplate redisTemplate;
-    private final LoginService loginService;
-    private final ObjectMapper mapper;
-    private final LaunchService launchService;
-    private final AesEncryptionUtil aesUtil;
-
-    @Value("${security.jwt.hmac-base64-secret:}")
-    private String hmacSecret;
-
-    @Value("${security.jwt.ttl-seconds:900}")
-    private long accessTokenTtl;
-
-    @Value("${security.jwt.refresh-ttl-seconds:43200}")
-    private long refreshTokenTtl;
-
-    @Value("${security.login.blocked-ips:}")
-    private String blockedIpsConfig;
-
-    @Value("${security.payload.rsa-public:}")
-    private String rsaPublicPem;
-
-
-    // =================================================================================================
-    //                                           ENDPOINTS
-    // =================================================================================================
-
-    @PostMapping(value = "/check-user")
-    public Mono<ApiResponse<VerifyUserDTO>> checkUser(ServerHttpRequest request, @RequestBody Map<String, String> body) {
-        final String rawClientIp = LoginUtility.getClientIp(request);
-        String userId = body.get("userId");
-        log.info("Check-User info user id: {} , ip : {}", LoginUtility.sanitizeLog(userId), rawClientIp);
-
-        // 1. IP BLOCK CHECK
-        if (isIpBlocked(rawClientIp)) {
-            log.warn("Check-User BLOCKED for user: {} from IP: {}", LoginUtility.sanitizeLog(userId), rawClientIp);
-            VerifyUserDTO blockedResponse = VerifyUserDTO.builder()
-                    .userId(userId)
-                    .message("Access denied: Your IP address is blocked.")
-                    .userStatus(Constants.RESTRICTED)
-                    .build();
-            return Mono.just(ApiResponse.success(blockedResponse, "Access Restricted"));
-        }
-
-        // 2. CONFIGURATION VALIDATION
-        // Check if key is null or empty before proceeding
-        if (rsaPublicPem == null || rsaPublicPem.isBlank()) {
-            return Mono.just(ApiResponse.error("Public key not configured on server", "CONFIG_ERROR"));
-        }
-
-        // 3. FETCH USER AND APPEND PUBLIC KEY
-        return Mono.fromCallable(() -> loginService.checkUser(userId.toLowerCase()))
-                .subscribeOn(Schedulers.boundedElastic())
-                .map(dto -> {
-                    dto.setPublicKey(rsaPublicPem);
-                    return ApiResponse.success(dto, "User check completed");
-                });
-    }
-
-
-    /**
-     * LOGIN ENDPOINT
-     * 1. Validates credentials (Blocking DB call on Elastic Scheduler).
-     * 2. Generates Access Token & Refresh Token.
-     * 3. Stores Access Token JTI in Redis (Session Start).
-     * 4. Returns Access Token in Body, Refresh Token in HttpOnly Cookie.
-     */
-    @PostMapping(value = "/login", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ResponseEntity<ApiResponse<?>>> login(
-            ServerHttpRequest request, ServerHttpResponse response, @RequestBody @Valid UserDto payload) {
-        final String clientIp = LoginUtility.getClientIp(request);
-        log.info("Login request for user: {} from IP: {}", LoginUtility.sanitizeLog(payload.getUserId()), clientIp);
-
-        // 1. IP BLOCK CHECK
-        if (isIpBlocked(clientIp)) {
-            return Mono.just(ResponseEntity.status(HttpStatus.FORBIDDEN)
-                    .body(ApiResponse.error("Access denied: Your IP address is blocked.", "IP_BLOCKED")));
-        }
-
-        return Mono.fromCallable(() -> loginService.verifyUserCredentials(payload, clientIp))
-                .subscribeOn(Schedulers.boundedElastic())
-                .flatMap(user -> {
-
-                    // =========================================================
-                    // CASE 1: INVALID CREDENTIALS (Wrong Password / Locked)
-                    // =========================================================
-                    if (!user.isValidCredentials()) {
-                        log.warn("Login Failed for user: {}. Reason: {}", LoginUtility.sanitizeLog(payload.getUserId()), user.getMessage());
-
-                        // Build response to show Attempts Left
-                        LoginResponseDTO errorResponse = LoginResponseDTO.builder()
-                                .userId(user.getUserId())
-                                .validCredentials(false)
-                                .userStatus(user.getUserStatus())
-                                .passwordLoginStatus(user.getPasswordLoginStatus())
-                                .attemptsLeft(user.getAttemptsLeft()) // <--- PASS COUNT TO FRONTEND
-                                .error(user.getMessage())
-                                .build();
-
-                        // decide Status Code:
-                        // If attempts are 0 OR status is INACTIVE -> 403 Forbidden (Locked)
-                        // Otherwise -> 401 Unauthorized (Try again)
-                        HttpStatus status = (user.getAttemptsLeft() == 0) || Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLoginStatus())
-                                ? HttpStatus.FORBIDDEN
-                                : HttpStatus.UNAUTHORIZED;
-
-                        return Mono.just(ResponseEntity.status(status)
-                                .body(ApiResponse.success(errorResponse, user.getMessage())));
-                    }
-
-                    // =========================================================
-                    // CASE 2: CONFIG ERROR
-                    // =========================================================
-                    if (hmacSecret == null || hmacSecret.isBlank()) {
-                        return Mono.just(ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                                .body(ApiResponse.error("Server Config Error", "CONFIG_ERROR")));
-                    }
-
-                    // =========================================================
-                    // Dynamic Routing based on MFA Flag
-                    // =========================================================
-                    if (user.isOtpRequired()) {
-                        log.info("MFA Enabled: Routing user {} to OTP Phase.", LoginUtility.sanitizeLog(user.getUserId()));
-                        return loginService.initiateOtpPhase(user)
-                                .map(otpDto -> ResponseEntity.status(HttpStatus.ACCEPTED)
-                                        .body(ApiResponse.<OtpInitiatedResponseDTO>success(otpDto, "OTP Sent to registered contacts.")));
-                    } else {
-                        log.info("MFA Disabled: Routing user {} to Direct Login.", LoginUtility.sanitizeLog(user.getUserId()));
-                        return generateSessionAndTokens(user, response);
-                    }
-                });
-    }
-
-
-    /**
-     * REFRESH TOKEN ENDPOINT
-     * 1. Reads Refresh Token from Cookie.
-     * 2. Validates Signature & Expiry.
-     * 3. Checks Redis to ensure User Session is still valid/active.
-     * 4. Rotates Tokens (New Access Token + New Refresh Cookie).
-     */
-    @PostMapping(value = "/refresh-token", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ApiResponse<LoginResponseDTO>> refreshToken(ServerHttpRequest request, ServerHttpResponse response) {
-        org.springframework.http.HttpCookie cookie = request.getCookies().getFirst("refresh_token");
-        String refreshToken = (cookie != null) ? cookie.getValue() : null;
-
-        if (refreshToken == null || refreshToken.isBlank()) {
-            log.warn("Refresh failed: No refresh token cookie.");
-            return Mono.error(new ResponseStatusException(HttpStatus.BAD_REQUEST, "Missing refresh token cookie"));
-        }
-
-        return Mono.fromCallable(() -> {
-                    // Note: Exception handler will catch ExpiredJwtException specifically
-                    return extractClaims(refreshToken);
-                })
-                .subscribeOn(Schedulers.boundedElastic())
-                .flatMap(claims -> {
-                    String userId = claims.getSubject();
-                    String userKey = USER_PREFIX + userId;
-                    log.info("Refreshing Token for User: {}", LoginUtility.sanitizeLog(userId));
-
-                    // Check Session in Redis
-                    return redisTemplate.opsForValue().get(userKey)
-                            .switchIfEmpty(Mono.defer(() -> {
-                                log.warn("Redis returned EMPTY for key: {}. Session expired.", userKey);
-                                return Mono.error(new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Session expired. Please login again."));
-                            }))
-                            .flatMap(currentJti -> {
-                                log.info("Session Active in Redis. Fetching Full Profile.");
-
-                                return Mono.fromCallable(() -> loginService.getUserProfile(userId))
-                                        .subscribeOn(Schedulers.boundedElastic())
-                                        .flatMap(userDto -> {
-                                            if (userDto == null) {
-                                                return Mono.error(new ResponseStatusException(HttpStatus.NOT_FOUND, "User not found"));
-                                            }
-
-                                            return Mono.fromCallable(() -> loginService.fetchRoleWiseData(userId))
-                                                    .subscribeOn(Schedulers.boundedElastic())
-                                                    .flatMap(roleData -> {
-
-                                                        // Generate New Tokens
-                                                        @SuppressWarnings("unchecked")
-                                                        Map<String, Object> claimsMap = mapper.convertValue(userDto.getUser(), Map.class);
-                                                        String newAccessToken = HmacJwtUtil.generate(hmacSecret, userId, accessTokenTtl, claimsMap);
-
-                                                        Map<String, Object> refreshClaims = Map.of("type", "refresh");
-                                                        String newRefreshToken = HmacJwtUtil.generate(hmacSecret, userId, refreshTokenTtl, refreshClaims);
-
-                                                        String newJti = extractClaims(newAccessToken).getId();
-
-                                                        response.addCookie(createRefreshTokenCookie(newRefreshToken));
-
-                                                        // 1. Rotate JWT Session
-                                                        // 2. FETCH and EXTEND the existing AES Key
-                                                        return validator.registerUserSession(userId, newJti)
-                                                                .then(fetchAndExtendAesKey(userId))
-                                                                .map(existingAesKey -> ApiResponse.success(
-                                                                        LoginResponseDTO.builder()
-                                                                                .accessToken(newAccessToken)
-                                                                                .userId(userId)
-                                                                                .jti(newJti)
-                                                                                .expiresIn(accessTokenTtl)
-                                                                                .validCredentials(true)
-                                                                                .roleData(roleData)
-                                                                                .userData(userDto.getUser())
-                                                                                .payloadEncryptionKey(existingAesKey)
-                                                                                .userStatus(userDto.getUserStatus())
-                                                                                .passwordLoginStatus(userDto.getPasswordLoginStatus())
-                                                                                .sub(userId)
-                                                                                .build(),
-                                                                        "Token refreshed successfully"
-                                                                ));
-                                                    });
-                                        });
-                            });
-                });
-    }
-
-
-    /**
-     * LOGOUT ENDPOINT (ROBUST & VERIFIED)
-     * Handles:
-     * 1. Valid Tokens -> Standard Logout
-     * 2. Expired Tokens -> Manually extracts claims -> Cleans up Redis if JTI matches
-     * 3. Concurrent Logins -> Blacklists current token, but PRESERVES the active session in Redis
-     * 4. Missing/Malformed Tokens -> Clears cookies and returns success (Idempotent)
-     */
-    @PostMapping(value = "/logout", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ResponseEntity<ApiResponse<LoginResponseDTO>>> logout(
-            JwtAuthenticationToken jwtAuth, ServerHttpRequest request, ServerHttpResponse response) {
-
-        // 1. Always clear the Refresh Token Cookie (Idempotent)
-        response.addCookie(createEmptyCookie());
-        String tokenString = null;
-
-        // Strategy A: Valid Context
-        if (jwtAuth != null && jwtAuth.getToken() != null) {
-            tokenString = jwtAuth.getToken().getTokenValue();
-        }
-        // Strategy B: Manual Header Extraction (Expired Tokens)
-        else {
-            String header = request.getHeaders().getFirst("Authorization");
-            if (header != null && header.startsWith("Bearer ")) {
-                tokenString = header.substring(7);
-            }
-        }
-
-        // 3. Fast Exit: If no token found anywhere, just return success so frontend can clear state
-        if (tokenString == null || tokenString.isBlank()) {
-            log.warn("Logout called without token. Cleaning up cookies only.");
-            return Mono.just(ResponseEntity.ok(
-                    ApiResponse.<LoginResponseDTO>success(
-                            LoginResponseDTO.builder().userId("anonymous").build(),
-                            "Logged out (No Token)"
-                    )
-            ));
-        }
-
-        final String finalToken = tokenString;
-
-        // 4. Processing Chain
-        return Mono.fromCallable(() -> {
-                    try {
-                        return extractClaims(finalToken);
-                    } catch (ExpiredJwtException e) {
-                        // If token is expired, we STILL want the claims to perform cleanup
-                        log.info("Logout: Token is expired. Using claims from exception for cleanup.");
-                        return e.getClaims();
-                    }
-                })
-                .subscribeOn(Schedulers.boundedElastic())
-                .flatMap(claims -> {
-                    String userId = claims.getSubject();
-                    String incomingJti = claims.getId();
-
-                    if (userId == null || incomingJti == null) {
-                        return Mono.just(ResponseEntity.ok(
-                                ApiResponse.<LoginResponseDTO>success(null, "Invalid Token Claims during logout")
-                        ));
-                    }
-
-                    log.info("Logout Processing for User: {} | JTI: {}", LoginUtility.sanitizeLog(userId), LoginUtility.sanitizeLog(incomingJti));
-
-                    // 5. Blacklist the Token (Always blacklist the incoming token)
-                    return validator.blacklistToken(incomingJti)
-                            .then(redisTemplate.opsForValue().get(USER_PREFIX + userId))
-                            .flatMap(activeJti -> {
-                                // 6. Conditional Redis Cleanup
-                                if (activeJti != null && activeJti.equals(incomingJti)) {
-                                    // SCENARIO: Normal Logout. The session in Redis belongs to THIS token.
-                                    // Action: Delete it.
-                                    log.info("Session MATCH. Deleting active session for user: {}", LoginUtility.sanitizeLog(userId));
-                                    return validator.clearUserSession(userId)
-                                            .then(redisTemplate.delete(AES_KEY_PREFIX + userId))
-                                            .then(Mono.just(ResponseEntity.ok(
-                                                    ApiResponse.<LoginResponseDTO>success(
-                                                            LoginResponseDTO.builder().userId(userId).error("Logged out").build(),
-                                                            "Logged out successfully"
-                                                    )
-                                            )));
-                                } else {
-                                    // SCENARIO: Concurrent Login.
-                                    // The session in Redis belongs to a NEWER token (on another device/tab).
-                                    // Do NOT delete it. Just let the blacklist happen.
-                                    log.warn("Session MISMATCH or ALREADY GONE. Active JTI: {}. Incoming JTI: {}. Preserving Redis Session.", LoginUtility.sanitizeLog(activeJti), LoginUtility.sanitizeLog(incomingJti));
-                                    return Mono.just(ResponseEntity.ok(
-                                            ApiResponse.<LoginResponseDTO>success(
-                                                    LoginResponseDTO.builder().userId(userId).error("Logged out (Concurrent Session Preserved)").build(),
-                                                    "Logged out (Concurrent Session Preserved)"
-                                            )
-                                    ));
-                                }
-                            })
-                            // If key is missing in Redis (Already timed out), return success
-                            .switchIfEmpty(Mono.just(ResponseEntity.ok(
-                                    ApiResponse.<LoginResponseDTO>success(
-                                            LoginResponseDTO.builder().userId(userId).error("Logged out (Session already expired)").build(),
-                                            "Logged out (Session already expired)"
-                                    )
-                            )));
-                })
-                .onErrorResume(e -> {
-                    log.error("Logout Unexpected Error", e);
-                    return Mono.just(ResponseEntity.ok(
-                            ApiResponse.<LoginResponseDTO>success(null, "Logged out (System Error handled)")
-                    ));
-                });
-    }
-
-
-    @PostMapping(value = "/update-password")
-    public Mono<ApiResponse<UpdatePasswordDTO>> updatePassword(@RequestBody @Valid UpdatePasswordDTO dto) {
-        return Mono.fromCallable(() -> loginService.updatePassword(dto))
-                .subscribeOn(Schedulers.boundedElastic())
-                .map(result -> ApiResponse.success(result, result.getMessage()));
-    }
-
-    @GetMapping("/start-prod")
-    public ResponseEntity<LaunchResponse> getLaunchData() {
-        return ResponseEntity.ok(launchService.getLaunchDetails());
-    }
-
-    // --- NEW OTP ENDPOINTS ---
-
-    @PostMapping(value = "/verify-otp", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ResponseEntity<ApiResponse<?>>> verifyOtp(
-            @RequestBody @Valid VerifyOtpRequestDTO requestDto, ServerHttpResponse response) {
-        log.info("OTP Verification for TxId: {}", LoginUtility.sanitizeLog(requestDto.getTransactionId()));
-
-        return loginService.verifyOtpAndGetUser(requestDto)
-                .flatMap(userDto -> generateSessionAndTokens(userDto, response)); // Reuse the extracted JWT generation
-    }
-
-    @PostMapping(value = "/resend-otp", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ResponseEntity<ApiResponse<OtpResendResponseDTO>>> resendOtp(
-            @RequestBody @Valid ResendOtpRequestDTO requestDto, ServerHttpRequest request) {
-
-        log.info("OTP Resend for TxId: {}", LoginUtility.sanitizeLog(requestDto.getTransactionId()));
-
-        return loginService.resendOtp(requestDto, LoginUtility.getClientIp(request))
-                .map(responseDto -> ResponseEntity.status(HttpStatus.ACCEPTED)
-                        .body(ApiResponse.success(responseDto, "A new OTP has been dispatched.")));
-    }
-
-    // =================================================================================================
-    //                                           EXTRACTED JWT LOGIC
-    // =================================================================================================
-
-    /**
-     * Generate Session and Tokens after successful logic pass for both /login and /verify-otp
-     */
-    private Mono<ResponseEntity<ApiResponse<?>>> generateSessionAndTokens(UserDto user, ServerHttpResponse response) {
-        log.info("Generating JWTs for user {}.", LoginUtility.sanitizeLog(user.getUserId()));
-        Map<String, Object> claimsMap = mapper.convertValue(
-                user.getUser(),
-                new TypeReference<>() {
-                }
-        );
-        String accessToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), accessTokenTtl, claimsMap);
-
-        Map<String, Object> refreshClaims = Map.of("type", "refresh");
-        String refreshToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), refreshTokenTtl, refreshClaims);
-
-        String jti = extractClaims(accessToken).getId();
-        response.addCookie(createRefreshTokenCookie(refreshToken));
-
-        // 1. Register JWT Session
-        // 2. Generate new AES key
-        // 3. Fetch Roles
-        return validator.registerUserSession(user.getUserId(), jti)
-                .then(generateAndStoreAesKey(user.getUserId()))
-                .flatMap(aesKey -> Mono.defer(() -> Mono.fromCallable(() -> loginService.fetchRoleWiseData(user.getUserId()))
-                                .subscribeOn(Schedulers.boundedElastic()))
-                        .map(roleData -> {
-                            LoginResponseDTO loginResponse = LoginResponseDTO.builder()
-                                    .userId(user.getUserId())
-                                    .validCredentials(true)
-                                    .accessToken(accessToken)
-                                    .tokenType("Bearer")
-                                    .expiresIn(accessTokenTtl)
-                                    .sub(user.getUserId())
-                                    .jti(jti)
-                                    .roleData(roleData)
-                                    .userData(user.getUser())
-                                    .payloadEncryptionKey(aesKey) // <--- AES key to frontend
-                                    .userStatus(user.getUserStatus())
-                                    .passwordLoginStatus(user.getPasswordLoginStatus())
-                                    .attemptsLeft(null)
-                                    .build();
-
-                            return ResponseEntity.ok(ApiResponse.success(loginResponse, "Login successful"));
-                        }));
-    }
-
-    // =================================================================================================
-    //                                              HELPERS
-    // =================================================================================================
-
-    private String sanitizeIp(String rawIp) {
-        if (rawIp == null) return "";
-        String ip = rawIp;
-        if (ip.startsWith("/")) ip = ip.substring(1);
-        int colonIndex = ip.indexOf(':');
-        if (colonIndex != -1) ip = ip.substring(0, colonIndex);
-        return ip;
-    }
-
-    private boolean isIpBlocked(String rawClientIp) {
-        if (blockedIpsConfig == null || blockedIpsConfig.trim().isEmpty()) return false;
-        String cleanIp = sanitizeIp(rawClientIp);
-        List<String> blockedIps = Arrays.asList(blockedIpsConfig.split("\\s*,\\s*"));
-        boolean blocked = blockedIps.contains(cleanIp);
-        if (blocked) {
-            log.warn("Blocked IP Match Found: Raw='{}' -> Clean='{}'", LoginUtility.sanitizeLog(rawClientIp), LoginUtility.sanitizeLog(cleanIp));
-        }
-        return blocked;
-    }
-
-
-    private ResponseCookie createRefreshTokenCookie(String token) {
-        return ResponseCookie.from("refresh_token", token)
-                .httpOnly(true)
-                .secure(true) // Set to true in PROD
-                .path("/")
-                .maxAge(Duration.ofSeconds(refreshTokenTtl))
-                .sameSite("Strict")
-                .build();
-    }
-
-    /**
-     * Creates an empty cookie to clear the refresh token on logout.
-     */
-    private ResponseCookie createEmptyCookie() {
-        return ResponseCookie.from("refresh_token", "")
-                .httpOnly(true)
-                .secure(true) // Set to true in PROD
-                .path("/")
-                .maxAge(0)
-                .sameSite("Strict")
-                .build();
-    }
-
-    private Claims extractClaims(String token) {
-        byte[] secretBytes = Base64.getDecoder().decode(hmacSecret);
-        return Jwts.parser()
-                .verifyWith(Keys.hmacShaKeyFor(secretBytes))
-                .build()
-                .parseSignedClaims(token)
-                .getPayload();
-    }
-
-    /**
-     * Helper to generate a new AES key if one doesn't exist.
-     */
-    private String generateNewAesKey() {
-        return aesUtil.generateBase64SessionKey();
-    }
-
-    /**
-     * Generates a new AES key and saves it to Redis. Used during Initial Login.
-     */
-    private Mono<String> generateAndStoreAesKey(String userId) {
-        return Mono.fromCallable(this::generateNewAesKey)
-                .flatMap(aesKey -> redisTemplate.opsForValue()
-                        .set(AES_KEY_PREFIX + userId, aesKey, Duration.ofSeconds(refreshTokenTtl))
-                        .thenReturn(aesKey)
-                );
-    }
-
-    /**
-     * Fetches the existing AES key, heals it if missing, and extends the TTL. Used during Refresh.
-     */
-    private Mono<String> fetchAndExtendAesKey(String userId) {
-        return redisTemplate.opsForValue().get(AES_KEY_PREFIX + userId)
-                .switchIfEmpty(Mono.defer(() -> {
-                    log.warn("AES key missing/evicted for user {} during refresh. Generating new fallback key.", LoginUtility.sanitizeLog(userId));
-                    return Mono.just(generateNewAesKey());
-                }))
-                .flatMap(aesKey ->
-                        // Extend the TTL for the rolling session
-                        redisTemplate.opsForValue()
-                                .set(AES_KEY_PREFIX + userId, aesKey, Duration.ofSeconds(refreshTokenTtl))
-                                .thenReturn(aesKey)
-                );
-    }
-
-}
-
-
-
-package com.fincore.gateway.dto;
-
-import com.fasterxml.jackson.annotation.JsonInclude;
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-import java.time.LocalDateTime;
-
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-@JsonInclude(JsonInclude.Include.NON_NULL)
-public class ApiResponse<T> {
-
-    @Builder.Default
-    private boolean success = true;
-
-    private String message;
-
-    private T data;
-
-    private String errorCode;
-
-    @Builder.Default
-    private LocalDateTime timestamp = LocalDateTime.now();
-
-    // --- Static Factories ---
-
-    public static <T> ApiResponse<T> success(T data, String message) {
-        return ApiResponse.<T>builder()
-                .success(true)
-                .data(data)
-                .message(message)
-                .build();
-    }
-
-    public static <T> ApiResponse<T> success(T data) {
-        return success(data, "Operation successful");
-    }
-
-    public static <T> ApiResponse<T> error(String message, String errorCode) {
-        return ApiResponse.<T>builder()
-                .success(false)
-                .message(message)
-                .errorCode(errorCode)
-                .build();
-    }
-
-}
-
-
-package com.fincore.gateway.dto;
-
-/**
- * Projection interface to capture specific fields from the JOIN query
- * between BRANCH_MASTER, CIRCLE_MASTER, ZONE_MASTER and STATE_MASTER.
- */
-public interface BranchCircleProjection {
-
-    String getBranchCode();
-
-    String getBranchName();
-
-    Integer getBranchStatus();
-
-    String getCity();
-
-    String getAddress();
-
-    String getPincode();
-
-    String getNmrCode();
-
-    String getBranchType();
-
-    String getCircleCode();
-
-    String getCircleName();
-
-    String getStateName();
-
-    String getStateCode();
-
-    String getZoneCode();
-
-    String getZoneName();
-
-    String getCircleBranch();
-}
-
-
-package com.fincore.gateway.dto;
-
-import lombok.AllArgsConstructor;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-/**
- * Data Transfer Object (DTO) representing a child menu item within a hierarchical menu structure.
- * This class is used to structure the menu data returned to the client application.
- *
- * <p>
- * Uses Lombok annotations for boilerplate code reduction:
- * <ul>
- *     <li>{@code @Data} generates getters, setters, equals, hashCode, and toString methods.</li>
- *     <li>{@code @NoArgsConstructor} generates a no-argument constructor.</li>
- *     <li>{@code @AllArgsConstructor} generates a constructor with all fields as arguments.</li>
- * </ul>
- * </p>
- */
-@Data
-@NoArgsConstructor
-@AllArgsConstructor
-public class ChildMenu {
-
-    /**
-     * The unique identifier for the menu item. Corresponds to a permission ID in the database.
-     */
-    private int id;
-
-    /**
-     * The title or display name of the menu item shown in the UI.
-     */
-    private String title;
-
-    /**
-     * The name of the icon to be used for this menu item in the UI.
-     */
-    private String icon;
-
-    /**
-     * The client-side route or URL fragment used for navigation to this menu item's view/screen.
-     */
-    private String route;
-
-    // A field for ScreenDetails was commented out in the original source.
-    // private ScreenDetails screenDetails;
-
-    /**
-     * The internal path to the frontend component that corresponds to this menu item.
-     */
-    private String componentPath;
-
-    /**
-     * A brief description of what the screen/menu item does.
-     */
-    private String screenDescription;
-
-    /**
-     * The display order of this child menu item within its parent menu or list.
-     */
-    private int orderId;
-
-    private String menuAction;
-
-    private String requestType;
-}
-
-
-package com.fincore.gateway.dto;
-
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-/**
- * Data Transfer Object (DTO) used to carry the response data after a successful or failed login attempt.
- * It implements the {@link UserLoginDTO} interface and provides comprehensive details about the
- * authenticated user, generated tokens, and login status.
- *
- * <p>
- * Uses Lombok annotations for boilerplate code reduction:
- * <ul>
- *     <li>{@code @Data} generates getters, setters, equals, hashCode, and toString methods.</li>
- *     <li>{@code @Builder} provides a fluent API for creating instances of this DTO.</li>
- * </ul>
- * </p>
- */
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class LoginResponseDTO implements UserLoginDTO {
-
-    /**
-     * The unique identifier of the authenticated user.
-     */
-    private String userId;
-
-    /**
-     * The generated JWT access token used for subsequent authorized requests.
-     */
-    private String accessToken;
-
-    /**
-     * The type of the token, typically "Bearer".
-     */
-    private String tokenType;
-
-    /**
-     * The time until the access token expires, in seconds.
-     */
-    private long expiresIn;
-
-    /**
-     * The subject of the JWT (usually the user ID or username).
-     */
-    private String sub;
-
-    /**
-     * The unique JWT ID (JTI) for session tracking.
-     */
-    private String jti;
-
-    /**
-     * A structured object containing the menu and permissions data associated with the user's role.
-     */
-    private MenuResponse roleData;
-
-    /**
-     * An error message provided in case of a login failure (e.g., bad credentials, locked account).
-     */
-    private String error;
-
-    /**
-     * A flag indicating whether the provided credentials were fundamentally valid.
-     */
-    private boolean validCredentials;
-
-    /**
-     * The current status of the user account (e.g., ACTIVE, INACTIVE, LOCKED).
-     */
-    private String userStatus;
-
-    /**
-     * The status specific to the password validation result (e.g., SUCCESS, EXPIRED, TEMP_PASSWORD).
-     */
-    private String passwordLoginStatus;
-
-    /**
-     * Re-generated token for continue session valid for 12 hours
-     */
-    private String refreshToken;
-
-    /**
-     * Invalid password attempt count
-     */
-    private Integer attemptsLeft;
-
-    /**
-     * User profile details extracted directly for frontend convenience.
-     */
-    private UserTokenDataDto userData;
-
-    /**
-     * Session-scoped True-Random AES-256 key for payload encryption.
-     * To be held in volatile memory on the frontend.
-     */
-    private String payloadEncryptionKey;
-}package com.fincore.gateway.dto;
-
-public record LaunchResponse(
-        String prodDate,
-        String launchTime,
-        String timezone,
-        String version,
-        String appName
-) {}
-
-package com.fincore.gateway.dto;
-
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-/**
- * Data Transfer Object (DTO) used to carry the response data after a successful or failed login attempt.
- * It implements the {@link UserLoginDTO} interface and provides comprehensive details about the
- * authenticated user, generated tokens, and login status.
- *
- * <p>
- * Uses Lombok annotations for boilerplate code reduction:
- * <ul>
- *     <li>{@code @Data} generates getters, setters, equals, hashCode, and toString methods.</li>
- *     <li>{@code @Builder} provides a fluent API for creating instances of this DTO.</li>
- * </ul>
- * </p>
- */
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class LoginResponseDTO implements UserLoginDTO {
-
-    /**
-     * The unique identifier of the authenticated user.
-     */
-    private String userId;
-
-    /**
-     * The generated JWT access token used for subsequent authorized requests.
-     */
-    private String accessToken;
-
-    /**
-     * The type of the token, typically "Bearer".
-     */
-    private String tokenType;
-
-    /**
-     * The time until the access token expires, in seconds.
-     */
-    private long expiresIn;
-
-    /**
-     * The subject of the JWT (usually the user ID or username).
-     */
-    private String sub;
-
-    /**
-     * The unique JWT ID (JTI) for session tracking.
-     */
-    private String jti;
-
-    /**
-     * A structured object containing the menu and permissions data associated with the user's role.
-     */
-    private MenuResponse roleData;
-
-    /**
-     * An error message provided in case of a login failure (e.g., bad credentials, locked account).
-     */
-    private String error;
-
-    /**
-     * A flag indicating whether the provided credentials were fundamentally valid.
-     */
-    private boolean validCredentials;
-
-    /**
-     * The current status of the user account (e.g., ACTIVE, INACTIVE, LOCKED).
-     */
-    private String userStatus;
-
-    /**
-     * The status specific to the password validation result (e.g., SUCCESS, EXPIRED, TEMP_PASSWORD).
-     */
-    private String passwordLoginStatus;
-
-    /**
-     * Re-generated token for continue session valid for 12 hours
-     */
-    private String refreshToken;
-
-    /**
-     * Invalid password attempt count
-     */
-    private Integer attemptsLeft;
-
-    /**
-     * User profile details extracted directly for frontend convenience.
-     */
-    private UserTokenDataDto userData;
-
-    /**
-     * Session-scoped True-Random AES-256 key for payload encryption.
-     * To be held in volatile memory on the frontend.
-     */
-    private String payloadEncryptionKey;
-}
-package com.fincore.gateway.dto;
-
-import lombok.AllArgsConstructor;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-import java.util.List;
-
-/**
- * Data Transfer Object (DTO) used to structure the complete menu configuration returned to the client
- * after a successful login or during application initialization. It acts as a container for
- * a list of top-level (root) menu items.
- *
- * <p>
- * Uses Lombok annotations for boilerplate code reduction:
- * <ul>
- *     <li>{@code @Data} generates getters, setters, equals, hashCode, and toString methods.</li>
- *     <li>{@code @NoArgsConstructor} generates a no-argument constructor.</li>
- *     <li>{@code @AllArgsConstructor} generates a constructor with all fields as arguments.</li>
- * </ul>
- * </p>
- */
-@Data
-@NoArgsConstructor
-@AllArgsConstructor
-public class MenuResponse {
-
-    /**
-     * A list of {@link RootMenu} DTOs, representing the top-level navigation structure of the application
-     * accessible by the user's role.
-     */
-    private List<RootMenu> root_menus;
-}
-package com.fincore.gateway.dto;
-
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-/**
- * Payload returned to the frontend when LDAP succeeds and OTP is sent.
- * Contains NO sensitive data, only masked hints and the transaction ID.
- */
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class OtpInitiatedResponseDTO {
-    private String transactionId;
-    private String maskedMobile;
-    private String maskedEmail;
-    private int expiresInSeconds;
-    private int resendCooldownSeconds;
-    private int resendsRemaining;
-}package com.fincore.gateway.dto;
-
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class OtpResendResponseDTO {
-    private int resendCooldownSeconds;
-    private int resendsRemaining;
-}
-package com.fincore.gateway.dto;
-
-
-/**
- * Projection interface used by Spring Data JPA repositories to retrieve specific,
- * mapped columns from a native database query result.
- * <p>
- * This interface defines the contract for accessing data returned by the
- * {@link com.fincore.gateway.repository.RolePermissionsRepository#findAllPermissionsByUserId(String) RolePermissionsRepository.findAllPermissionsByUserId}
- * method, mapping SQL aliases to Java method names (e.g., SQL column {@code menuId} maps to {@code getMenuId()}).
- * This pattern is often referred to as a "DTO projection" or "interface projection" in Spring Data JPA documentation.
- * </p>
- */
-public interface PermissionRow {
-
-    /**
-     * Retrieves the menu item's unique identifier.
-     * Corresponds to the SQL column aliased as {@code menuId}.
-     *
-     * @return The menu ID.
-     */
-    int getMenuId();
-
-    /**
-     * Retrieves the display title of the menu item.
-     * Corresponds to the SQL column aliased as {@code menuTitle}.
-     *
-     * @return The menu title.
-     */
-    String getMenuTitle();
-
-    /**
-     * Retrieves the icon identifier for the menu item.
-     * Corresponds to the SQL column aliased as {@code menuIcon}.
-     *
-     * @return The menu icon name/path.
-     */
-    String getMenuIcon();
-
-    /**
-     * Indicates if this item is a submenu/parent item.
-     * Corresponds to the SQL column aliased as {@code subMenu}.
-     *
-     * @return A string indicating submenu status (e.g., "Y" or "N").
-     */
-    String getSubMenu();
-
-    /**
-     * Retrieves the action associated with the menu item (e.g., READ, WRITE).
-     * Corresponds to the SQL column aliased as {@code menuAction}.
-     *
-     * @return The associated action string.
-     */
-    String getMenuAction();
-
-    /**
-     * Retrieves the URL path for client-side routing.
-     * Corresponds to the SQL column aliased as {@code menuUrl}.
-     *
-     * @return The destination URL.
-     */
-    String getMenuUrl();
-
-    /**
-     * Retrieves the internal application component path.
-     * Corresponds to the SQL column aliased as {@code componentPath}.
-     *
-     * @return The path to the UI component.
-     */
-    String getComponentPath();
-
-    /**
-     * Retrieves the description of the menu item/screen.
-     * Corresponds to the SQL column aliased as {@code menuDescription}.
-     *
-     * @return The menu description.
-     */
-    String getMenuDescription();
-
-    /**
-     * Retrieves the ID of a parent or dependent menu item if this item is hierarchical.
-     * Corresponds to the SQL column aliased as {@code dependant}.
-     *
-     * @return The ID of the dependent item, or null/empty if none.
-     */
-    String getDependant();
-
-    /**
-     * Retrieves the x-request type for gateway level validation.
-     * Corresponds to the SQL column aliased as {@code requestType}.
-     *
-     * @return The requestType of item, or null/empty if none.
-     */
-    String getRequestType();
-
-    /**
-     * Retrieves the order in which the menu item should be displayed.
-     * Corresponds to the SQL column aliased as {@code permissionOrder}.
-     *
-     * @return The display order ID.
-     */
-    int getPermissionOrder();
-
-}
-package com.fincore.gateway.dto;
-
-import jakarta.validation.constraints.NotBlank;
-import lombok.Data;
-
-@Data
-public class ResendOtpRequestDTO {
-
-    @NotBlank(message = "Transaction ID is required")
-    private String transactionId;
-}package com.fincore.gateway.dto;
-
-import lombok.AllArgsConstructor;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-import java.util.List;
-
-/**
- * Data Transfer Object (DTO) representing a top-level (root) menu item in a hierarchical navigation structure.
- * This class typically holds references to a list of {@link ChildMenu} DTOs.
- *
- * <p>
- * Uses Lombok annotations for boilerplate code reduction:
- * <ul>
- *     <li>{@code @Data} generates getters, setters, equals, hashCode, and toString methods.</li>
- *     <li>{@code @NoArgsConstructor} generates a no-argument constructor.</li>
- *     <li>{@code @AllArgsConstructor} generates a constructor with all fields as arguments.</li>
- * </ul>
- * </p>
- */
-@Data
-@NoArgsConstructor
-@AllArgsConstructor
-public class RootMenu {
-
-    /**
-     * The unique identifier for the root menu item.
-     */
-    private int id;
-
-    /**
-     * The title or display name of the root menu item shown in the UI.
-     */
-    private String title;
-
-    /**
-     * The name of the icon to be used for this root menu item.
-     */
-    private String icon;
-
-    /**
-     * The client-side route or URL fragment for this menu item.
-     */
-    private String route;
-
-    /**
-     * A flag indicating whether this root menu item contains nested child menus.
-     */
-    private boolean hasChildren;
-
-
-    /**
-     * The internal path to the frontend component associated with this root menu item.
-     */
-    private String componentPath;
-
-    /**
-     * A brief description of the screen or functionality provided by this menu item.
-     */
-    private String screenDescription;
-
-    /**
-     * The display order ID for positioning this root menu item in the main navigation bar/list.
-     */
-    private int orderId;
-
-    /**
-     * The display menu action for special access in root menu item in the main navigation bar/list.
-     */
-    private String menuAction;
-
-    /**
-     * The display x-requestType for root menu item in the main navigation bar/list.
-     */
-    private String requestType;
-
-    /**
-     * A list of {@link ChildMenu} DTOs representing the sub-items within this root menu.
-     */
-    private List<ChildMenu> children;
-}
-package com.fincore.gateway.dto;
-
-import lombok.AllArgsConstructor;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-/**
- * DTO used for handling password update requests and responses.
- *
- * Carries basic details like userId, password, OTP, and a flag
- * indicating whether the password was successfully updated or not.
- */
-@Data
-@AllArgsConstructor
-@NoArgsConstructor
-public class UpdatePasswordDTO {
-
-    /** Unique ID of the user performing password update. */
-    private String userId;
-
-    /** Message describing update status or additional info. */
-    private String message;
-
-    /** The new password to be set for the user. */
-    private String password;
-
-    /** Flag that indicates if password update was successful. */
-    private boolean updateFlag;
-
-    /** OTP value used for verifying the password change. */
-    private String otp;
-}package com.fincore.gateway.dto;
-
-import com.fasterxml.jackson.annotation.JsonProperty;
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-import java.sql.Timestamp;
-
-/**
- * DTO that represents user details along with login and token info.
- *
- * Used across authentication and profile flows for passing
- * consolidated user information between layers.
- */
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class UserDto implements UserLoginDTO {
-
-    /** Unique identifier for the user. */
-    private String userId;
-
-    /** Role ID or level assigned to the user. */
-    private int userRole;
-
-    /** First name of the user. */
-    private String firstName;
-
-    /** Middle name of the user, if provided. */
-    private String middleName;
-
-    /** Last name of the user. */
-    private String lastName;
-
-    /** Registered phone number. */
-    private String phoneNumber;
-
-    /** User's email address. */
-    private String email;
-
-    /** Stored password hash for authentication. */
-    @JsonProperty(access = JsonProperty.Access.WRITE_ONLY)
-    private String passwordHash;
-
-    /** Plain password (usually used temporarily during validation). */
-    @JsonProperty(access = JsonProperty.Access.WRITE_ONLY)
-    private String password;
-
-    /** Current role status (ACTIVE / INACTIVE). */
-    private String roleStatus;
-
-    /** Timestamp when the account was created. */
-    private Timestamp createdAt;
-
-    /** Timestamp when the user record was last updated. */
-    private Timestamp updatedAt;
-
-    /** Timestamp of the user’s last successful login. */
-    private Timestamp lastLoginAt;
-
-    /** Soft delete flag (Y/N). */
-    private String isDeleted;
-
-    /** Timestamp when the user was deleted (if applicable). */
-    private Timestamp deletedAt;
-
-    /** Time when a temporary password was last set. */
-    private Timestamp tempPasswordSetAt;
-
-    /** Number of failed password attempts. */
-    private int userWrongPasswordCount;
-
-    /** Branch or location code associated with the user. */
-    private int branch;
-
-    /** Optional status message returned from operations. */
-    private String message;
-
-    /** Login method used (P - Password, O - OTP, etc.). */
-    private char loginMethod;
-
-    /** Current status of the user account. */
-    private String userStatus;
-
-    /** Access token issued after login. */
-    private String accessToken;
-
-    /** Refresh token for renewing session without re-login. */
-    private String refreshToken;
-
-    /** Flag indicating if the password needs to be updated. */
-    private boolean updatePassword;
-
-    /** Whether the user exists and is valid in system. */
-    private boolean userCheck;
-
-    /** Remaining attempts before account lockout. */
-    private int attemptsLeft;
-
-    /** True if credentials are valid during authentication. */
-    private boolean validCredentials;
-
-    /** Status of password login attempt. */
-    private String passwordLoginStatus;
-
-    /** Token-related data, if available. */
-    private UserTokenDataDto user;
-
-    /**
-     * Flag indicating if the user must complete OTP verification
-     */
-    private boolean otpRequired;
-}
-package com.fincore.gateway.dto;
-
-public interface UserLoginDTO {
-    /***
-     * Marker interface for DTOs involved in user login or authentication flows.
-     * This allows for type grouping and cleaner handling in service or controller
-     * layers.
-     */
-
-}package com.fincore.gateway.dto;
-
-import lombok.AllArgsConstructor;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-/**
- * DTO that carries minimal user data embedded inside a token.
- *
- * This object is typically serialized within access or refresh tokens
- * to represent the authenticated user's identity and basic profile info.
- */
-@Data
-@NoArgsConstructor
-@AllArgsConstructor
-public class UserTokenDataDto {
-
-    /** Unique identifier of the user. */
-    private String userId;
-
-    /** Numeric role ID assigned to the user. */
-    private Integer role;
-
-    /** Name of the role (e.g. ADMIN, MANAGER, USER). */
-    private String roleName;
-
-    /** First name of the user. */
-    private String firstName;
-
-    /** Middle name, if provided. */
-    private String middleName;
-
-    /** Last name of the user. */
-    private String lastName;
-
-    /** Contact number registered with the user. */
-    private String phoneNumber;
-
-    /** Email address associated with the user account. */
-    private String email;
-
-    /** Branch or office code where the user is mapped. */
-    private int branch;
-
-
-
-    private String branchCode;
-
-    /** Branch name (BRANCH_MASTER.NAME). */
-    private String branchName;
-
-    /** Branch status flag (BRANCH_MASTER.STATUS). */
-    private Integer branchStatus;
-
-    /** City (BRANCH_MASTER.CITY). */
-    private String city;
-
-    /** Address (BRANCH_MASTER.ADDRESS). */
-    private String address;
-
-    /** Pincode (BRANCH_MASTER.PINCODE). */
-    private String pincode;
-
-    /** NMR code (BRANCH_MASTER.NMR_CODE). */
-    private String nmrCode;
-
-    /** Branch type (BRANCH_MASTER.BRANCH_TYPE). */
-    private String branchType;
-
-    /** Circle code (CIRCLE_MASTER.CIRCLE_CODE). */
-    private String circleCode;
-
-    /** Circle name (CIRCLE_MASTER.CIRCLE_NAME). */
-    private String circleName;
-
-    /** State name (STATE_MASTER.NAME). */
-    private String stateName;
-
-    /** State code (STATE_MASTER.STATE_CODE). */
-    private String stateCode;
-
-    /** Zone code (CIRCLE_MASTER.ZONE_CODE). */
-    private String zoneCode;
-
-    /** Zone description/name (ZONE_MASTER.ZONE_DESC). */
-    private String zoneName;
-
-    /** Circle branch code (CIRCLE_MASTER.BRANCH_CODE). */
-    private String circleBranch;
-
-    /** Flag indicating if the user's mapped branch is the Circle HQ. */
-    private Boolean isCircle;
-
-    // ########## Branch Information Ends ##########
-
-    // ========== New code changes as per requirement for role access ========== [ @author v1015698 ]
-
-    /** Flag that specifies the access level granted to this role. */
-    private String roleDescription;
-
-    /** Flag that specifies the access level granted to this role. */
-    private String roleAccess;
-
-    /** Flag that specifies the access level granted to this role. */
-    private String accessName;
-
-    /** Flag that specifies the access level granted to this role. */
-    private String accessDescription;
-
-    // ########## Branch Information Ends ##########
-
-}
-package com.fincore.gateway.dto;
-
-import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.Pattern;
-import lombok.Data;
-
-@Data
-public class VerifyOtpRequestDTO {
-
-    @NotBlank(message = "Transaction ID is required")
-    private String transactionId;
-
-    @NotBlank(message = "OTP is required")
-    @Pattern(regexp = "^\\d{6}$", message = "OTP must be exactly 6 digits")
-    private String otp;
-}
-package com.fincore.gateway.dto;
-
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-/**
- * DTO used during user verification process.
- *
- * Contains essential details about the user’s login state,
- * role validation, and password update requirements.
- */
-@Data
-@AllArgsConstructor
-@NoArgsConstructor
-@Builder
-public class VerifyUserDTO {
-
-    /** Unique ID of the user being verified. */
-    private String userId;
-
-    /** Message conveying status or feedback from verification. */
-    private String message;
-
-    /** Login method used (P - Password, O - OTP, etc.). */
-    private char loginMethod;
-
-    /** Current status of the user account. */
-    private String userStatus;
-
-    /** Current status of the user's role (ACTIVE / INACTIVE). */
-    private String roleStatus;
-
-    /** Indicates if user needs to update their password. */
-    private boolean updatePassword;
-
-    /** Whether the user exists and passes basic checks. */
-    private boolean userCheck;
-
-    /** Status of password login attempt. */
-    private String passwordLoginStatus;
-
-    /**
-     * Public key to encrypt payload
-     */
-    private String publicKey;
-}
-
-
-
-main code 
-
-package com.fincore.gateway.JwtUtil;
-
-import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.security.Keys;
-import lombok.extern.slf4j.Slf4j;
-
-import javax.crypto.SecretKey;
-import java.time.Instant;
-import java.util.Base64;
-import java.util.Date;
-import java.util.Map;
-import java.util.UUID;
-
-/**
- * Utility class for generating HMAC-SHA256 (HS256) JSON Web Tokens (JWTs).
- * <p>
- * This class provides a method to create signed JWTs for authentication and authorization purposes.
- * It is marked with {@code @Slf4j} for logging capabilities.
- * </p>
- */
-@Slf4j
-public final class HmacJwtUtil {
-
-    /**
-     * Private constructor to prevent instantiation of this utility class.
-     */
-    private HmacJwtUtil() {
-    }
-
-    /**
-     * Generates a signed JSON Web Token (JWT) using the HS256 algorithm.
-     * <p>
-     * The token includes a subject, unique ID (JTI), issue time, expiration time,
-     * and custom user data as claims. The secret key for signing must be provided
-     * in Base64 encoded format.
-     * </p>
-     *
-     * @param base64Secret The Base64 encoded secret key used for signing the JWT (HS256).
-     * @param subject The principal subject of the token (e.g., a user ID or username).
-     * @param ttlSeconds The time-to-live for the token in seconds from the current time.
-     * @param UserData A {@link Map} containing custom claims (user data) to be included in the token payload.
-     * @return A compact, signed JWT string.
-     */
-    public static String generate(String base64Secret, String subject, long ttlSeconds, Map<String,Object> UserData) {
-        // Decode the Base64 secret to a byte array
-        byte[] secret = Base64.getDecoder().decode(base64Secret);
-        // Create an HMAC secret key object from the byte array
-        SecretKey key = Keys.hmacShaKeyFor(secret);
-
-        Instant now = Instant.now();
-        Instant exp = now.plusSeconds(ttlSeconds);
-        log.info("Generated exp in Seconds={}", exp);
-        String jti = UUID.randomUUID().toString();
-        log.info("Jti generated={}", jti);
-
-//        // Build the JWT token
-//        return Jwts.builder()
-//                .setClaims(UserData)                 // Set custom user data claims
-//                .setSubject(String.valueOf(subject)) // Set the subject claim
-//                .id(jti)                             // Set the unique JWT ID (jti)
-//                .issuedAt(Date.from(now))            // Set the issued at time (iat)
-//                .expiration(Date.from(exp))          // Set the expiration time (exp)
-//                .signWith(key)                       // Sign the token using the HS256 key
-//                .compact();                          // Compact the token into its final string form
-
-        return Jwts.builder()
-                .claims(UserData)                    // custom claims
-                .subject(String.valueOf(subject))    // "sub"
-                .id(jti)                             // "jti"
-                .issuedAt(Date.from(now))            // "iat"
-                .expiration(Date.from(exp))          // "exp"
-                .signWith(key, Jwts.SIG.HS256)       // explicit algorithm
-                .compact();
-    }
-}
-package com.fincore.gateway.model;
-
-import jakarta.persistence.*;
-import lombok.Data;
-import java.time.Instant;
-
-@Entity
-@Table(name = "LAUNCH_CONFIG")
-@Data
-public class LaunchConfig {
-
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY) // Or SEQUENCE for Oracle
-    @Column(name = "ID")
-    private Long id;
-
-    @Column(name = "APP_NAME")
-    private String appName;
-
-    @Column(name = "APP_VERSION")
-    private String appVersion;
-
-    // Instant automatically represents a specific moment on the UTC timeline
-    @Column(name = "LAUNCH_TIMESTAMP", columnDefinition = "TIMESTAMP WITH TIME ZONE")
-    private Instant launchTimestamp;
-}package com.fincore.gateway.model;
-
-import jakarta.persistence.*;
-import lombok.Getter;
-import lombok.Setter;
-import java.sql.Timestamp;
-
-/**
- * Entity class that stores details of each user login attempt.
- * 
- * Maps to the USER_LOGIN_ATTEMPTS table and keeps track of
- * login activity such as user ID, login method, IP address,
- * timestamp, and whether the attempt was successful or not.
- */
-@Entity
-@Getter
-@Setter
-@Table(name = "USER_LOGIN_ATTEMPTS")
-public class LoginAttempt {
-
-    /** Primary key for the login attempt record. */
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    @Column(name = "ATTEMPT_ID")
-    private Long attemptId;
-
-    /** ID of the user who tried to log in. */
-    @Column(name = "USER_ID")
-    private String userId;
-
-    /** Type of login method used (e.g. PASSWORD, OTP, BIOMETRIC). */
-    @Column(name = "LOGIN_METHOD")
-    private String loginMethod;
-
-    /** IP address from which the login attempt was made. */
-    @Column(name = "IP_ADDRESS")
-    private String ipAddress;
-
-    /**
-     * Timestamp when the login attempt occurred.
-     * 
-     * This is managed at the database level and not manually updated in code.
-     */
-    @Column(name = "ATTEMPT_TIME", nullable = false, updatable = false, insertable = false)
-    private Timestamp attemptTime;
-
-    /** Indicates if the login was successful (Y/N). */
-    @Column(name = "SUCCESS")
-    private String success;
-
-    /** Reason for failure, if the attempt was not successful. */
-    @Column(name = "FAILURE_REASON")
-    private String failureReason;
-}
-
-package com.fincore.gateway.model;
-
-import jakarta.persistence.Column;
-import jakarta.persistence.Entity;
-import jakarta.persistence.Id;
-import jakarta.persistence.Table;
-import lombok.Getter;
-import lombok.Setter;
-import lombok.ToString;
-
-/**
- * Entity representing the system-wide login configuration paramters.
- * 
- * Maps to the LOGIN_PARAM table, which holds information such as
- * the active login mode, OTP validity period, password validity period,
- * allowed wrong attempts, and interval between attempts.
- */
-@Entity
-@Getter
-@Setter
-@ToString
-@Table(name = "LOGIN_PARAM")
-public class LoginParam {
-
-    /** Defines the currently active login mode in the system. */
-    @Id
-    @Column(name = "ACTIVE_LOGIN_MODE")
-    private char activeLoginMode;
-
-    /** OTP validity period in minutes. */
-    @Column(name = "OTP_VALIDITY")
-    private int otpValidity;
-
-    /** Password validity period in days. */
-    @Column(name = "PASSWORD_VALIDITY")
-    private int passwordValidity;
-
-    /** Number of consecutive wrong password attemps allowed before blocking. */
-    @Column(name = "WRONG_PASSWORD_ATTEMPTS")
-    private int wrongPasswordAttempts;
-
-    /** Time interval (in minutes) after which a new login attempt is allowed. */
-    @Column(name = "ATTEMPT_INTERVAL")
-    private int attemptInterval;
-
-    /**
-     * Flag to indicate if OTP/MFA is required after primary authentication
-     */
-    @Column(name = "IS_OTP_ENABLED")
-    private String isOtpEnabled;
-}package com.fincore.gateway.model;
-
-import jakarta.persistence.Column;
-import jakarta.persistence.Entity;
-import jakarta.persistence.Id;
-import jakarta.persistence.Table;
-import lombok.Data;
-
-/**
- * Entity representing permission details for each menu or action in the system.
- * 
- * Maps to the PERMISSIONS table and defines information such as menu title,
- * icon, sub-menu, related action, and route path used within the application.
- */
-@Entity
-@Data
-@Table(name = "PERMISSIONS")
-public class Permissions {
-
-    /** Unique ID for the menu or permission entry. */
-    @Id
-    @Column(name = "MENU_ID")
-    private int menuId;
-
-    /** Title displayed for this menu item or feature. */
-    @Column(name = "MENU_TITLE")
-    private String menuTitle;
-
-    /** Icon associated with the menu item (used in UI). */
-    @Column(name = "MENU_ICON")
-    private String menuIcon;
-
-    /** Name of the parent or sub menu this item belongs to. */
-    @Column(name = "MENU_SUBMENU")
-    private String subMenu;
-
-    /** Specific action type or permission (like VIEW, EDIT, DELETE etc). */
-    @Column(name = "MENU_ACTION")
-    private String menuAction;
-
-    /** URL path or endpoint linked with this menu. */
-    @Column(name = "MENU_URL")
-    private String menuUrl;
-
-    /** Component path or frontend route used for navigation. */
-    @Column(name = "MENU_COMPONENT_PATH")
-    private String componentPath;
-
-    /** Short description explaining what this permission or menu does. */
-    @Column(name = "MENU_DESCRIPTION")
-    private String menuDescription;
-
-    /** Indicates if this menu depends on another one. */
-    @Column(name = "MENU_DEPENDANT")
-    private String dependent;
-
-    /** Order in which the menu appears in UI. */
-    private int orderId;
-}
-package com.fincore.gateway.model;
-
-import jakarta.persistence.*;
-import lombok.Getter;
-import lombok.Setter;
-import java.sql.Timestamp;
-
-/**
- * Entity representing user session details along with the refresh token.
- * 
- * Maps to USER_SESSION table and keeps track of when a session was started,
- * ended, and from which device it was initiated.
- */
-@Entity
-@Getter
-@Setter
-@Table(name = "USER_SESSION")
-public class RefreshToken {
-
-    /** Primary key for the user session. */
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    @Column(name = "SESSION_ID")
-    private Long sessionId;
-
-    /** Unique ID of the user associated with this session. */
-    @Column(name = "USER_ID")
-    private String userId;
-
-    /** Refresh token assigned to the current session. */
-    @Column(name = "REFRESH_TOKEN")
-    private String refreshToken;
-
-    /** Timestamp indicating when the session started. */
-    @Column(name = "SESSION_STARTED_AT", insertable = false, updatable = false)
-    private Timestamp sessionStartedAt;
-
-    /** Timestamp indicating when the session ended. */
-    @Column(name = "SESSION_ENDED_AT")
-    private Timestamp sessionEndedAt;
-
-    /** Device identifier or token from which session was created. */
-    @Column(name = "DEVICE_ID")
-    private String deviceId;
-}package com.fincore.gateway.model;
-
-import jakarta.persistence.*;
-import lombok.Data;
-
-/**
- * Entity representing the mapping between roles and permissions.
- * 
- * Each entry defines which permission belongs to which role.
- * This acts as a bridge table between USER_ROLES and PERMISSIONS.
- */
-@Entity
-@Data
-@Table(name = "ROLE_PERMISSIONS")
-public class RolePermissions {
-
-    /** ID of the role. */
-    @Id
-    @Column(name = "ROLE_ID")
-    private int roleId;
-
-    /** ID of the permission linked to the role. */
-    @Column(name = "PERMISSION_ID")
-    private int permissionId;
-}package com.fincore.gateway.model;
-
-import jakarta.persistence.Column;
-import jakarta.persistence.Entity;
-import jakarta.persistence.Id;
-import jakarta.persistence.Table;
-import lombok.Data;
-
-import java.sql.Timestamp;
-
-/**
- * Entity representing a user in the system.
- * 
- * Holds user profile information, credentials, and audit details
- * such as creation date, last login, and deletion timestamp.
- */
-@Data
-@Entity
-@Table(name = "USERS")
-public class User {
-
-    /** Unique identifier for the user. */
-    @Id
-    @Column(name = "USER_ID")
-    private String userId;
-
-    /** First name of the user. */
-    @Column(name = "FIRST_NAME")
-    private String firstName;
-
-    /** Middle name, if provided. */
-    @Column(name = "MIDDLE_NAME")
-    private String middleName;
-
-    /** Last name of the user. */
-    @Column(name = "LAST_NAME")
-    private String lastName;
-
-    /** Registered phone number of the user. */
-    @Column(name = "PHONE_NUMBER")
-    private String phoneNumber;
-
-    /** Email address used for login or notifications. */
-    @Column(name = "EMAIL")
-    private String email;
-
-    /** Encrypted password hash used for authentication. */
-    @Column(name = "PASSWORD_HASH")
-    private String passwordHash;
-
-    /** Current status of the account (e.g. ACTIVE, INACTIVE, LOCKED). */
-    @Column(name = "ACCOUNT_STATUS")
-    private String accountStatus;
-
-    /** Timestamp when the user record was created. */
-    @Column(name = "CREATED_AT")
-    private Timestamp createdAt;
-
-    /** Timestamp when the record was last updated. */
-    @Column(name = "UPDATED_AT")
-    private Timestamp updatedAt;
-
-    /** Timestamp of the user's last successful login. */
-    @Column(name = "LAST_LOGIN_AT")
-    private Timestamp lastLoginAt;
-
-    /** Flag to indicate soft delete status (Y/N). */
-    @Column(name = "IS_DELETED")
-    private String isDeleted;
-
-    /** Timestamp when the user was marked as deleted. */
-    @Column(name = "DELETED_AT")
-    private Timestamp deletedAt;
-
-    /** When the temporary password was last set, if applicable. */
-    @Column(name = "TEMP_PASSWORD_SET_AT")
-    private Timestamp tempPasswordSetAt;
-
-    /** Count of consecutive wrong password attempts. */
-    @Column(name = "USER_WRONG_PASSWORD_COUNT")
-    private int userWrongPasswordCount;
-
-    /** Branch or location code assigned to the user. */
-    @Column(name = "BRANCH")
-    private int branch;
-
-    /** Indicates if password login is enabled or not. */
-    @Column(name = "PASSWORD_LOGIN")
-    private String passwordLogin;
-}package com.fincore.gateway.model;
-
-import jakarta.persistence.*;
-import lombok.Data;
-
-import java.util.Set;
-
-/**
- * Entity representing the roles assigned within the system.
- * 
- * Each role defines a set of permissions and accessible menu items.
- * Roles are linked to users and control access levels across the app.
- */
-@Data
-@Entity
-@Table(name = "ROLES")
-public class UserRoles {
-
-    /** Unique ID assigned to the role. */
-    @Id
-    @Column(name = "ROLE_ID")
-    private Integer role;
-
-    /** Name of the role (e.g. ADMIN, MANAGER, USER). */
-    @Column(name = "ROLE_NAME")
-    private String roleName;
-
-    /** Description of the role (e.g. ADMIN of FinCore). */
-    @Column(name = "ROLE_DESCRIPTION")
-    private String roleDescription;
-
-    /** ID of the user to whom this role belongs. */
-    @Column(name = "USER_ID")
-    private String userId;
-
-    /** Status of the role (e.g. ACTIVE, INACTIVE). */
-    @Column(name = "ROLE_STATUS")
-    private String roleStatus;
-
-    /** Access of the role (e.g. B, C, W). */
-    @Column(name = "ROLE_ACCESS")
-    private String roleAccess;
-
-    /** Access Name of the role (e.g. BRANCH, CIRCLE, WHOLE-BANK). */
-    @Column(name = "ACCESS_NAME")
-    private String accessName;
-
-    /** Access Description of the role (e.g. Scoped for branch level). */
-    @Column(name = "ACCESS_DESCRIPTION")
-    private String accessDescription;
-
-    /** Access Status of the role (e.g. ACTIVE, INACTIVE). */
-    @Column(name = "ACCESS_STATUS")
-    private String accessStatus;
-
-}
-
-
-package com.fincore.gateway.Service;
-
-import com.fincore.gateway.utility.LoginUtility;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.ldap.CommunicationException;
-import org.springframework.ldap.NamingException;
-import org.springframework.ldap.core.LdapTemplate;
-import org.springframework.security.authentication.BadCredentialsException;
-import org.springframework.stereotype.Service;
-import org.springframework.ldap.support.LdapEncoder;
-
-/**
- * Service responsible for interacting with Active Directory.
- * Handles the "Bind" operation to verify credentials.
- */
-@Slf4j
-@Service
-@RequiredArgsConstructor
-public class AdAuthenticationService {
-
-    private final LdapTemplate ldapTemplate;
-
-    @Value("${spring.ldap.domain:UATAD.SBI}")
-    private String adDomain;
-
-
-    public boolean authenticate(String username, String password) {
-        if (username == null || username.isBlank() || password == null || password.isBlank()) {
-            log.warn("LDAP Auth failed: Empty username or password");
-            return false;
-        }
-
-        try {
-           
-            String principalName = username + "@" + adDomain;
-
-            log.info("Attempting LDAP Bind for principal: {}", LoginUtility.sanitizeLog(principalName));
-
-            String safeUsername = LdapEncoder.filterEncode(username);
-
-            // The authenticate method handles the opening of connection and binding.
-            // Filter: (sAMAccountName=username) checks if the user exists.
-            // Password: The credential to verify.
-            boolean authenticated = ldapTemplate.authenticate(
-                    "",                                  // Base DN is already set in config
-                    "(sAMAccountName=" + safeUsername + ")", // Filter to locate the user
-                    password                             // Password to verify
-            );
-
-            if (authenticated) {
-                log.info("LDAP Authentication SUCCESS for user: {}", LoginUtility.sanitizeLog(username));
-                return true;
-            } else {
-                log.warn("LDAP Authentication FAILED for user (Invalid Credentials)");
-                return false;
-            }
-
-        } catch (BadCredentialsException e) {
-            log.warn("LDAP Authentication FAILED for user (BadCredentialsException): {}", LoginUtility.sanitizeLog(username));
-            return false;
-        } catch (CommunicationException e) {
-            log.error("LDAP CONNECTION ERROR: {}", e.getMessage());
-            throw new RuntimeException("LDAP Server Down", e);
-        } catch (NamingException e) {
-            log.error("LDAP Naming Error during auth for user: {}. Error: {}", LoginUtility.sanitizeLog(username), e.getMessage());
-            return false;
-        } catch (Exception e) {
-            log.error("LDAP Unexpected Error during auth for user: {}. Error: {}", LoginUtility.sanitizeLog(username), e.getMessage(), e);
-            return false;
-        }
-    }
-}
-
-package com.fincore.gateway.Service;
-
-
-import com.fincore.gateway.dto.LaunchResponse;
-import com.fincore.gateway.model.LaunchConfig;
-import com.fincore.gateway.repository.LaunchConfigRepository;
-import lombok.RequiredArgsConstructor;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Service;
-
-import java.time.ZoneId;
-import java.time.ZonedDateTime;
-import java.time.format.DateTimeFormatter;
-
-@Service
-@RequiredArgsConstructor
-public class LaunchServiceImpl implements LaunchService {
-
-    private final LaunchConfigRepository launchConfigRepository;
-
-    @Override
-    public LaunchResponse getLaunchDetails() {
-        LaunchConfig config = launchConfigRepository.findTopByOrderByIdDesc()
-                .orElseThrow(() -> new RuntimeException("Launch configuration not found in DB"));
-
-        // explicitly set the timezone to IST
-        ZonedDateTime istLaunchTime = config.getLaunchTimestamp().atZone(ZoneId.of("Asia/Kolkata"));
-
-        DateTimeFormatter dateFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd");
-        DateTimeFormatter timeFormatter = DateTimeFormatter.ofPattern("HH:mm:ss");
-
-        return new LaunchResponse(
-                istLaunchTime.format(dateFormatter),
-                istLaunchTime.format(timeFormatter),
-                "IST", // Updated to reflect the correct timezone
-                config.getAppVersion(),
-                config.getAppName()
-        );
-    }
-}
-
-
-
-package com.fincore.gateway.Service;
-
-import com.fincore.gateway.dto.*;
-import com.fincore.gateway.model.LoginAttempt;
-import com.fincore.gateway.model.LoginParam;
-import com.fincore.gateway.model.User;
-import com.fincore.gateway.model.UserRoles;
-import reactor.core.publisher.Mono;
-
-/**
- * Contract for login/authentication workflows, user/session checks, and menu resolution.
- *
- * <p>Implementations should:
- * <ul>
- *   <li>Validate credentials (password-based or SSO-based)</li>
- *   <li>Issue JWTs and compose token-visible user data</li>
- *   <li>Enforce wrong-password attempt limits and track attempts</li>
- *   <li>Transform role permissions to a menu response</li>
- * </ul>
- */
-public interface LoginService {
-
-    /**
-     * Verifies user credentials and, on success, produces a {@link UserDto} containing
-     * validity flags, statuses, and an access token with token-visible user data.
-     *
-     * @param userCredentials input payload with userId (and password for password mode)
-     * @param clientIp        caller's IP address for auditing
-     * @return populated {@link UserDto} describing the outcome
-     */
-    UserDto verifyUserCredentials(UserDto userCredentials, String clientIp);
-
-    /**
-     * Fetches role-wise permissions for the user and transforms them into a menu response.
-     *
-     * @param userId the user identifier
-     * @return {@link MenuResponse} built from ordered permissions (possibly empty)
-     */
-    MenuResponse fetchRoleWiseData(String userId);
-
-    /**
-     * Checks a user's status and requirements prior to login.
-     *
-     * @param userId the user identifier
-     * @return {@link VerifyUserDTO} describing status and next steps (e.g., update password)
-     */
-    VerifyUserDTO checkUser(String userId);
-
-    /**
-     * Updates a user's password hash and related metadata.
-     *
-     * @param userCredentials input DTO containing {@code userId} and new raw {@code password}
-     * @return {@link UpdatePasswordDTO} with status and message
-     */
-    UpdatePasswordDTO updatePassword(UpdatePasswordDTO userCredentials);
-
-    /**
-     * Executes password-based authentication logic, enforcing wrong-password limits and
-     * updating counters/flags in the provided objects.
-     *
-     * @param password     raw password from the request
-     * @param loginAttempt login attempt entity to update with success/failure
-     * @param userInfo     output DTO to set validity flags and attempts left
-     * @param user         the user being authenticated
-     * @param loginParam   login parameters (e.g., permitted attempts)
-     */
-    void passwordBasedLogin(String password,
-                            LoginAttempt loginAttempt,
-                            UserDto userInfo,
-                            User user,
-                            LoginParam loginParam);
-
-    /**
-     * Produces a human-readable message describing a blocked login due to the given status/type.
-     *
-     * @param status status string (e.g., ACTIVE/INACTIVE/LOCKED)
-     * @param type   subject type (e.g., "user", "role")
-     * @return formatted message
-     */
-    String generateStatusMessage(String status, String type);
-
-
-
-    /**
-     * Retrives the user profile information.
-     * used during token refresh to ensure user claims are up to date.
-     * @param userId
-     * @return userRole
-     */
-    UserDto getUserProfile(String userId);
-
-    /**
-     * Send otp after correct user id and password entered to initiate the login process
-     *
-     * @param userDto
-     * @return otp initiated for the first time response
-     */
-    Mono<OtpInitiatedResponseDTO> initiateOtpPhase(UserDto userDto);
-
-    /**
-     * Verifies the otp and generate the final successful login response data
-     *
-     * @param requestDto
-     * @return verify otp and final login successful response
-     */
-    Mono<UserDto> verifyOtpAndGetUser(VerifyOtpRequestDTO requestDto);
-
-    /**
-     * Resend otp after a cooldown period of 30 seconds
-     *
-     * @param requestDto
-     * @param clientIp
-     * @return otp resend success response
-     */
-    Mono<OtpResendResponseDTO> resendOtp(ResendOtpRequestDTO requestDto, String clientIp);
-
-}
-
-
-
-package com.fincore.gateway.Service;
-
-import com.fincore.gateway.Config.KeyUtils;
-import com.fincore.gateway.JwtUtil.HmacJwtUtil;
-import com.fincore.gateway.dto.*;
-import com.fincore.gateway.model.LoginAttempt;
-import com.fincore.gateway.model.LoginParam;
-import com.fincore.gateway.model.User;
-import com.fincore.gateway.model.UserRoles;
-import com.fincore.gateway.repository.*;
-import com.fincore.gateway.utility.Constants;
-import com.fincore.gateway.utility.LoginUtility;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.http.HttpStatus;
-import org.springframework.orm.ObjectOptimisticLockingFailureException;
-import org.springframework.orm.jpa.JpaSystemException;
-import org.springframework.security.crypto.password.PasswordEncoder;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-import org.springframework.web.server.ResponseStatusException;
-import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Scheduler;
-import reactor.core.scheduler.Schedulers;
-import tools.jackson.databind.ObjectMapper;
-
-import java.security.SecureRandom;
-import java.sql.Timestamp;
-import java.time.LocalDateTime;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
-
-/**
- * Service implementation handling user login/verification, menu resolution, and password updates.
- *
- * <p><strong>Responsibilities</strong>
- * <ul>
- *   <li>Validate credentials (password-based and SSO-based)</li>
- *   <li>Issue HS256 JWTs and embed limited user/role claims</li>
- *   <li>Transform role permissions into menu responses</li>
- *   <li>Track login attempts and enforce wrong password limits</li>
- * </ul>
- *
- * <p><strong>Notes</strong>
- * <ul>
- *   <li>JWT generation uses an HMAC Base64 secret; ensure it is configured for the environment.</li>
- *   <li>{@code BCryptPasswordEncoder} is created locally for convenience; consider injecting a singleton bean instead.</li>
- *   <li>Write operations are wrapped in {@link Transactional} where appropriate.</li>
- * </ul>
- */
-@Slf4j
-@Service("LoginService")
-@RequiredArgsConstructor
-public class LoginServiceImpl implements LoginService {
-
-    /**
-     * Prefer injecting a singleton bean; retained local instance for compatibility.
-     */
-    private final PasswordEncoder passwordEncoder;
-
-    // ======= Config =======
-    private final UserRepository userRepository;
-    private final LoginAttemptRepository loginAttemptRepository;
-
-    // ======= Dependencies =======
-    private final LoginParamRepository loginParamRepository;
-    private final RolePermissionsRepository rolePermissionsRepository;
-    private final MenuService menuService;
-    private final ObjectMapper mapper;
-    private final BranchRepository branchRepository;
-    private final Scheduler ldapScheduler;
-    private final AdAuthenticationService adAuthenticationService;
-
-    // ========== OTP ==========
-    private final OtpSessionService otpSessionService;
-    private final OtpKafkaProducer otpKafkaProducer;
-
-    @Value("${security.payload.rsa-private:}")
-    private String rsaPrivatePem;
-
-    /**
-     * Base64-encoded HMAC secret used to sign HS256 JWTs.
-     */
-    @Value("${security.jwt.hmac-base64-secret:}")
-    private String hmacSecret;
-
-    /**
-     * Token time-to-live in seconds.
-     */
-    @Value("${security.jwt.ttl-seconds:900}")
-    private long ttlSeconds;
-
-    // =========================================================================================
-    // NEW OTP LIFECYCLE METHODS
-    // =========================================================================================
-
-    @Override
-    public Mono<OtpInitiatedResponseDTO> initiateOtpPhase(UserDto userDto) {
-        UserTokenDataDto tokenData = userDto.getUser();
-
-        String mobile = (tokenData != null && tokenData.getPhoneNumber() != null) ? tokenData.getPhoneNumber().trim() : "";
-        String email = (tokenData != null && tokenData.getEmail() != null) ? tokenData.getEmail().trim() : "";
-
-        // 1. THE FAIL-FAST BARRIER
-        boolean hasMobile = !mobile.isEmpty();
-        boolean hasEmail = email.contains("@");
-
-        if (!hasMobile && !hasEmail) {
-            log.error("Login halted for user {}: No registered mobile or email found.", LoginUtility.sanitizeLog(userDto.getUserId()));
-            return Mono.error(new ResponseStatusException(
-                    HttpStatus.FORBIDDEN,
-                    "No registered mobile number or email address found. Please contact fincore support to update your profile."
-            ));
-        }
-
-        // 2. DYNAMIC CHANNEL ROUTER
-        List<String> activeChannels = new java.util.ArrayList<>();
-        if (hasMobile) activeChannels.add("SMS");
-        if (hasEmail) activeChannels.add("EMAIL");
-
-        String txId = UUID.randomUUID().toString();
-        String plainOtp = generateSecureOtp();
-        String fName = tokenData.getFirstName() != null ? tokenData.getFirstName() : "User";
-
-        // 3. THE SAGA PIPELINE (Redis -> Kafka -> Success OR Rollback)
-        return otpSessionService.saveOtpState(txId, userDto.getUserId(), plainOtp, false)
-                .then(otpKafkaProducer.publishOtpEvent(txId, mobile, email, plainOtp, fName, activeChannels))
-                .thenReturn(OtpInitiatedResponseDTO.builder()
-                        .transactionId(txId)
-                        .maskedMobile(hasMobile ? maskMobile(mobile) : "Not Registered")
-                        .maskedEmail(hasEmail ? maskEmail(email) : "Not Registered")
-                        .expiresInSeconds(300)
-                        .resendCooldownSeconds(30)
-                        .resendsRemaining(5)
-                        .build())
-                .onErrorResume(error -> {
-                    // 4. COMPENSATING TRANSACTION (KAFKA DOWN)
-                    log.error("Infrastructure failure during OTP dispatch for txId={}. Rolling back Redis state.", LoginUtility.sanitizeLog(txId), error);
-
-                    // If Kafka fails, we must delete the Redis keys so the user isn't stuck
-                    return otpSessionService.rollbackOtpState(txId)
-                            .then(Mono.error(new ResponseStatusException(
-                                    HttpStatus.INTERNAL_SERVER_ERROR,
-                                    "Unable to dispatch OTP due to system latency. Please try again."
-                            )));
-                });
-    }
-
-    @Override
-    public Mono<UserDto> verifyOtpAndGetUser(VerifyOtpRequestDTO requestDto) {
-        return otpSessionService.verifyOtp(requestDto.getTransactionId(), requestDto.getOtp())
-                .flatMap(userId -> Mono.fromCallable(() -> {
-                    UserDto userDto = getUserProfile(userId);
-                    if (userDto == null) {
-                        throw new IllegalStateException("User missing post OTP verification");
-                    }
-                    userDto.setValidCredentials(true); // Signal to AuthController to issue tokens
-                    return userDto;
-                }).subscribeOn(Schedulers.boundedElastic()));
-    }
-
-    @Override
-    public Mono<OtpResendResponseDTO> resendOtp(ResendOtpRequestDTO requestDto, String clientIp) {
-        String txId = requestDto.getTransactionId();
-
-        return otpSessionService.checkIpRateLimit(clientIp)
-                // 1. Process Resend atomically in Redis
-                .then(otpSessionService.processResend(txId, generateSecureOtp()))
-                .flatMap(tuple -> {
-
-                    String plainOtp = tuple.getT1();
-                    String userId = tuple.getT2();
-                    Long currentResendCount = tuple.getT3();
-
-                    int remaining = 5 - currentResendCount.intValue(); // Max(5) - Current
-
-                    // 2. Fetch User Profile for contact info
-                    return Mono.fromCallable(() -> getUserProfile(userId))
-                            .subscribeOn(Schedulers.boundedElastic())
-                            .flatMap(userDto -> {
-
-                                UserTokenDataDto tokenData = userDto.getUser();
-                                String mobile = (tokenData != null && tokenData.getPhoneNumber() != null) ?
-                                        tokenData.getPhoneNumber().trim() : "";
-                                String email = (tokenData != null && tokenData.getEmail() != null) ?
-                                        tokenData.getEmail().trim() : "";
-
-                                // 3. THE FAIL-FAST BARRIER
-                                boolean hasMobile = !mobile.isEmpty();
-                                boolean hasEmail = email.contains("@");
-
-                                if (!hasMobile && !hasEmail) {
-                                    log.error("OTP Resend halted for user {}: No registered mobile or email found.", LoginUtility.sanitizeLog(userId));
-                                    return Mono.error(new ResponseStatusException(
-                                            HttpStatus.FORBIDDEN,
-                                            "No registered mobile number or email address found. Please contact fincore support."
-                                    ));
-                                }
-
-                                // 4. DYNAMIC CHANNEL ROUTER
-                                List<String> activeChannels = new java.util.ArrayList<>();
-                                if (hasMobile) activeChannels.add("SMS");
-                                if (hasEmail) activeChannels.add("EMAIL");
-
-                                String fName = tokenData.getFirstName() != null ? tokenData.getFirstName() : "User";
-
-                                // 5. THE SAGA PIPELINE (Kafka Publish -> Rollback on Failure)
-                                return otpKafkaProducer.publishOtpEvent(txId, mobile, email, plainOtp, fName, activeChannels)
-                                        .thenReturn(OtpResendResponseDTO.builder()
-                                                .resendCooldownSeconds(30)
-                                                .resendsRemaining(remaining) // <--- Return exact math
-                                                .build())
-                                        .onErrorResume(error -> {
-                                            log.error("Infrastructure failure during OTP resend for txId={}. Rolling back Redis state.", LoginUtility.sanitizeLog(txId), error);
-                                            // Rollback: Delete the transaction.
-                                            return otpSessionService.rollbackOtpState(txId)
-                                                    .then(Mono.error(new ResponseStatusException(
-                                                            HttpStatus.INTERNAL_SERVER_ERROR,
-                                                            "Unable to dispatch OTP due to system latency. Please try again."
-                                                    )));
-                                        });
-                            });
-                });
-    }
-
-
-    // =========================================================================================
-    // AUTH METHODS
-    // =========================================================================================
-
-    /**
-     * Fetches role-wise permissions for the given user and transforms them into a menu response.
-     *
-     * @param userId ID of the user
-     * @return {@link MenuResponse} built from ordered permissions; empty if none or on error
-     */
-    @Transactional(readOnly = true)
-    @Override
-    public MenuResponse fetchRoleWiseData(String userId) {
-        log.info("Fetching role-wise data for userId: {}", LoginUtility.sanitizeLog(userId));
-        try {
-            List<PermissionRow> rows = rolePermissionsRepository.findAllPermissionsByUserId(userId);
-
-            if (rows == null || rows.isEmpty()) {
-                log.info("No permissions found for userId: {}", LoginUtility.sanitizeLog(userId));
-                return new MenuResponse(Collections.emptyList());
-            }
-            return menuService.transformFromProjection(rows);
-        } catch (Exception e) {
-            log.error("Error fetching permissions for userId: {}", LoginUtility.sanitizeLog(userId), e);
-            return new MenuResponse(Collections.emptyList());
-        }
-    }
-
-    /**
-     * Verifies user credentials and, on success, builds {@link UserDto} populated with an access token and token data.
-     * <p>Also records the login attempt and enforces password attempt limits.</p>
-     *
-     * @param userCredentials payload containing {@code userId} and (for password mode) {@code password}
-     * @param clientIp        caller's IP address for audit
-     * @return {@link UserDto} with validity flags, statuses, and (if valid) a signed access token
-     */
-    @Transactional
-    @Override
-    public UserDto verifyUserCredentials(UserDto userCredentials, String clientIp) {
-
-        final String userId = userCredentials.getUserId().toLowerCase();
-        final String encryptedPassword = userCredentials.getPassword(); // This is now RSA Encrypted
-
-        UserDto result = new UserDto();
-
-        // 1. AUTHORIZATION CHECK (Must exist in Local DB)
-        User user = userRepository.findByUserId(userId);
-        if (user == null) {
-            result.setValidCredentials(false);
-            result.setUserStatus(Constants.INVALID);
-            log.warn("Login blocked: User {} not found in local DB.", LoginUtility.sanitizeLog(userId));
-            return result;
-        }
-
-        LoginParam loginParam = loginParamRepository.getLoginParam();
-        char activeMode = loginParam.getActiveLoginMode();
-
-        // Prepare Audit Log
-        LoginAttempt attempt = new LoginAttempt();
-        attempt.setLoginMethod(determineMethodString(activeMode));
-        attempt.setSuccess("N");
-        attempt.setIpAddress(clientIp);
-        attempt.setUserId(userId);
-
-        result.setLoginMethod(activeMode);
-        result.setUserId(user.getUserId());
-        result.setOtpRequired("Y".equalsIgnoreCase(loginParam.getIsOtpEnabled()));
-        UserRoles userRole = userRepository.getUserRole(userId);
-
-        // 2. STATUS CHECKS
-        result.setRoleStatus(userRole.getRoleStatus());
-        result.setUserStatus(user.getAccountStatus());
-        result.setPasswordLoginStatus(user.getPasswordLogin());
-
-        if (!Constants.ACTIVE.equalsIgnoreCase(userRole.getRoleStatus())) {
-            attempt.setFailureReason(generateStatusMessage(userRole.getRoleStatus(), "role"));
-            loginAttemptRepository.save(attempt);
-            result.setValidCredentials(false);
-            return result;
-        }
-
-        if (!Constants.ACTIVE.equalsIgnoreCase(user.getAccountStatus())) {
-            attempt.setFailureReason(generateStatusMessage(user.getAccountStatus(), "user"));
-            loginAttemptRepository.save(attempt);
-            result.setValidCredentials(false);
-            return result;
-        }
-
-        try {
-            // Decrypt RSA Payload
-            String rawPassword = KeyUtils.decryptRsaPassword(encryptedPassword, rsaPrivatePem);
-
-            // 3. AUTHENTICATION LOGIC BASED ON MODE
-            if (activeMode == Constants.LDAP) {
-                // --- MODE: LDAP ---
-                log.info("Processing LDAP Login for user: {}", LoginUtility.sanitizeLog(userId));
-                try {
-                    // Execute the blocking LDAP call on the isolated thread pool
-                    Boolean ldapSuccess = Mono.fromCallable(() -> adAuthenticationService.authenticate(userId, rawPassword))
-                            .subscribeOn(ldapScheduler) // <-- Use the dedicated pool
-                            .block(); // Block is acceptable here as we are already inside a thread dedicated to the login transaction
-                    if (ldapSuccess != null && ldapSuccess) {
-                        handleSuccess(attempt, result, user, userRole);
-                    } else {
-                        // Failure: Wrong Password -> Count it against limits
-                        handleFailure(attempt, result, user, loginParam, "LDAP Authentication Failed");
-                    }
-                } catch (RuntimeException e) {
-                    log.error("LDAP Server Error for user {}: {}", LoginUtility.sanitizeLog(userId), e.getMessage());
-                    // NOT incrementing wrong password count (It's not the user's fault)
-                    attempt.setSuccess("N");
-                    attempt.setFailureReason("LDAP Server Down / Connectivity Issue");
-                    result.setValidCredentials(false);
-                    result.setMessage("System Error: Unable to connect to Authentication Server. Please try again later.");
-                    return result;
-                }
-            } else if (activeMode == Constants.PWD_MODE) {
-                // MODE: LOCAL PASSWORD
-                // Check if Password Login is explicitly disabled for this specific user
-                if (Constants.ACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
-                    passwordBasedLogin(rawPassword, attempt, result, user, loginParam);
-                } else {
-                    // Account is Locked or Disabled
-                    handleAccountLocked(attempt, result, user);
-                }
-
-            }
-        } catch (SecurityException e) {
-            log.error("Login rejected for user {}: Payload decryption failed", LoginUtility.sanitizeLog(userId));
-            result.setValidCredentials(false);
-            result.setMessage("Security Error: Invalid encrypted payload");
-            attempt.setFailureReason("Payload Decryption Failed (Possible MITM or invalid format)");
-            return result;
-        }
-
-        loginAttemptRepository.save(attempt);
-        log.debug("verifyUserCredentials result={}", result);
-        return result;
-    }
-
-    /**
-     * Password-based authentication flow that enforces wrong password limits and updates counters/flags.
-     * 1. Increments count on failure.
-     * 2. Calculates remaining attempts.
-     * 3. Locks account immediately if limit reached.
-     *
-     * @param password     raw password from the request
-     * @param loginAttempt login attempt entity to be updated with success/failure
-     * @param userInfo     output DTO updated with validity and attempts left
-     * @param user         the user entity being authenticated
-     * @param loginParam   login parameter configuration (e.g., permitted attempts)
-     */
-    @Transactional
-    @Override
-    public void passwordBasedLogin(String password, LoginAttempt loginAttempt, UserDto userInfo, User user, LoginParam loginParam) {
-        log.info("Password-based login for userId={}", LoginUtility.sanitizeLog(user.getUserId()));
-
-        if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
-            handleAccountLocked(loginAttempt, userInfo, user);
-            return;
-        }
-
-        if (passwordEncoder.matches(password, user.getPasswordHash())) {
-            UserRoles userRole = userRepository.getUserRole(user.getUserId());
-            handleSuccess(loginAttempt, userInfo, user, userRole);
-        } else {
-            handleFailure(loginAttempt, userInfo, user, loginParam, "Wrong Password");
-        }
-    }
-
-
-    /**
-     * Produces a human-readable message describing a blocked login due to {@code status} of a given {@code type}.
-     *
-     * @param status status string (e.g., ACTIVE/INACTIVE/LOCKED)
-     * @param type   subject type (e.g., "user", "role")
-     * @return formatted message
-     */
-    @Override
-    public String generateStatusMessage(String status, String type) {
-        return String.format("Trying to login with a %s %s", status, type);
-    }
-
-    /**
-     * Checks the status and requirements for a user attempting to log in (without performing login).
-     *
-     * @param userId the user identifier
-     * @return {@link VerifyUserDTO} describing status, password update requirements, and messages
-     */
-    @Transactional(readOnly = true)
-    public VerifyUserDTO checkUser(String userId) {
-        VerifyUserDTO out = new VerifyUserDTO();
-        out.setUserId(userId);
-
-        User user = userRepository.findByUserId(userId);
-        LoginParam loginParam = loginParamRepository.getLoginParam();
-        out.setLoginMethod(loginParam.getActiveLoginMode());
-
-        if (user == null) {
-            out.setUserCheck(false);
-            out.setUserStatus(Constants.INVALID);
-            out.setMessage("Invalid User");
-            return out;
-        }
-
-        if (Constants.ACTIVE.equalsIgnoreCase(user.getAccountStatus())) {
-            Timestamp setAt = user.getTempPasswordSetAt();
-            boolean isPasswordValid = false;
-
-            // Validate password expiration only for Password Mode
-            if (loginParam.getActiveLoginMode() == Constants.PWD_MODE && setAt != null) {
-                LocalDateTime lastUpdate = setAt.toLocalDateTime();
-                isPasswordValid = LocalDateTime.now()
-                        .isBefore(lastUpdate.plusHours(loginParam.getPasswordValidity()));
-            } else {
-                // For LDAP/SSO, we rely on their policies, so treat local validity as true
-                isPasswordValid = true;
-            }
-
-            UserRoles userRole = userRepository.getUserRole(userId);
-            out.setRoleStatus(userRole.getRoleStatus());
-
-            // Logic: Update Password only needed if Mode is Password AND (Password is null OR Expired)
-            boolean updateNeeded = (loginParam.getActiveLoginMode() == Constants.PWD_MODE)
-                    && (user.getPasswordHash() == null || !isPasswordValid);
-
-            out.setUpdatePassword(updateNeeded);
-            out.setUserStatus(Constants.ACTIVE);
-            out.setMessage(Constants.ACTIVE_USER);
-            out.setPasswordLoginStatus(user.getPasswordLogin());
-        } else {
-            String accountStatus = user.getAccountStatus();
-            out.setUserCheck(true);
-            out.setUserStatus(accountStatus);
-            out.setMessage(
-                    accountStatus.equalsIgnoreCase("locked") ? "Your account is locked. Please contact support."
-                            : accountStatus.equalsIgnoreCase("inactive") ? "Inactive User" : "Verification Pending"
-            );
-        }
-
-        return out;
-    }
-
-    /**
-     * Updates the user's password hash and resets the temporary password timestamp.
-     *
-     * @param userCredentials input DTO with {@code userId} and new raw {@code password}
-     * @return {@link UpdatePasswordDTO} indicating success and message; sensitive fields are cleared
-     */
-    @Transactional
-    public UpdatePasswordDTO updatePassword(UpdatePasswordDTO userCredentials) {
-        String userId = userCredentials.getUserId();
-        String encryptedPassword = userCredentials.getPassword();
-
-        // Always sanitize outbound fields
-        userCredentials.setUpdateFlag(false);
-        userCredentials.setPassword("");
-        userCredentials.setOtp("");
-
-        try {
-            User user = userRepository.findByUserId(userId);
-            if (user == null) {
-                userCredentials.setMessage("Invalid user id");
-                return userCredentials;
-            }
-
-            String rawPassword;
-            try {
-                rawPassword = KeyUtils.decryptRsaPassword(encryptedPassword, rsaPrivatePem);
-            } catch (SecurityException e) {
-                log.error("Update password rejected for user {}: Payload decryption failed", userId);
-                userCredentials.setMessage("Security Error: Invalid encrypted payload");
-                return userCredentials;
-            }
-
-            String passwordHash = passwordEncoder.encode(rawPassword);
-            user.setPasswordHash(passwordHash);
-            user.setTempPasswordSetAt(Timestamp.valueOf(LocalDateTime.now()));
-            userRepository.save(user);
-
-            userCredentials.setMessage("User password successfully updated");
-            userCredentials.setUpdateFlag(true);
-
-        } catch (DataIntegrityViolationException e) {
-            log.warn("Data integrity violation while updating password for userId={}", LoginUtility.sanitizeLog(userId), e);
-            userCredentials.setMessage("Failed to change password, please try again");
-        } catch (ObjectOptimisticLockingFailureException e) {
-            log.warn("Optimistic locking failure while updating password for userId={}", LoginUtility.sanitizeLog(userId), e);
-            userCredentials.setMessage("The user data was modified by another process, please retry");
-        } catch (JpaSystemException e) {
-            log.error("JPA system error while updating password for userId={}", LoginUtility.sanitizeLog(userId), e);
-            userCredentials.setMessage("A database error occurred, please try again later");
-        }
-
-        return userCredentials;
-    }
-
-
-    // =========================================================================================
-    // HELPERS
-    // =========================================================================================
-
-    /**
-     * Initializes the token-visible user data embedded/returned alongside the JWT.
-     * Fetches branch and circle mapping dynamically.
-     *
-     * @param user     the user entity
-     * @param userRole the role mapping for the user
-     * @return user token DTO with non-sensitive fields
-     */
-    private UserTokenDataDto initializeTokenData(User user, UserRoles userRole) {
-        UserTokenDataDto tokenData = new UserTokenDataDto();
-        tokenData.setFirstName(user.getFirstName());
-        tokenData.setLastName(user.getLastName());
-        tokenData.setPhoneNumber(user.getPhoneNumber());
-        tokenData.setUserId(user.getUserId());
-        tokenData.setBranch(user.getBranch());
-        tokenData.setEmail(user.getEmail());
-        tokenData.setRole(userRole.getRole());
-        tokenData.setRoleName(userRole.getRoleName());
-
-        // ========== New code changes as per requirement for role access ========== added by v1015698
-        tokenData.setRoleDescription(userRole.getRoleDescription());
-        tokenData.setRoleAccess(userRole.getRoleAccess());
-        tokenData.setAccessName(userRole.getAccessName());
-        tokenData.setAccessDescription(userRole.getAccessDescription());
-
-        // FORMAT the branch integer to a 5-digit string (e.g., 8080 -> "08080")
-        String branchCodeStr = String.format("%05d", user.getBranch());
-
-        // Fetch specific details from the database
-        BranchCircleProjection bcInfo = branchRepository.findBranchAndCircleDetails(branchCodeStr);
-
-        if (bcInfo != null) {
-            tokenData.setBranchName(bcInfo.getBranchName());
-            tokenData.setCity(bcInfo.getCity());
-            tokenData.setAddress(bcInfo.getAddress());
-            tokenData.setPincode(bcInfo.getPincode());
-            tokenData.setNmrCode(bcInfo.getNmrCode());
-            tokenData.setBranchStatus(bcInfo.getBranchStatus());
-            tokenData.setBranchType(bcInfo.getBranchType());
-            tokenData.setCircleCode(bcInfo.getCircleCode());
-            tokenData.setCircleName(bcInfo.getCircleName());
-            tokenData.setZoneCode(bcInfo.getZoneCode());
-            tokenData.setZoneName(bcInfo.getZoneName());
-            tokenData.setCircleBranch(bcInfo.getCircleBranch());
-            tokenData.setStateName(bcInfo.getStateName());
-            tokenData.setStateCode(bcInfo.getStateCode());
-
-
-            // Check if user's branch matches the Circle's designated branch code
-            boolean isCircle = branchCodeStr.equals(bcInfo.getCircleBranch());
-            tokenData.setIsCircle(isCircle);
-        } else {
-            // Fallback if branch is somehow missing in the master table
-            tokenData.setIsCircle(false);
-            log.warn("Branch details not found in BRANCH_MASTER for branch code: {}", branchCodeStr);
-        }
-
-        return tokenData;
-    }
-
-
-    /**
-     * Retrieves the full user profile for Token Refresh.
-     * Uses the exact same structure as verifyUserCredentials to ensure token claims are identical.
-     */
-    @Override
-    @Transactional(readOnly = true)
-    public UserDto getUserProfile(String userId) {
-        User user = userRepository.findByUserId(userId);
-        UserRoles userRole = userRepository.getUserRole(userId);
-
-        // Return null if user doesn't exist, caller handles the error
-        if (user == null) {
-            return null;
-        }
-        UserDto userDto = new UserDto();
-        userDto.setUserId(user.getUserId());
-        userDto.setUserStatus(user.getPasswordLogin());
-        userDto.setPasswordLoginStatus(user.getPasswordLogin());
-        userDto.setUser(initializeTokenData(user, userRole));
-        return userDto;
-    }
-
-
-    private String determineMethodString(char mode) {
-        if (mode == Constants.LDAP) return "LDAP";
-        if (mode == Constants.PWD_MODE) return Constants.PASSWORD_BASED_LOGIN;
-        return Constants.SSO_BASED_LOGIN;
-    }
-
-    private void handleAccountLocked(LoginAttempt attempt, UserDto result, User user) {
-        result.setValidCredentials(false);
-        result.setPasswordLoginStatus(user.getPasswordLogin());
-        result.setMessage("Your account is locked due to multiple failed attempts.");
-
-        if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
-            result.setAttemptsLeft(0);
-            attempt.setFailureReason("Account Locked (Pre-check)");
-        } else {
-            result.setMessage("Password login is disabled.");
-            attempt.setFailureReason("Password login disabled");
-        }
-    }
-
-    private void handleSuccess(LoginAttempt attempt, UserDto result, User user, UserRoles userRole) {
-        attempt.setSuccess("Y");
-        attempt.setFailureReason("Success");
-        result.setValidCredentials(true);
-        result.setMessage("Login Successful");
-
-        // Reset wrong password count on successful login
-        if (user.getUserWrongPasswordCount() > 0) {
-            user.setUserWrongPasswordCount(0);
-            userRepository.save(user);
-        }
-
-        log.info("Credentials validated. Issuing token for userId={}", LoginUtility.sanitizeLog(user.getUserId()));
-
-        // Fetch contextual user data (including branch and circle)
-        UserTokenDataDto tokenData = initializeTokenData(user, userRole);
-
-        @SuppressWarnings("unchecked")
-        String accessToken = HmacJwtUtil.generate(
-                hmacSecret,
-                user.getUserId(),
-                ttlSeconds,
-                mapper.convertValue(tokenData, Map.class) // Embed all tokenData properties into the JWT claims
-        );
-
-        result.setAccessToken(accessToken);
-        result.setUser(tokenData);
-    }
-
-    private void handleFailure(LoginAttempt attempt, UserDto userInfo, User user, LoginParam loginParam, String reason) {
-        log.warn("Login failed for user {}: {}", LoginUtility.sanitizeLog(user.getUserId()), reason);
-        attempt.setSuccess("N");
-
-        int currentFailedCount = user.getUserWrongPasswordCount();
-        int maxAllowed = loginParam.getWrongPasswordAttempts();
-        int newFailedCount = currentFailedCount + 1;
-
-        user.setUserWrongPasswordCount(newFailedCount);
-        userInfo.setValidCredentials(false);
-
-        if (newFailedCount >= maxAllowed) {
-            user.setPasswordLogin(Constants.INACTIVE);
-            // user.setAccountStatus(Constants.LOCKED); // Optional: Depending on business rule
-            attempt.setFailureReason(reason + " -> Account Locked");
-            userInfo.setMessage("Your account has been locked due to multiple unsuccessful login attempts.");
-            userInfo.setPasswordLoginStatus(Constants.INACTIVE);
-            userInfo.setAttemptsLeft(0);
-        } else {
-            int remaining = maxAllowed - newFailedCount;
-            attempt.setFailureReason(reason);
-            if (remaining > 1) {
-                userInfo.setMessage("Incorrect credentials. Please check and try again.");
-            } else {
-                userInfo.setMessage("Incorrect credentials. Final attempt before lock.");
-            }
-            userInfo.setAttemptsLeft(remaining);
-        }
-        userRepository.save(user);
-    }
-
-
-    // ================== OTP Format Utilities ====================
-
-    private String generateSecureOtp() {
-        SecureRandom random = new SecureRandom();
-        int otp = 100000 + random.nextInt(900000);
-        return String.valueOf(otp);
-    }
-
-    private String maskEmail(String email) {
-        if (email == null || !email.contains("@")) return email;
-        String[] parts = email.split("@");
-        return (parts[0].length() <= 2 ? "**" : parts[0].charAt(0) + "***" + parts[0].charAt(parts[0].length() - 1)) + "@" + parts[1];
-    }
-
-    private String maskMobile(String mobile) {
-        if (mobile == null || mobile.length() < 4) return mobile;
-        return "******" + mobile.substring(mobile.length() - 4);
-    }
-}
-
-
-package com.fincore.gateway.Service;
-
-import com.fincore.gateway.dto.ChildMenu;
-import com.fincore.gateway.dto.MenuResponse;
-import com.fincore.gateway.dto.PermissionRow;
-import com.fincore.gateway.dto.RootMenu;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-
-import java.util.*;
-import java.util.stream.Collectors;
-
-/**
- * Builds navigational menu structures from permission entities or projections.
- *
- * <p>Responsibilities:</p>
- * <ul>
- *   <li>Group permissions by root menu title</li>
- *   <li>Create root and child menu DTOs</li>
- *   <li>Ensure deterministic ordering (by {@code orderId} / {@code permissionOrder})</li>
- *   <li>Be tolerant to missing/nullable sorting fields</li>
- * </ul>
- *
- * <p><strong>Ordering</strong>: Root menus and child menus are sorted in ascending order using their respective
- * order fields. Null order values are placed last to keep ordering stable.</p>
- *
- * <strong>UPDATED:</strong> Merges 'menuAction' for Root Menus with the same Title.
- */
-@Slf4j
-@Service
-public class MenuService {
-
-    /**
-     * Returns a non-null order for {@link PermissionRow} (nulls go to the end).
-     */
-    private static int safePermissionOrder(PermissionRow r) {
-        Integer v = r.getPermissionOrder();
-        return v != null ? v : Integer.MAX_VALUE;
-    }
-
-    // --------------------------------------------------------------------------------------------
-    // Builders
-    // --------------------------------------------------------------------------------------------
-
-    /**
-     * Comparator key extractor for root menus.
-     */
-    private static int safeOrderIdRoot(RootMenu r) {
-        Integer v = r.getOrderId();
-        return v != null ? v : Integer.MAX_VALUE;
-    }
-
-    /**
-     * Comparator key extractor for child menus.
-     */
-    private static int safeOrderIdChild(ChildMenu c) {
-        Integer v = c.getOrderId();
-        return v != null ? v : Integer.MAX_VALUE;
-    }
-
-    // --------------------------------------------------------------------------------------------
-    // Null-safe order helpers
-    // --------------------------------------------------------------------------------------------
-
-    /**
-     * Transforms a list of {@link PermissionRow} projections into a {@link MenuResponse}.
-     * <p>Groups by {@code menuTitle}, creates root items, and child items from rows having a non-null {@code subMenu}.</p>
-     *
-     * @param rows permission projection rows (typically from a custom query join)
-     * @return menu response with ordered root and child menus
-     */
-    public MenuResponse transformFromProjection(List<PermissionRow> rows) {
-        MenuResponse response = new MenuResponse();
-
-        if (rows == null || rows.isEmpty()) {
-            response.setRoot_menus(Collections.emptyList());
-            return response;
-        }
-
-        // Group by root menu title
-        Map<String, List<PermissionRow>> grouped = rows.stream().collect(Collectors.groupingBy(PermissionRow::getMenuTitle));
-
-        List<RootMenu> rootMenus = new ArrayList<>();
-
-        for (Map.Entry<String, List<PermissionRow>> entry : grouped.entrySet()) {
-            List<PermissionRow> group = entry.getValue();
-
-            //1. Representative root row: choose the smallest non-null permissionOrder
-            PermissionRow root = group.stream().min(Comparator.comparing(MenuService::safePermissionOrder)).orElse(group.get(0));
-
-            RootMenu rootMenu = buildRootFromProjection(root);
-
-            // 2. MERGE ROOT ACTIONS
-            String mergedAction = group.stream().map(PermissionRow::getMenuAction)       // Get action from each row
-                    .filter(Objects::nonNull)                // Ignore nulls
-                    .flatMap(action -> Arrays.stream(action.split("\\|"))) // Split "create|modify"
-                    .map(String::trim)                       // Clean spaces
-                    .filter(s -> !s.isEmpty())               // Remove empty strings
-                    .distinct()                              // Remove duplicates
-                    .collect(Collectors.joining("|"));       // Join back to "create|modify|block"
-            // Overwrite the single-row action with the merged action
-            rootMenu.setMenuAction(mergedAction);
-
-            // 3.  Children (only rows that actually represent a sub-menu), ordered by permissionOrder asc
-            List<ChildMenu> children = group.stream().filter(r ->
-                    r.getSubMenu() != null)
-                    .map(this::buildChildFromProjection)
-                    .sorted(Comparator.comparing(MenuService::safeOrderIdChild))
-                    .collect(Collectors.toList());
-
-            boolean multiChildren = children.size() > 1;
-            rootMenu.setHasChildren(multiChildren);
-            if (!multiChildren) {
-                // children size is 0 or 1
-                if (children.size() == 1) {
-                    // promote the only child
-                    rootMenu.setTitle(children.get(0).getTitle());
-                }
-            } else {
-                // children > 1 → set children normally
-                rootMenu.setChildren(children);
-            }
-            // add root menu
-            rootMenus.add(rootMenu);
-        }
-
-        // Order root menus as well
-        rootMenus.sort(Comparator.comparing(MenuService::safeOrderIdRoot));
-
-        response.setRoot_menus(rootMenus);
-        return response;
-    }
-
-    private RootMenu buildRootFromProjection(PermissionRow r) {
-        RootMenu root = new RootMenu();
-        root.setId(r.getMenuId());
-        root.setTitle(r.getMenuTitle());
-        root.setIcon(r.getMenuIcon());
-        root.setRoute(r.getMenuUrl());
-        root.setMenuAction(r.getMenuAction());
-        root.setComponentPath(r.getComponentPath());
-        root.setScreenDescription(r.getMenuDescription());
-        root.setOrderId(safePermissionOrder(r));
-        root.setRequestType(r.getRequestType());
-        return root;
-    }
-
-    private ChildMenu buildChildFromProjection(PermissionRow r) {
-        ChildMenu c = new ChildMenu();
-        c.setId(r.getMenuId());
-        c.setTitle(r.getSubMenu());
-        c.setIcon(r.getMenuIcon());
-        c.setRoute(r.getMenuUrl());
-        c.setComponentPath(r.getComponentPath());
-        c.setScreenDescription(r.getMenuDescription());
-        c.setMenuAction(r.getMenuAction());
-        c.setRequestType(r.getRequestType());
-        c.setOrderId(safePermissionOrder(r));
-        return c;
-    }
-}
-package com.fincore.gateway.Service;
-
-import com.fincore.gateway.utility.LoginUtility;
-import tools.jackson.databind.ObjectMapper;
-import com.fincore.commonutilities.util.AesEncryptionUtil;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.kafka.core.KafkaTemplate;
-import org.springframework.stereotype.Service;
-import reactor.core.publisher.Mono;
-
-import java.time.Instant;
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
-
-/**
- * Publishes encrypted PII payloads to Kafka.
- * * INTERNAL AES KEY INSTRUCTION:
- * The `security.internal.kafka-aes-key` property is a static, shared secret between
- * the Fincore Gateway and the Communication Service.
- * Generate this once using `AesEncryptionUtil.generateBase64SessionKey()` and store
- * it in your application-dev/uat/prod.properties.
- * Example: security.internal.kafka-aes-key=bWV0a...
- */
-@Slf4j
-@Service
-@RequiredArgsConstructor
-public class OtpKafkaProducer {
-
-    private final KafkaTemplate<String, String> kafkaTemplate;
-    private final ObjectMapper mapper;
-    private final AesEncryptionUtil aesUtil;
-
-    @Value("${security.internal.kafka-aes-key}")
-    private String internalAesKey;
-
-    @Value("${spring.profiles.active:dev}")
-    private String currentEnvironment;
-
-    public Mono<Void> publishOtpEvent(String txId, String mobile, String email, String plainOtp, String userName, List<String> activeChannels) {
-        return Mono.fromCallable(() -> {
-                    /*
-                     * ====================================================================
-                     * ZERO-TRUST KAFKA PAYLOAD ARCHITECTURE
-                     * ====================================================================
-                     */
-
-                    // 1. Build the sensitive inner payload
-                    Map<String, Object> innerPayload = Map.of(
-                            "otpPlaintext", plainOtp,
-                            "expiryMins", 3,
-                            "userName", userName != null ? userName : "User"
-                    );
-                    String innerJson = mapper.writeValueAsString(innerPayload);
-
-                    // 2. Encrypt the inner payload (Zero-Trust on Broker)
-                    String encryptedPayload = aesUtil.encrypt(innerJson, internalAesKey);
-
-                    // 3. Build the outer routable event
-                    Map<String, Object> event = Map.of(
-                            "eventId", "evt-" + UUID.randomUUID().toString(),
-                            "txId", txId,
-                            "eventType", "LOGIN_OTP",
-                            "channel", activeChannels,
-                            "priority", "CRITICAL",
-                            "templateId", "AUTH_LOGIN_OTP_V1",
-                            "recipient", Map.of(
-                                    "mobile", mobile != null ? mobile : "",
-                                    "email", email != null ? email : ""
-                            ),
-                            "payload", encryptedPayload,
-                            "createdAt", Instant.now().toString()
-                    );
-
-                    return mapper.writeValueAsString(event);
-
-                }).flatMap(jsonString -> {
-                    // Wraps standard KafkaTemplate into a non-blocking Mono
-                    return Mono.fromFuture(
-                            kafkaTemplate.send("fincore.auth.otp.priority", txId, jsonString)
-                    );
-                }).doOnSuccess(result -> log.info("Encrypted OTP event published to Kafka for txId={}", LoginUtility.sanitizeLog(txId)))
-                .then();
-    }
-}
-
-package com.fincore.gateway.Service;
-
-import com.fincore.gateway.utility.LoginUtility;
-import tools.jackson.core.JacksonException;
-import tools.jackson.core.type.TypeReference;
-import tools.jackson.databind.ObjectMapper;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
-import org.springframework.http.HttpStatus;
-import org.springframework.security.crypto.password.PasswordEncoder;
-import org.springframework.stereotype.Service;
-import org.springframework.web.server.ResponseStatusException;
-import reactor.core.publisher.Mono;
-import reactor.util.function.Tuple2;
-import reactor.util.function.Tuples;
-
-import java.time.Duration;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-
-/**
- * ============================================================================
- * OTP LIFECYCLE & REDIS STATE ENGINE PLAN
- * ============================================================================
- * OTP Validity               : 5 min
- * Max Wrong Attempts         : 5
- * Resend Cooldown            : 30 sec
- * Max Resend Count           : 5
- * Lock Type                  : OTP Session Lock (NOT AD/LDAP Account Lock)
- * OTP Regeneration           : New OTP every resend
- * Previous OTP Valid         : No (Overwritten in Redis)
- * Rate Limit Scope           : IP Address (To prevent SMS Toll Fraud)
- * <p>
- * REDIS KEYS PER TRANSACTION (txId):
- * 1. OTP_TX:{txId}       -> { "userId": "...", "otpHash": "..." } (TTL: 5m)
- * 2. OTP_FAILURES:{txId} -> Integer count (TTL: 5m)
- * 3. OTP_RESENDS:{txId}  -> Integer count (TTL: 5m)
- * 4. OTP_COOLDOWN:{txId} -> "locked" (TTL: 30s)
- * 5. RATE_LIMIT:OTP_REQ:IP:{ip} -> Integer count (TTL: 1h)
- * ============================================================================
- */
-@Slf4j
-@Service
-@RequiredArgsConstructor
-public class OtpSessionService {
-
-    private static final Duration OTP_VALIDITY = Duration.ofMinutes(5);
-    private static final Duration COOLDOWN = Duration.ofSeconds(30);
-    private static final int MAX_RESENDS = 5;
-    private static final int MAX_FAILURES = 5;
-    private static final int MAX_HOURLY_IP_REQUESTS = 50;
-    private final ReactiveStringRedisTemplate redis;
-    private final PasswordEncoder passwordEncoder;
-    private final ObjectMapper mapper;
-
-    /**
-     * Rate limits OTP requests by IP to prevent API abuse and SMS Toll Fraud.
-     */
-    public Mono<Void> checkIpRateLimit(String clientIp) {
-        String key = "RATE_LIMIT:OTP_REQ:IP:" + clientIp;
-        return redis.opsForValue().increment(key)
-                .flatMap(count -> {
-                    if (count == 1) {
-                        return redis.expire(key, Duration.ofHours(1)).then();
-                    } else if (count > MAX_HOURLY_IP_REQUESTS) {
-                        log.warn("SECURITY ALERT: IP {} exceeded hourly OTP limit.", LoginUtility.sanitizeLog(clientIp));
-                        return Mono.error(new ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS, "Rate limit exceeded. Try again later."));
-                    }
-                    return Mono.empty();
-                });
-    }
-
-    /**
-     * Initializes or Updates the OTP state in Redis atomically.
-     */
-    public Mono<Void> saveOtpState(String txId, String userId, String plainOtp, boolean isResend) {
-        String hash = passwordEncoder.encode(plainOtp);
-
-        try {
-            String payload = mapper.writeValueAsString(Map.of("userId", userId, "otpHash", hash));
-            List<Mono<?>> operations = new ArrayList<>();
-
-            // 1. Core Transaction (Overwrites old OTP if resend)
-            operations.add(redis.opsForValue().set("OTP_TX:" + txId, payload, OTP_VALIDITY));
-            // 2. Always reset failures on a fresh OTP dispatch
-            operations.add(redis.opsForValue().set("OTP_FAILURES:" + txId, "0", OTP_VALIDITY));
-
-            if (!isResend) {
-                // First generation: Initialize resend counter
-                operations.add(redis.opsForValue().set("OTP_RESENDS:" + txId, "0", OTP_VALIDITY));
-                // Lock the cooldown on the very first OTP dispatch
-                operations.add(redis.opsForValue().set("OTP_COOLDOWN:" + txId, "locked", COOLDOWN));
-            } else {
-                // Resend: Extend the TTL of the resend counter so it survives the 5 min window refresh
-                operations.add(redis.expire("OTP_RESENDS:" + txId, OTP_VALIDITY));
-            }
-
-            return Mono.when(operations)
-                    .doOnSuccess(v -> log.info("Saved OTP State txId={} for user={} isResend={}",
-                            LoginUtility.sanitizeLog(txId), LoginUtility.sanitizeLog(userId), isResend));
-
-        } catch (JacksonException e) {
-            return Mono.error(new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to process internal OTP payload"));
-        }
-    }
-
-    /**
-     * Safely executes an OTP Resend, enforcing cooldowns and max limits.
-     * Returns Tuple of (NewPlainOtp, UserId).
-     */
-    public Mono<reactor.util.function.Tuple3<String, String, Long>> processResend(String txId, String newPlainOtp) {
-        String cooldownKey = "OTP_COOLDOWN:" + txId;
-        String resendKey = "OTP_RESENDS:" + txId;
-
-        // 1. Atomic Cooldown Lock (SETNX)
-        return redis.opsForValue().setIfAbsent(cooldownKey, "locked", COOLDOWN)
-                .flatMap(acquired -> {
-                    if (!Boolean.TRUE.equals(acquired)) {
-                        return redis.getExpire(cooldownKey)
-                                .flatMap(ttl -> Mono.error(new ResponseStatusException(
-                                        HttpStatus.TOO_MANY_REQUESTS,
-                                        "Please wait " + ttl.getSeconds() + " seconds before requesting another OTP."
-                                )));
-                    }
-
-                    // 2. Atomic Increment Resends
-                    return redis.opsForValue().increment(resendKey)
-                            .flatMap(resendCount -> {
-                                if (resendCount > MAX_RESENDS) {
-                                    return Mono.error(new ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS, "Maximum OTP resend limit exceeded."));
-                                }
-
-                                // 3. Fetch userId, update TX, and return Tuple
-                                return getUserIdFromTx(txId)
-                                        .switchIfEmpty(Mono.error(new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Transaction expired.")))
-                                        .flatMap(userId -> saveOtpState(txId, userId, newPlainOtp, true)
-                                                .thenReturn(Tuples.of(newPlainOtp, userId, resendCount)));
-                            });
-                });
-    }
-
-    /**
-     * Verifies the OTP using constant-time cryptographic matching (BCrypt).
-     */
-    public Mono<String> verifyOtp(String txId, String inputOtp) {
-        String txKey = "OTP_TX:" + txId;
-        String failKey = "OTP_FAILURES:" + txId;
-
-        return redis.opsForValue().get(txKey)
-                .switchIfEmpty(Mono.error(new ResponseStatusException(HttpStatus.UNAUTHORIZED, "OTP Session Expired or Invalid Transaction.")))
-                .flatMap(payload -> {
-                    try {
-                        Map<String, String> data = mapper.readValue(payload, new TypeReference<>() {
-                        });
-                        String userId = data.get("userId");
-                        String storedHash = data.get("otpHash");
-
-                        if (passwordEncoder.matches(inputOtp, storedHash)) {
-                            // SUCCESS: Terminate transaction to prevent replay attacks
-                            return redis.delete(txKey).thenReturn(userId);
-                        } else {
-                            //FAILURE: Atomic increment
-                            return redis.opsForValue().increment(failKey)
-                                    .flatMap(failCount -> {
-                                        if (failCount >= MAX_FAILURES) {
-                                            // Enforce Session Lockout (Do NOT lock AD account)
-                                            return redis.delete(txKey)
-                                                    .then(Mono.error(new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Maximum wrong attempts exceeded. Session locked.")));
-                                        }
-                                        return Mono.error(new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid OTP. Attempts remaining: " + (MAX_FAILURES - failCount)));
-                                    });
-                        }
-                    } catch (JacksonException e) {
-                        return Mono.error(new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Redis payload corruption"));
-                    }
-                });
-    }
-
-    private Mono<String> getUserIdFromTx(String txId) {
-        return redis.opsForValue().get("OTP_TX:" + txId)
-                .flatMap(payload -> {
-                    try {
-                        Map<String, String> map = mapper.readValue(payload, new TypeReference<>() {
-                        });
-                        return Mono.just(map.get("userId"));
-                    } catch (JacksonException e) {
-                        return Mono.error(new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Redis payload corruption"));
-                    }
-                });
-    }
-
-    /**
-     * Compensating transaction: Cleans up the Redis state if Kafka fails,
-     * ensuring the user isn't penalized for our infrastructure issues.
-     */
-    public Mono<Void> rollbackOtpState(String txId) {
-        return Mono.when(
-                redis.delete("OTP_TX:" + txId),
-                redis.delete("OTP_FAILURES:" + txId),
-                redis.delete("OTP_RESENDS:" + txId)
-        ).doOnSuccess(v -> log.info("Successfully rolled back Redis state for txId={}", LoginUtility.sanitizeLog(txId)));
-    }
-}
-
-
-package com.fincore.gateway.Service;
-
-import com.fincore.gateway.utility.LoginUtility;
-import lombok.extern.slf4j.Slf4j;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
-import org.springframework.security.authentication.BadCredentialsException;
-import org.springframework.security.core.Authentication;
-import org.springframework.security.oauth2.jwt.Jwt;
-import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
-import org.springframework.stereotype.Component;
-import reactor.core.publisher.Mono;
-
-import java.time.Duration;
-import java.util.Objects;
-
-/**
- * Validates JWT sessions against Redis using two key families:
- * <ul>
- *   <li><b>USR:&lt;username&gt;</b> → stores the latest active JTI for the user</li>
- *   <li><b>BL:&lt;jti&gt;</b> → blacklisted JTIs (revoked/expired/rotated)</li>
- * </ul>
- *
- * <p><strong>Workflow</strong></p>
- * <ol>
- *   <li><b>registerUserSession</b>: On login, blacklist any previous JTI and store the new one.</li>
- *   <li><b>validateWithRedis</b>: On each request, reject if blacklisted or if JTI != stored latest.</li>
- *   <li><b>clearUserSession</b>: On logout, remove the USR:&lt;user&gt; pointer.</li>
- *   <li><b>blacklistToken</b>: On logout or rotation, add JTI to blacklist.</li>
- * </ol>
- *
- * <p><strong>TTL</strong>: Keys are set to the same TTL as the JWT (configurable via
- * {@code security.jwt.ttl-seconds}).</p>
- */
-@Component
-@Slf4j
-public class TokenSessionValidator {
-
-    /**
-     * Redis key prefixes.
-     */
-    private static final String USER_PREFIX = "USR:";
-    private static final String BLACKLIST_PREFIX = "BL:";
-    private static final String GRACE_PREFIX = "GRACE:";
-    private final ReactiveStringRedisTemplate redis;
-
-    /**
-     * Token TTL aligned with JWT expiry.
-     */
-    private final Duration tokenTtl;
-
-    /**
-     * Configurable grace period (e.g., 45 seconds for in-flight requests)
-     */
-    private final Duration gracePeriod = Duration.ofSeconds(45);
-
-    public TokenSessionValidator(
-            ReactiveStringRedisTemplate redis,
-            @Value("${security.jwt.refresh-ttl-seconds:86400}") long refreshTtlSeconds // <--- Use Refresh TTL
-    ) {
-        this.redis = redis;
-        this.tokenTtl = Duration.ofSeconds(refreshTtlSeconds); // Set Redis to live for 12h
-    }
-
-    // --------------------------------------------------------------------------------------------
-    // Session management
-    // --------------------------------------------------------------------------------------------
-
-    private static String userKey(String username) {
-        return USER_PREFIX + username;
-    }
-
-    private static String blacklistKey(String jti) {
-        return BLACKLIST_PREFIX + jti;
-    }
-
-    private static String graceKey(String jti) {
-        return GRACE_PREFIX + jti;
-    }
-
-    /**
-     * Register a new session for a user.
-     * <ol>
-     *   <li>Registers a new session. Old sessions are moved to a Grace Period, not instantly killed.</li>
-     *   <li>Store the new JTI under {@code USR:<username>} with {@link #tokenTtl}.</li>
-     * </ol>
-     *
-     * @param username the subject/username
-     * @param newJti   the new token ID
-     * @return completion signal
-     */
-    public Mono<Void> registerUserSession(String username, String newJti) {
-        Objects.requireNonNull(username, "username must not be null");
-        Objects.requireNonNull(newJti, "newJti must not be null");
-
-        final String userKey = userKey(username);
-        log.info("Registering new session user={} jti={}", username, newJti);
-
-        return redis.opsForValue().get(userKey)
-                .flatMap(oldJti -> {
-                    if (oldJti != null && !oldJti.equals(newJti)) {
-                        log.info("Moving old session to Grace Period for user={} -> oldJti={}", LoginUtility.sanitizeLog(username), LoginUtility.sanitizeLog(oldJti));
-                        return redis.opsForValue().set(graceKey(oldJti), username, gracePeriod).then();
-                    }
-                    return Mono.empty();
-                })
-                .then(
-                        redis.opsForValue()
-                                .set(userKey, newJti, tokenTtl)
-                                .doOnSuccess(v -> log.info("Registered active session in Redis user={} jti={}", LoginUtility.sanitizeLog(username), LoginUtility.sanitizeLog(newJti)))
-                                .then()
-                );
-    }
-
-    // --------------------------------------------------------------------------------------------
-    // Request-time validation
-    // --------------------------------------------------------------------------------------------
-
-    /**
-     * Blacklist a JTI (used on logout or token rotation).
-     *
-     * @param jti token id
-     * @return {@code true} if set succeeded
-     */
-    public Mono<Boolean> blacklistToken(String jti) {
-        Objects.requireNonNull(jti, "jti must not be null");
-        final String blKey = blacklistKey(jti);
-        return redis.opsForValue().set(blKey, "true", tokenTtl)
-                .doOnSuccess(v -> log.info("Blacklisted jti={}", jti));
-    }
-
-    // --------------------------------------------------------------------------------------------
-    // Key helpers
-    // --------------------------------------------------------------------------------------------
-
-    /**
-     * Clear the current session pointer for a user.
-     *
-     * @param username the subject/username
-     * @return {@code true} if a key was deleted
-     */
-    public Mono<Boolean> clearUserSession(String username) {
-        Objects.requireNonNull(username, "username must not be null");
-        return redis.delete(userKey(username))
-                .map(deleted -> {
-                    if (deleted > 0) {
-                        log.info("Cleared session for user={}", LoginUtility.sanitizeLog(username));
-                        return true;
-                    }
-                    return false;
-                });
-    }
-
-    /**
-     * Validate an incoming {@link Authentication} against Redis:
-     * <ul>
-     *   <li>Reject if not a {@link JwtAuthenticationToken}</li>
-     *   <li>Reject if JTI is blacklisted</li>
-     *   <li>Reject if JTI != {@code USR:&lt;username&gt;} stored JTI</li>
-     * </ul>
-     *
-     * @param authentication the Spring Security authentication (expected {@link JwtAuthenticationToken})
-     * @return a {@link Mono} with the same {@code authentication} on success, or an error on failure
-     */
-    public Mono<Authentication> validateWithRedis(Authentication authentication) {
-        if (!(authentication instanceof JwtAuthenticationToken jwtAuth)) {
-            log.warn("Validation failed: not a JwtAuthenticationToken -> {}", authentication);
-            return Mono.error(new BadCredentialsException("Invalid authentication type"));
-        }
-
-        Jwt jwt = jwtAuth.getToken();
-        String username = jwt.getSubject();
-        String jti = jwt.getId();
-
-        if (username == null || username.isBlank()) {
-            log.error("Token missing subject -> rejecting");
-            return Mono.error(new BadCredentialsException("Missing subject (sub)"));
-        }
-        if (jti == null || jti.isBlank()) {
-            log.error("Token missing JTI claim -> rejecting user={}", LoginUtility.sanitizeLog(username));
-            return Mono.error(new BadCredentialsException("Missing token ID (jti)"));
-        }
-
-        log.info("Validating token user={} jti={}", username, jti);
-
-        // 1) Check explicit blacklist
-        return redis.hasKey(blacklistKey(jti))
-                .flatMap(isBlacklisted -> {
-                    if (Boolean.TRUE.equals(isBlacklisted)) {
-                        log.warn("Token is blacklisted jti={} user={}", jti, LoginUtility.sanitizeLog(username));
-                        return Mono.error(new BadCredentialsException("Token revoked"));
-                    }
-
-                    // 2) Ensure JTI matches the latest session pointer
-                    return redis.opsForValue().get(userKey(username))
-                            .flatMap(currentJti -> {
-                                log.debug("Redis stored JTI for user={} -> {}", LoginUtility.sanitizeLog(username), LoginUtility.sanitizeLog(currentJti));
-
-                                if (currentJti != null && currentJti.equals(jti)) {
-                                    log.info("Token validation success user={} jti={}", LoginUtility.sanitizeLog(username), LoginUtility.sanitizeLog(jti));
-                                    return Mono.just(authentication); // Valid Primary Session
-                                }
-
-                                // 3) Check if it is in the Grace Period (Handling in-flight requests)
-                                return redis.hasKey(graceKey(jti))
-                                        .flatMap(isInGrace -> {
-                                            if (Boolean.TRUE.equals(isInGrace)) {
-                                                log.warn("Token accepted under Grace Period. user={} jti={}",
-                                                        LoginUtility.sanitizeLog(username), LoginUtility.sanitizeLog(jti));
-                                                return Mono.just(authentication);
-                                            }
-
-                                            // 4) If not primary and not in grace -> Concurrent Login
-                                            log.warn("Token mismatch user={} expectedJti={} gotJti={}", LoginUtility.sanitizeLog(username),
-                                                    LoginUtility.sanitizeLog(currentJti), LoginUtility.sanitizeLog(jti));
-                                            return Mono.error(new BadCredentialsException("Another session is active"));
-                                        });
-                            })
-                            .switchIfEmpty(Mono.error(new BadCredentialsException("No active session")));
-                });
-    }
-}
+
+-- ==============================================================================
+-- 4. TRIGGERS
+-- ==============================================================================
+CREATE OR REPLACE EDITIONABLE TRIGGER "REQUEST_VID_TRIGGER" 
+BEFORE INSERT ON REQUEST_VOUCHER
+FOR EACH ROW
+DECLARE
+    v_seq_number NUMBER;
+    v_prefix VARCHAR2(20);
+BEGIN
+    v_prefix := 'VID-' || TO_CHAR(SYSDATE, 'YYMM') || '-';
+    SELECT REQUEST_VOUCHER_SEQ.NEXTVAL INTO v_seq_number FROM DUAL;
+    :NEW.VID := v_prefix || LPAD(v_seq_number, 5, '0');
+END;
+/
+ALTER TRIGGER "REQUEST_VID_TRIGGER" ENABLE;
+
+
+
+
+-- ==============================================================================
+-- 1. SEQUENCES
+-- ==============================================================================
+CREATE SEQUENCE "JOURNAL_REQUEST_SEQ" MINVALUE 1 MAXVALUE 999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 1000 NOORDER NOCYCLE NOKEEP NOSCALE GLOBAL;
+CREATE SEQUENCE "VOUCHER_POSTING_DATA_SEQ" MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 NOCACHE NOORDER NOCYCLE NOKEEP NOSCALE GLOBAL;
+CREATE SEQUENCE "WORKFLOWID_SEQ" MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 20 ORDER NOCYCLE NOKEEP NOSCALE GLOBAL;
+CREATE SEQUENCE "JRNL_SEQ" MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 20 NOORDER NOCYCLE NOKEEP NOSCALE GLOBAL;
+
+
+CREATE SEQUENCE "REQUEST_VOUCHER_SEQ" MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 20 NOORDER NOCYCLE NOKEEP NOSCALE GLOBAL;
+
+
+
+
+-------------------------------------------------------
+--  DDL for Table JS_EOD_MASTER
+--------------------------------------------------------
+
+  CREATE TABLE JS_EOD_MASTER 
+   (	"ID" NUMBER DEFAULT 1, 
+	"JS_STATUS" NUMBER(1,0) DEFAULT 1, 
+	"EOD_STATUS" NUMBER(1,0) DEFAULT 0, 
+	"JS_UPDATED_AT" TIMESTAMP (6), 
+	"EOD_UPDATED_AT" TIMESTAMP (6), 
+	"JS_PENDING_COUNTER" NUMBER DEFAULT 0
+   )
+--------------------------------------------------------
+--  DDL for Index SYS_C0012134
+--------------------------------------------------------
+
+  CREATE UNIQUE INDEX "SYS_C0012134" ON JS_EOD_MASTER ("ID")
+--------------------------------------------------------
+--  Constraints for Table JS_EOD_MASTER
+--------------------------------------------------------
+
+  ALTER TABLE JS_EOD_MASTER ADD CONSTRAINT "CHK_JS_EOD_SINGLE_ROW" CHECK (ID = 1) ENABLE
+  ALTER TABLE JS_EOD_MASTER ADD PRIMARY KEY ("ID")
+  USING INDEX  ENABLE
+
+
+
+
+
+
+
+
+--------------------------------------------------------
+--  DDL for Table REQUEST_VOUCHER
+--------------------------------------------------------
+
+  CREATE TABLE "REQUEST_VOUCHER" 
+   (	"ID" NUMBER GENERATED BY DEFAULT AS IDENTITY MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 20 NOORDER  NOCYCLE  NOKEEP  NOSCALE , 
+	"VID" VARCHAR2(20), 
+	"CATEGORY_ID" NUMBER, 
+	"DESCRIPTION" VARCHAR2(500), 
+	"ALLOWED_ROLE" NUMBER, 
+	"SD_REQ_NO" VARCHAR2(100), 
+	"CREATED_BY" VARCHAR2(100), 
+	"CREATED_AT" TIMESTAMP (6) DEFAULT CURRENT_TIMESTAMP, 
+	"TERMINATED_BY" VARCHAR2(100), 
+	"TERMINATED_AT" TIMESTAMP (6), 
+	"STATUS" VARCHAR2(30), 
+	"REMARKS" VARCHAR2(500), 
+	"BACK_DATE" DATE, 
+	"IS_BACK_DATED" NUMBER(1,0) DEFAULT 0
+   )
+--------------------------------------------------------
+--  DDL for Index SYS_C0012545
+--------------------------------------------------------
+
+  CREATE UNIQUE INDEX "SYS_C0012545" ON "REQUEST_VOUCHER" ("ID")
+--------------------------------------------------------
+--  DDL for Index SYS_C0012546
+--------------------------------------------------------
+
+  CREATE UNIQUE INDEX "SYS_C0012546" ON "REQUEST_VOUCHER" ("VID")
+--------------------------------------------------------
+--  DDL for Trigger REQUEST_VID_TRIGGER
+--------------------------------------------------------
+
+  CREATE OR REPLACE EDITIONABLE TRIGGER "REQUEST_VID_TRIGGER" 
+BEFORE INSERT ON REQUEST_VOUCHER
+FOR EACH ROW
+
+DECLARE
+
+    v_seq_number NUMBER;
+    v_prefix VARCHAR2(20);
+
+BEGIN
+
+    v_prefix :=
+            'VID-' ||
+            TO_CHAR(SYSDATE, 'YYMM') ||
+            '-';
+
+    SELECT REQUEST_VOUCHER_SEQ.NEXTVAL
+    INTO v_seq_number
+    FROM DUAL;
+
+    :NEW.VID :=
+            v_prefix ||
+            LPAD(v_seq_number, 5, '0');
+
+END;
+
+ALTER TRIGGER "REQUEST_VID_TRIGGER" ENABLE
+--------------------------------------------------------
+--  Constraints for Table REQUEST_VOUCHER
+--------------------------------------------------------
+
+  ALTER TABLE "REQUEST_VOUCHER" MODIFY ("ID" NOT NULL ENABLE)
+  ALTER TABLE "REQUEST_VOUCHER" MODIFY ("VID" NOT NULL ENABLE)
+  ALTER TABLE "REQUEST_VOUCHER" MODIFY ("CATEGORY_ID" NOT NULL ENABLE)
+  ALTER TABLE "REQUEST_VOUCHER" MODIFY ("DESCRIPTION" NOT NULL ENABLE)
+  ALTER TABLE "REQUEST_VOUCHER" MODIFY ("ALLOWED_ROLE" NOT NULL ENABLE)
+  ALTER TABLE "REQUEST_VOUCHER" MODIFY ("STATUS" NOT NULL ENABLE)
+  ALTER TABLE "REQUEST_VOUCHER" ADD PRIMARY KEY ("ID")
+  USING INDEX  ENABLE
+  ALTER TABLE "REQUEST_VOUCHER" ADD UNIQUE ("VID")
+  USING INDEX  ENABLE
+  ALTER TABLE "REQUEST_VOUCHER" MODIFY ("IS_BACK_DATED" NOT NULL ENABLE)
+
+
+
+
+
+
+--------------------------------------------------------
+--  DDL for Table REQUEST_VOUCHER_ISSUE_CATEGORY
+--------------------------------------------------------
+
+  CREATE TABLE "REQUEST_VOUCHER_ISSUE_CATEGORY" 
+   (	"ID" NUMBER, 
+	"REQUEST_VOUCHER_ID" NUMBER, 
+	"ISSUE_CATEGORY_ID" NUMBER
+   )
+--------------------------------------------------------
+--  DDL for Index SYS_C0012833
+--------------------------------------------------------
+
+  CREATE UNIQUE INDEX "SYS_C0012833" ON "REQUEST_VOUCHER_ISSUE_CATEGORY" ("ID")
+--------------------------------------------------------
+--  Constraints for Table REQUEST_VOUCHER_ISSUE_CATEGORY
+--------------------------------------------------------
+
+  ALTER TABLE "REQUEST_VOUCHER_ISSUE_CATEGORY" MODIFY ("REQUEST_VOUCHER_ID" NOT NULL ENABLE)
+  ALTER TABLE "REQUEST_VOUCHER_ISSUE_CATEGORY" MODIFY ("ISSUE_CATEGORY_ID" NOT NULL ENABLE)
+  ALTER TABLE "REQUEST_VOUCHER_ISSUE_CATEGORY" ADD PRIMARY KEY ("ID")
+  USING INDEX  ENABLE
+--------------------------------------------------------
+--  Ref Constraints for Table REQUEST_VOUCHER_ISSUE_CATEGORY
+--------------------------------------------------------
+
+  ALTER TABLE "REQUEST_VOUCHER_ISSUE_CATEGORY" ADD CONSTRAINT "FK_REQ_VOUCHER_ISSUE" FOREIGN KEY ("REQUEST_VOUCHER_ID")
+	  REFERENCES "REQUEST_VOUCHER" ("ID") ENABLE
+  ALTER TABLE "REQUEST_VOUCHER_ISSUE_CATEGORY" ADD CONSTRAINT "FK_REQ_ISSUE_CATEGORY" FOREIGN KEY ("ISSUE_CATEGORY_ID")
+	  REFERENCES "ISSUE_CATEGORY" ("ID") ENABLE
+
+
+
+
+
+
+
+--------------------------------------------------------
+--  DDL for Table SCHEDULED_BATCH_RETRY
+--------------------------------------------------------
+
+  CREATE TABLE "SCHEDULED_BATCH_RETRY" 
+   (	"BATCH_ID" VARCHAR2(50), 
+	"CREATED_AT" TIMESTAMP (6) DEFAULT SYSTIMESTAMP, 
+	"RETRY_COUNT" NUMBER DEFAULT 0, 
+	"STATUS" VARCHAR2(20) DEFAULT 'PENDING'
+   )
+--------------------------------------------------------
+--  DDL for Index PK_SCHEDULED_RETRY
+--------------------------------------------------------
+
+  CREATE UNIQUE INDEX "PK_SCHEDULED_RETRY" ON "SCHEDULED_BATCH_RETRY" ("BATCH_ID")
+--------------------------------------------------------
+--  Constraints for Table SCHEDULED_BATCH_RETRY
+--------------------------------------------------------
+
+  ALTER TABLE "SCHEDULED_BATCH_RETRY" MODIFY ("BATCH_ID" NOT NULL ENABLE)
+  ALTER TABLE "SCHEDULED_BATCH_RETRY" ADD CONSTRAINT "PK_SCHEDULED_RETRY" PRIMARY KEY ("BATCH_ID")
+  USING INDEX  ENABLE
+
+
+
+
+
+--------------------------------------------------------
+--  DDL for Table VOUCHER_CATEGORY
+--------------------------------------------------------
+
+  CREATE TABLE "VOUCHER_CATEGORY" 
+   (	"ID" NUMBER GENERATED BY DEFAULT AS IDENTITY MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 20 NOORDER  NOCYCLE  NOKEEP  NOSCALE , 
+	"CATEGORY_NAME" VARCHAR2(20), 
+	"CREATED_DATE" TIMESTAMP (6) DEFAULT CURRENT_TIMESTAMP
+   )
+--------------------------------------------------------
+--  DDL for Index SYS_C0012529
+--------------------------------------------------------
+
+  CREATE UNIQUE INDEX "SYS_C0012529" ON "VOUCHER_CATEGORY" ("ID")
+--------------------------------------------------------
+--  DDL for Index SYS_C0012530
+--------------------------------------------------------
+
+  CREATE UNIQUE INDEX "SYS_C0012530" ON "VOUCHER_CATEGORY" ("CATEGORY_NAME")
+--------------------------------------------------------
+--  Constraints for Table VOUCHER_CATEGORY
+--------------------------------------------------------
+
+  ALTER TABLE "VOUCHER_CATEGORY" MODIFY ("ID" NOT NULL ENABLE)
+  ALTER TABLE "VOUCHER_CATEGORY" MODIFY ("CATEGORY_NAME" NOT NULL ENABLE)
+  ALTER TABLE "VOUCHER_CATEGORY" ADD PRIMARY KEY ("ID")
+  USING INDEX  ENABLE
+  ALTER TABLE "VOUCHER_CATEGORY" ADD UNIQUE ("CATEGORY_NAME")
+  USING INDEX  ENABLE
+
+
+
+
+
+
+
+
+
+
+
+
+--------------------------------------------------------
+--  DDL for Table VOUCHER_POSTING
+--------------------------------------------------------
+
+  CREATE TABLE "VOUCHER_POSTING" 
+   (	"BATCH_ID" VARCHAR2(50), 
+	"VID_FK" VARCHAR2(20), 
+	"WORKFLOW_CODE" VARCHAR2(100), 
+	"CREATED_BY" VARCHAR2(100), 
+	"CREATED_AT" TIMESTAMP (6) DEFAULT CURRENT_TIMESTAMP, 
+	"PENDING_AT" NUMBER, 
+	"IS_EXECUTION_SCHEDULED" VARCHAR2(3), 
+	"SCHEDULED_TIME" TIMESTAMP (6), 
+	"IS_SCHEDULE_OVERRIDE" VARCHAR2(3), 
+	"EXECUTED_AT" TIMESTAMP (6), 
+	"BATCH_STATUS" VARCHAR2(20), 
+	"RECORDS_COUNT" NUMBER, 
+	"COMMON_BATCH_REMARKS" VARCHAR2(30 CHAR), 
+	"CREATOR_ROLE" NUMBER(10,0), 
+	"EXECUTOR_ID" VARCHAR2(10), 
+	"FIX_TYPE" CHAR(1) DEFAULT 'J', 
+	"TARGET_DATE" DATE
+   )
+--------------------------------------------------------
+--  DDL for Index SYS_C0012550
+--------------------------------------------------------
+
+  CREATE UNIQUE INDEX "SYS_C0012550" ON "VOUCHER_POSTING" ("BATCH_ID")
+--------------------------------------------------------
+--  Constraints for Table VOUCHER_POSTING
+--------------------------------------------------------
+
+  ALTER TABLE "VOUCHER_POSTING" MODIFY ("VID_FK" NOT NULL ENABLE)
+  ALTER TABLE "VOUCHER_POSTING" ADD CHECK (UPPER("IS_EXECUTION_SCHEDULED")='YES' OR UPPER("IS_EXECUTION_SCHEDULED")='NO') ENABLE
+  ALTER TABLE "VOUCHER_POSTING" ADD CHECK (UPPER(is_schedule_override) IN ('YES', 'NO')) ENABLE
+  ALTER TABLE "VOUCHER_POSTING" ADD PRIMARY KEY ("BATCH_ID")
+  USING INDEX  ENABLE
+  ALTER TABLE "VOUCHER_POSTING" MODIFY ("FIX_TYPE" NOT NULL ENABLE)
+
+
+
+
+
+
+
+
+--------------------------------------------------------
+--  DDL for Table VOUCHER_POSTING_DATA
+--------------------------------------------------------
+
+  CREATE TABLE "VOUCHER_POSTING_DATA" 
+   (	"REQ_STATUS" VARCHAR2(10 CHAR) DEFAULT 'P', 
+	"REQ_DATE" DATE DEFAULT SYSDATE, 
+	"CREATOR_ID" VARCHAR2(12 CHAR), 
+	"EXECUTION_DATE" DATE, 
+	"BATCH_ID" VARCHAR2(50 CHAR), 
+	"JOURNAL_ID" VARCHAR2(50 CHAR), 
+	"REQ_BRANCH_CODE" VARCHAR2(50 CHAR), 
+	"REQ_CURRENCY" VARCHAR2(3), 
+	"REQ_CGL" VARCHAR2(50 CHAR), 
+	"REQ_AMOUNT" NUMBER(25,4), 
+	"REQ_NARRATION" VARCHAR2(200 CHAR), 
+	"REQ_PRODUCT" VARCHAR2(50 CHAR), 
+	"REQ_ID" NUMBER(19,0), 
+	"IS_CGL_VALID" CHAR(1), 
+	"IS_CURRENCY_VALID" CHAR(1), 
+	"IS_BRANCH_VALID" CHAR(1), 
+	"IS_VALIDATED" CHAR(1) DEFAULT 'N'
+   ) 
+
+   COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_STATUS" IS 'Row-level processing status (e.g., P for Pending, A for Approved, R for Rejected).'
+   COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_DATE" IS 'The date when maker created the journal'
+   COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."EXECUTION_DATE" IS 'Timestamp when this checker acted upon the journal'
+   COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."BATCH_ID" IS 'Foreign key linking this row to its parent in JOURNAL_BATCH_MASTER.'
+   COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."JOURNAL_ID" IS 'Unique identifier for the individual request.'
+   COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_BRANCH_CODE" IS 'The branch code requested for the transaction.'
+   COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_CURRENCY" IS 'The 3-character currency code requested.'
+   COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_CGL" IS 'The 10-digit CGL account code requested.'
+   COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_AMOUNT" IS 'Raw requested amount '
+   COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_NARRATION" IS 'remarks from the uploaded file.'
+   COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_PRODUCT" IS 'The product  code requested.'
+   COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."IS_VALIDATED" IS 'Flag for checking row is checked or not for validation'
+--------------------------------------------------------
+--  DDL for Index IDX_JR_BATCH_OPT
+--------------------------------------------------------
+
+  CREATE INDEX "IDX_JR_BATCH_OPT" ON "VOUCHER_POSTING_DATA" ("BATCH_ID", "REQ_STATUS")
+--------------------------------------------------------
+--  DDL for Index IDX_JR_BRANCH_CODE
+--------------------------------------------------------
+
+  CREATE INDEX "IDX_JR_BRANCH_CODE" ON "VOUCHER_POSTING_DATA" ("REQ_BRANCH_CODE")
+--------------------------------------------------------
+--  DDL for Index PK_VOUCHER_POSTING_DATA
+--------------------------------------------------------
+
+  CREATE UNIQUE INDEX "PK_VOUCHER_POSTING_DATA" ON "VOUCHER_POSTING_DATA" ("REQ_ID")
+--------------------------------------------------------
+--  DDL for Index IDX_JR_JOURNAL_ID
+--------------------------------------------------------
+
+  CREATE INDEX "IDX_JR_JOURNAL_ID" ON "VOUCHER_POSTING_DATA" ("JOURNAL_ID")
+--------------------------------------------------------
+--  DDL for Index IDX_JR_BATCH_ID
+--------------------------------------------------------
+
+  CREATE INDEX "IDX_JR_BATCH_ID" ON "VOUCHER_POSTING_DATA" ("BATCH_ID")
+--------------------------------------------------------
+--  Constraints for Table VOUCHER_POSTING_DATA
+--------------------------------------------------------
+
+  ALTER TABLE "VOUCHER_POSTING_DATA" MODIFY ("REQ_STATUS" NOT NULL ENABLE)
+  ALTER TABLE "VOUCHER_POSTING_DATA" MODIFY ("REQ_DATE" NOT NULL ENABLE)
+  ALTER TABLE "VOUCHER_POSTING_DATA" MODIFY ("CREATOR_ID" NOT NULL ENABLE)
+  ALTER TABLE "VOUCHER_POSTING_DATA" MODIFY ("REQ_ID" NOT NULL ENABLE)
+  ALTER TABLE "VOUCHER_POSTING_DATA" MODIFY ("IS_VALIDATED" NOT NULL ENABLE)
+  ALTER TABLE "VOUCHER_POSTING_DATA" ADD CONSTRAINT "PK_VOUCHER_POSTING_DATA" PRIMARY KEY ("REQ_ID")
+  USING INDEX  ENABLE
+
+
+
+
+
+--------------------------------------------------------
+--  DDL for Table VOUCHER_TRANSACTIONS
+--------------------------------------------------------
+
+  CREATE TABLE "VOUCHER_TRANSACTIONS" 
+   (	"TRANSACTION_ID" NUMBER(20,0), 
+	"BATCH_ID" VARCHAR2(50 CHAR), 
+	"JOURNAL_ID" VARCHAR2(50 CHAR), 
+	"TRANSACTION_DATE" DATE, 
+	"POST_DATE" TIMESTAMP (6), 
+	"BRANCH_CODE" VARCHAR2(50 CHAR), 
+	"CURRENCY" VARCHAR2(3), 
+	"CGL" VARCHAR2(10), 
+	"NARRATION" VARCHAR2(40 CHAR), 
+	"DEBIT_AMOUNT" NUMBER(25,4), 
+	"CREDIT_AMOUNT" NUMBER(25,4), 
+	"TRANSACTION_COUNT" NUMBER(10,0), 
+	"SOURCE_FLAG" VARCHAR2(1)
+   )
+--------------------------------------------------------
+--  DDL for Index VOUCHER_TRANSACTIONS_PK
+--------------------------------------------------------
+
+  CREATE UNIQUE INDEX "VOUCHER_TRANSACTIONS_PK" ON "VOUCHER_TRANSACTIONS" ("TRANSACTION_ID")
+--------------------------------------------------------
+--  Constraints for Table VOUCHER_TRANSACTIONS
+--------------------------------------------------------
+
+  ALTER TABLE "VOUCHER_TRANSACTIONS" MODIFY ("TRANSACTION_ID" NOT NULL ENABLE)
+  ALTER TABLE "VOUCHER_TRANSACTIONS" ADD CONSTRAINT "VOUCHER_TRANSACTIONS_PK" PRIMARY KEY ("TRANSACTION_ID")
+  USING INDEX  ENABLE
+
+
+
+
+
+
+
+
+
+
+--------------------------------------------------------
+--  DDL for Table VOUCHER_WORKFLOW
+--------------------------------------------------------
+
+  CREATE TABLE "VOUCHER_WORKFLOW" 
+   (	"WORKFLOW_ID" NUMBER GENERATED ALWAYS AS IDENTITY MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 20 NOORDER  NOCYCLE  NOKEEP  NOSCALE , 
+	"BATCH_ID_FK" VARCHAR2(50), 
+	"VID_FK" VARCHAR2(20), 
+	"LAST_ACTION" VARCHAR2(30), 
+	"LAST_ACTION_BY" VARCHAR2(100), 	
+	"LAST_ACTION_AT" TIMESTAMP (6) DEFAULT CURRENT_TIMESTAMP, 
+	"REMARKS" VARCHAR2(500), 
+	"SCHEDULED_TIME" TIMESTAMP (6)
+   )
+--------------------------------------------------------
+--  DDL for Index SYS_C0012554
+--------------------------------------------------------
+
+  CREATE UNIQUE INDEX "SYS_C0012554" ON "VOUCHER_WORKFLOW" ("WORKFLOW_ID")
+--------------------------------------------------------
+--  Constraints for Table VOUCHER_WORKFLOW
+--------------------------------------------------------
+
+  ALTER TABLE "VOUCHER_WORKFLOW" MODIFY ("WORKFLOW_ID" NOT NULL ENABLE)
+  ALTER TABLE "VOUCHER_WORKFLOW" MODIFY ("BATCH_ID_FK" NOT NULL ENABLE)
+  ALTER TABLE "VOUCHER_WORKFLOW" MODIFY ("VID_FK" NOT NULL ENABLE)
+  ALTER TABLE "VOUCHER_WORKFLOW" ADD PRIMARY KEY ("WORKFLOW_ID")
+  USING INDEX  ENABLE
+--------------------------------------------------------
+--  Ref Constraints for Table VOUCHER_WORKFLOW
+--------------------------------------------------------
+
+  ALTER TABLE "VOUCHER_WORKFLOW" ADD CONSTRAINT "FK_VP_BATCH" FOREIGN KEY ("BATCH_ID_FK")
+	  REFERENCES "VOUCHER_POSTING" ("BATCH_ID") ENABLE
+
+
+
+--------------------------------------------------------
+--  DDL for Table HDFS_SYNC_RETRY_QUEUE
+--------------------------------------------------------
+
+  CREATE TABLE "HDFS_SYNC_RETRY_QUEUE" 
+   (	"BATCH_ID" VARCHAR2(50), 
+	"CREATED_AT" TIMESTAMP (6) DEFAULT SYSTIMESTAMP, 
+	"RETRY_COUNT" NUMBER DEFAULT 0, 
+	"STATUS" VARCHAR2(20) DEFAULT 'PENDING' -- PENDING, FAILED, COMPLETED
+
+   )
+--------------------------------------------------------
+--  DDL for Index SYS_C009672
+--------------------------------------------------------
+
+  CREATE UNIQUE INDEX "SYS_C009672" ON "HDFS_SYNC_RETRY_QUEUE" ("BATCH_ID")
+--------------------------------------------------------
+--  DDL for Index IDX_HDFS_RETRY_STATUS
+--------------------------------------------------------
+
+  CREATE INDEX "IDX_HDFS_RETRY_STATUS" ON "HDFS_SYNC_RETRY_QUEUE" ("STATUS")
+--------------------------------------------------------
+--  Constraints for Table HDFS_SYNC_RETRY_QUEUE
+--------------------------------------------------------
+
+  ALTER TABLE "HDFS_SYNC_RETRY_QUEUE" ADD PRIMARY KEY ("BATCH_ID")
+  USING INDEX  ENABLE
+
+
+
+
+
+
+--------------------------------------------------------
+--  DDL for Table WORKFLOW_TRANSITIONS
+--------------------------------------------------------
+
+  CREATE TABLE "WORKFLOW_TRANSITIONS" 
+   (	"WORKFLOW_CODE" VARCHAR2(50), 
+	"ALLOWED_ROLE_ID" NUMBER(10,0), 
+	"IS_FINAL_APPROVAL" CHAR(1) DEFAULT 'N', 
+	"SCHEDULING_ALLOWED" CHAR(1), 
+	"WORKFLOW_STAGE" VARCHAR2(100), 
+	"ESCALATION_TIME" NUMBER(10,0), 
+	"WORKFLOW_ORDER" NUMBER(3,0), 
+	"WORKFLOW_ID" NUMBER DEFAULT "WORKFLOWID_SEQ"."NEXTVAL"
+   )
+--------------------------------------------------------
+--  DDL for Index WORKFLOW_TRANSITIONS_PK
+--------------------------------------------------------
+
+  CREATE UNIQUE INDEX "WORKFLOW_TRANSITIONS_PK" ON "WORKFLOW_TRANSITIONS" ("WORKFLOW_CODE", "WORKFLOW_ORDER")
+--------------------------------------------------------
+--  DDL for Index WORKFLOW_TRANSITIONS_UK1
+--------------------------------------------------------
+
+  CREATE UNIQUE INDEX "WORKFLOW_TRANSITIONS_UK1" ON "WORKFLOW_TRANSITIONS" ("WORKFLOW_ID")
+--------------------------------------------------------
+--  Constraints for Table WORKFLOW_TRANSITIONS
+--------------------------------------------------------
+
+  ALTER TABLE "WORKFLOW_TRANSITIONS" ADD CONSTRAINT "WORKFLOW_TRANSITIONS_UK1" UNIQUE ("WORKFLOW_ID")
+  USING INDEX  ENABLE
+  ALTER TABLE "WORKFLOW_TRANSITIONS" MODIFY ("WORKFLOW_CODE" NOT NULL ENABLE)
+  ALTER TABLE "WORKFLOW_TRANSITIONS" MODIFY ("WORKFLOW_ORDER" NOT NULL ENABLE)
+  ALTER TABLE "WORKFLOW_TRANSITIONS" ADD CONSTRAINT "WORKFLOW_TRANSITIONS_PK" PRIMARY KEY ("WORKFLOW_CODE", "WORKFLOW_ORDER")
+  USING INDEX  ENABLE
+
+
+
+
+
+
+
+
+ --------------------------------------------------------
+--  DDL for Table ISSUE_CATEGORY
+--------------------------------------------------------
+
+  CREATE TABLE "FINCORE"."ISSUE_CATEGORY" 
+   (	"ID" NUMBER, 
+	"VOUCHER_CATEGORY_ID" NUMBER, 
+	"ISSUE_CATEGORY_NAME" VARCHAR2(100), 
+	"CREATED_DATE" TIMESTAMP (6) DEFAULT SYSTIMESTAMP
+   )
+--------------------------------------------------------
+--  DDL for Index SYS_C0012824
+--------------------------------------------------------
+
+  CREATE UNIQUE INDEX "FINCORE"."SYS_C0012824" ON "FINCORE"."ISSUE_CATEGORY" ("ID")
+--------------------------------------------------------
+--  Constraints for Table ISSUE_CATEGORY
+--------------------------------------------------------
+
+  ALTER TABLE "FINCORE"."ISSUE_CATEGORY" MODIFY ("VOUCHER_CATEGORY_ID" NOT NULL ENABLE)
+  ALTER TABLE "FINCORE"."ISSUE_CATEGORY" MODIFY ("ISSUE_CATEGORY_NAME" NOT NULL ENABLE)
+  ALTER TABLE "FINCORE"."ISSUE_CATEGORY" ADD PRIMARY KEY ("ID")
+  USING INDEX  ENABLE
+--------------------------------------------------------
+--  Ref Constraints for Table ISSUE_CATEGORY
+--------------------------------------------------------
+
+  ALTER TABLE "FINCORE"."ISSUE_CATEGORY" ADD CONSTRAINT "FK_ISSUE_CATEGORY_VOUCHER" FOREIGN KEY ("VOUCHER_CATEGORY_ID")
+	  REFERENCES "FINCORE"."VOUCHER_CATEGORY" ("ID") ENABLE
+
+
+
+indexes
+
+
+  CREATE INDEX "FINCORE"."IDX_JR_BATCH_ID" ON "FINCORE"."VOUCHER_POSTING_DATA" ("BATCH_ID") 
+  PCTFREE 10 INITRANS 2 MAXTRANS 255 COMPUTE STATISTICS 
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "TBS_FINCORE" ;
+
+
+
+  CREATE INDEX "FINCORE"."IDX_JR_JOURNAL_ID" ON "FINCORE"."VOUCHER_POSTING_DATA" ("JOURNAL_ID") 
+  PCTFREE 10 INITRANS 2 MAXTRANS 255 COMPUTE STATISTICS 
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "TBS_FINCORE" ;
+
+
+
+  CREATE UNIQUE INDEX "FINCORE"."PK_VOUCHER_POSTING_DATA" ON "FINCORE"."VOUCHER_POSTING_DATA" ("REQ_ID") 
+  PCTFREE 10 INITRANS 2 MAXTRANS 255 COMPUTE STATISTICS 
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "TBS_FINCORE" ;
+
+
+
+  CREATE UNIQUE INDEX "FINCORE"."VOUCHER_TRANSACTIONS_PK" ON "FINCORE"."VOUCHER_TRANSACTIONS" ("TRANSACTION_ID") 
+  PCTFREE 10 INITRANS 2 MAXTRANS 255 COMPUTE STATISTICS 
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "TBS_FINCORE" ;
+
+
+
+  CREATE UNIQUE INDEX "FINCORE"."WORKFLOW_TRANSITIONS_PK" ON "FINCORE"."WORKFLOW_TRANSITIONS" ("WORKFLOW_CODE", "WORKFLOW_ORDER") 
+  PCTFREE 10 INITRANS 2 MAXTRANS 255 COMPUTE STATISTICS 
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "TBS_FINCORE" ;
+
+
+
+  CREATE UNIQUE INDEX "FINCORE"."WORKFLOW_TRANSITIONS_UK1" ON "FINCORE"."WORKFLOW_TRANSITIONS" ("WORKFLOW_ID") 
+  PCTFREE 10 INITRANS 2 MAXTRANS 255 COMPUTE STATISTICS 
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "TBS_FINCORE" ;
+
+
 
 
