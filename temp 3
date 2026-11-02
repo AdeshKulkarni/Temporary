@@ -1,76 +1,791 @@
-Here are the exact replacements to make in your pom.xml to resolve all the identified vulnerabilities.
-1. Update Properties (Fixes Jackson & Log4j)
-Replace this:
-        <!-- ADDED: fixes jackson-core 2.21.4 / 3.1.4 (transitive) CVEs -->
-        <jackson-bom.version>3.2.3</jackson-bom.version>
-        <jackson-2-bom.version>2.22.3</jackson-2-bom.version>
+-- ==============================================================================
+-- 1. procedure
+-- ==============================================================================
 
-With this (updates Jackson and adds a standard Spring Boot property to force the secure Log4j version):
-        <!-- Fixes Jackson CVE-2026-110879 & CVE-2026-110729 -->
-        <jackson-bom.version>3.2.4</jackson-bom.version>
-        <jackson-2-bom.version>2.22.4</jackson-2-bom.version>
-        <!-- Fixes Log4j CVE-2026-49844 -->
-        <log4j2.version>2.25.5</log4j2.version>
+create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
+    p_batch_id      IN VARCHAR2,
+    p_executor_id   IN VARCHAR2,
+    p_remarks       IN VARCHAR2,
+    p_status        IN VARCHAR2,
+    o_cursor        OUT SYS_REFCURSOR
+) AS
+    v_missing_rates NUMBER;
+    v_txn_count     NUMBER; 
+    v_users_date    DATE; -- Store business date from FINCORE_DATE
+BEGIN
+    -- ==============================================================================
+    -- 0. FETCH OPERATIONAL SYSTEM BUSINESS DATE
+    -- ==============================================================================
+    SELECT USERS_DATE INTO v_users_date 
+    FROM FINCORE_DATE 
+    WHERE ROWNUM = 1;
 
-2. Update Jackson Dependencies (Fixes Jackson DataBind)
-Replace this:
-        <!-- Fix for Jackson 3.x (CHANGED: 3.2.2 -> 3.2.3) -->
-        <dependency>
-            <groupId>tools.jackson.core</groupId>
-            <artifactId>jackson-databind</artifactId>
-            <version>3.2.3</version>
-        </dependency>
 
-        <!-- Fix for Jackson 2.x (CHANGED: 2.22.2 -> 2.22.3) -->
-        <dependency>
-            <groupId>com.fasterxml.jackson.core</groupId>
-            <artifactId>jackson-databind</artifactId>
-            <version>2.22.3</version>
-        </dependency>
 
-With this:
-        <!-- Fix for Jackson 3.x -->
-        <dependency>
-            <groupId>tools.jackson.core</groupId>
-            <artifactId>jackson-databind</artifactId>
-            <version>3.2.4</version>
-        </dependency>
+    -- ==============================================================================
+    -- 0.1. PRE-CHECK: EXCHANGE RATE INTEGRITY
+    -- ==============================================================================
+    SELECT COUNT(*) INTO v_missing_rates
+    FROM (
+        SELECT DISTINCT REQ_CURRENCY FROM voucher_posting_data
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+    ) req
+    LEFT JOIN CURRENCY_MASTER cm
+        ON req.REQ_CURRENCY = cm.CURRENCY_CODE AND cm.FLAG = 1
+    WHERE req.REQ_CURRENCY <> 'INR'
+      AND (cm.CURRENCY_RATE IS NULL OR cm.CURRENCY_RATE <= 0);
 
-        <!-- Fix for Jackson 2.x -->
-        <dependency>
-            <groupId>com.fasterxml.jackson.core</groupId>
-            <artifactId>jackson-databind</artifactId>
-            <version>2.22.4</version>
-        </dependency>
 
-3. Update Apache POI Dependencies (Fixes POI & Commons-Compress)
-Replace this:
-         <dependency>
-    		<groupId>org.apache.poi</groupId>
-   			<artifactId>poi</artifactId>
-   			<version>5.2.5</version>
-		</dependency>
-		<dependency>
-    		<groupId>org.apache.poi</groupId>
-    		<artifactId>poi-ooxml</artifactId>
-    		<version>5.2.5</version>
-		</dependency>
 
-With this (updates POI and explicitly forces the secure version of commons-compress to satisfy the scanner):
-         <dependency>
-    		<groupId>org.apache.poi</groupId>
-   			<artifactId>poi</artifactId>
-   			<version>5.4.0</version>
-		</dependency>
-		<dependency>
-    		<groupId>org.apache.poi</groupId>
-    		<artifactId>poi-ooxml</artifactId>
-    		<version>5.4.0</version>
-		</dependency>
-        <!-- Fixes Commons Compress CVE-2024-25710 & CVE-2024-26308 -->
-        <dependency>
-            <groupId>org.apache.commons</groupId>
-            <artifactId>commons-compress</artifactId>
-            <version>1.26.0</version>
-        </dependency>
+    IF v_missing_rates > 0 THEN
+        RAISE_APPLICATION_ERROR(-20001, 'EXCHANGE_RATE_MISSING');
+    END IF;
 
+
+
+    -- ==============================================================================
+    -- 0.5. PRE-CALCULATE TRANSACTION COUNT
+    -- ==============================================================================
+    SELECT COUNT(*) INTO v_txn_count
+    FROM voucher_posting_data
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+
+
+
+    -- ==============================================================================
+    -- 1. Insert GL_TRANSACTIONS (Fixed with Subquery for Sequence sorting)
+    -- ==============================================================================
+    INSERT /*+ PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
+        TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
+        BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG, TRANSACTION_COUNT
+    )
+    SELECT 
+        GL_TRANSACTIONS_SEQ.nextval, 
+        ordered_data.BATCH_ID, 
+        ordered_data.JOURNAL_ID, 
+        ordered_data.TRANSACTION_DATE, 
+        ordered_data.POST_DATE,
+        ordered_data.REQ_BRANCH_CODE, 
+        ordered_data.REQ_CURRENCY, 
+        ordered_data.REQ_CGL, 
+        ordered_data.REQ_NARRATION,
+        ordered_data.DEBIT_AMOUNT, 
+        ordered_data.CREDIT_AMOUNT, 
+        ordered_data.SOURCE_FLAG, 
+        ordered_data.TRANSACTION_COUNT
+    FROM (
+        SELECT /*+ PARALLEL(voucher_posting_data, 8) */
+            BATCH_ID, 
+            JOURNAL_ID,
+            v_users_date AS TRANSACTION_DATE,                                        
+            CAST(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata' AS TIMESTAMP) AS POST_DATE,      
+            REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
+            CASE WHEN REQ_AMOUNT > 0 THEN (REQ_AMOUNT * -1)   ELSE 0 END AS DEBIT_AMOUNT,
+            CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END AS CREDIT_AMOUNT,
+            'J' AS SOURCE_FLAG,
+            '1' AS TRANSACTION_COUNT
+        FROM voucher_posting_data
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+        -- Sorting happens HERE inside the safe subquery
+        ORDER BY REQ_CURRENCY, REQ_BRANCH_CODE, REQ_CGL
+    ) ordered_data;
+    
+    
+    -- ==============================================================================
+    -- 2. Insert VOUCHER_TRANSACTIONS (Fixed with Subquery for Sequence sorting)
+    -- ==============================================================================
+    INSERT /*+ PARALLEL(VOUCHER_TRANSACTIONS, 8) */ INTO VOUCHER_TRANSACTIONS (
+        TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
+        BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG, TRANSACTION_COUNT
+    )
+    SELECT 
+        VOUCHER_TRANSACTIONS_SEQ.nextval, 
+        ordered_data.BATCH_ID, 
+        ordered_data.JOURNAL_ID, 
+        ordered_data.TRANSACTION_DATE, 
+        ordered_data.POST_DATE,
+        ordered_data.REQ_BRANCH_CODE, 
+        ordered_data.REQ_CURRENCY, 
+        ordered_data.REQ_CGL, 
+        ordered_data.REQ_NARRATION,
+        ordered_data.DEBIT_AMOUNT, 
+        ordered_data.CREDIT_AMOUNT, 
+        ordered_data.SOURCE_FLAG, 
+        ordered_data.TRANSACTION_COUNT
+    FROM (
+        SELECT /*+ PARALLEL(voucher_posting_data, 8) */
+            BATCH_ID, 
+            JOURNAL_ID,
+            v_users_date AS TRANSACTION_DATE,                                        
+            CAST(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata' AS TIMESTAMP) AS POST_DATE,      
+            REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
+            CASE WHEN REQ_AMOUNT > 0 THEN (REQ_AMOUNT * -1)   ELSE 0 END AS DEBIT_AMOUNT,
+            CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END AS CREDIT_AMOUNT,
+            'J' AS SOURCE_FLAG,
+            '1' AS TRANSACTION_COUNT
+        FROM voucher_posting_data
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+        -- Sorting happens HERE inside the safe subquery
+        ORDER BY REQ_CURRENCY, REQ_BRANCH_CODE, REQ_CGL
+    ) ordered_data;
+    
+
+
+
+    -- ==============================================================================
+    -- 3. Merge GL Balances (Logic stays exactly the same)
+    -- ==============================================================================
+    MERGE INTO GL_BALANCE target
+    USING (
+        SELECT j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL,
+               v_users_date as BAL_DATE, 
+               SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
+               CASE WHEN j.REQ_CURRENCY = 'INR' THEN 1 ELSE MAX(c.CURRENCY_RATE) END as EXCH_RATE
+        FROM voucher_posting_data j
+        LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1
+        WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
+        GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL
+    ) source
+    ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE
+        AND target.CURRENCY = source.REQ_CURRENCY
+        AND target.CGL = source.REQ_CGL
+        AND target.BALANCE_DATE = source.BAL_DATE)
+    WHEN MATCHED THEN
+        UPDATE SET
+            target.BALANCE = target.BALANCE + source.TXN_AMOUNT,
+            target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
+    WHEN NOT MATCHED THEN
+        INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
+        VALUES (GL_BALANCE_SEQ.nextval, source.BAL_DATE, source.REQ_BRANCH_CODE,
+                source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT,
+                (source.TXN_AMOUNT * source.EXCH_RATE));
+
+
+
+    -- ==============================================================================
+    -- 4. Capture Sync Data for HDFS (Data Lake)
+    -- ==============================================================================
+    OPEN o_cursor FOR
+    SELECT
+        j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL,
+        v_users_date AS BAL_DATE,
+        g.BALANCE AS NEW_BALANCE, g.INR_BALANCE AS NEW_INR_BALANCE
+    FROM (
+        SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL
+        FROM voucher_posting_data WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+    ) j
+    JOIN GL_BALANCE g
+        ON g.BRANCH_CODE = j.REQ_BRANCH_CODE
+        AND g.CURRENCY = j.REQ_CURRENCY
+        AND g.CGL = j.REQ_CGL
+        AND g.BALANCE_DATE = v_users_date;
+
+
+
+    -- ==============================================================================
+    -- 5. Finalize Batch Status
+    -- ==============================================================================
+    UPDATE voucher_posting_data
+    SET REQ_STATUS = p_status,
+        EXECUTION_DATE =  CAST(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata' AS TIMESTAMP) 
+    WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+
+
+
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;
+
+
+
+
+
+create or replace PROCEDURE "PURGE_JOURNAL_BATCH" (
+    p_batch_id IN VARCHAR2,
+    p_user_id  IN VARCHAR2
+) AS
+    v_status VARCHAR2(20);
+BEGIN
+    SELECT BATCH_STATUS INTO v_status
+    FROM VOUCHER_POSTING
+    WHERE BATCH_ID = p_batch_id 
+      AND UPPER(TRIM(CREATED_BY)) = UPPER(TRIM(p_user_id));
+
+    IF v_status NOT IN ('P') THEN
+        RAISE_APPLICATION_ERROR(-20002, 'Cannot delete batch. Status is ' || v_status);
+    END IF;
+
+    DELETE FROM VOUCHER_WORKFLOW WHERE BATCH_ID_FK = p_batch_id;
+    DELETE FROM VOUCHER_POSTING_DATA WHERE BATCH_ID = p_batch_id;
+    DELETE FROM VOUCHER_POSTING WHERE BATCH_ID = p_batch_id;
+END;
+
+
+
+
+-- ==============================================================================
+-- 1. SEQUENCES
+-- ==============================================================================
+
+CREATE SEQUENCE "JOURNAL_REQUEST_SEQ" MINVALUE 1 MAXVALUE 999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 1000 NOORDER NOCYCLE NOKEEP NOSCALE GLOBAL;
+CREATE SEQUENCE "VOUCHER_POSTING_DATA_SEQ" MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 NOCACHE NOORDER NOCYCLE NOKEEP NOSCALE GLOBAL;
+CREATE SEQUENCE "WORKFLOWID_SEQ" MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 20 ORDER NOCYCLE NOKEEP NOSCALE GLOBAL;
+CREATE SEQUENCE "JRNL_SEQ" MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 20 NOORDER NOCYCLE NOKEEP NOSCALE GLOBAL;
+CREATE SEQUENCE "REQUEST_VOUCHER_SEQ" MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 20 NOORDER NOCYCLE NOKEEP NOSCALE GLOBAL;
+
+-- ==============================================================================
+-- 2. TABLES AND PRIMARY CONSTRAINTS (NO FOREIGN KEYS YET)
+-- ==============================================================================
+
+
+--------------------------------------------------------
+--  DDL for Table JS_EOD_MASTER
+--------------------------------------------------------
+CREATE TABLE JS_EOD_MASTER 
+(	
+    "ID" NUMBER DEFAULT 1, 
+	"JS_STATUS" NUMBER(1,0) DEFAULT 1, 
+	"EOD_STATUS" NUMBER(1,0) DEFAULT 0, 
+	"JS_UPDATED_AT" TIMESTAMP (6), 
+	"EOD_UPDATED_AT" TIMESTAMP (6), 
+	"JS_PENDING_COUNTER" NUMBER DEFAULT 0,
+    CONSTRAINT "CHK_JS_EOD_SINGLE_ROW" CHECK (ID = 1),
+    PRIMARY KEY ("ID")
+);
+
+--------------------------------------------------------
+--  DDL for Table REQUEST_VOUCHER
+--------------------------------------------------------
+CREATE TABLE "REQUEST_VOUCHER" 
+(	
+    "ID" NUMBER GENERATED BY DEFAULT AS IDENTITY MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 20 NOORDER NOCYCLE NOKEEP NOSCALE NOT NULL ENABLE, 
+	"VID" VARCHAR2(20) NOT NULL ENABLE, 
+	"CATEGORY_ID" NUMBER NOT NULL ENABLE, 
+	"DESCRIPTION" VARCHAR2(500) NOT NULL ENABLE, 
+	"ALLOWED_ROLE" NUMBER NOT NULL ENABLE, 
+	"SD_REQ_NO" VARCHAR2(100), 
+	"CREATED_BY" VARCHAR2(100), 
+	"CREATED_AT" TIMESTAMP (6) DEFAULT CURRENT_TIMESTAMP, 
+	"TERMINATED_BY" VARCHAR2(100), 
+	"TERMINATED_AT" TIMESTAMP (6), 
+	"STATUS" VARCHAR2(30) NOT NULL ENABLE, 
+	"REMARKS" VARCHAR2(500), 
+	"BACK_DATE" DATE, 
+	"IS_BACK_DATED" NUMBER(1,0) DEFAULT 0 NOT NULL ENABLE,
+    PRIMARY KEY ("ID"),
+    UNIQUE ("VID")
+);
+
+--------------------------------------------------------
+--  DDL for Table VOUCHER_CATEGORY
+--------------------------------------------------------
+CREATE TABLE "VOUCHER_CATEGORY" 
+(	
+    "ID" NUMBER GENERATED BY DEFAULT AS IDENTITY MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 20 NOORDER NOCYCLE NOKEEP NOSCALE NOT NULL ENABLE, 
+	"CATEGORY_NAME" VARCHAR2(20) NOT NULL ENABLE, 
+	"CREATED_DATE" TIMESTAMP (6) DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY ("ID"),
+    UNIQUE ("CATEGORY_NAME")
+);
+
+--------------------------------------------------------
+--  DDL for Table ISSUE_CATEGORY
+--------------------------------------------------------
+CREATE TABLE "ISSUE_CATEGORY" 
+(	
+    "ID" NUMBER, 
+	"VOUCHER_CATEGORY_ID" NUMBER NOT NULL ENABLE, 
+	"ISSUE_CATEGORY_NAME" VARCHAR2(100) NOT NULL ENABLE, 
+	"CREATED_DATE" TIMESTAMP (6) DEFAULT SYSTIMESTAMP,
+    PRIMARY KEY ("ID")
+);
+
+--------------------------------------------------------
+--  DDL for Table REQUEST_VOUCHER_ISSUE_CATEGORY
+--------------------------------------------------------
+CREATE TABLE "REQUEST_VOUCHER_ISSUE_CATEGORY" 
+(	
+    "ID" NUMBER, 
+	"REQUEST_VOUCHER_ID" NUMBER NOT NULL ENABLE, 
+	"ISSUE_CATEGORY_ID" NUMBER NOT NULL ENABLE,
+    PRIMARY KEY ("ID")
+);
+
+--------------------------------------------------------
+--  DDL for Table VOUCHER_POSTING
+--------------------------------------------------------
+CREATE TABLE "VOUCHER_POSTING" 
+(	
+    "BATCH_ID" VARCHAR2(50), 
+	"VID_FK" VARCHAR2(20) NOT NULL ENABLE, 
+	"WORKFLOW_CODE" VARCHAR2(100), 
+	"CREATED_BY" VARCHAR2(100), 
+	"CREATED_AT" TIMESTAMP (6) DEFAULT CURRENT_TIMESTAMP, 
+	"PENDING_AT" NUMBER, 
+	"IS_EXECUTION_SCHEDULED" VARCHAR2(3), 
+	"SCHEDULED_TIME" TIMESTAMP (6), 
+	"IS_SCHEDULE_OVERRIDE" VARCHAR2(3), 
+	"EXECUTED_AT" TIMESTAMP (6), 
+	"BATCH_STATUS" VARCHAR2(20), 
+	"RECORDS_COUNT" NUMBER, 
+	"COMMON_BATCH_REMARKS" VARCHAR2(30 CHAR), 
+	"CREATOR_ROLE" NUMBER(10,0), 
+	"EXECUTOR_ID" VARCHAR2(10), 
+	"FIX_TYPE" CHAR(1) DEFAULT 'J' NOT NULL ENABLE, 
+	"TARGET_DATE" DATE,
+    CHECK (UPPER("IS_EXECUTION_SCHEDULED")='YES' OR UPPER("IS_EXECUTION_SCHEDULED")='NO'),
+    CHECK (UPPER("IS_SCHEDULE_OVERRIDE") IN ('YES', 'NO')),
+    PRIMARY KEY ("BATCH_ID")
+);
+
+--------------------------------------------------------
+--  DDL for Table VOUCHER_POSTING_DATA
+--------------------------------------------------------
+CREATE TABLE "VOUCHER_POSTING_DATA" 
+(	
+    "REQ_STATUS" VARCHAR2(10 CHAR) DEFAULT 'P' NOT NULL ENABLE, 
+	"REQ_DATE" DATE DEFAULT SYSDATE NOT NULL ENABLE, 
+	"CREATOR_ID" VARCHAR2(12 CHAR) NOT NULL ENABLE, 
+	"EXECUTION_DATE" DATE, 
+	"BATCH_ID" VARCHAR2(50 CHAR), 
+	"JOURNAL_ID" VARCHAR2(50 CHAR), 
+	"REQ_BRANCH_CODE" VARCHAR2(50 CHAR), 
+	"REQ_CURRENCY" VARCHAR2(3), 
+	"REQ_CGL" VARCHAR2(50 CHAR), 
+	"REQ_AMOUNT" NUMBER(25,4), 
+	"REQ_NARRATION" VARCHAR2(200 CHAR), 
+	"REQ_PRODUCT" VARCHAR2(50 CHAR), 
+	"REQ_ID" NUMBER(19,0) NOT NULL ENABLE, 
+	"IS_CGL_VALID" CHAR(1), 
+	"IS_CURRENCY_VALID" CHAR(1), 
+	"IS_BRANCH_VALID" CHAR(1), 
+	"IS_VALIDATED" CHAR(1) DEFAULT 'N' NOT NULL ENABLE,
+    PRIMARY KEY ("REQ_ID")
+);
+
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_STATUS" IS 'Row-level processing status (e.g., P for Pending, A for Approved, R for Rejected).';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_DATE" IS 'The date when maker created the voucher';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."EXECUTION_DATE" IS 'Timestamp when this checker acted upon the voucher';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."BATCH_ID" IS 'Foreign key linking this row to its parent in JOURNAL_BATCH_MASTER.';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."JOURNAL_ID" IS 'Unique identifier for the individual request.';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_BRANCH_CODE" IS 'The branch code requested for the transaction.';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_CURRENCY" IS 'The 3-character currency code requested.';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_CGL" IS 'The 10-digit CGL account code requested.';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_AMOUNT" IS 'Raw requested amount';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_NARRATION" IS 'remarks from the uploaded file.';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_PRODUCT" IS 'The product code requested.';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."IS_VALIDATED" IS 'Flag for checking row is checked or not for validation';
+
+--------------------------------------------------------
+--  DDL for Table VOUCHER_TRANSACTIONS
+--------------------------------------------------------
+CREATE TABLE "VOUCHER_TRANSACTIONS" 
+(	
+    "TRANSACTION_ID" NUMBER(20,0) NOT NULL ENABLE, 
+	"BATCH_ID" VARCHAR2(50 CHAR), 
+	"JOURNAL_ID" VARCHAR2(50 CHAR), 
+	"TRANSACTION_DATE" DATE, 
+	"POST_DATE" TIMESTAMP (6), 
+	"BRANCH_CODE" VARCHAR2(50 CHAR), 
+	"CURRENCY" VARCHAR2(3), 
+	"CGL" VARCHAR2(10), 
+	"NARRATION" VARCHAR2(40 CHAR), 
+	"DEBIT_AMOUNT" NUMBER(25,4), 
+	"CREDIT_AMOUNT" NUMBER(25,4), 
+	"TRANSACTION_COUNT" NUMBER(10,0), 
+	"SOURCE_FLAG" VARCHAR2(1),
+    PRIMARY KEY ("TRANSACTION_ID")
+);
+
+--------------------------------------------------------
+--  DDL for Table VOUCHER_WORKFLOW
+--------------------------------------------------------
+CREATE TABLE "VOUCHER_WORKFLOW" 
+(	
+    "WORKFLOW_ID" NUMBER GENERATED ALWAYS AS IDENTITY MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 20 NOORDER NOCYCLE NOKEEP NOSCALE NOT NULL ENABLE, 
+	"BATCH_ID_FK" VARCHAR2(50) NOT NULL ENABLE, 
+	"VID_FK" VARCHAR2(20) NOT NULL ENABLE, 
+	"LAST_ACTION" VARCHAR2(30), 
+	"LAST_ACTION_BY" VARCHAR2(100), 	
+	"LAST_ACTION_AT" TIMESTAMP (6) DEFAULT CURRENT_TIMESTAMP, 
+	"REMARKS" VARCHAR2(500), 
+	"SCHEDULED_TIME" TIMESTAMP (6),
+    PRIMARY KEY ("WORKFLOW_ID")
+);
+
+--------------------------------------------------------
+--  DDL for Table SCHEDULED_BATCH_RETRY
+--------------------------------------------------------
+CREATE TABLE "SCHEDULED_BATCH_RETRY" 
+(	
+    "BATCH_ID" VARCHAR2(50) NOT NULL ENABLE, 
+	"CREATED_AT" TIMESTAMP (6) DEFAULT SYSTIMESTAMP, 
+	"RETRY_COUNT" NUMBER DEFAULT 0, 
+	"STATUS" VARCHAR2(20) DEFAULT 'PENDING',
+    PRIMARY KEY ("BATCH_ID")
+);
+
+--------------------------------------------------------
+--  DDL for Table HDFS_SYNC_RETRY_QUEUE
+--------------------------------------------------------
+CREATE TABLE "HDFS_SYNC_RETRY_QUEUE" 
+(	
+    "BATCH_ID" VARCHAR2(50), 
+	"CREATED_AT" TIMESTAMP (6) DEFAULT SYSTIMESTAMP, 
+	"RETRY_COUNT" NUMBER DEFAULT 0, 
+	"STATUS" VARCHAR2(20) DEFAULT 'PENDING',
+    PRIMARY KEY ("BATCH_ID")
+);
+
+--------------------------------------------------------
+--  DDL for Table WORKFLOW_TRANSITIONS
+--------------------------------------------------------
+CREATE TABLE "WORKFLOW_TRANSITIONS" 
+(	
+    "WORKFLOW_CODE" VARCHAR2(50) NOT NULL ENABLE, 
+	"ALLOWED_ROLE_ID" NUMBER(10,0), 
+	"IS_FINAL_APPROVAL" CHAR(1) DEFAULT 'N', 
+	"SCHEDULING_ALLOWED" CHAR(1), 
+	"WORKFLOW_STAGE" VARCHAR2(100), 
+	"ESCALATION_TIME" NUMBER(10,0), 
+	"WORKFLOW_ORDER" NUMBER(3,0) NOT NULL ENABLE, 
+	"WORKFLOW_ID" NUMBER DEFAULT "WORKFLOWID_SEQ"."NEXTVAL",
+    UNIQUE ("WORKFLOW_ID"),
+    PRIMARY KEY ("WORKFLOW_CODE", "WORKFLOW_ORDER")
+);
+
+-- ==============================================================================
+-- 3. FOREIGN KEYS / REF CONSTRAINTS
+-- ==============================================================================
+
+ALTER TABLE "ISSUE_CATEGORY" ADD CONSTRAINT "FK_ISSUE_CATEGORY_VOUCHER" FOREIGN KEY ("VOUCHER_CATEGORY_ID")
+    REFERENCES "VOUCHER_CATEGORY" ("ID") ENABLE;
+
+ALTER TABLE "REQUEST_VOUCHER_ISSUE_CATEGORY" ADD CONSTRAINT "FK_REQ_VOUCHER_ISSUE" FOREIGN KEY ("REQUEST_VOUCHER_ID")
+    REFERENCES "REQUEST_VOUCHER" ("ID") ENABLE;
+    
+ALTER TABLE "REQUEST_VOUCHER_ISSUE_CATEGORY" ADD CONSTRAINT "FK_REQ_ISSUE_CATEGORY" FOREIGN KEY ("ISSUE_CATEGORY_ID")
+    REFERENCES "ISSUE_CATEGORY" ("ID") ENABLE;
+
+ALTER TABLE "VOUCHER_WORKFLOW" ADD CONSTRAINT "FK_VP_BATCH" FOREIGN KEY ("BATCH_ID_FK")
+    REFERENCES "VOUCHER_POSTING" ("BATCH_ID") ENABLE;
+
+-- ==============================================================================
+-- 4. NON-PRIMARY INDEXES
+-- ==============================================================================
+
+
+CREATE INDEX "IDX_JR_BATCH_OPT" ON "VOUCHER_POSTING_DATA" ("BATCH_ID", "REQ_STATUS");
+CREATE INDEX "IDX_JR_BRANCH_CODE" ON "VOUCHER_POSTING_DATA" ("REQ_BRANCH_CODE");
+CREATE INDEX "IDX_JR_JOURNAL_ID" ON "VOUCHER_POSTING_DATA" ("JOURNAL_ID");
+CREATE INDEX "IDX_JR_BATCH_ID" ON "VOUCHER_POSTING_DATA" ("BATCH_ID");
+
+CREATE INDEX "IDX_HDFS_RETRY_STATUS" ON "HDFS_SYNC_RETRY_QUEUE" ("STATUS");
+
+-- ==============================================================================
+-- 5. TRIGGERS
+-- ==============================================================================
+
+
+CREATE OR REPLACE EDITIONABLE TRIGGER "REQUEST_VID_TRIGGER" 
+BEFORE INSERT ON REQUEST_VOUCHER
+FOR EACH ROW
+DECLARE
+    v_seq_number NUMBER;
+    v_prefix VARCHAR2(20);
+BEGIN
+    v_prefix := 'VID-' || TO_CHAR(SYSDATE, 'YYMM') || '-';
+    
+    SELECT REQUEST_VOUCHER_SEQ.NEXTVAL
+    INTO v_seq_number
+    FROM DUAL;
+    
+    :NEW.VID := v_prefix || LPAD(v_seq_number, 5, '0');
+END;
+/
+ALTER TRIGGER "REQUEST_VID_TRIGGER" ENABLE;
+
+
+-- ==============================================================================
+-- 1. SEQUENCES
+-- ==============================================================================
+
+CREATE SEQUENCE "JOURNAL_REQUEST_SEQ" MINVALUE 1 MAXVALUE 999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 1000 NOORDER NOCYCLE NOKEEP NOSCALE GLOBAL;
+CREATE SEQUENCE "VOUCHER_POSTING_DATA_SEQ" MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 NOCACHE NOORDER NOCYCLE NOKEEP NOSCALE GLOBAL;
+CREATE SEQUENCE "WORKFLOWID_SEQ" MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 20 ORDER NOCYCLE NOKEEP NOSCALE GLOBAL;
+CREATE SEQUENCE "JRNL_SEQ" MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 20 NOORDER NOCYCLE NOKEEP NOSCALE GLOBAL;
+CREATE SEQUENCE "REQUEST_VOUCHER_SEQ" MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 20 NOORDER NOCYCLE NOKEEP NOSCALE GLOBAL;
+
+-- ==============================================================================
+-- 2. TABLES AND PRIMARY CONSTRAINTS (NO FOREIGN KEYS YET)
+-- ==============================================================================
+
+
+--------------------------------------------------------
+--  DDL for Table JS_EOD_MASTER
+--------------------------------------------------------
+CREATE TABLE JS_EOD_MASTER 
+(	
+    "ID" NUMBER DEFAULT 1, 
+	"JS_STATUS" NUMBER(1,0) DEFAULT 1, 
+	"EOD_STATUS" NUMBER(1,0) DEFAULT 0, 
+	"JS_UPDATED_AT" TIMESTAMP (6), 
+	"EOD_UPDATED_AT" TIMESTAMP (6), 
+	"JS_PENDING_COUNTER" NUMBER DEFAULT 0,
+    CONSTRAINT "CHK_JS_EOD_SINGLE_ROW" CHECK (ID = 1),
+    PRIMARY KEY ("ID")
+);
+
+--------------------------------------------------------
+--  DDL for Table REQUEST_VOUCHER
+--------------------------------------------------------
+CREATE TABLE "REQUEST_VOUCHER" 
+(	
+    "ID" NUMBER GENERATED BY DEFAULT AS IDENTITY MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 20 NOORDER NOCYCLE NOKEEP NOSCALE NOT NULL ENABLE, 
+	"VID" VARCHAR2(20) NOT NULL ENABLE, 
+	"CATEGORY_ID" NUMBER NOT NULL ENABLE, 
+	"DESCRIPTION" VARCHAR2(500) NOT NULL ENABLE, 
+	"ALLOWED_ROLE" NUMBER NOT NULL ENABLE, 
+	"SD_REQ_NO" VARCHAR2(100), 
+	"CREATED_BY" VARCHAR2(100), 
+	"CREATED_AT" TIMESTAMP (6) DEFAULT CURRENT_TIMESTAMP, 
+	"TERMINATED_BY" VARCHAR2(100), 
+	"TERMINATED_AT" TIMESTAMP (6), 
+	"STATUS" VARCHAR2(30) NOT NULL ENABLE, 
+	"REMARKS" VARCHAR2(500), 
+	"BACK_DATE" DATE, 
+	"IS_BACK_DATED" NUMBER(1,0) DEFAULT 0 NOT NULL ENABLE,
+    PRIMARY KEY ("ID"),
+    UNIQUE ("VID")
+);
+
+--------------------------------------------------------
+--  DDL for Table VOUCHER_CATEGORY
+--------------------------------------------------------
+CREATE TABLE "VOUCHER_CATEGORY" 
+(	
+    "ID" NUMBER GENERATED BY DEFAULT AS IDENTITY MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 20 NOORDER NOCYCLE NOKEEP NOSCALE NOT NULL ENABLE, 
+	"CATEGORY_NAME" VARCHAR2(20) NOT NULL ENABLE, 
+	"CREATED_DATE" TIMESTAMP (6) DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY ("ID"),
+    UNIQUE ("CATEGORY_NAME")
+);
+
+--------------------------------------------------------
+--  DDL for Table ISSUE_CATEGORY
+--------------------------------------------------------
+CREATE TABLE "ISSUE_CATEGORY" 
+(	
+    "ID" NUMBER, 
+	"VOUCHER_CATEGORY_ID" NUMBER NOT NULL ENABLE, 
+	"ISSUE_CATEGORY_NAME" VARCHAR2(100) NOT NULL ENABLE, 
+	"CREATED_DATE" TIMESTAMP (6) DEFAULT SYSTIMESTAMP,
+    PRIMARY KEY ("ID")
+);
+
+--------------------------------------------------------
+--  DDL for Table REQUEST_VOUCHER_ISSUE_CATEGORY
+--------------------------------------------------------
+CREATE TABLE "REQUEST_VOUCHER_ISSUE_CATEGORY" 
+(	
+    "ID" NUMBER, 
+	"REQUEST_VOUCHER_ID" NUMBER NOT NULL ENABLE, 
+	"ISSUE_CATEGORY_ID" NUMBER NOT NULL ENABLE,
+    PRIMARY KEY ("ID")
+);
+
+--------------------------------------------------------
+--  DDL for Table VOUCHER_POSTING
+--------------------------------------------------------
+CREATE TABLE "VOUCHER_POSTING" 
+(	
+    "BATCH_ID" VARCHAR2(50), 
+	"VID_FK" VARCHAR2(20) NOT NULL ENABLE, 
+	"WORKFLOW_CODE" VARCHAR2(100), 
+	"CREATED_BY" VARCHAR2(100), 
+	"CREATED_AT" TIMESTAMP (6) DEFAULT CURRENT_TIMESTAMP, 
+	"PENDING_AT" NUMBER, 
+	"IS_EXECUTION_SCHEDULED" VARCHAR2(3), 
+	"SCHEDULED_TIME" TIMESTAMP (6), 
+	"IS_SCHEDULE_OVERRIDE" VARCHAR2(3), 
+	"EXECUTED_AT" TIMESTAMP (6), 
+	"BATCH_STATUS" VARCHAR2(20), 
+	"RECORDS_COUNT" NUMBER, 
+	"COMMON_BATCH_REMARKS" VARCHAR2(30 CHAR), 
+	"CREATOR_ROLE" NUMBER(10,0), 
+	"EXECUTOR_ID" VARCHAR2(10), 
+	"FIX_TYPE" CHAR(1) DEFAULT 'J' NOT NULL ENABLE, 
+	"TARGET_DATE" DATE,
+    CHECK (UPPER("IS_EXECUTION_SCHEDULED")='YES' OR UPPER("IS_EXECUTION_SCHEDULED")='NO'),
+    CHECK (UPPER("IS_SCHEDULE_OVERRIDE") IN ('YES', 'NO')),
+    PRIMARY KEY ("BATCH_ID")
+);
+
+--------------------------------------------------------
+--  DDL for Table VOUCHER_POSTING_DATA
+--------------------------------------------------------
+CREATE TABLE "VOUCHER_POSTING_DATA" 
+(	
+    "REQ_STATUS" VARCHAR2(10 CHAR) DEFAULT 'P' NOT NULL ENABLE, 
+	"REQ_DATE" DATE DEFAULT SYSDATE NOT NULL ENABLE, 
+	"CREATOR_ID" VARCHAR2(12 CHAR) NOT NULL ENABLE, 
+	"EXECUTION_DATE" DATE, 
+	"BATCH_ID" VARCHAR2(50 CHAR), 
+	"JOURNAL_ID" VARCHAR2(50 CHAR), 
+	"REQ_BRANCH_CODE" VARCHAR2(50 CHAR), 
+	"REQ_CURRENCY" VARCHAR2(3), 
+	"REQ_CGL" VARCHAR2(50 CHAR), 
+	"REQ_AMOUNT" NUMBER(25,4), 
+	"REQ_NARRATION" VARCHAR2(200 CHAR), 
+	"REQ_PRODUCT" VARCHAR2(50 CHAR), 
+	"REQ_ID" NUMBER(19,0) NOT NULL ENABLE, 
+	"IS_CGL_VALID" CHAR(1), 
+	"IS_CURRENCY_VALID" CHAR(1), 
+	"IS_BRANCH_VALID" CHAR(1), 
+	"IS_VALIDATED" CHAR(1) DEFAULT 'N' NOT NULL ENABLE,
+    PRIMARY KEY ("REQ_ID")
+);
+
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_STATUS" IS 'Row-level processing status (e.g., P for Pending, A for Approved, R for Rejected).';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_DATE" IS 'The date when maker created the voucher';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."EXECUTION_DATE" IS 'Timestamp when this checker acted upon the voucher';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."BATCH_ID" IS 'Foreign key linking this row to its parent in JOURNAL_BATCH_MASTER.';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."JOURNAL_ID" IS 'Unique identifier for the individual request.';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_BRANCH_CODE" IS 'The branch code requested for the transaction.';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_CURRENCY" IS 'The 3-character currency code requested.';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_CGL" IS 'The 10-digit CGL account code requested.';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_AMOUNT" IS 'Raw requested amount';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_NARRATION" IS 'remarks from the uploaded file.';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."REQ_PRODUCT" IS 'The product code requested.';
+COMMENT ON COLUMN "VOUCHER_POSTING_DATA"."IS_VALIDATED" IS 'Flag for checking row is checked or not for validation';
+
+--------------------------------------------------------
+--  DDL for Table VOUCHER_TRANSACTIONS
+--------------------------------------------------------
+CREATE TABLE "VOUCHER_TRANSACTIONS" 
+(	
+    "TRANSACTION_ID" NUMBER(20,0) NOT NULL ENABLE, 
+	"BATCH_ID" VARCHAR2(50 CHAR), 
+	"JOURNAL_ID" VARCHAR2(50 CHAR), 
+	"TRANSACTION_DATE" DATE, 
+	"POST_DATE" TIMESTAMP (6), 
+	"BRANCH_CODE" VARCHAR2(50 CHAR), 
+	"CURRENCY" VARCHAR2(3), 
+	"CGL" VARCHAR2(10), 
+	"NARRATION" VARCHAR2(40 CHAR), 
+	"DEBIT_AMOUNT" NUMBER(25,4), 
+	"CREDIT_AMOUNT" NUMBER(25,4), 
+	"TRANSACTION_COUNT" NUMBER(10,0), 
+	"SOURCE_FLAG" VARCHAR2(1),
+    PRIMARY KEY ("TRANSACTION_ID")
+);
+
+--------------------------------------------------------
+--  DDL for Table VOUCHER_WORKFLOW
+--------------------------------------------------------
+CREATE TABLE "VOUCHER_WORKFLOW" 
+(	
+    "WORKFLOW_ID" NUMBER GENERATED ALWAYS AS IDENTITY MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 20 NOORDER NOCYCLE NOKEEP NOSCALE NOT NULL ENABLE, 
+	"BATCH_ID_FK" VARCHAR2(50) NOT NULL ENABLE, 
+	"VID_FK" VARCHAR2(20) NOT NULL ENABLE, 
+	"LAST_ACTION" VARCHAR2(30), 
+	"LAST_ACTION_BY" VARCHAR2(100), 	
+	"LAST_ACTION_AT" TIMESTAMP (6) DEFAULT CURRENT_TIMESTAMP, 
+	"REMARKS" VARCHAR2(500), 
+	"SCHEDULED_TIME" TIMESTAMP (6),
+    PRIMARY KEY ("WORKFLOW_ID")
+);
+
+--------------------------------------------------------
+--  DDL for Table SCHEDULED_BATCH_RETRY
+--------------------------------------------------------
+CREATE TABLE "SCHEDULED_BATCH_RETRY" 
+(	
+    "BATCH_ID" VARCHAR2(50) NOT NULL ENABLE, 
+	"CREATED_AT" TIMESTAMP (6) DEFAULT SYSTIMESTAMP, 
+	"RETRY_COUNT" NUMBER DEFAULT 0, 
+	"STATUS" VARCHAR2(20) DEFAULT 'PENDING',
+    PRIMARY KEY ("BATCH_ID")
+);
+
+--------------------------------------------------------
+--  DDL for Table HDFS_SYNC_RETRY_QUEUE
+--------------------------------------------------------
+CREATE TABLE "HDFS_SYNC_RETRY_QUEUE" 
+(	
+    "BATCH_ID" VARCHAR2(50), 
+	"CREATED_AT" TIMESTAMP (6) DEFAULT SYSTIMESTAMP, 
+	"RETRY_COUNT" NUMBER DEFAULT 0, 
+	"STATUS" VARCHAR2(20) DEFAULT 'PENDING',
+    PRIMARY KEY ("BATCH_ID")
+);
+
+--------------------------------------------------------
+--  DDL for Table WORKFLOW_TRANSITIONS
+--------------------------------------------------------
+CREATE TABLE "WORKFLOW_TRANSITIONS" 
+(	
+    "WORKFLOW_CODE" VARCHAR2(50) NOT NULL ENABLE, 
+	"ALLOWED_ROLE_ID" NUMBER(10,0), 
+	"IS_FINAL_APPROVAL" CHAR(1) DEFAULT 'N', 
+	"SCHEDULING_ALLOWED" CHAR(1), 
+	"WORKFLOW_STAGE" VARCHAR2(100), 
+	"ESCALATION_TIME" NUMBER(10,0), 
+	"WORKFLOW_ORDER" NUMBER(3,0) NOT NULL ENABLE, 
+	"WORKFLOW_ID" NUMBER DEFAULT "WORKFLOWID_SEQ"."NEXTVAL",
+    UNIQUE ("WORKFLOW_ID"),
+    PRIMARY KEY ("WORKFLOW_CODE", "WORKFLOW_ORDER")
+);
+
+-- ==============================================================================
+-- 3. FOREIGN KEYS / REF CONSTRAINTS
+-- ==============================================================================
+
+ALTER TABLE "ISSUE_CATEGORY" ADD CONSTRAINT "FK_ISSUE_CATEGORY_VOUCHER" FOREIGN KEY ("VOUCHER_CATEGORY_ID")
+    REFERENCES "VOUCHER_CATEGORY" ("ID") ENABLE;
+
+ALTER TABLE "REQUEST_VOUCHER_ISSUE_CATEGORY" ADD CONSTRAINT "FK_REQ_VOUCHER_ISSUE" FOREIGN KEY ("REQUEST_VOUCHER_ID")
+    REFERENCES "REQUEST_VOUCHER" ("ID") ENABLE;
+    
+ALTER TABLE "REQUEST_VOUCHER_ISSUE_CATEGORY" ADD CONSTRAINT "FK_REQ_ISSUE_CATEGORY" FOREIGN KEY ("ISSUE_CATEGORY_ID")
+    REFERENCES "ISSUE_CATEGORY" ("ID") ENABLE;
+
+ALTER TABLE "VOUCHER_WORKFLOW" ADD CONSTRAINT "FK_VP_BATCH" FOREIGN KEY ("BATCH_ID_FK")
+    REFERENCES "VOUCHER_POSTING" ("BATCH_ID") ENABLE;
+
+-- ==============================================================================
+-- 4. NON-PRIMARY INDEXES
+-- ==============================================================================
+
+
+CREATE INDEX "IDX_JR_BATCH_OPT" ON "VOUCHER_POSTING_DATA" ("BATCH_ID", "REQ_STATUS");
+CREATE INDEX "IDX_JR_BRANCH_CODE" ON "VOUCHER_POSTING_DATA" ("REQ_BRANCH_CODE");
+CREATE INDEX "IDX_JR_JOURNAL_ID" ON "VOUCHER_POSTING_DATA" ("JOURNAL_ID");
+CREATE INDEX "IDX_JR_BATCH_ID" ON "VOUCHER_POSTING_DATA" ("BATCH_ID");
+
+CREATE INDEX "IDX_HDFS_RETRY_STATUS" ON "HDFS_SYNC_RETRY_QUEUE" ("STATUS");
+
+-- ==============================================================================
+-- 5. TRIGGERS
+-- ==============================================================================
+
+
+CREATE OR REPLACE EDITIONABLE TRIGGER "REQUEST_VID_TRIGGER" 
+BEFORE INSERT ON REQUEST_VOUCHER
+FOR EACH ROW
+DECLARE
+    v_seq_number NUMBER;
+    v_prefix VARCHAR2(20);
+BEGIN
+    v_prefix := 'VID-' || TO_CHAR(SYSDATE, 'YYMM') || '-';
+    
+    SELECT REQUEST_VOUCHER_SEQ.NEXTVAL
+    INTO v_seq_number
+    FROM DUAL;
+    
+    :NEW.VID := v_prefix || LPAD(v_seq_number, 5, '0');
+END;
+/
+ALTER TRIGGER "REQUEST_VID_TRIGGER" ENABLE;
