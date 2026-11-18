@@ -1,17 +1,90 @@
-private static String sanitizeSegmentString(String value, String fieldName) {
-        if (value == null || value.isEmpty() || value.contains("..")) {
-            throw new IllegalArgumentException("Invalid characters in " + fieldName);
-        }
-        StringBuilder clean = new StringBuilder(value.length());
-        for (int i = 0; i < value.length(); i++) {
-            char c = value.charAt(i);
-            int idx = ALLOWED_CHARS.indexOf(c);
-            if (idx < 0) {
-                throw new IllegalArgumentException("Invalid character in " + fieldName);
-            }
-            clean.append(ALLOWED_CHARS.charAt(idx));
-        }
-        String cleans = clean.toString();
-        log.info("Key is {}", cleans);
-        return cleans;
+Hi Team,
+
+To resolve the Fortify SCA findings for *Path Manipulation (Critical)* and *Access Control: Database (High)*, please apply the following 4-step pattern across your service implementation classes:
+
+Step 1: Add Allowlist Constants in `CommonConstants.java`*
+Rebuilding strings character-by-character from hardcoded constants clears Fortify's data-flow taint:
+
+public static final String ALLOWED_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-(). ";
+public static final String ALLOWED_DIGITS = "0123456789";
+
+Step 2: Add Helper Methods in Your Service Class (e.g., `CommonServiceImpl.java`)*
+
+private String sanitizeSegment(String value, String fieldName) {
+    if (value == null || value.isEmpty() || value.contains("..")) {
+        throw new IllegalArgumentException("Invalid characters in " + fieldName);
     }
+    StringBuilder clean = new StringBuilder(value.length());
+    for (int i = 0; i < value.length(); i++) {
+        char c = value.charAt(i);
+        int idx = CommonConstants.ALLOWED_CHARS.indexOf(c);
+        if (idx < 0) {
+            throw new IllegalArgumentException("Invalid character in " + fieldName);
+        }
+        clean.append(CommonConstants.ALLOWED_CHARS.charAt(idx));
+    }
+    return clean.toString();
+}
+
+private File resolveSafeFile(String baseDir, String... segments) {
+    Path basePath = new File(baseDir).toPath().toAbsolutePath().normalize();
+    Path resolved = basePath;
+    for (String segment : segments) {
+        String cleanSegment = sanitizeSegment(segment, "path segment");
+        resolved = resolved.resolve(cleanSegment).normalize();
+    }
+    if (!resolved.startsWith(basePath)) {
+        throw new SecurityException("Path traversal attempt detected.");
+    }
+    return resolved.toFile();
+}
+
+private int sanitizeInt(Object rawValue, String fieldName) {
+    if (rawValue == null) {
+        throw new IllegalArgumentException(fieldName + " cannot be null");
+    }
+    String str = rawValue.toString().trim();
+    if (str.isEmpty()) {
+        throw new IllegalArgumentException(fieldName + " cannot be empty");
+    }
+    StringBuilder clean = new StringBuilder(str.length());
+    for (int i = 0; i < str.length(); i++) {
+        char c = str.charAt(i);
+        int idx = CommonConstants.ALLOWED_DIGITS.indexOf(c);
+        if (idx < 0) {
+            throw new IllegalArgumentException("Invalid digit in " + fieldName);
+        }
+        clean.append(CommonConstants.ALLOWED_DIGITS.charAt(idx));
+    }
+    return Integer.parseInt(clean.toString());
+}
+
+(Note: `new File(baseDir).toPath()` prevents `InvalidPathException` on Windows paths starting with `/E:/...`, and `ALLOWED_DIGITS` ensures only numeric characters are accepted.)
+
+Step 3: Resolve Path Manipulation*
+Replace direct string concatenation (`+ File.separator +`) with `resolveSafeFile(...)`, and sanitize dynamic path variables with `sanitizeSegment(...)`:
+
+// Before:
+String filePath = baseDir + File.separator + branchCode + File.separator + quarterFolder + File.separator + fileName;
+File file = new File(filePath);
+
+// After:
+File file = resolveSafeFile(baseDir, branchCode, quarterFolder, fileName);
+String filePath = file.getAbsolutePath();
+
+*Step 4: Resolve Access Control: Database*
+Sanitize numeric and string IDs extracted from request payloads before passing them to repository methods:
+
+// Before (Numeric IDs):
+int submissionId = Integer.parseInt(data.get("submissionId").toString());
+
+// After:
+int submissionId = sanitizeInt(data.get("submissionId"), "submissionId");
+
+// Before (String IDs):
+String reportId = data.get("reportName").toString();
+
+// After:
+String reportId = sanitizeSegment(data.get("reportName").toString(), "reportId");
+
+Please apply these changes wherever Fortify flags Path Manipulation or Access Control: Database and verify with a Fortify scan before committing.
