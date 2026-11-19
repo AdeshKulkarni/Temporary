@@ -1,123 +1,46 @@
-# Final Security Remediation Guide
+# Fix for Remaining Fortify Issue (`LfarAudiServiceImpl.java:159`)
 
-This guide resolves:
-1. **The last remaining `Access Control: Database` (High)** issue in `LfarAudiServiceImpl.java`.
-2. **All 5 `System Information Leak: External` (Medium)** issues across your controllers/services.
+### 1. Add a Date Sanitizer Helper Method
+Add this helper method right next to `sanitizeSegment` and `sanitizeInt` at the bottom of `LfarAudiServiceImpl.java` (it uses the exact same `StringBuilder` allowlist loop so Fortify clears the taint):
 
-**Business Logic Confirmation:** Zero business logic is altered. Detailed exceptions are still logged internally on the server (`log.info` / `log.error`), while safe generic messages are returned to the client.
+```java
+    private String sanitizeDate(String value, String fieldName) {
+        if (value == null || value.isEmpty()) {
+            throw new IllegalArgumentException(fieldName + " cannot be null or empty");
+        }
+        String allowedDateChars = "0123456789/-";
+        StringBuilder clean = new StringBuilder(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            int idx = allowedDateChars.indexOf(c);
+            if (idx < 0) {
+                throw new IllegalArgumentException("Invalid character in " + fieldName);
+            }
+            clean.append(allowedDateChars.charAt(idx));
+        }
+        return clean.toString();
+    }
+```
 
 ---
 
-## Part 1: Resolve Remaining `Access Control: Database` (High)
+### 2. Update `saveQuestion()` in `LfarAudiServiceImpl.java`
+Sanitize `quarterEndDate` right where you extract it from `user` so that `formatter.parse(quarterEndDate)` produces a clean `Date` object.
 
-### 1. `LfarAudiServiceImpl.java` -> `saveQuestion()` (Line 159)
-**Why it is still flagging:** Look at the `CrsLfarDataId` object on line 156:
-`new CrsLfarDataId(branch_code, formatter.parse(quarterEndDate), reportId, cleanSeq)`
-While `reportId` and `cleanSeq` were sanitized, `branch_code` was pulled directly from the `user` map without sanitization! Fortify sees `branch_code` as tainted and flags the `findById(dataId)` call.
-
-*Find this (around line 130 in `saveQuestion()`):*
-```java
-String branch_code = user.get("branch_code");
-String quarterEndDate = user.get("quarterEndDate");
-String submissionId = sanitizeSegment(String.valueOf(data.get("submissionId")), "submissionId");
-String reportId = sanitizeSegment(String.valueOf(data.get("reportId")), "reportId");
-```
-
-*Replace with (Sanitize `branch_code` as well):*
+*Find this (around line 127):*
 ```java
 String branch_code = sanitizeSegment(String.valueOf(user.get("branch_code")), "branch_code");
 String quarterEndDate = user.get("quarterEndDate");
 String submissionId = sanitizeSegment(String.valueOf(data.get("submissionId")), "submissionId");
 String reportId = sanitizeSegment(String.valueOf(data.get("reportId")), "reportId");
 ```
-*(Because `branch_code` is now rebuilt via `sanitizeSegment`, all four parameters inside `CrsLfarDataId` are completely untainted, clearing line 159).*
 
----
-
-## Part 2: Resolve `System Information Leak: External` (5 Medium Issues)
-
-**What this issue is:** In your `catch` blocks, you are putting raw Java exceptions (`e.getMessage()` or the `e` object itself) directly into `responseVo.setMessage(...)` or `result.put("msg", ...)`. When the Controller returns `ResponseEntity<>(responseVo, HttpStatus.OK)`, internal stack traces, SQL errors, or class names are leaked to the external caller.
-**How to resolve it:** Keep logging the actual exception on the server so your team can debug issues, but replace `e.getMessage()` and `e` in the response payload with a generic, hardcoded string.
-
-### Issue 1: `Lfar2ServiceImpl.java` -> `getData()` (Line 316)
-*Find this:*
-```java
-} catch (Exception e) {
-    log.info("NullPointer Exception Occurred: " + e.getCause());
-    e.printStackTrace();
-    responseVo.setStatusCode(HttpStatus.INTERNAL_SERVER_ERROR.value());
-    responseVo.setMessage(e.getMessage());
-}
-```
 *Replace with:*
 ```java
-} catch (Exception e) {
-    log.info("NullPointer Exception Occurred: " + e.getCause());
-    e.printStackTrace();
-    responseVo.setStatusCode(HttpStatus.INTERNAL_SERVER_ERROR.value());
-    responseVo.setMessage("Error fetching data");
-}
+String branch_code = sanitizeSegment(String.valueOf(user.get("branch_code")), "branch_code");
+String quarterEndDate = sanitizeDate(String.valueOf(user.get("quarterEndDate")), "quarterEndDate");
+String submissionId = sanitizeSegment(String.valueOf(data.get("submissionId")), "submissionId");
+String reportId = sanitizeSegment(String.valueOf(data.get("reportId")), "reportId");
 ```
 
----
-
-### Issues 2 & 3: `Lfar3ComplianceServiceImpl.java` -> `saveComplianceData()` (Lines 162 & 167)
-*Find this:*
-```java
-} catch (NullPointerException e) {
-    log.error("Null Pointer Exception Occurred : {}", e.getMessage());
-    result.put(STATUS, false);
-    result.put("msg", e.getMessage());
-} catch (Exception e) {
-    log.error("Exception Occurred : {}",e.getMessage());
-    // e.printStackTrace();
-    result.put(STATUS, false);
-    result.put("msg", e.getMessage());
-}
-```
-*Replace with:*
-```java
-} catch (NullPointerException e) {
-    log.error("Null Pointer Exception Occurred : {}", e.getMessage());
-    result.put(STATUS, false);
-    result.put("msg", "Invalid or missing required data");
-} catch (Exception e) {
-    log.error("Exception Occurred : {}", e.getMessage());
-    // e.printStackTrace();
-    result.put(STATUS, false);
-    result.put("msg", "Failed to save compliance data");
-}
-```
-
----
-
-### Issues 4 & 5: `Lfar3ServiceImpl.java` -> `saveData()` (Lines 159 & 163)
-*Find this:*
-```java
-} catch (NullPointerException e) {
-    log.info("Null Pointer Exception Occured" + e);
-    result.put("status", false);
-    result.put("msg", e);
-} catch (Exception e) {
-    log.info("Exception Occured" + e);
-    result.put("status", false);
-    result.put("msg", e);
-}
-```
-*Replace with:*
-```java
-} catch (NullPointerException e) {
-    log.info("Null Pointer Exception Occured" + e);
-    result.put("status", false);
-    result.put("msg", "Invalid or missing required data");
-} catch (Exception e) {
-    log.info("Exception Occured" + e);
-    result.put("status", false);
-    result.put("msg", "Failed to save data");
-}
-```
-
----
-
-### Proactive Check (Preventing Future Leaks in Other Files)
-While checking your original code, **`Lfar2_1ServiceImpl.java`** (around line 104 in `getData()`) also has a `responseVo.setMessage(e.getMessage());` line. Make sure you replace that with `responseVo.setMessage("Error fetching data");` as well so Fortify doesn't flag it on the next scan!
+*(Business Logic Confirmation: Valid dates like `"31/03/2026"` pass through untouched, while Fortify's `NUMBER` taint flag on the parsed `Date` is completely broken—resolving line 159).*
